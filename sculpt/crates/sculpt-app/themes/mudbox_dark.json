@@ -1,0 +1,26 @@
+{
+  "name": "Mudbox Dark",
+  "dark": true,
+  "ui": {
+    "window": "#2b2b2b",
+    "panel": "#444444",
+    "tray": "#3a3a3a",
+    "widget": "#565656",
+    "widget_hover": "#646464",
+    "widget_active": "#5a7896",
+    "text": "#dcdcdc",
+    "text_weak": "#9a9a9a",
+    "accent": "#5285a6",
+    "separator": "#2e2e2e"
+  },
+  "viewport": {
+    "background_top": "#5d6670",
+    "background_bottom": "#23272c",
+    "clay": "#b9a597",
+    "overlay": "#3f8cf2",
+    "freeze": "#2d4fd6",
+    "cursor": "#ff6a3d",
+    "hud_text": "#e6e6e6"
+  },
+  "metrics": { "corner_radius": 2, "spacing": 6.0, "font_size": 13.0, "tray_tile": 68.0 }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "Studio Light",
+  "dark": false,
+  "ui": {
+    "window": "#f4f4f4",
+    "panel": "#e3e3e3",
+    "tray": "#d6d6d6",
+    "widget": "#cacaca",
+    "widget_hover": "#bdbdbd",
+    "widget_active": "#8fb3d9",
+    "text": "#1d1d1d",
+    "text_weak": "#5c5c5c",
+    "accent": "#2f6fb3",
+    "separator": "#b5b5b5"
+  },
+  "viewport": {
+    "background_top": "#c9ced6",
+    "background_bottom": "#8a919b",
+    "clay": "#c7b3a3",
+    "overlay": "#1f6fe0",
+    "freeze": "#3048c8",
+    "cursor": "#d94a1a",
+    "hud_text": "#101010"
+  },
+  "metrics": { "corner_radius": 4, "spacing": 6.0, "font_size": 13.0, "tray_tile": 68.0 }
+}

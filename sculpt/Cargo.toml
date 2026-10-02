@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/sculpt-core", "crates/sculpt-cli", "crates/sculpt-app"]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# Sculpting kernels are unusable unoptimized; keep tests fast too.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
