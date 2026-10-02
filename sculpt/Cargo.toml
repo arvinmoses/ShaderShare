@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sculpt-core", "crates/sculpt-cli"]
+members = ["crates/sculpt-core", "crates/sculpt-cli", "crates/sculpt-app"]
 resolver = "2"
 
 [profile.release]

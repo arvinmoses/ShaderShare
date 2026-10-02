@@ -10,14 +10,58 @@ data-driven layered project format.
 
 *`sculpt-cli demo`: topological Move, Clay Buildup, Trim Dynamic and a posed bump; right panel shows the detail layer's mask (fbm noise ⊕ hand paint − cavity).*
 
-This is the headless engine core plus a CLI. The GPU viewport and Mudbox-style
-UI are the next phase — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
-the design, measured performance and roadmap.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design, measured
+performance and roadmap.
 
 ```
 crates/sculpt-core   engine library (no UI, no GPU dependency)
+crates/sculpt-app    the desktop app: egui + wgpu, Mudbox-style, themeable
 crates/sculpt-cli    demo / benchmark / project tools / thumbnail renderer
-docs/                architecture and roadmap
+docs/                architecture, roadmap, screenshots
+```
+
+## The app
+
+![app](docs/screenshots/app_mudbox_dark.png)
+
+```sh
+cargo run --release -p sculpt-app                        # level-7 sphere (98k faces)
+cargo run --release -p sculpt-app -- --level 9           # 1.6M faces
+cargo run --release -p sculpt-app -- path/to/head.sculpt # open a project
+cargo run --release -p sculpt-app --features tablet      # + octotablet pen pressure (Windows Ink / Wayland)
+```
+
+| Input | Action |
+|---|---|
+| LMB drag | sculpt / paint with the current tool |
+| Shift + stroke | Smooth · Ctrl + stroke: invert (dig, fill, unfreeze, erase) |
+| Alt + LMB, or RMB drag | orbit |
+| Alt + MMB, or MMB drag | pan |
+| Alt + RMB drag, or wheel | zoom |
+| `1`–`7` | Clay Buildup, Trim Dynamic, Move, Smooth, Freeze, Mask Paint, Pose |
+| `[` `]` / Shift+`[` `]` | brush size / strength |
+| `F` frame · `Shift+D` subdivide · `Ctrl+L` new layer · `O` cycle overlay · `H` HUD | |
+
+Everything above is data: **themes** are JSON files (built-ins in
+`crates/sculpt-app/themes/`; your own go in `~/.config/sculpt/themes/` and
+hot-reload on save, or use *Display ▸ Theme editor*), and **hotkeys** are
+overridden per command in `~/.config/sculpt/keymap.json` (same format as
+`crates/sculpt-app/keymap.json`). Set `SCULPT_HOME` to relocate the config folder.
+
+| Studio Light | High Contrast |
+|---|---|
+| ![](docs/screenshots/app_studio_light.png) | ![](docs/screenshots/app_high_contrast.png) |
+
+### Measuring it on your machine
+
+The HUD (top-left, `H`) shows fps, CPU time for input+dabs and the viewport,
+bytes uploaded to the GPU per frame, and which **pen source** is live with the
+current pressure. For a repeatable number, run the built-in stroke test — it
+pushes synthetic 240 Hz pen strokes through the real input → dab → upload →
+render path and prints percentiles:
+
+```sh
+cargo run --release -p sculpt-app -- --level 10 --test-strokes 180 --screenshot test.png
 ```
 
 ## Build & run

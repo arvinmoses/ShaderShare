@@ -1,0 +1,18 @@
+[package]
+name = "sculpt-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.2"
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.36"
+glam = "0.33.12"
+octotablet = { version = "0.1", optional = true }
+png = "0.18.1"
+sculpt-core = { version = "0.1.0", path = "../sculpt-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[features]
+tablet = ["dep:octotablet"]

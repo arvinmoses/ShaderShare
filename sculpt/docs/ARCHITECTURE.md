@@ -29,7 +29,7 @@ built this way, and what comes next.
 | Data-driven layered file format | **Done**: JSON manifest + typed raw blobs | `io/project.rs` |
 | Import data/noise from other programs | **Done (v1)**: per-vertex channel files, mask stacks as JSON | `io/mod.rs`, `MaskStack` serde |
 | Substance-style texture layers | **Designed**, deferred (§7) | — |
-| Mudbox-style UI / GPU viewport | **Designed**, next phase (§8) | — |
+| Mudbox-style UI / GPU viewport | **Done (v1)**: egui + wgpu, themeable, data-driven hotkeys (§8) | `crates/sculpt-app` |
 
 ---
 
@@ -231,24 +231,99 @@ Planned on the same foundations:
 
 ---
 
-## 8. UI: Mudbox layout, ZBrush feel
+## 8. UI: Mudbox layout, ZBrush feel (`crates/sculpt-app`)
 
-Recommended stack: Rust, **wgpu** (Vulkan/Metal/DX12) for the viewport, and
-**egui** with a custom Mudbox-like theme for panels. The core crate is
-headless and UI-agnostic, so a C++/Qt front end over a C ABI is possible later
-if needed.
+**Stack:** Rust, **egui 0.36** for panels, **wgpu 30** for the viewport, one
+process, one GPU device. Chosen over Qt (via cxx-qt) and Tauri/React because
+the viewport and pen input must not cross a process or language boundary, and
+one language keeps the app easy to extend. Qt remains viable later: the
+engine is UI-agnostic.
 
-* **Viewport:** Maya/Mudbox navigation (Alt+LMB/MMB/RMB), matcap and PBR
-  modes, wireframe overlay, a brush cursor that shows the clay footprint
-  square.
-* **Bottom tray:** Sculpt Tools, Paint Tools, Pose Tools, Select/Move tabs,
-  plus Stamp/Stencil/Falloff trays.
-* **Right panels:** Object List; **Layers** (Sculpt | Paint tabs) with an
-  inline strength slider per layer, visibility, lock, mask thumbnail, and a
-  mask-stack editor in the Substance style; Properties for brush settings.
-* **Hotkeys:** Shift = Smooth, Ctrl = invert, B + drag = size, M + drag =
-  strength, Ctrl-click = topological pose mask. Remappable as data.
-* Undo history panel (labels already exist: `Document::undo_labels`).
+**Frame loop (latency first).** Per frame, on the UI thread:
+`keymap commands → panels → every pointer sample of the frame → raycast →
+stroke spacing → dabs → dirty-leaf GPU upload → render → present`. Input and
+its result land in the same frame. Safeguards:
+
+* **Per-dab time budget (12 ms):** dabs that don't fit are queued for the next
+  frame, so a huge brush on a huge mesh makes the stroke trail slightly rather
+  than freezing the UI.
+* **Strokes lift over gaps:** leaving the silhouette or jumping across a depth
+  discontinuity restarts spacing instead of interpolating dabs across the gap
+  (this was a 236 ms hitch before the fix).
+* **Strokes can start off the mesh** and begin when the pen reaches it.
+* **Background jobs** (load, subdivide, bake, large-mesh mask evaluation) run
+  on a worker thread; the viewport shows a progress overlay meanwhile.
+* **`SurfaceConfig::LOW_LATENCY`** presentation.
+
+**GPU data path.** Positions, normals and an overlay scalar live in separate
+vertex buffers in the engine's internal vertex order. The engine tracks dirty
+leaves (`Document::take_geometry_dirty` / `take_scalar_dirty`), and since
+every leaf owns a contiguous vertex range, an update is a few `write_buffer`
+calls for exactly the touched ranges. Index buffers rebuild only when
+`topology_id` changes (subdivide / load). The scene renders at 4× MSAA into an
+offscreen texture displayed by egui.
+
+**Viewport shading:** camera-relative studio clay (key/fill/rim/spec), overlay
+tint for freeze / layer mask / any channel / pose weights, and a ZBrush-style
+brush ring drawn on the surface at the true world radius.
+
+**Panels (Mudbox layout):** menu bar; bottom tool tray (Sculpt / Paint / Pose
+tabs, vector-drawn icons, hotkey badges); right panel with
+**Layers** (visibility, lock, active layer, inline strength slider −100…200%,
+mask badge, New / Flatten / Delete, *Base mesh* row) and the
+**Substance-style mask stack editor** (per mask layer: on, invert, reorder,
+blend mode, opacity, source parameters, levels, blur; add Noise / Painted
+channel / Curvature / Cavity / AO / Thickness / Direction / Gradient / Fill);
+**Properties** (per-tool size, strength, hardness, front-faces, plus
+tool-specific settings); **Object** (stats, pen status, channels); status bar
+with tool hints.
+
+**Tools wired to the engine:** Clay Buildup, Trim Dynamic, Move (topological
+option), Smooth (and Shift-smooth), Freeze paint, Mask paint, Pose
+(click a limb → topological mask with soft joint, drag → rotate or translate,
+live preview below 1.5M verts, applied on release above that).
+
+**Theming:** a theme is JSON with UI colors, viewport colors (background
+gradient, clay, overlays, cursor, HUD) and metrics (font size, spacing,
+corner radius, tray tile size). Three built-ins (Mudbox Dark, Studio Light,
+High Contrast); user themes load from the config folder and **hot-reload when
+the file changes**; *Display ▸ Theme editor* edits live and saves JSON. The
+chosen theme and per-tool settings persist between sessions.
+
+**Extensibility:** every action is a `Command`; menus, tray and hotkeys all
+dispatch commands; bindings are JSON (`keymap.json`, user overrides per
+command). Adding a feature = one enum variant + one handler. A scripting layer
+(Python via pyo3 or Lua) can dispatch the same commands later.
+
+**Pen pressure:** three sources with automatic fallback — octotablet (feature
+`tablet`: Windows Ink + Wayland; unmaintained since 2024-03, so isolated
+behind a feature), pointer force from winit (Windows pen), mouse = 1.0. The
+HUD and Object tab show which source is live.
+
+### Measured (cloud VM, 4 cores, **software** Vulkan — lavapipe)
+
+Synthetic 240 Hz pen strokes through the real path (`--test-strokes`):
+
+| Mesh | Input + dabs, median | p95 | max | GPU upload / frame | UI panels |
+|---|---|---|---|---|---|
+| 98k faces | 2.1 ms | 5.1 ms | 8.1 ms | 0.9 MB | ~0.5 ms |
+| 393k faces | 2.8 ms | 5.0 ms | 10.6 ms | 1.3 MB | ~0.5 ms |
+| 6.3M faces | 12.4 ms | 16.4 ms | 20.6 ms | 4.7 MB | ~0.5 ms |
+
+*Viewport render time here (0.09–2.6 s/frame) is lavapipe rasterizing on the
+same 4 CPU cores and is not representative; a discrete GPU draws 12.6M
+triangles in a few ms.* What these numbers do show: panels cost ~0.5 ms per
+frame, uploads are proportional to the brush, not the mesh, and no frame
+stalls past the budget. At 6.3M faces with a large brush on 4 cores dabs
+saturate the budget (the stroke trails the pen); more cores scale this
+linearly — see §6.
+
+**Still to validate on real hardware:** input-to-photon latency, tablet
+pressure on your OS/tablet, GPU frame time at 6M+ faces.
+
+**UI roadmap:** dockable/undockable panels (egui_dock), stamp/stencil/falloff
+trays, camera bookmarks, wireframe, matcap library, Transpose action-line
+gizmo, undo-history panel, node view for mask stacks, multi-object list.
 
 ---
 

@@ -1,0 +1,26 @@
+{
+  "name": "High Contrast",
+  "dark": true,
+  "ui": {
+    "window": "#000000",
+    "panel": "#101010",
+    "tray": "#0a0a0a",
+    "widget": "#262626",
+    "widget_hover": "#3a3a3a",
+    "widget_active": "#7a5c00",
+    "text": "#ffffff",
+    "text_weak": "#cfcfcf",
+    "accent": "#ffc400",
+    "separator": "#808080"
+  },
+  "viewport": {
+    "background_top": "#1a1a1a",
+    "background_bottom": "#000000",
+    "clay": "#d8d8d8",
+    "overlay": "#00b7ff",
+    "freeze": "#ff3df2",
+    "cursor": "#ffc400",
+    "hud_text": "#ffffff"
+  },
+  "metrics": { "corner_radius": 0, "spacing": 7.0, "font_size": 15.0, "tray_tile": 76.0 }
+}

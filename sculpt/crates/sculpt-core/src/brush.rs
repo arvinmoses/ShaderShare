@@ -257,10 +257,13 @@ impl Brush for Smooth {
 /// with falloff weights, and drags them rigidly with the cursor. With
 /// `topological` the selection grows by geodesic (edge) distance, so nearby
 /// but unconnected or distant-along-surface parts (fingers, lips) stay put.
+/// Per leaf: `(local vertex, weight, position at grab time)`.
+type Grab = Vec<(u32, Vec<(u32, f32, Vec3)>)>;
+
 #[derive(Debug, Default)]
 pub struct MoveBrush {
     pub topological: bool,
-    grab: Option<Vec<(u32, Vec<(u32, f32, Vec3)>)>>,
+    grab: Option<Grab>,
 }
 
 impl MoveBrush {
@@ -287,7 +290,7 @@ impl MoveBrush {
                 })
                 .collect()
         };
-        let mut per_leaf: Vec<(u32, Vec<(u32, f32, Vec3)>)> = Vec::new();
+        let mut per_leaf: Grab = Vec::new();
         let mut sorted: Vec<(u32, f32)> = weighted
             .into_iter()
             .map(|(v, w)| (v, w * s.strength.max(0.0) * (1.0 - doc.freeze()[v as usize])))

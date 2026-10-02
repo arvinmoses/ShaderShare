@@ -18,7 +18,7 @@ pub mod primitives;
 pub mod subdiv;
 mod undo;
 
-pub use document::{Displacements, Document, PaintTarget, SurfaceHit};
+pub use document::{DirtySet, Displacements, Document, PaintTarget, SurfaceHit};
 pub use glam;
 pub use layers::{LayerId, SculptLayer};
 

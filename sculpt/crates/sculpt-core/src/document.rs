@@ -37,6 +37,60 @@ impl Displacements {
     }
 }
 
+/// Which spatial leaves changed since the renderer last asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirtySet {
+    None,
+    All,
+    /// Sorted leaf ids; upload each leaf's owned vertex range.
+    Leaves(Vec<u32>),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DirtyTracker {
+    all: bool,
+    marks: Vec<bool>,
+    any: bool,
+}
+
+impl DirtyTracker {
+    fn all() -> DirtyTracker {
+        DirtyTracker { all: true, ..Default::default() }
+    }
+    pub(crate) fn mark(&mut self, leaf: u32, leaves: usize) {
+        if self.all {
+            return;
+        }
+        if self.marks.len() != leaves {
+            self.marks = vec![false; leaves];
+        }
+        self.marks[leaf as usize] = true;
+        self.any = true;
+    }
+    pub(crate) fn mark_all(&mut self) {
+        self.all = true;
+    }
+    fn take(&mut self) -> DirtySet {
+        let out = if self.all {
+            DirtySet::All
+        } else if self.any {
+            DirtySet::Leaves(self.marks.iter().enumerate().filter(|(_, m)| **m).map(|(i, _)| i as u32).collect())
+        } else {
+            DirtySet::None
+        };
+        self.all = false;
+        self.any = false;
+        self.marks.iter_mut().for_each(|m| *m = false);
+        out
+    }
+}
+
+static NEXT_TOPOLOGY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn new_topology_id() -> u64 {
+    NEXT_TOPOLOGY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaintTarget {
     /// Mudbox "freeze": 1 = fully protected from sculpting and posing.
@@ -82,6 +136,11 @@ pub struct Document {
     pub(crate) stroke_origin: Vec<Option<Box<[Vec3]>>>,
     pub(crate) dirty_channels: BTreeSet<String>,
     pub(crate) level: u32,
+    /// Positions/normals changed (renderer upload tracking).
+    pub(crate) geometry_dirty: DirtyTracker,
+    /// Freeze / channels / layer masks changed (overlay upload tracking).
+    pub(crate) scalar_dirty: DirtyTracker,
+    pub(crate) topology_id: u64,
     /// Free-form, round-tripped by the file format (UI state, app metadata).
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
@@ -112,6 +171,9 @@ impl Document {
             stroke_origin: Vec::new(),
             dirty_channels: BTreeSet::new(),
             level: 0,
+            geometry_dirty: DirtyTracker::all(),
+            scalar_dirty: DirtyTracker::all(),
+            topology_id: new_topology_id(),
             metadata: BTreeMap::new(),
         })
     }
@@ -163,6 +225,22 @@ impl Document {
     pub fn level(&self) -> u32 {
         self.level
     }
+
+    /// Unique id of the current face/vertex layout; changes on subdivision
+    /// and load, signalling renderers to rebuild index buffers.
+    pub fn topology_id(&self) -> u64 {
+        self.topology_id
+    }
+
+    /// Leaves whose positions/normals changed since the last call.
+    pub fn take_geometry_dirty(&mut self) -> DirtySet {
+        self.geometry_dirty.take()
+    }
+
+    /// Leaves whose freeze, channel or layer-mask values changed since the last call.
+    pub fn take_scalar_dirty(&mut self) -> DirtySet {
+        self.scalar_dirty.take()
+    }
     pub fn bounds(&self) -> Aabb {
         self.bvh.bounds()
     }
@@ -208,6 +286,7 @@ impl Document {
         }
         self.channels.insert(name.into(), values);
         self.dirty_channels.insert(name.into());
+        self.scalar_dirty.mark_all();
         self.undo.clear();
         self.refresh_dependent_masks()
     }
@@ -227,6 +306,7 @@ impl Document {
 
     pub fn remove_channel(&mut self, name: &str) {
         self.channels.remove(name);
+        self.scalar_dirty.mark_all();
         self.undo.clear();
     }
 
@@ -235,6 +315,7 @@ impl Document {
             return Err(Error::InvalidData("freeze size mismatch".into()));
         }
         self.freeze = values;
+        self.scalar_dirty.mark_all();
         self.undo.clear();
         Ok(())
     }
@@ -329,6 +410,7 @@ impl Document {
         let layer = &mut self.layers[i];
         layer.mask = stack;
         layer.mask_values = values;
+        self.scalar_dirty.mark_all();
         let leaves = layer.allocated_leaves();
         self.recomposite(&leaves);
         Ok(())
@@ -342,6 +424,7 @@ impl Document {
                 let values = self.evaluate_mask(&stack)?;
                 self.layers[i].mask_values = Some(values);
                 leaves.extend(self.layers[i].allocated_leaves());
+                self.scalar_dirty.mark_all();
             }
         }
         self.recomposite(&leaves.into_iter().collect::<Vec<_>>());
@@ -359,6 +442,7 @@ impl Document {
             let mut used = Vec::new();
             stack.channels(&mut used);
             if used.iter().any(|c| dirty.contains(c)) {
+                self.scalar_dirty.mark_all();
                 let values = self.evaluate_mask(&stack)?;
                 self.layers[i].mask_values = Some(values);
                 leaves.extend(self.layers[i].allocated_leaves());
@@ -424,6 +508,7 @@ impl Document {
         };
         self.channels.insert(attribute.channel_name().into(), values);
         self.dirty_channels.insert(attribute.channel_name().into());
+        self.scalar_dirty.mark_all();
     }
 
     // --------------------------------------------------------------- queries
@@ -676,7 +761,9 @@ impl Document {
                 self.channels.get_mut(n).unwrap()
             }
         };
-        for (_, list) in updates {
+        let nleaves = self.bvh.leaves.len();
+        for (l, list) in updates {
+            self.scalar_dirty.mark(l, nleaves);
             for (v, x) in list {
                 values[v as usize] = x;
             }
@@ -735,9 +822,15 @@ impl Document {
                     .collect()
             })
             .collect();
+        let nleaves = self.bvh.leaves.len();
+        for &l in &set {
+            self.geometry_dirty.mark(l, nleaves);
+        }
         for list in normals {
             for (v, n) in list {
                 self.normals[v as usize] = n;
+                // Normals of borrowed vertices belong to their owner leaf's upload range.
+                self.geometry_dirty.mark(self.bvh.vert_leaf[v as usize], nleaves);
             }
         }
         self.bvh.refit_leaves(&self.positions, &self.faces, &set);
@@ -830,6 +923,7 @@ impl Document {
                     let data = old.map_or(undo::Data::Absent, |o| undo::Data::Scalars(o.into_boxed_slice()));
                     inverse.records.push(Record { target: target.clone(), leaf, data });
                     self.dirty_channels.insert(name.clone());
+                    self.scalar_dirty.mark_all();
                 }
                 continue;
             }
@@ -850,12 +944,14 @@ impl Document {
                 (undo::Target::Freeze, undo::Data::Scalars(s)) => {
                     let cur: Box<[f32]> = self.freeze[r.clone()].into();
                     self.freeze[r].copy_from_slice(&s);
+                    self.scalar_dirty.mark(leaf, self.bvh.leaves.len());
                     undo::Data::Scalars(cur)
                 }
                 (undo::Target::Channel(n), undo::Data::Scalars(s)) => {
                     let Some(ch) = self.channels.get_mut(n) else { continue };
                     let cur: Box<[f32]> = ch[r.clone()].into();
                     ch[r].copy_from_slice(&s);
+                    self.scalar_dirty.mark(leaf, self.bvh.leaves.len());
                     self.dirty_channels.insert(n.clone());
                     undo::Data::Scalars(cur)
                 }
@@ -923,6 +1019,9 @@ impl Document {
         self.layers = layers;
         self.canonical_to_internal = perm;
         self.level += 1;
+        self.topology_id = new_topology_id();
+        self.geometry_dirty.mark_all();
+        self.scalar_dirty.mark_all();
         self.undo.clear();
         self.stroke_origin.clear();
         for i in 0..self.layers.len() {
