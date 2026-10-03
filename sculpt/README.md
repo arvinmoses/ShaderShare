@@ -48,9 +48,19 @@ hot-reload on save, or use *Display ▸ Theme editor*), and **hotkeys** are
 overridden per command in `~/.config/sculpt/keymap.json` (same format as
 `crates/sculpt-app/keymap.json`). Set `SCULPT_HOME` to relocate the config folder.
 
-| Studio Light | High Contrast |
-|---|---|
-| ![](docs/screenshots/app_studio_light.png) | ![](docs/screenshots/app_high_contrast.png) |
+The layout is a Substance Painter / Mudbox hybrid:
+
+- **Context toolbar** above the viewport (Painter): current tool, size, strength, falloff, front-faces, overlay.
+- **LAYERS** (right): sculpt layers with eye / lock / inline strength, and each layer's mask effects
+  nested beneath it (Paint, Fill, Noise, Curvature, Cavity, AO, Thickness, Direction, Gradient).
+  Double-click to rename; the toolbar adds layers, masks and effects, flattens and deletes.
+- **PROPERTIES** (right, below): edits whatever is selected (layer, mask or effect), then the brush.
+  Selecting a Paint effect makes Mask Paint draw into it.
+- **Tray** (bottom, Mudbox): Sculpt / Paint / Pose tools and a Falloff tray of curve presets.
+
+| Painter Dark | Studio Light | High Contrast |
+|---|---|---|
+| ![](docs/screenshots/app_painter_dark.png) | ![](docs/screenshots/app_studio_light.png) | ![](docs/screenshots/app_high_contrast.png) |
 
 ### Measuring it on your machine
 

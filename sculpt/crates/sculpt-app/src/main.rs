@@ -8,6 +8,7 @@
 
 mod app;
 mod camera;
+mod icons;
 mod keymap;
 mod panels;
 mod pen;

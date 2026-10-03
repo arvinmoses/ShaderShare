@@ -11,7 +11,9 @@
     "text": "#dcdcdc",
     "text_weak": "#9a9a9a",
     "accent": "#5285a6",
-    "separator": "#2e2e2e"
+    "separator": "#2e2e2e",
+    "header": "#383838",
+    "row_selected": "#4b6378"
   },
   "viewport": {
     "background_top": "#5d6670",
@@ -22,5 +24,10 @@
     "cursor": "#ff6a3d",
     "hud_text": "#e6e6e6"
   },
-  "metrics": { "corner_radius": 2, "spacing": 6.0, "font_size": 13.0, "tray_tile": 68.0 }
+  "metrics": {
+    "corner_radius": 2,
+    "spacing": 6.0,
+    "font_size": 13.0,
+    "tray_tile": 68.0
+  }
 }

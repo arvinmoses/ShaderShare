@@ -11,7 +11,9 @@
     "text": "#1d1d1d",
     "text_weak": "#5c5c5c",
     "accent": "#2f6fb3",
-    "separator": "#b5b5b5"
+    "separator": "#b5b5b5",
+    "header": "#d0d0d0",
+    "row_selected": "#b9cfe6"
   },
   "viewport": {
     "background_top": "#c9ced6",
@@ -22,5 +24,10 @@
     "cursor": "#d94a1a",
     "hud_text": "#101010"
   },
-  "metrics": { "corner_radius": 4, "spacing": 6.0, "font_size": 13.0, "tray_tile": 68.0 }
+  "metrics": {
+    "corner_radius": 4,
+    "spacing": 6.0,
+    "font_size": 13.0,
+    "tray_tile": 68.0
+  }
 }

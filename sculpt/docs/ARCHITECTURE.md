@@ -267,16 +267,21 @@ offscreen texture displayed by egui.
 tint for freeze / layer mask / any channel / pose weights, and a ZBrush-style
 brush ring drawn on the surface at the true world radius.
 
-**Panels (Mudbox layout):** menu bar; bottom tool tray (Sculpt / Paint / Pose
-tabs, vector-drawn icons, hotkey badges); right panel with
-**Layers** (visibility, lock, active layer, inline strength slider −100…200%,
-mask badge, New / Flatten / Delete, *Base mesh* row) and the
-**Substance-style mask stack editor** (per mask layer: on, invert, reorder,
-blend mode, opacity, source parameters, levels, blur; add Noise / Painted
-channel / Curvature / Cavity / AO / Thickness / Direction / Gradient / Fill);
-**Properties** (per-tool size, strength, hardness, front-faces, plus
-tool-specific settings); **Object** (stats, pen status, channels); status bar
-with tool hints.
+**Layout (Substance Painter / Mudbox hybrid):** menu bar; Painter-style
+**context toolbar** (active tool, size, strength, falloff, front-faces,
+overlay, HUD toggle); right dock with **LAYERS** over **PROPERTIES**, both
+with uppercase title bars. The layer stack shows each sculpt layer (eye,
+clay thumbnail, name with double-click rename, mask button, lock, inline
+strength −100…200%) with its mask effects nested beneath as indented rows
+(eye, type icon, name, blend + opacity), then the mask base row, then
+*Base*. Its toolbar adds layers, white/black masks and effects, flattens and
+deletes the selection. **PROPERTIES** edits the selection (layer, mask base,
+or a single effect: blend, opacity, source parameters, levels, blur, order)
+and then the brush; selecting a Paint effect retargets Mask Paint to that
+effect's channel. Bottom: Mudbox **tray** (Sculpt / Paint / Pose tools and a
+Falloff tray of curve presets) and a status bar (tool hint, pen, active
+layer, face count). All icons are vector-drawn, so nothing depends on font
+glyph coverage.
 
 **Tools wired to the engine:** Clay Buildup, Trim Dynamic, Move (topological
 option), Smooth (and Shift-smooth), Freeze paint, Mask paint, Pose
@@ -285,7 +290,7 @@ live preview below 1.5M verts, applied on release above that).
 
 **Theming:** a theme is JSON with UI colors, viewport colors (background
 gradient, clay, overlays, cursor, HUD) and metrics (font size, spacing,
-corner radius, tray tile size). Three built-ins (Mudbox Dark, Studio Light,
+corner radius, tray tile size). Four built-ins (Mudbox Dark, Painter Dark, Studio Light,
 High Contrast); user themes load from the config folder and **hot-reload when
 the file changes**; *Display ▸ Theme editor* edits live and saves JSON. The
 chosen theme and per-tool settings persist between sessions.

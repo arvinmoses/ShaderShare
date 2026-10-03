@@ -1,0 +1,33 @@
+{
+  "name": "Painter Dark",
+  "dark": true,
+  "ui": {
+    "window": "#1b1b1b",
+    "panel": "#272727",
+    "tray": "#222222",
+    "widget": "#363636",
+    "widget_hover": "#414141",
+    "widget_active": "#2c5d8f",
+    "text": "#d2d2d2",
+    "text_weak": "#878787",
+    "accent": "#3a8ee6",
+    "separator": "#141414",
+    "header": "#1f1f1f",
+    "row_selected": "#34465a"
+  },
+  "viewport": {
+    "background_top": "#4b4b4b",
+    "background_bottom": "#262626",
+    "clay": "#b4b0ab",
+    "overlay": "#3a8ee6",
+    "freeze": "#3b52c9",
+    "cursor": "#f2f2f2",
+    "hud_text": "#d8d8d8"
+  },
+  "metrics": {
+    "corner_radius": 2,
+    "spacing": 5.0,
+    "font_size": 12.5,
+    "tray_tile": 64.0
+  }
+}

@@ -24,6 +24,7 @@ pub enum Tray {
     Sculpt,
     Paint,
     Pose,
+    Falloff,
 }
 
 impl Tool {

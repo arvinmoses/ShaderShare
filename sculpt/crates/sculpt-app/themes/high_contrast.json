@@ -11,7 +11,9 @@
     "text": "#ffffff",
     "text_weak": "#cfcfcf",
     "accent": "#ffc400",
-    "separator": "#808080"
+    "separator": "#808080",
+    "header": "#000000",
+    "row_selected": "#5c4600"
   },
   "viewport": {
     "background_top": "#1a1a1a",
@@ -22,5 +24,10 @@
     "cursor": "#ffc400",
     "hud_text": "#ffffff"
   },
-  "metrics": { "corner_radius": 0, "spacing": 7.0, "font_size": 15.0, "tray_tile": 76.0 }
+  "metrics": {
+    "corner_radius": 0,
+    "spacing": 7.0,
+    "font_size": 15.0,
+    "tray_tile": 76.0
+  }
 }

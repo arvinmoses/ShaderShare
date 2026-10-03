@@ -53,6 +53,21 @@ pub struct UiColors {
     pub text_weak: Hex,
     pub accent: Hex,
     pub separator: Hex,
+    /// Panel title bars ("LAYERS", "PROPERTIES"). Defaults to `window`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<Hex>,
+    /// Selected row in lists (layer stack). Defaults to a dimmed accent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_selected: Option<Hex>,
+}
+
+impl UiColors {
+    pub fn header(&self) -> Color32 {
+        self.header.map_or(self.window.0, |h| h.0)
+    }
+    pub fn row_selected(&self) -> Color32 {
+        self.row_selected.map_or(self.accent.0.gamma_multiply(0.45), |h| h.0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -140,8 +155,9 @@ impl Theme {
     }
 }
 
-const BUILTIN: [&str; 3] = [
+const BUILTIN: [&str; 4] = [
     include_str!("../themes/mudbox_dark.json"),
+    include_str!("../themes/painter_dark.json"),
     include_str!("../themes/studio_light.json"),
     include_str!("../themes/high_contrast.json"),
 ];

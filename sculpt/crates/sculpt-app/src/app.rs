@@ -90,11 +90,13 @@ pub struct FrameStats {
     pub pending: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RightTab {
-    Layers,
-    Properties,
-    Object,
+/// What the Properties panel edits, within the active layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    Layer,
+    Mask,
+    /// Index into the active layer's mask stack.
+    Effect(usize),
 }
 
 pub struct SculptApp {
@@ -120,7 +122,13 @@ pub struct SculptApp {
     pub project_path: Option<PathBuf>,
     pub dialog: Option<Dialog>,
     pub status: String,
-    pub right_tab: RightTab,
+    pub selection: Selection,
+    /// Layers whose mask effects are shown in the stack.
+    pub expanded: std::collections::HashSet<sculpt_core::LayerId>,
+    pub renaming: Option<(sculpt_core::LayerId, String)>,
+    pub show_mesh_info: bool,
+    /// Active layer when the mask editing copy was last synced.
+    pub last_active: Option<sculpt_core::LayerId>,
     pub tray: Tray,
     pub mask_dirty: bool,
     pub pen: Pen,
@@ -177,13 +185,17 @@ impl SculptApp {
             overlay_strength: 0.75,
             pose_weights: None,
             pose_weights_changed: false,
-            hud: true,
+            hud: false,
             stats: FrameStats::default(),
             last_frame: None,
             project_path: None,
             dialog: None,
             status: String::new(),
-            right_tab: RightTab::Layers,
+            selection: Selection::Layer,
+            expanded: Default::default(),
+            renaming: None,
+            show_mesh_info: false,
+            last_active: None,
             tray: Tray::Sculpt,
             mask_dirty: false,
             pen: Pen::new(cc),
@@ -270,8 +282,12 @@ impl SculptApp {
         let stack = MaskStack::new(0.0)
             .with(MaskLayer::new("Breakup", MaskSource::Noise(NoiseParams { scale: 3.0, seed: 4, ..Default::default() })).levels(Levels::range(0.4, 0.6)))
             .with(MaskLayer::new("Top light", MaskSource::Direction { axis: Vec3::Y, sharpness: 2.0 }).blend(BlendMode::Screen).opacity(0.6));
-        let _ = doc.set_layer_mask(id, Some(stack));
+        let _ = doc.set_layer_mask(id, Some(stack.clone()));
         let _ = doc.set_layer_opacity(id, 0.85);
+        self.mask_edit = Some((id, stack));
+        self.last_active = Some(id);
+        self.expanded.insert(id);
+        self.selection = Selection::Effect(0);
         self.overlay = OverlayKind::LayerMask;
         self.overlay_strength = 0.45;
     }
@@ -312,7 +328,8 @@ impl SculptApp {
             }
             Command::NewLayer => {
                 let n = doc.layers().len() + 1;
-                doc.add_layer(&format!("Layer {n}"));
+                let id = doc.add_layer(&format!("Layer {n}"));
+                self.expanded.insert(id);
             }
             Command::ToggleHud => self.hud = !self.hud,
             Command::CycleOverlay => {
@@ -743,6 +760,12 @@ impl SculptApp {
             painter.text(c, egui::Align2::CENTER_CENTER, format!("{label}…  {secs:.1}s"), egui::FontId::proportional(16.0), Color32::WHITE);
         }
         if !self.hud {
+            // Minimal Mudbox-style readout; H shows the full performance HUD.
+            if let Some(doc) = &self.doc {
+                let fps = if self.stats.interval_ms > 0.0 { 1000.0 / self.stats.interval_ms } else { 0.0 };
+                let text = format!("{} faces   {:.0} fps", fmt_count(doc.face_count()), fps);
+                painter.text(Pos2::new(rect.min.x + 10.0, rect.max.y - 10.0), egui::Align2::LEFT_BOTTOM, text, egui::FontId::proportional(11.0), col.gamma_multiply(0.7));
+            }
             return;
         }
         let s = &self.stats;
@@ -815,12 +838,14 @@ impl eframe::App for SculptApp {
             self.run(&ctx, cmd);
         }
         crate::panels::menu_bar(self, ui);
+        crate::panels::context_bar(self, ui);
         crate::panels::status_bar(self, ui);
         crate::panels::tray(self, ui);
         crate::panels::right_panel(self, ui);
         crate::panels::dialogs(self, &ctx);
         crate::panels::theme_editor(self, &ctx);
         crate::panels::keymap_window(self, &ctx);
+        crate::panels::mesh_info(self, &ctx);
         if self.mask_dirty && !ctx.input(|i| i.pointer.any_down()) {
             self.mask_dirty = false;
             crate::panels::apply_mask_edit(self);
