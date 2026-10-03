@@ -129,11 +129,13 @@ pub struct SculptApp {
     pub show_mesh_info: bool,
     /// Active layer when the mask editing copy was last synced.
     pub last_active: Option<sculpt_core::LayerId>,
+    /// Last status text seen by the status bar and when it appeared.
+    pub status_seen: (String, Instant),
     pub tray: Tray,
     pub mask_dirty: bool,
     pub pen: Pen,
     test: Option<crate::test_driver::TestDriver>,
-    cursor: Option<(Vec3, f32)>,
+    cursor: Option<(Vec3, f32, f32)>,
     viewport_rect: Rect,
     last_theme_poll: Instant,
     pub show_keymap: bool,
@@ -164,6 +166,7 @@ impl SculptApp {
         let settings: serde_json::Value = std::fs::read_to_string(cfg.join("settings.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let theme_name = opts.theme.clone().or_else(|| settings["theme"].as_str().map(String::from)).unwrap_or_else(|| "Mudbox Dark".into());
         let theme = themes.get(&theme_name);
+        crate::theme::install_fonts(&cc.egui_ctx);
         theme.apply(&cc.egui_ctx);
         let keymap = Keymap::load(&cfg.join("keymap.json"));
         let tools = serde_json::from_value(settings["tools"].clone()).unwrap_or_default();
@@ -196,6 +199,7 @@ impl SculptApp {
             renaming: None,
             show_mesh_info: false,
             last_active: None,
+            status_seen: (String::new(), Instant::now()),
             tray: Tray::Sculpt,
             mask_dirty: false,
             pen: Pen::new(cc),
@@ -689,8 +693,8 @@ impl SculptApp {
                 let local = hover - rect.min;
                 let ray = self.camera.ray(GVec2::new(local.x, local.y), GVec2::new(rect.width(), rect.height()));
                 if let Some(hit) = doc.raycast(&ray) {
-                    let size = self.tools.params(self.tool).size_px;
-                    self.cursor = Some((hit.point, size * self.camera.world_per_pixel(hit.point, rect.height())));
+                    let p = self.tools.params(self.tool);
+                    self.cursor = Some((hit.point, p.size_px * self.camera.world_per_pixel(hit.point, rect.height()), p.hardness));
                 }
             }
 
@@ -759,12 +763,13 @@ impl SculptApp {
             painter.rect_filled(Rect::from_center_size(c, Vec2::new(360.0, 56.0)), 6.0, Color32::from_black_alpha(170));
             painter.text(c, egui::Align2::CENTER_CENTER, format!("{label}…  {secs:.1}s"), egui::FontId::proportional(16.0), Color32::WHITE);
         }
+        self.paint_axis_gizmo(&painter, rect);
         if !self.hud {
             // Minimal Mudbox-style readout; H shows the full performance HUD.
             if let Some(doc) = &self.doc {
                 let fps = if self.stats.interval_ms > 0.0 { 1000.0 / self.stats.interval_ms } else { 0.0 };
-                let text = format!("{} faces   {:.0} fps", fmt_count(doc.face_count()), fps);
-                painter.text(Pos2::new(rect.min.x + 10.0, rect.max.y - 10.0), egui::Align2::LEFT_BOTTOM, text, egui::FontId::proportional(11.0), col.gamma_multiply(0.7));
+                let text = format!("{} faces   ·   {:.0} fps", fmt_count(doc.face_count()), fps);
+                painter.text(Pos2::new(rect.max.x - 12.0, rect.max.y - 10.0), egui::Align2::RIGHT_BOTTOM, text, egui::FontId::proportional(11.0), col.gamma_multiply(0.65));
             }
             return;
         }
@@ -785,6 +790,30 @@ impl SculptApp {
         for l in lines {
             painter.text(Pos2::new(rect.min.x + 10.0, y), egui::Align2::LEFT_TOP, l, egui::FontId::monospace(12.0), col);
             y += 16.0;
+        }
+    }
+
+    /// XYZ orientation triad in the bottom-left corner of the viewport.
+    fn paint_axis_gizmo(&self, painter: &egui::Painter, rect: Rect) {
+        let center = Pos2::new(rect.min.x + 42.0, rect.max.y - 42.0);
+        let len = 26.0;
+        painter.circle_filled(center, len + 8.0, Color32::from_black_alpha(40));
+        let (right, up, fwd) = (self.camera.right(), self.camera.up(), self.camera.forward());
+        let mut axes = [
+            (Vec3::X, Color32::from_rgb(232, 86, 86), "X"),
+            (Vec3::Y, Color32::from_rgb(120, 200, 90), "Y"),
+            (Vec3::Z, Color32::from_rgb(80, 140, 240), "Z"),
+        ];
+        // Far axes first so near ones draw on top.
+        axes.sort_by(|a, b| b.0.dot(fwd).total_cmp(&a.0.dot(fwd)));
+        for (axis, color, label) in axes {
+            let dir = Vec2::new(axis.dot(right), -axis.dot(up));
+            let tip = center + dir * len;
+            let facing_away = axis.dot(fwd) > 0.0;
+            let c = if facing_away { color.gamma_multiply(0.55) } else { color };
+            painter.line_segment([center, tip], egui::Stroke::new(2.0, c));
+            painter.circle_filled(tip, 7.5, c);
+            painter.text(tip, egui::Align2::CENTER_CENTER, label, egui::FontId::new(9.5, crate::theme::bold()), Color32::from_black_alpha(220));
         }
     }
 

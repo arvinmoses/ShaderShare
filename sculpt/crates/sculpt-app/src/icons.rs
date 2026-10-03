@@ -137,8 +137,13 @@ impl Icon {
                 }
             }
             Icon::Base => {
-                p.circle_filled(r.center(), w * 0.32, c.gamma_multiply(0.75));
-                p.circle_filled(r.center() - vec2(w * 0.1, w * 0.1), w * 0.1, c);
+                // Little shaded clay ball: dark core, lit cap, specular dot.
+                let ctr = r.center();
+                let rad = w * 0.36;
+                p.circle_filled(ctr, rad, c.gamma_multiply(0.45));
+                p.circle_filled(ctr - vec2(rad * 0.18, rad * 0.18), rad * 0.8, c.gamma_multiply(0.75));
+                p.circle_filled(ctr - vec2(rad * 0.3, rad * 0.3), rad * 0.5, c);
+                p.circle_filled(ctr - vec2(rad * 0.42, rad * 0.42), rad * 0.16, Color32::from_white_alpha(170));
             }
         }
     }

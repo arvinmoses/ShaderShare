@@ -295,7 +295,7 @@ impl Viewport {
 
     /// Render into the offscreen texture. Returns the egui texture to display.
     #[allow(clippy::too_many_arguments)]
-    pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, theme: &Theme, overlay_strength: f32, cursor: Option<(Vec3, f32)>) -> Option<egui::TextureId> {
+    pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, theme: &Theme, overlay_strength: f32, cursor: Option<(Vec3, f32, f32)>) -> Option<egui::TextureId> {
         let size = [size[0].max(1), size[1].max(1)];
         self.ensure_targets(rs, size);
         let vp = &theme.viewport;
@@ -312,8 +312,9 @@ impl Viewport {
             overlay,
             bg_top: linear(vp.background_top.0),
             bg_bottom: linear(vp.background_bottom.0),
-            cursor: cursor.map_or(Vec4::ZERO, |(c, r)| c.extend(r)).to_array(),
-            cursor_color: linear(vp.cursor.0),
+            cursor: cursor.map_or(Vec4::ZERO, |(c, r, _)| c.extend(r)).to_array(),
+            // Alpha carries the falloff hardness (inner cursor ring).
+            cursor_color: { let mut cc = linear(vp.cursor.0); cc[3] = cursor.map_or(0.0, |(_, _, h)| h); cc },
         };
         rs.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 

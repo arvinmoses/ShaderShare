@@ -48,6 +48,9 @@ hot-reload on save, or use *Display ▸ Theme editor*), and **hotkeys** are
 overridden per command in `~/.config/sculpt/keymap.json` (same format as
 `crates/sculpt-app/keymap.json`). Set `SCULPT_HOME` to relocate the config folder.
 
+The UI font is [Inter](https://rsms.me/inter/) (SIL Open Font License 1.1,
+bundled in `crates/sculpt-app/assets/fonts/` with its license).
+
 The layout is a Substance Painter / Mudbox hybrid:
 
 - **Context toolbar** above the viewport (Painter): current tool, size, strength, falloff, front-faces, overlay.

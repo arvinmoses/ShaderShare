@@ -113,38 +113,66 @@ impl Theme {
         let c = &self.ui;
         let mut v = if self.dark { Visuals::dark() } else { Visuals::light() };
         let r = CornerRadius::same(self.metrics.corner_radius);
+        let soft = |col: Color32, a: f32| col.gamma_multiply(a);
         v.panel_fill = c.panel.0;
-        v.window_fill = c.window.0;
+        v.window_fill = c.panel.0;
         v.extreme_bg_color = c.window.0;
-        v.faint_bg_color = c.widget.0;
-        v.window_corner_radius = r;
+        v.faint_bg_color = soft(c.widget.0, 0.5);
+        v.code_bg_color = c.window.0;
+        v.window_corner_radius = CornerRadius::same(self.metrics.corner_radius + 3);
+        v.menu_corner_radius = CornerRadius::same(self.metrics.corner_radius + 2);
         v.window_stroke = Stroke::new(1.0, c.separator.0);
+        let shadow_alpha = if self.dark { 110 } else { 45 };
+        v.window_shadow = egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(shadow_alpha) };
+        v.popup_shadow = egui::Shadow { offset: [0, 3], blur: 10, spread: 0, color: Color32::from_black_alpha(shadow_alpha) };
+        // Painter-style sliders: accent-filled track and a round handle.
+        v.slider_trailing_fill = true;
+        v.handle_shape = egui::style::HandleShape::Circle;
         v.selection.bg_fill = c.accent.0;
-        v.selection.stroke = Stroke::new(1.0, c.text.0);
+        v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
         v.hyperlink_color = c.accent.0;
         v.override_text_color = Some(c.text.0);
+        v.weak_text_color = Some(c.text_weak.0);
+        v.collapsing_header_frame = false;
+        v.indent_has_left_vline = false;
+        v.striped = true;
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = c.panel.0;
         w.noninteractive.weak_bg_fill = c.panel.0;
         w.noninteractive.bg_stroke = Stroke::new(1.0, c.separator.0);
         w.noninteractive.fg_stroke = Stroke::new(1.0, c.text.0);
+        w.noninteractive.corner_radius = r;
         for (state, bg) in [(&mut w.inactive, c.widget.0), (&mut w.hovered, c.widget_hover.0), (&mut w.active, c.widget_active.0), (&mut w.open, c.widget_active.0)] {
             state.bg_fill = bg;
             state.weak_bg_fill = bg;
             state.corner_radius = r;
             state.fg_stroke = Stroke::new(1.0, c.text.0);
+            state.bg_stroke = Stroke::NONE;
+            state.expansion = 0.0;
         }
-        w.hovered.bg_stroke = Stroke::new(1.0, c.accent.0);
+        // Subtle outline on hover, accent only while dragging/pressed.
+        w.hovered.bg_stroke = Stroke::new(1.0, soft(c.text.0, 0.18));
+        w.hovered.fg_stroke = Stroke::new(1.2, c.text.0);
         w.active.bg_stroke = Stroke::new(1.0, c.accent.0);
+        w.inactive.fg_stroke = Stroke::new(1.0, soft(c.text.0, 0.9));
         ctx.set_visuals(v);
 
+        let m = &self.metrics;
         ctx.global_style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(self.metrics.spacing, self.metrics.spacing * 0.66);
+            let sp = &mut style.spacing;
+            sp.item_spacing = egui::vec2(m.spacing, m.spacing * 0.7);
+            sp.button_padding = egui::vec2(8.0, 3.0);
+            sp.interact_size.y = (m.font_size * 1.65).max(20.0);
+            sp.slider_rail_height = 4.0;
+            sp.indent = 14.0;
+            sp.menu_margin = egui::Margin::same(6);
+            sp.window_margin = egui::Margin::same(10);
             for (text_style, font) in style.text_styles.iter_mut() {
                 font.size = match text_style {
-                    egui::TextStyle::Heading => self.metrics.font_size * 1.35,
-                    egui::TextStyle::Small => self.metrics.font_size * 0.8,
-                    _ => self.metrics.font_size,
+                    egui::TextStyle::Heading => m.font_size * 1.3,
+                    egui::TextStyle::Small => m.font_size * 0.82,
+                    egui::TextStyle::Monospace => m.font_size * 0.92,
+                    _ => m.font_size,
                 };
             }
         });
@@ -153,6 +181,26 @@ impl Theme {
     pub fn weak_text(&self) -> Color32 {
         self.ui.text_weak.0
     }
+}
+
+/// Semibold family for titles and emphasis.
+pub fn bold() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
+}
+
+/// Install Inter (SIL Open Font License, see `assets/fonts/Inter-OFL.txt`) as
+/// the UI font, keeping egui's defaults as fallbacks for symbols and emoji.
+pub fn install_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("inter".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf"))));
+    fonts.font_data.insert("inter-semibold".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))));
+    let fallbacks = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "inter".into());
+    let mut semibold = vec!["inter-semibold".to_string()];
+    semibold.extend(fallbacks);
+    fonts.families.insert(bold(), semibold);
+    ctx.set_fonts(fonts);
 }
 
 const BUILTIN: [&str; 4] = [

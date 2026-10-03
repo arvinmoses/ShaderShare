@@ -281,7 +281,12 @@ and then the brush; selecting a Paint effect retargets Mask Paint to that
 effect's channel. Bottom: Mudbox **tray** (Sculpt / Paint / Pose tools and a
 Falloff tray of curve presets) and a status bar (tool hint, pen, active
 layer, face count). All icons are vector-drawn, so nothing depends on font
-glyph coverage.
+glyph coverage. Visual style: Inter typography (semibold
+letter-spaced section titles), accent-filled sliders with round handles,
+soft popup/window shadows, a camera-relative clay material (wrapped key,
+hemisphere ambient, subsurface warmth, fresnel rim) on a vignetted, dithered
+backdrop, an XYZ orientation gizmo, and a brush cursor that shows both the
+radius and the falloff hardness ring.
 
 **Tools wired to the engine:** Clay Buildup, Trim Dynamic, Move (topological
 option), Smooth (and Shift-smooth), Freeze paint, Mask paint, Pose

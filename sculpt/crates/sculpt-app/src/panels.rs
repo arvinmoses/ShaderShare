@@ -17,7 +17,7 @@ use sculpt_core::noise::{NoiseKind, NoiseParams};
 use crate::app::{Dialog, SculptApp, Selection, fmt_count};
 use crate::icons::{Icon, icon_button};
 use crate::keymap::Command;
-use crate::theme::Hex;
+use crate::theme::{Hex, bold};
 use crate::tools::{PoseMode, Tool, Tray};
 use crate::viewport::OverlayKind;
 
@@ -42,14 +42,15 @@ fn cmd_button(app: &mut SculptApp, ui: &mut Ui, cmd: Command) {
 fn panel_header(ui: &mut Ui, app: &SculptApp, title: &str, right: impl FnOnce(&mut Ui)) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, app.theme.ui.header());
-    let mut child = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
-    child.label(RichText::new(title).size(app.theme.metrics.font_size * 0.85).strong().color(app.theme.weak_text()));
+    ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
+    let mut child = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))).layout(Layout::left_to_right(Align::Center)));
+    child.label(RichText::new(title).size(app.theme.metrics.font_size * 0.8).family(bold()).color(app.theme.weak_text()).extra_letter_spacing(0.6));
     child.with_layout(Layout::right_to_left(Align::Center), right);
 }
 
 /// Section header inside Properties.
 fn section(ui: &mut Ui, font_size: f32, id: &str, title: &str, body: impl FnOnce(&mut Ui)) {
-    egui::CollapsingHeader::new(RichText::new(title).size(font_size * 0.88).strong())
+    egui::CollapsingHeader::new(RichText::new(title).size(font_size * 0.82).family(bold()).extra_letter_spacing(0.5))
         .id_salt(id)
         .default_open(true)
         .show(ui, |ui| {
@@ -129,6 +130,9 @@ const BLENDS: [BlendMode; 9] = [
 pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
     egui::Panel::top("menu").frame(egui::Frame::side_top_panel(ui.style()).fill(app.theme.ui.window.0)).show(ui, |ui| {
         egui::MenuBar::new().ui(ui, |ui| {
+            let (logo, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+            Icon::Base.paint(ui.painter(), logo, app.theme.ui.accent.0);
+            ui.add_space(4.0);
             ui.menu_button("File", |ui| {
                 ui.menu_button("New sphere", |ui| {
                     for (level, label) in [(5u32, "6k faces"), (6, "25k"), (7, "98k"), (8, "393k"), (9, "1.6M"), (10, "6.3M")] {
@@ -209,6 +213,16 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                     ui.close();
                 }
             });
+            // Document title, centred like Painter's project name.
+            let title = app.project_path.as_ref().and_then(|p| p.file_name()).map_or("Untitled".to_string(), |n| n.to_string_lossy().into_owned());
+            let full = ui.max_rect();
+            ui.painter().text(
+                egui::pos2(full.center().x, full.center().y),
+                egui::Align2::CENTER_CENTER,
+                format!("Sculpt  ·  {title}"),
+                egui::FontId::new(app.theme.metrics.font_size * 0.9, egui::FontFamily::Proportional),
+                app.theme.weak_text(),
+            );
         });
     });
 }
@@ -222,8 +236,10 @@ pub fn context_bar(app: &mut SculptApp, ui: &mut Ui) {
             let tool = app.tool;
             let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
             tool.paint_icon(ui.painter(), r, ui.visuals().strong_text_color());
-            ui.label(RichText::new(tool.label()).strong());
+            ui.label(RichText::new(tool.label()).family(bold()));
+            ui.add_space(6.0);
             ui.separator();
+            ui.add_space(6.0);
             ui.spacing_mut().slider_width = 110.0;
             let p = app.tools.params_mut(tool);
             ui.label(RichText::new("Size").weak());
@@ -279,9 +295,16 @@ pub fn status_bar(app: &mut SculptApp, ui: &mut Ui) {
                     ui.separator();
                 }
                 ui.label(RichText::new(format!("Pen: {} {:.2}", app.pen.source.label(), app.pen.pressure)).color(weak));
-                if !app.status.is_empty() {
+                // Transient messages fade out after a few seconds.
+                if app.status != app.status_seen.0 {
+                    app.status_seen = (app.status.clone(), std::time::Instant::now());
+                }
+                let age = app.status_seen.1.elapsed().as_secs_f32();
+                if !app.status.is_empty() && age < 6.0 {
+                    let alpha = (6.0 - age).clamp(0.0, 1.0);
                     ui.separator();
-                    ui.label(RichText::new(&app.status).color(weak));
+                    ui.label(RichText::new(&app.status).color(weak.gamma_multiply(alpha)));
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                 }
             });
         });
@@ -335,7 +358,9 @@ fn tile_ui(ui: &mut Ui, app: &SculptApp, tile: f32, selected: bool, icon: impl F
         (v.widgets.inactive.bg_fill.gamma_multiply(0.6), v.text_color())
     };
     let painter = ui.painter();
-    painter.rect_filled(rect, app.theme.metrics.corner_radius as f32, bg);
+    let radius = app.theme.metrics.corner_radius as f32 + 2.0;
+    painter.rect_filled(rect, radius, bg);
+    painter.line_segment([rect.left_top() + vec2(radius, 0.5), rect.right_top() + vec2(-radius, 0.5)], egui::Stroke::new(1.0, Color32::from_white_alpha(if selected { 40 } else { 14 })));
     if selected {
         painter.rect_filled(Rect::from_min_max(rect.left_bottom() - vec2(0.0, 2.0), rect.right_bottom()), 0.0, app.theme.ui.accent.0);
     }
@@ -650,7 +675,7 @@ fn layer_row(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
             let _ = app.doc.as_mut().unwrap().rename_layer(id, text.trim());
         }
     } else {
-        row.label(if selected { RichText::new(&name).strong() } else { RichText::new(&name) });
+        row.label(if selected { RichText::new(&name).family(bold()) } else { RichText::new(&name) });
     }
 
     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
