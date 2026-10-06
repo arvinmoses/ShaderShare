@@ -4,14 +4,15 @@ Status: research and spec. Target is the egui layer panel for sculpt delta layer
 (`SculptLayer { opacity, visible, locked, mask: MaskStack }`, freeze, channels,
 bakes). See `../ARCHITECTURE.md`.
 
-**Confidence notes.** Adobe's documentation hosts (helpx, experienceleague,
-substance3d.adobe.com) were blocked by the research proxy. Facts marked **[doc]**
-come from search-indexed excerpts of the official pages (sources at the end).
-Facts marked **[obs]** come from long-standing, widely shown SP behaviour in
-tutorials (2021.x to 12.x). Pixel sizes are **[spec]**: values we choose to get
-the same density, not measurements of SP. Menu ordering changes between SP
-versions, so treat the ordering given here as the order *we* will ship, modelled
-on SP's grouping.
+**Confidence notes.** Verified in a second pass (see "Verified against" at the end)
+by reading the official Experience League pages directly. `helpx.adobe.com`
+returns "Access Denied" (the site's own bot protection, not the proxy), so the
+Experience League mirror was used instead. Facts marked **[doc]** are
+confirmed by those pages. **[obs]** marks long-standing SP behaviour seen in
+tutorials that the pages do not state. **[spec]** marks values we choose.
+Pixel sizes are always **[spec]**. Menu ordering changes between SP
+versions, so the ordering given here is the order *we* will ship, modelled on
+SP's grouping.
 
 ---
 
@@ -119,12 +120,14 @@ under a "mask" sub-header and use greyscale thumbnails **[obs]**.
 
 ### 3.1 Toolbar (SP)
 
-SP puts a row of icon buttons on the Layers panel header, next to the channel/view
-dropdown **[doc + obs]**. The buttons are: *Add smart material*, *Add smart
-mask*, *Add effect* ▾, *Add mask* ▾, *Add fill layer*, *Add paint layer*,
-*Add folder*, *Delete*. Every button inserts **above the current selection**
-**[doc]**. Buttons with ▾ open a menu that lists the same items as the matching
-right-click submenu.
+SP puts a row of icon buttons at the top right of the Layers panel, next to
+the channel/view dropdown **[doc]**. Verified order, left to right: *Add effect*,
+*Create mask* ▾ (white, black, bitmap, color selection, height combination),
+*Create new paint layer*, *Create new fill layer*, *Add new smart materials*,
+*Add new folder*, *Delete layer*. The paint and fill buttons insert **above the
+current selection** **[doc]**; the pages do not state the insertion point for
+the other buttons. Buttons with ▾ open a menu that lists the same items as the
+matching right-click submenu.
 
 **Ours** [spec]: put the bar at the **bottom of the panel, directly under the
 list**, so the cursor travels a short way from the last-touched row. Left to
@@ -261,7 +264,7 @@ mask without moving the cursor.
 | Copy / paste | Ctrl+C / Ctrl+V for layers and effects **[doc 2021.1]** | Same, including mask ops between layers |
 | Duplicate | Ctrl+D, RMB → Duplicate, Ctrl+drag **[doc]** | Same |
 | Group | Ctrl+G **[doc]** | Same. Shift+Ctrl+G ungroups |
-| Merge / flatten | Ctrl+M flattens a group into a copy and disables the source **[doc 12.0]** | Ctrl+E merges down. *Flatten into base* (menu only, confirm). Ctrl+M flattens a folder to a new layer and hides the source |
+| Merge / flatten | Ctrl+M flattens a group into a copy and disables the source **[doc 12.0]** | Ctrl+E merges down (ours; not an SP binding). *Flatten into base* (menu only, confirm). Ctrl+M flattens a folder to a new layer and hides the source |
 | Rename | Double-click name **[obs]** | Double-click or F2. Enter commits, Esc cancels |
 | Delete | Del, or the trash button **[doc]** | Del. Undo restores everything, including mask ops |
 | New layer/folder | Toolbar | Ctrl+Shift+N for a layer, Ctrl+Shift+F for a folder |
@@ -449,8 +452,60 @@ only the layer area, its menus, and viewport hotkeys.
 - Release notes 2021.1 (geometry mask, effect copy/paste, multi-select): https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/release-notes/old-versions/version-2021-1-7-1-0
 - Release notes 8.2 (Apply to all channels): https://helpx.adobe.com/substance-3d-painter/release-notes/version-8-2.html
 - Release notes 12.0 (Flatten, Ctrl+M, export from layer stack): https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/release-notes/version-12-0
-- Shortcuts: https://helpx.adobe.com/substance-3d-painter/interface/settings/shortcuts.html
+- Shortcuts: https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/interface/settings/shortcuts
 - Interface overview (Properties follows selection): https://helpx.adobe.com/substance-3d-painter/using/interface-overview.html
 - Community request, isolate layer (solo not native): https://community.adobe.com/t5/substance-3d-painter-ideas/feature-suggestion-isolate-layer/idi-p/12850398
 - Community custom shortcut set (mask toggle/view habits): https://github.com/cbuliarca/BCM_SubstancePainter_shortcuts/blob/master/README.md
 - Adobe Substance magazine, smoother texturing UX: https://www.adobe.com/products/substance3d/magazine/a-smoother-texturing-experience-with-substance-3d-painter
+
+---
+
+## Verified against (second pass)
+
+Pages read in full from Experience League. Corrections to the first draft are
+listed under each.
+
+- **Layer stack**: row = eye, content thumbnail, mask thumbnail (greyscale),
+  name, opacity, blend mode, both **per channel** (top-left dropdown picks the
+  channel). Paint, Fill and Folder layer types. Bottom layer draws first.
+  Correction: toolbar order is as in 3.1 above. Our earlier order (smart
+  material, smart mask first) was wrong.
+- **Masking and effects**: Alt+LMB on a mask thumbnail isolates it in the
+  viewport. Shift+LMB disables it temporarily and toggles it back. Mask
+  right-click menu has copy, paste and invert. Re-adding or removing a mask
+  destroys its effects. Ctrl while dropping a fill layer creates a mask at once.
+  A line under each thumbnail shows effects: **grey = none, red = at least one**.
+  Smart masks: Ctrl while dropping overwrites the effect list.
+- **Managing layers**: drag shows a bar for the destination. Dropping on a
+  folder nests. Multi-select with Ctrl/Cmd+click and Shift+click range. Group
+  with right-click ▸ Group Layers or Ctrl+G.
+- **Creating layers**: duplicate by right-click, Ctrl+D, or Ctrl+drag. Dropping
+  assets (materials, smart materials, effects) onto the stack creates layers.
+  Insertion point is not specified for drops.
+- **Flatten layers**: Ctrl+M = merge selection. Flatten makes a new fill layer
+  and **disables** (does not delete) the source. Only visible layers count.
+  Correction: there is **no Ctrl+E merge down** in SP. It is our own shortcut.
+- **Layer instancing**: paste as instance (right-click, or Ctrl+Shift+V per this
+  page). Source and target icons act as navigation buttons. Only the source can
+  be edited. Cycles are refused. The shortcuts page instead lists Ctrl+Shift+C/V
+  as copy/paste layer *content*, so the two pages disagree; we do not copy
+  either binding blindly.
+- **Shortcuts**: Ctrl+C/X/V, Delete, Ctrl+D, Ctrl+G, Ctrl+Shift+C/V all work
+  **only while the mouse is over the layer stack** **[doc]**. Quick-mask edit:
+  U toggle, Y clear, I invert (global).
+
+### Not verified
+
+- `helpx.adobe.com` pages (blocked by the site), release-notes pages 2021.1, 8.2
+  and 12.0 (not re-read this pass), row pixel sizes, exact right-click menu
+  order, whether new items auto-expand, drop-zone proportions, spring-open timing
+  and auto-scroll. These stay **[obs]** or **[spec]**.
+- Screenshots: not downloaded, so row geometry is unconfirmed visually.
+- `artstation.com` and `polycount.com` return 403 from a Cloudflare challenge,
+  not the proxy; they were not usable.
+
+### Implication for our design
+
+SP's layer-stack hotkeys only work over the layer panel. The cursor-local rule
+(hotkeys while hovering the viewport) is therefore a deliberate improvement,
+not a clone.
