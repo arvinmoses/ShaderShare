@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use glam::Vec3;
 
-use crate::layers::{Chunk, LayerId};
+use crate::layers::{Chunk, LayerId, LayerMeta, SculptLayer};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Target {
@@ -17,10 +17,24 @@ pub(crate) enum Target {
     Layer(LayerId),
     Freeze,
     Channel(String),
+    /// Layer-list structure (insert, remove, move, rename...). `leaf` is unused.
+    Structure,
+}
+
+/// A reversible edit of the layer list. Applying one returns its inverse.
+#[derive(Debug)]
+pub(crate) enum StructOp {
+    Insert { index: usize, layer: Box<SculptLayer> },
+    Remove { index: usize },
+    /// Move `id` under `parent` at vec position `index` (counted with `id` removed).
+    Place { id: LayerId, parent: Option<LayerId>, index: usize },
+    Meta { id: LayerId, meta: LayerMeta },
+    Active { id: Option<LayerId> },
 }
 
 #[derive(Debug)]
 pub(crate) enum Data {
+    Op(StructOp),
     Positions(Box<[Vec3]>),
     Deltas(Chunk),
     Scalars(Box<[f32]>),

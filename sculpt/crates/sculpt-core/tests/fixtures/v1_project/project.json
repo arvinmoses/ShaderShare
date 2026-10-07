@@ -1,0 +1,65 @@
+{
+  "format": "sculpt-project",
+  "version": 1,
+  "generator": "sculpt-core 0.1.0",
+  "mesh": {
+    "vertex_count": 98,
+    "face_count": 96,
+    "level": 0,
+    "base_positions": {
+      "path": "blobs/base_positions.bin",
+      "dtype": "f32",
+      "components": 3,
+      "count": 98
+    },
+    "faces": {
+      "path": "blobs/faces.bin",
+      "dtype": "u32",
+      "components": 4,
+      "count": 96
+    }
+  },
+  "channels": [],
+  "layers": [
+    {
+      "id": 1,
+      "name": "Old layer",
+      "opacity": 0.5,
+      "visible": true,
+      "locked": false,
+      "indices": {
+        "path": "blobs/layer_1_indices.bin",
+        "dtype": "u32",
+        "components": 1,
+        "count": 9
+      },
+      "deltas": {
+        "path": "blobs/layer_1_deltas.bin",
+        "dtype": "f32",
+        "components": 3,
+        "count": 9
+      }
+    },
+    {
+      "id": 2,
+      "name": "Second",
+      "opacity": 1.0,
+      "visible": true,
+      "locked": false,
+      "indices": {
+        "path": "blobs/layer_2_indices.bin",
+        "dtype": "u32",
+        "components": 1,
+        "count": 0
+      },
+      "deltas": {
+        "path": "blobs/layer_2_deltas.bin",
+        "dtype": "f32",
+        "components": 3,
+        "count": 0
+      }
+    }
+  ],
+  "active_layer": 2,
+  "metadata": {}
+}

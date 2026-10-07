@@ -21,9 +21,37 @@ pub type Chunk = Option<Box<[Vec3]>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerId(pub u32);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerKind {
+    /// Holds sculpt deltas.
+    #[default]
+    Layer,
+    /// Organises other nodes. Its strength and visibility scale its subtree.
+    Folder,
+}
+
+/// The user-editable, cheap-to-copy part of a layer. Undo records swap these.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerMeta {
+    pub name: String,
+    pub opacity: f32,
+    pub visible: bool,
+    pub locked: bool,
+    pub collapsed: bool,
+    pub mask: Option<MaskStack>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SculptLayer {
     pub id: LayerId,
+    pub kind: LayerKind,
+    /// Containing folder; `None` for top level.
+    pub parent: Option<LayerId>,
+    /// Folder shown collapsed in the layer list (persisted).
+    pub collapsed: bool,
+    /// Effective strength after ancestors and solo (derived, kept by the document).
+    pub(crate) scale: f32,
     pub name: String,
     /// Strength slider. Mudbox allows going past 100% and negative.
     pub opacity: f32,
@@ -36,9 +64,46 @@ pub struct SculptLayer {
 }
 
 impl SculptLayer {
+    pub(crate) fn new_folder(id: LayerId, name: &str, leaves: usize) -> SculptLayer {
+        SculptLayer { kind: LayerKind::Folder, ..SculptLayer::new(id, name, leaves) }
+    }
+
+    pub fn is_folder(&self) -> bool {
+        self.kind == LayerKind::Folder
+    }
+
+    /// Effective strength: own strength times every ancestor's, zero when hidden or soloed out.
+    pub fn effective_scale(&self) -> f32 {
+        self.scale
+    }
+
+    pub fn meta(&self) -> LayerMeta {
+        LayerMeta {
+            name: self.name.clone(),
+            opacity: self.opacity,
+            visible: self.visible,
+            locked: self.locked,
+            collapsed: self.collapsed,
+            mask: self.mask.clone(),
+        }
+    }
+
+    pub(crate) fn set_meta(&mut self, m: LayerMeta) {
+        self.name = m.name;
+        self.opacity = m.opacity;
+        self.visible = m.visible;
+        self.locked = m.locked;
+        self.collapsed = m.collapsed;
+        self.mask = m.mask;
+    }
+
     pub(crate) fn new(id: LayerId, name: &str, leaves: usize) -> SculptLayer {
         SculptLayer {
             id,
+            kind: LayerKind::Layer,
+            parent: None,
+            collapsed: false,
+            scale: 1.0,
             name: name.into(),
             opacity: 1.0,
             visible: true,
@@ -52,10 +117,7 @@ impl SculptLayer {
     /// Effective per-vertex weight of this layer.
     #[inline]
     pub fn weight(&self, v: usize) -> f32 {
-        if !self.visible {
-            return 0.0;
-        }
-        self.opacity * self.mask_values.as_ref().map_or(1.0, |m| m[v])
+        self.scale * self.mask_values.as_ref().map_or(1.0, |m| m[v])
     }
 
     pub fn mask_values(&self) -> Option<&[f32]> {

@@ -128,6 +128,7 @@ pub struct Document {
     pub(crate) channels: BTreeMap<String, Vec<f32>>,
     pub(crate) layers: Vec<SculptLayer>,
     pub(crate) active: Option<LayerId>,
+    pub(crate) solo: Option<LayerId>,
     pub(crate) next_layer_id: u32,
     /// `canonical index -> internal index`.
     pub(crate) canonical_to_internal: Vec<u32>,
@@ -165,6 +166,7 @@ impl Document {
             channels: BTreeMap::new(),
             layers: Vec::new(),
             active: None,
+            solo: None,
             next_layer_id: 1,
             canonical_to_internal: perm,
             undo: UndoStack::default(),
@@ -330,7 +332,7 @@ impl Document {
         self.layers.iter().find(|l| l.id == id)
     }
 
-    fn layer_index(&self, id: LayerId) -> Result<usize> {
+    pub(crate) fn layer_index(&self, id: LayerId) -> Result<usize> {
         self.layers.iter().position(|l| l.id == id).ok_or(Error::NoSuchLayer(id.0))
     }
 
@@ -341,7 +343,10 @@ impl Document {
     /// `None` sculpts directly on the base mesh.
     pub fn set_active_layer(&mut self, id: Option<LayerId>) -> Result<()> {
         if let Some(id) = id {
-            self.layer_index(id)?;
+            let i = self.layer_index(id)?;
+            if self.layers[i].is_folder() {
+                return Err(Error::InvalidData(format!("'{}' is a folder and cannot be sculpted on", self.layers[i].name)));
+            }
         }
         self.active = id;
         Ok(())
@@ -357,14 +362,7 @@ impl Document {
     }
 
     pub fn remove_layer(&mut self, id: LayerId) -> Result<()> {
-        let i = self.layer_index(id)?;
-        let layer = self.layers.remove(i);
-        if self.active == Some(id) {
-            self.active = self.layers.last().map(|l| l.id);
-        }
-        self.undo.clear();
-        self.recomposite(&layer.allocated_leaves());
-        Ok(())
+        self.delete_layer(id)
     }
 
     pub fn rename_layer(&mut self, id: LayerId, name: &str) -> Result<()> {
@@ -378,8 +376,7 @@ impl Document {
         let i = self.layer_index(id)?;
         if self.layers[i].opacity != opacity {
             self.layers[i].opacity = opacity;
-            let leaves = self.layers[i].allocated_leaves();
-            self.recomposite(&leaves);
+            self.refresh_scales();
         }
         Ok(())
     }
@@ -388,8 +385,7 @@ impl Document {
         let i = self.layer_index(id)?;
         if self.layers[i].visible != visible {
             self.layers[i].visible = visible;
-            let leaves = self.layers[i].allocated_leaves();
-            self.recomposite(&leaves);
+            self.refresh_scales();
         }
         Ok(())
     }
@@ -455,6 +451,9 @@ impl Document {
     /// Bake `layer` into the base mesh at its current strength and remove it.
     pub fn flatten_layer(&mut self, id: LayerId) -> Result<()> {
         let i = self.layer_index(id)?;
+        if self.layers[i].is_folder() {
+            return Err(Error::InvalidData("flatten works on layers, not folders".into()));
+        }
         let layer = self.layers.remove(i);
         for l in layer.allocated_leaves() {
             let r = self.bvh.leaves[l as usize].owned_range();
@@ -629,7 +628,10 @@ impl Document {
                 if l.locked {
                     return Err(Error::LayerLocked(l.name.clone()));
                 }
-                if !l.visible {
+                if l.is_folder() {
+                    return Err(Error::InvalidData(format!("'{}' is a folder and cannot be sculpted on", l.name)));
+                }
+                if !l.visible || (l.scale == 0.0 && l.opacity != 0.0) {
                     return Err(Error::LayerHidden(l.name.clone()));
                 }
                 Ok(SculptTarget::Layer(i))
@@ -679,7 +681,7 @@ impl Document {
                     let len = leaves[l as usize].owned_len();
                     layer.chunks[l as usize].get_or_insert_with(|| vec![Vec3::ZERO; len].into_boxed_slice());
                 }
-                let (opacity, visible) = (layer.opacity, layer.visible);
+                let scale = layer.scale;
                 let mask_values = layer.mask_values.as_deref();
                 let mut chunk_refs: Vec<&mut Box<[Vec3]>> = Vec::with_capacity(leaf_ids.len());
                 let mut wanted = leaf_ids.iter().peekable();
@@ -693,7 +695,7 @@ impl Document {
                     |((((_, list), chunk), pos), r)| {
                         for &(k, d) in list {
                             let v = r.start + k as usize;
-                            let w = if visible { opacity * mask_values.map_or(1.0, |m| m[v]) } else { 0.0 };
+                            let w = scale * mask_values.map_or(1.0, |m| m[v]);
                             chunk[k as usize] += d;
                             pos[k as usize] += d * w;
                         }
@@ -852,6 +854,7 @@ impl Document {
             }
             undo::Target::Freeze => undo::Data::Scalars(self.freeze[r].into()),
             undo::Target::Channel(n) => undo::Data::Scalars(self.channels[n][r].into()),
+            undo::Target::Structure => unreachable!("structure edits are recorded by layer_ops"),
         };
         group.records.push(Record { target: target.clone(), leaf, data });
     }
@@ -908,6 +911,14 @@ impl Document {
         let mut leaves = BTreeSet::new();
         for rec in group.records.into_iter().rev() {
             let Record { target, leaf, data } = rec;
+            let data = match data {
+                undo::Data::Op(op) => {
+                    let inverse_op = self.apply_struct(op, &mut leaves);
+                    inverse.records.push(Record { target, leaf, data: undo::Data::Op(inverse_op) });
+                    continue;
+                }
+                other => other,
+            };
             if leaf == u32::MAX {
                 // Whole-channel creation/removal.
                 if let undo::Target::Channel(name) = &target {
@@ -1048,6 +1059,9 @@ impl Document {
             layer.opacity = pl.opacity;
             layer.visible = pl.visible;
             layer.locked = pl.locked;
+            layer.kind = pl.kind;
+            layer.parent = pl.parent;
+            layer.collapsed = pl.collapsed;
             layer.mask = pl.mask;
             for (ci, d) in pl.indices.iter().zip(pl.deltas) {
                 let v = doc.canonical_index(*ci as usize);
@@ -1060,7 +1074,20 @@ impl Document {
             doc.next_layer_id = doc.next_layer_id.max(pl.id.0 + 1);
             doc.layers.push(layer);
         }
-        doc.active = parts.active.filter(|id| doc.layers.iter().any(|l| l.id == *id));
+        for l in &doc.layers {
+            if let Some(p) = l.parent
+                && !doc.layers.iter().any(|f| f.id == p && f.is_folder())
+            {
+                return Err(Error::Format(format!("layer '{}' names a missing parent folder", l.name)));
+            }
+        }
+        for l in &doc.layers {
+            if doc.is_ancestor(l.id, l.id) {
+                return Err(Error::Format(format!("folder '{}' contains itself", l.name)));
+            }
+        }
+        doc.active = parts.active.filter(|id| doc.layers.iter().any(|l| l.id == *id && !l.is_folder()));
+        doc.refresh_scales_into(&mut Default::default());
         for i in 0..doc.layers.len() {
             if let Some(stack) = doc.layers[i].mask.clone() {
                 doc.layers[i].mask_values = Some(doc.evaluate_mask(&stack)?);
@@ -1076,6 +1103,10 @@ impl SculptLayer {
     fn clone_meta(&self) -> SculptLayer {
         SculptLayer {
             id: self.id,
+            kind: self.kind,
+            parent: self.parent,
+            collapsed: self.collapsed,
+            scale: self.scale,
             name: self.name.clone(),
             opacity: self.opacity,
             visible: self.visible,

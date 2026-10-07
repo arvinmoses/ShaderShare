@@ -9,6 +9,7 @@ pub mod bvh;
 pub mod document;
 pub mod geom;
 pub mod io;
+pub mod layer_ops;
 pub mod layers;
 pub mod mask;
 pub mod mesh;
@@ -20,7 +21,8 @@ mod undo;
 
 pub use document::{DirtySet, Displacements, Document, PaintTarget, SurfaceHit};
 pub use glam;
-pub use layers::{LayerId, SculptLayer};
+pub use layer_ops::{Placement, TreeRow};
+pub use layers::{LayerId, LayerKind, LayerMeta, SculptLayer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
