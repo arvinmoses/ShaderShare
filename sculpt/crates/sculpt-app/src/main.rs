@@ -9,6 +9,7 @@
 mod app;
 mod camera;
 mod icons;
+mod layer_panel;
 mod keymap;
 mod panels;
 mod pen;

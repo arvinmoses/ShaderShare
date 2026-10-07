@@ -40,7 +40,9 @@ cargo run --release -p sculpt-app --features tablet      # + octotablet pen pres
 | Alt + RMB drag, or wheel | zoom |
 | `1`–`7` | Clay Buildup, Trim Dynamic, Move, Smooth, Freeze, Mask Paint, Pose |
 | `[` `]` / Shift+`[` `]` | brush size / strength |
-| `F` frame · `Shift+D` subdivide · `Ctrl+L` new layer · `O` cycle overlay · `H` HUD | |
+| `F` frame · `Shift+D` subdivide · `O` cycle overlay · `H` HUD | |
+| `Ctrl+L` new layer · `Ctrl+Shift+N` new folder · `Ctrl+D` duplicate · `Ctrl+G` / `Ctrl+Shift+G` group / ungroup | layers act on the selection |
+| `Ctrl+E` merge down · `S` solo · `Shift+L` lock · `Shift+H` hide · `F2` rename · `Delete` delete | work while hovering the viewport too |
 
 Everything above is data: **themes** are JSON files (built-ins in
 `crates/sculpt-app/themes/`; your own go in `~/.config/sculpt/themes/` and
@@ -54,9 +56,14 @@ bundled in `crates/sculpt-app/assets/fonts/` with its license).
 The layout is a Substance Painter / Mudbox hybrid:
 
 - **Context toolbar** above the viewport (Painter): current tool, size, strength, falloff, front-faces, overlay.
-- **LAYERS** (right): sculpt layers with eye / lock / inline strength, and each layer's mask effects
-  nested beneath it (Paint, Fill, Noise, Curvature, Cavity, AO, Thickness, Direction, Gradient).
-  Double-click to rename; the toolbar adds layers, masks and effects, flattens and deletes.
+- **LAYERS** (right): a Painter-style stack. Each row has an eye, a content thumbnail, a mask
+  thumbnail (hover an empty slot for **+**), the name, solo, lock and a strength you scrub or type
+  (−100% to 200%). **Folders** nest layers and scale them together; click the chevron to collapse.
+  Click selects, Ctrl+click toggles, Shift+click selects a range, double-click or `F2` renames.
+  Drag rows to reorder or into a folder (blue line = between, outline = into, red = refused,
+  Ctrl+drag copies, Esc cancels, hovering a closed folder opens it). Right-click any row for a menu
+  that lists hotkeys. The bar under the list (**+ Layer, Folder, Mask, Op**, duplicate, merge, delete)
+  inserts above the selection. Every layer action is undoable with `Ctrl+Z`.
 - **PROPERTIES** (right, below): edits whatever is selected (layer, mask or effect), then the brush.
   Selecting a Paint effect makes Mask Paint draw into it.
 - **Tray** (bottom, Mudbox): Sculpt / Paint / Pose tools and a Falloff tray of curve presets.

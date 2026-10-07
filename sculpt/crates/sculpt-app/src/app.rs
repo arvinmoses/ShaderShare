@@ -125,7 +125,7 @@ pub struct SculptApp {
     pub selection: Selection,
     /// Layers whose mask effects are shown in the stack.
     pub expanded: std::collections::HashSet<sculpt_core::LayerId>,
-    pub renaming: Option<(sculpt_core::LayerId, String)>,
+    pub layers: crate::layer_panel::PanelState,
     pub show_mesh_info: bool,
     /// Active layer when the mask editing copy was last synced.
     pub last_active: Option<sculpt_core::LayerId>,
@@ -196,7 +196,7 @@ impl SculptApp {
             status: String::new(),
             selection: Selection::Layer,
             expanded: Default::default(),
-            renaming: None,
+            layers: Default::default(),
             show_mesh_info: false,
             last_active: None,
             status_seen: (String::new(), Instant::now()),
@@ -282,7 +282,15 @@ impl SculptApp {
         use sculpt_core::mask::{BlendMode, Levels, MaskLayer, MaskSource, MaskStack};
         use sculpt_core::noise::NoiseParams;
         let Some(doc) = self.doc.as_mut() else { return };
-        let id = doc.add_layer("Detail");
+        // A small hierarchy so the stack shows folders, nesting and a mask.
+        use sculpt_core::Placement;
+        let face = doc.insert_folder("Face", Placement::Top).ok();
+        if let Some(f) = face {
+            let _ = doc.insert_layer("Wrinkles", Placement::Into(f));
+            let _ = doc.insert_layer("Pores", Placement::Into(f));
+        }
+        let _ = doc.insert_layer("Skin tone variation", Placement::Top);
+        let id = doc.insert_layer("Detail", Placement::Top).expect("top-level layer");
         let stack = MaskStack::new(0.0)
             .with(MaskLayer::new("Breakup", MaskSource::Noise(NoiseParams { scale: 3.0, seed: 4, ..Default::default() })).levels(Levels::range(0.4, 0.6)))
             .with(MaskLayer::new("Top light", MaskSource::Direction { axis: Vec3::Y, sharpness: 2.0 }).blend(BlendMode::Screen).opacity(0.6));
@@ -304,13 +312,19 @@ impl SculptApp {
             self.select_tool(t);
             return;
         }
+        if let Some(lc) = crate::layer_panel::command::from_keymap(cmd, self) {
+            crate::layer_panel::command::execute(self, lc);
+            return;
+        }
         let Some(doc) = self.doc.as_mut() else { return };
         match cmd {
             Command::Undo => {
                 self.status = if doc.undo() { "Undo".into() } else { "Nothing to undo".into() };
+                crate::layer_panel::command::after_change(self);
             }
             Command::Redo => {
                 self.status = if doc.redo() { "Redo".into() } else { "Nothing to redo".into() };
+                crate::layer_panel::command::after_change(self);
             }
             Command::Save => match &self.project_path {
                 Some(p) => self.save_to(p.clone()),
@@ -329,11 +343,6 @@ impl SculptApp {
             Command::Subdivide => {
                 let faces = doc.face_count() * 4;
                 self.start_doc_job(&format!("Subdividing to {faces} faces"), |d| d.subdivide().map_err(|e| e.to_string()));
-            }
-            Command::NewLayer => {
-                let n = doc.layers().len() + 1;
-                let id = doc.add_layer(&format!("Layer {n}"));
-                self.expanded.insert(id);
             }
             Command::ToggleHud => self.hud = !self.hud,
             Command::CycleOverlay => {

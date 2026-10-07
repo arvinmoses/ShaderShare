@@ -59,11 +59,29 @@ pub struct UiColors {
     /// Selected row in lists (layer stack). Defaults to a dimmed accent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_selected: Option<Hex>,
+    /// Paint target: sculpt delta (orange by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_delta: Option<Hex>,
+    /// Paint target: layer mask (purple by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_mask: Option<Hex>,
+    /// Refused drops, disabled masks, destructive items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub danger: Option<Hex>,
 }
 
 impl UiColors {
     pub fn header(&self) -> Color32 {
         self.header.map_or(self.window.0, |h| h.0)
+    }
+    pub fn target_delta(&self) -> Color32 {
+        self.target_delta.map_or(Color32::from_rgb(0xf0, 0x8a, 0x30), |h| h.0)
+    }
+    pub fn target_mask(&self) -> Color32 {
+        self.target_mask.map_or(Color32::from_rgb(0xb0, 0x7c, 0xe8), |h| h.0)
+    }
+    pub fn danger(&self) -> Color32 {
+        self.danger.map_or(Color32::from_rgb(0xe0, 0x4a, 0x4a), |h| h.0)
     }
     pub fn row_selected(&self) -> Color32 {
         self.row_selected.map_or(self.accent.0.gamma_multiply(0.45), |h| h.0)
