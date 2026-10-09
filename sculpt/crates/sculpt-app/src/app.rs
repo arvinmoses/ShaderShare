@@ -921,6 +921,7 @@ impl eframe::App for SculptApp {
         crate::panels::tray(self, ui);
         crate::panels::right_panel(self, ui);
         crate::layer_panel::switcher::show(self, &ctx);
+        crate::layer_panel::radial::show(self, &ctx);
         crate::panels::dialogs(self, &ctx);
         crate::panels::theme_editor(self, &ctx);
         crate::panels::keymap_window(self, &ctx);

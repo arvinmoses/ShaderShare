@@ -21,6 +21,10 @@ pub struct PanelState {
     /// Row being renamed inline, with its edit buffer.
     pub rename: Option<(LayerId, String)>,
     pub drag: Option<DragState>,
+    /// Radial menu centre, when open.
+    pub radial: Option<Pos2>,
+    /// A mask op being dragged: its layer and its index in the mask stack.
+    pub op_drag: Option<(LayerId, usize)>,
     /// What the current tool would edit, refreshed each frame (drives the thumbnail frames).
     pub paint_kind: Option<super::target::TargetKind>,
     /// Dense rows (28 px) instead of comfortable ones (36 px). Saved in settings.
@@ -37,4 +41,6 @@ pub struct PanelState {
     pub rows: Vec<RowGeom>,
     /// Replaces the real pointer during a drag. Lets headless runs and tests place a drop.
     pub pointer_override: Option<Pos2>,
+    /// Treat Ctrl as held during a drag (copy). Same purpose as `pointer_override`.
+    pub copy_override: bool,
 }

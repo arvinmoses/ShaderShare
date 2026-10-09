@@ -146,17 +146,17 @@ pub fn add_mask_items(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     let clip = app.layers.mask_clip.is_some();
     if has_mask {
         let enabled = stack.as_ref().is_none_or(|s| s.enabled);
-        if item(app, ui, if enabled { "Disable mask" } else { "Enable mask" }, None, true) {
+        if item(app, ui, if enabled { "Disable mask" } else { "Enable mask" }, Some(Command::MaskToggle), true) {
             go(app, ui, LayerCommand::Mask { id, action: MaskAction::Toggle });
         }
         if item(app, ui, "Invert mask", None, true) {
             go(app, ui, LayerCommand::Mask { id, action: MaskAction::Invert });
         }
-        if item(app, ui, "Copy mask", None, true) {
+        if item(app, ui, "Copy mask", Some(Command::MaskCopy), true) {
             go(app, ui, LayerCommand::Mask { id, action: MaskAction::Copy });
         }
     }
-    if item(app, ui, "Paste mask", None, clip) {
+    if item(app, ui, "Paste mask", Some(Command::MaskPaste), clip) {
         go(app, ui, LayerCommand::Mask { id, action: MaskAction::Paste });
     }
     if has_mask {

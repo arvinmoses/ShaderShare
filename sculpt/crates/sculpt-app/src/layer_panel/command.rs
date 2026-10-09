@@ -82,6 +82,9 @@ pub fn from_keymap(cmd: Command, app: &SculptApp) -> Option<LayerCommand> {
             LayerCommand::Edit { id, edit: MetaEdit::Locked(!locked), coalesce: false }
         }
         Command::LayerFlatten => LayerCommand::FlattenFolder,
+        Command::MaskToggle => LayerCommand::Mask { id: app.doc.as_ref()?.active_layer()?, action: MaskAction::Toggle },
+        Command::MaskCopy => LayerCommand::Mask { id: app.doc.as_ref()?.active_layer()?, action: MaskAction::Copy },
+        Command::MaskPaste => LayerCommand::Mask { id: app.doc.as_ref()?.active_layer()?, action: MaskAction::Paste },
         Command::LayerHide => {
             let id = primary?;
             let visible = app.doc.as_ref()?.layer(id)?.visible;

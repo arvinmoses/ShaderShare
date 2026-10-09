@@ -22,6 +22,10 @@ pub fn run(app: &mut SculptApp, ctx: &Context, cmd: Command) -> bool {
             app.layers.switcher = if app.layers.switcher.is_some() { None } else { Some(Switcher { at, filter: String::new(), cursor: 0 }) };
             true
         }
+        Command::LayerRadial => {
+            super::radial::toggle(app, ctx);
+            true
+        }
         Command::ToggleTarget => {
             toggle_target(app);
             true

@@ -14,6 +14,8 @@ pub mod hud;
 pub mod dragdrop;
 pub mod mask_ops;
 pub mod menus;
+pub mod op_drag;
+pub mod radial;
 pub mod row;
 pub mod selection;
 pub mod state;

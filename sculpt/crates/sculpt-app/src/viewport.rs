@@ -302,13 +302,20 @@ impl Viewport {
         let overlay_color = if self.overlay_kind == OverlayKind::Freeze { vp.freeze.0 } else { vp.overlay.0 };
         let mut overlay = linear(overlay_color);
         overlay[3] = if self.overlay_kind == OverlayKind::None { 0.0 } else { overlay_strength };
+        // Viewing a layer's mask shows it as greyscale (white = applies, dark = hidden), still lit.
+        let mut clay = linear(vp.clay.0);
+        if self.overlay_kind == OverlayKind::LayerMask {
+            clay = linear(egui::Color32::from_gray(18));
+            overlay = linear(egui::Color32::from_gray(235));
+            overlay[3] = 1.0;
+        }
         let view_proj: Mat4 = cam.proj(size[0] as f32 / size[1] as f32) * cam.view();
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             eye: cam.eye().extend(1.0).to_array(),
             right: cam.right().extend(0.0).to_array(),
             up: cam.up().extend(0.0).to_array(),
-            clay: linear(vp.clay.0),
+            clay,
             overlay,
             bg_top: linear(vp.background_top.0),
             bg_bottom: linear(vp.background_bottom.0),

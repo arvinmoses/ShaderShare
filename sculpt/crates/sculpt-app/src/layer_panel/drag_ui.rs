@@ -17,6 +17,7 @@ pub fn update(app: &mut SculptApp, ui: &mut Ui, rows: &[RowGeom], list: Rect) {
     let ctx = ui.ctx().clone();
     let pointer = app.layers.pointer_override.or_else(|| ctx.input(|i| i.pointer.interact_pos()));
     let (released, escape, copy) = ctx.input(|i| (i.pointer.any_released(), i.key_pressed(Key::Escape), i.modifiers.command));
+    let copy = copy || app.layers.copy_override;
     let released = released && app.layers.pointer_override.is_none();
     if escape {
         app.layers.drag = None;

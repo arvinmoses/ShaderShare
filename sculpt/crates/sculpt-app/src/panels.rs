@@ -518,7 +518,7 @@ pub(crate) fn effect_menu(app: &mut SculptApp, ui: &mut Ui) {
 
 /// Row background + a child Ui for its contents.
 fn row_frame(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: bool) -> (egui::Response, Ui) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
     let bg = if selected {
         app.theme.ui.row_selected()
     } else if resp.hovered() {
@@ -544,10 +544,15 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
     let weak = app.theme.weak_text();
 
     // Effects, top of the stack first.
+    let mut op_rows: Vec<crate::layer_panel::op_drag::OpRow> = Vec::new();
     for i in (0..stack.layers.len()).rev() {
         let e = &stack.layers[i];
         let selected = active && app.selection == Selection::Effect(i);
         let (resp, mut row) = row_frame(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected);
+        op_rows.push((i, resp.rect));
+        if resp.drag_started() && active {
+            app.layers.op_drag = Some((id, i));
+        }
         row.spacing_mut().item_spacing.x = 4.0;
         if icon_button(&mut row, if e.enabled { Icon::Eye } else { Icon::EyeOff }, 18.0, false, "Enable").clicked() {
             select_layer(app, Some(id), Selection::Effect(i));
@@ -569,6 +574,7 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
         let (count, enabled) = (stack.layers.len(), e.enabled);
         egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::op_menu(app, ui, id, i, count, enabled));
     }
+    crate::layer_panel::op_drag::update(app, ui, id, &op_rows);
     // Mask base value row.
     let selected = active && app.selection == Selection::Mask;
     let (resp, mut row) = row_frame(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected);

@@ -38,6 +38,8 @@ pub enum OpAction {
     /// Towards the top of the stack, which is up in the list.
     Raise,
     Lower,
+    /// Move to this index in the mask stack (a drag).
+    MoveTo(usize),
     Delete,
 }
 
@@ -169,6 +171,12 @@ pub fn op_action(app: &mut SculptApp, id: LayerId, index: usize, action: OpActio
             index - 1
         }
         OpAction::Raise | OpAction::Lower => return,
+        OpAction::MoveTo(to) => {
+            let to = to.min(stack.layers.len() - 1);
+            let op = stack.layers.remove(index);
+            stack.layers.insert(to, op);
+            to
+        }
         OpAction::Delete => {
             stack.layers.remove(index);
             app.selection = Selection::Mask;
