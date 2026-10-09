@@ -144,6 +144,8 @@ pub struct Document {
     /// Freeze / channels / layer masks changed (overlay upload tracking).
     pub(crate) scalar_dirty: DirtyTracker,
     pub(crate) topology_id: u64,
+    /// Level-of-detail tree for dense meshes, and the topology it was built for.
+    pub(crate) lod: Option<(u64, std::sync::Arc<crate::lod::LodTree>)>,
     /// Free-form, round-tripped by the file format (UI state, app metadata).
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
@@ -179,6 +181,7 @@ impl Document {
             geometry_dirty: DirtyTracker::all(),
             scalar_dirty: DirtyTracker::all(),
             topology_id: new_topology_id(),
+            lod: None,
             metadata: BTreeMap::new(),
         })
     }
@@ -235,6 +238,17 @@ impl Document {
     /// and load, signalling renderers to rebuild index buffers.
     pub fn topology_id(&self) -> u64 {
         self.topology_id
+    }
+
+    /// Build (or rebuild) the level-of-detail tree for the current topology. Takes seconds on tens of millions of triangles.
+    pub fn build_lod(&mut self, params: crate::lod::LodParams) {
+        let tree = crate::lod::LodTree::build(&self.positions, &self.faces, &self.bvh, params);
+        self.lod = Some((self.topology_id, std::sync::Arc::new(tree)));
+    }
+
+    /// The level-of-detail tree, if one was built for the current topology.
+    pub fn lod(&self) -> Option<&std::sync::Arc<crate::lod::LodTree>> {
+        self.lod.as_ref().filter(|(t, _)| *t == self.topology_id).map(|(_, tree)| tree)
     }
 
     /// Leaves whose positions/normals changed since the last call.

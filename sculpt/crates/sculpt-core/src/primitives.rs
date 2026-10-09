@@ -52,3 +52,51 @@ pub fn grid(n: u32, size: f32) -> PolyMesh {
     }
     PolyMesh { positions, faces }
 }
+
+/// All-quad sphere with `res x res` quads on each of the six cube faces (`6 * res^2` quads in total).
+/// Unlike [`quad_sphere`] the size is not tied to powers of four, so benchmarks can ask for 10M quads.
+pub fn quad_sphere_res(res: u32, radius: f32) -> PolyMesh {
+    let n = res as usize;
+    let side = n + 1;
+    // Lattice point (x, y, z) on the cube surface, each in 0..=n, is shared by every face that touches it.
+    let key = |x: usize, y: usize, z: usize| (x * side + y) * side + z;
+    let on_surface = |x: usize, y: usize, z: usize| x == 0 || x == n || y == 0 || y == n || z == 0 || z == n;
+    let mut index = vec![u32::MAX; side * side * side];
+    let mut positions = Vec::with_capacity(6 * n * n + 2);
+    let mut vert = |x: usize, y: usize, z: usize| -> u32 {
+        debug_assert!(on_surface(x, y, z));
+        let k = key(x, y, z);
+        if index[k] == u32::MAX {
+            index[k] = positions.len() as u32;
+            let p = Vec3::new(x as f32, y as f32, z as f32) / n as f32 * 2.0 - Vec3::ONE;
+            positions.push(p.normalize() * radius);
+        }
+        index[k]
+    };
+    let mut faces: Vec<Face> = Vec::with_capacity(6 * n * n);
+    // Each cube face: a fixed axis value, and two free axes (a, b), wound so the quad faces outward.
+    for (fixed, at, flip) in [(0usize, 0usize, true), (0, n, false), (1, 0, false), (1, n, true), (2, 0, true), (2, n, false)] {
+        let (a, b) = match fixed {
+            0 => (1, 2),
+            1 => (2, 0),
+            _ => (0, 1),
+        };
+        for i in 0..n {
+            for j in 0..n {
+                let mut corner = |di: usize, dj: usize| {
+                    let mut c = [0usize; 3];
+                    c[fixed] = at;
+                    c[a] = i + di;
+                    c[b] = j + dj;
+                    vert(c[0], c[1], c[2])
+                };
+                let mut q = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)];
+                if flip {
+                    q.reverse();
+                }
+                faces.push(q);
+            }
+        }
+    }
+    PolyMesh { positions, faces }
+}

@@ -11,6 +11,7 @@ pub mod geom;
 pub mod io;
 pub mod layer_ops;
 pub mod layers;
+pub mod lod;
 pub mod mask;
 pub mod mesh;
 pub mod noise;
