@@ -113,6 +113,8 @@ pub struct SculptApp {
     pub lod_tau: f32,
     /// Background re-simplification of patches outdated by edits: (topology id, result channel).
     lod_refresh: Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>,
+    /// Triangles per background batch; grows while the worker outpaces frames, shrinks when it lags.
+    lod_batch: usize,
     /// When the last dab landed; refresh waits for the pen to rest so it never competes with a stroke.
     last_edit: Instant,
     viewport: Option<Viewport>,
@@ -188,6 +190,7 @@ impl SculptApp {
             doc: None,
             job: None,
             lod_refresh: None,
+            lod_batch: LOD_REFRESH_BATCH_MIN,
             last_edit: Instant::now(),
             lod_tau: std::env::var("SCULPT_LOD_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
@@ -777,7 +780,7 @@ impl SculptApp {
             if let Some(doc) = self.doc.as_mut() {
                 let idle = matches!(self.stroke, Stroke::None) && self.pending.is_empty() && self.last_edit.elapsed() >= LOD_REFRESH_IDLE;
                 let tr = Instant::now();
-                if poll_lod_refresh(doc, &mut self.lod_refresh, idle) {
+                if poll_lod_refresh(doc, &mut self.lod_refresh, &mut self.lod_batch, idle) {
                     ctx.request_repaint();
                 }
                 self.stats.lod_refresh_ms = tr.elapsed().as_secs_f32() * 1e3;
@@ -925,26 +928,33 @@ impl SculptApp {
 
 /// How long the pen must rest before outdated LOD patches are re-simplified.
 const LOD_REFRESH_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
-/// Triangles handed to the background re-simplifier at a time (a few patches; keeps the copy on this thread sub-millisecond).
-const LOD_REFRESH_BATCH: usize = 32_768;
+/// Triangles handed to the background re-simplifier at a time. The copy on the UI thread is about
+/// 0.5 ms per 32k triangles, so the batch only grows when frames are slow enough to hide it.
+const LOD_REFRESH_BATCH_MIN: usize = 32_768;
+const LOD_REFRESH_BATCH_MAX: usize = 262_144;
 
 /// Catch level-of-detail patches up with edits without ever blocking the UI thread on simplification:
 /// install a finished batch if one is back, and when `idle`, copy out the next batch for a worker thread.
 /// Edited areas draw at full detail until then, so the picture is always correct. Returns true while work remains.
-fn poll_lod_refresh(doc: &mut Document, slot: &mut Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>, idle: bool) -> bool {
+fn poll_lod_refresh(doc: &mut Document, slot: &mut Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>, batch_tris: &mut usize, idle: bool) -> bool {
     use std::sync::mpsc::TryRecvError;
     if let Some((topo, rx)) = slot {
         match rx.try_recv() {
             Ok(done) => {
                 doc.apply_lod_refresh(*topo, done);
                 *slot = None;
+                // Finished within a frame: the worker sat idle, so give it more next time.
+                *batch_tris = (*batch_tris * 2).min(LOD_REFRESH_BATCH_MAX);
             }
-            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Empty) => {
+                *batch_tris = (*batch_tris / 2).max(LOD_REFRESH_BATCH_MIN);
+                return true;
+            }
             Err(TryRecvError::Disconnected) => *slot = None,
         }
     }
     let stale = doc.lod().is_some_and(|t| t.stale_nodes() > 0);
-    if idle && let Some((topo, batch)) = doc.gather_lod_refresh(LOD_REFRESH_BATCH) {
+    if idle && let Some((topo, batch)) = doc.gather_lod_refresh(*batch_tris) {
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("lod refresh".into()).spawn(move || {
             let _ = tx.send(batch.run());
