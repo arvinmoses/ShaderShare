@@ -246,19 +246,39 @@ impl Document {
         self.lod = Some((self.topology_id, std::sync::Arc::new(tree)));
     }
 
-    /// Re-simplify level-of-detail patches that edits have outdated, for at most `budget`. Returns how many remain.
-    pub fn refresh_lod(&mut self, budget: std::time::Duration) -> usize {
-        let Some((t, tree)) = self.lod.as_mut() else { return 0 };
-        if *t != self.topology_id {
-            return 0;
+    fn lod_tree_mut(&mut self) -> Option<&mut crate::lod::LodTree> {
+        let topo = self.topology_id;
+        self.lod.as_mut().filter(|(t, _)| *t == topo).and_then(|(_, tree)| std::sync::Arc::get_mut(tree))
+    }
+
+    /// Re-simplify every level-of-detail patch that edits have outdated, on this thread.
+    pub fn refresh_lod_now(&mut self) {
+        let positions = std::mem::take(&mut self.positions);
+        if let Some(tree) = self.lod_tree_mut() {
+            tree.refresh_now(&positions);
         }
-        match std::sync::Arc::get_mut(tree) {
-            Some(tree) => tree.refresh(&self.positions, budget),
-            None => 0,
+        self.positions = positions;
+    }
+
+    /// Copy out up to `max_triangles` of outdated level-of-detail patches for a background thread.
+    /// Returns `None` when nothing is ready. The returned batch's topology id must match on apply.
+    pub fn gather_lod_refresh(&mut self, max_triangles: usize) -> Option<(u64, crate::lod::RefreshBatch)> {
+        let positions = std::mem::take(&mut self.positions);
+        let batch = self.lod_tree_mut().map(|tree| tree.gather_refresh(&positions, max_triangles));
+        self.positions = positions;
+        batch.filter(|b| !b.is_empty()).map(|b| (self.topology_id, b))
+    }
+
+    /// Install patches finished by a background thread. Ignored if the topology changed meanwhile.
+    pub fn apply_lod_refresh(&mut self, topology_id: u64, done: crate::lod::RefreshDone) {
+        if topology_id == self.topology_id
+            && let Some(tree) = self.lod_tree_mut()
+        {
+            tree.apply_refresh(done);
         }
     }
 
-    /// Pool ranges the last [`refresh_lod`](Self::refresh_lod) rewrote, for the renderer to copy.
+    /// Pool ranges rewritten by the last refresh, for the renderer to copy.
     pub fn take_lod_updates(&mut self) -> Vec<(u32, u32)> {
         match self.lod.as_mut().and_then(|(_, t)| std::sync::Arc::get_mut(t)) {
             Some(tree) => tree.take_updates(),

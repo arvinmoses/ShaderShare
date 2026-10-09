@@ -16,6 +16,9 @@ use crate::tools::Tool;
 const SAMPLES_PER_FRAME: usize = 4;
 const STROKE_FRAMES: u32 = 45;
 const WARMUP: u32 = 20;
+/// Taps mode (`SCULPT_TEST_TAPS=1`): short strokes with the pen lifted in between, like detailing work.
+const TAP_FRAMES: u32 = 4;
+const TAP_GAP: u32 = 8;
 const TOOLS: [Tool; 4] = [Tool::ClayBuildup, Tool::TrimDynamic, Tool::ClayBuildup, Tool::Smooth];
 
 #[derive(Default)]
@@ -34,6 +37,7 @@ struct Rec {
     dabs: usize,
     lod_tris: f32,
     lod_select_ms: f32,
+    lod_refresh_ms: f32,
 }
 
 pub struct TestDriver {
@@ -86,6 +90,25 @@ impl TestDriver {
             }
             return;
         }
+        if std::env::var_os("SCULPT_TEST_TAPS").is_some() {
+            let period = TAP_FRAMES + TAP_GAP;
+            let (seg, idx) = (local / period, local % period);
+            if idx == 0 {
+                self.edges.tool = Some(TOOLS[0]);
+                self.edges.begin = Some(Self::pos(rect, seg, (seg % 9) as f32 / 9.0));
+                self.active = true;
+            }
+            if idx < TAP_FRAMES {
+                for k in 1..=SAMPLES_PER_FRAME {
+                    let t = (seg % 9) as f32 / 9.0 + (idx as f32 + k as f32 / SAMPLES_PER_FRAME as f32) * 0.004;
+                    pending.push_back(crate::app::SampleIn { pos: Self::pos(rect, seg, t), pressure: 0.6 });
+                }
+            } else if idx == TAP_FRAMES && self.active {
+                self.edges.end = true;
+                self.active = false;
+            }
+            return;
+        }
         let seg = local / STROKE_FRAMES;
         let idx = local % STROKE_FRAMES;
         if idx == 0 {
@@ -122,6 +145,7 @@ impl TestDriver {
                 dabs: s.dabs,
                 lod_tris: s.lod.triangles as f32,
                 lod_select_ms: s.lod.select_ms,
+                lod_refresh_ms: s.lod_refresh_ms,
             });
         }
         self.frame += 1;
@@ -166,6 +190,7 @@ impl TestDriver {
             ("dabs", col(&|r| r.dabs as f32)),
             ("LOD: triangles drawn", col(&|r| r.lod_tris)),
             ("LOD: cut selection (ms)", col(&|r| r.lod_select_ms)),
+            ("LOD: refresh hand-off, UI (ms)", col(&|r| r.lod_refresh_ms)),
         ] {
             println!("{name:<34} {a:>9.2} {b:>9.2} {c:>9.2}");
         }

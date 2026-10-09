@@ -92,6 +92,8 @@ pub struct FrameStats {
     pub upload: UploadStats,
     pub render_ms: f32,
     pub lod: crate::viewport::LodStats,
+    /// UI-thread time spent handing LOD patches to / from the background re-simplifier.
+    pub lod_refresh_ms: f32,
     pub pending: usize,
 }
 
@@ -109,6 +111,10 @@ pub struct SculptApp {
     job: Option<Job>,
     /// Screen-space error tolerance for the LOD cut, in pixels.
     pub lod_tau: f32,
+    /// Background re-simplification of patches outdated by edits: (topology id, result channel).
+    lod_refresh: Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>,
+    /// When the last dab landed; refresh waits for the pen to rest so it never competes with a stroke.
+    last_edit: Instant,
     viewport: Option<Viewport>,
     pub camera: Camera,
     pub themes: ThemeLibrary,
@@ -181,6 +187,8 @@ impl SculptApp {
         let mut app = SculptApp {
             doc: None,
             job: None,
+            lod_refresh: None,
+            last_edit: Instant::now(),
             lod_tau: std::env::var("SCULPT_LOD_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
             camera: Camera::default(),
@@ -724,6 +732,9 @@ impl SculptApp {
 
         let last = resp.interact_pointer_pos();
         let dabs = self.process_samples(last);
+        if dabs > 0 {
+            self.last_edit = Instant::now();
+        }
         let released = resp.drag_stopped_by(egui::PointerButton::Primary) || (resp.clicked_by(egui::PointerButton::Primary) && self.test.is_none());
         if released && self.pending.is_empty() && !matches!(&self.stroke, Stroke::Brush { dabs, .. } if !dabs.is_empty()) {
             if matches!(self.stroke, Stroke::Pose { .. }) {
@@ -764,10 +775,12 @@ impl SculptApp {
         let px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
             if let Some(doc) = self.doc.as_mut() {
-                // Catch simplified patches up with edits, but never while a stroke is landing dabs.
-                if self.stats.dabs == 0 && doc.refresh_lod(std::time::Duration::from_millis(4)) > 0 {
+                let idle = matches!(self.stroke, Stroke::None) && self.pending.is_empty() && self.last_edit.elapsed() >= LOD_REFRESH_IDLE;
+                let tr = Instant::now();
+                if poll_lod_refresh(doc, &mut self.lod_refresh, idle) {
                     ctx.request_repaint();
                 }
+                self.stats.lod_refresh_ms = tr.elapsed().as_secs_f32() * 1e3;
                 let custom = self.pose_weights.as_deref();
                 vp.sync(rs, doc, &self.overlay, custom, std::mem::take(&mut self.pose_weights_changed));
                 self.stats.upload = vp.last_upload;
@@ -781,7 +794,7 @@ impl SculptApp {
             self.stats.lod = vp.lod_stats;
             if std::env::var_os("SCULPT_LOD_LOG").is_some() && self.stats.lod.active {
                 let stale = self.doc.as_ref().and_then(|d| d.lod()).map_or(0, |t| t.stale_nodes());
-                eprintln!("lod: {} tris, {} patches, tau {:.2}px, select {:.2} ms, stale {}, encode {:.1} ms", self.stats.lod.triangles, self.stats.lod.nodes, self.stats.lod.tau_px, self.stats.lod.select_ms, stale, t.elapsed().as_secs_f32() * 1e3);
+                eprintln!("lod: {} tris, {} patches, tau {:.2}px, select {:.2} ms, stale {}, refresh hand-off {:.2} ms, encode {:.1} ms", self.stats.lod.triangles, self.stats.lod.nodes, self.stats.lod.tau_px, self.stats.lod.select_ms, stale, self.stats.lod_refresh_ms, t.elapsed().as_secs_f32() * 1e3);
             }
             self.stats.render_ms = t.elapsed().as_secs_f32() * 1e3;
             if let Some(tex) = tex {
@@ -908,6 +921,39 @@ impl SculptApp {
     pub fn tool_hotkey(&self, ctx: &egui::Context, t: Tool) -> String {
         self.keymap.shortcut_text(ctx, t.command()).unwrap_or_default()
     }
+}
+
+/// How long the pen must rest before outdated LOD patches are re-simplified.
+const LOD_REFRESH_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Triangles handed to the background re-simplifier at a time (a few patches; keeps the copy on this thread sub-millisecond).
+const LOD_REFRESH_BATCH: usize = 32_768;
+
+/// Catch level-of-detail patches up with edits without ever blocking the UI thread on simplification:
+/// install a finished batch if one is back, and when `idle`, copy out the next batch for a worker thread.
+/// Edited areas draw at full detail until then, so the picture is always correct. Returns true while work remains.
+fn poll_lod_refresh(doc: &mut Document, slot: &mut Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>, idle: bool) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    if let Some((topo, rx)) = slot {
+        match rx.try_recv() {
+            Ok(done) => {
+                doc.apply_lod_refresh(*topo, done);
+                *slot = None;
+            }
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => *slot = None,
+        }
+    }
+    let stale = doc.lod().is_some_and(|t| t.stale_nodes() > 0);
+    if idle && let Some((topo, batch)) = doc.gather_lod_refresh(LOD_REFRESH_BATCH) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("lod refresh".into()).spawn(move || {
+            let _ = tx.send(batch.run());
+        });
+        if spawned.is_ok() {
+            *slot = Some((topo, rx));
+        }
+    }
+    stale
 }
 
 /// Meshes at or above this many triangles are drawn through the LOD tree.

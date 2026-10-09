@@ -175,8 +175,8 @@ fn edits_make_patches_stale_and_refresh_catches_up() {
     let before = doc.lod().unwrap().select(doc.bvh(), &view, 1.0, u64::MAX);
     assert_watertight(doc.lod().unwrap(), &before.ranges);
 
-    let left = doc.refresh_lod(std::time::Duration::from_secs(60));
-    assert_eq!(left, 0);
+    doc.refresh_lod_now();
+    assert_eq!(doc.lod().unwrap().stale_nodes(), 0);
     let updates = doc.take_lod_updates();
     assert!(!updates.is_empty() && updates.len() <= stale);
     assert!(doc.take_lod_updates().is_empty(), "updates are handed out once");
@@ -186,6 +186,40 @@ fn edits_make_patches_stale_and_refresh_catches_up() {
     assert!(after.triangles <= before.triangles, "a refreshed tree draws no more than the stale one");
     assert_watertight(tree, &after.ranges);
     for t in [0.2, 2.0, 8.0] {
+        let cut = tree.select(doc.bvh(), &view_from(Vec3::new(0.0, 0.0, 3.0), 35.0, 1080.0), t, u64::MAX);
+        assert_watertight(tree, &cut.ranges);
+    }
+}
+
+#[test]
+fn a_background_refresh_overtaken_by_an_edit_is_discarded() {
+    let mut doc = big_doc();
+    doc.build_lod(LodParams::default());
+    let bump = |doc: &mut Document, h: f32| {
+        let d = doc.compute_displacements(Vec3::Z, 0.25, |_, _, dist| Some(Vec3::Z * h * (1.0 - dist / 0.25)));
+        doc.begin_stroke("bump");
+        doc.apply_displacements(&d).unwrap();
+        doc.end_stroke();
+    };
+    bump(&mut doc, 0.1);
+    let (topo, batch) = doc.gather_lod_refresh(usize::MAX).expect("stale patches are ready");
+    assert!(doc.gather_lod_refresh(usize::MAX).is_none(), "patches in flight are not handed out twice");
+
+    // The worker runs while the user keeps sculpting the same spot.
+    let done = std::thread::spawn(move || batch.run()).join().unwrap();
+    bump(&mut doc, 0.1);
+    let stale = doc.lod().unwrap().stale_nodes();
+    doc.apply_lod_refresh(topo, done);
+    assert_eq!(doc.lod().unwrap().stale_nodes(), stale, "results computed before the second edit are dropped");
+
+    // Background rounds converge: gather, run, apply until nothing is left.
+    while let Some((topo, batch)) = doc.gather_lod_refresh(50_000) {
+        let done = batch.run();
+        doc.apply_lod_refresh(topo, done);
+    }
+    let tree = doc.lod().unwrap();
+    assert_eq!(tree.stale_nodes(), 0);
+    for t in [0.2, 1.0, 8.0] {
         let cut = tree.select(doc.bvh(), &view_from(Vec3::new(0.0, 0.0, 3.0), 35.0, 1080.0), t, u64::MAX);
         assert_watertight(tree, &cut.ranges);
     }

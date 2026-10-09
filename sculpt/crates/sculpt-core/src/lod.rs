@@ -120,6 +120,10 @@ pub struct LodTree {
     /// them (down to the edited leaves) until [`LodTree::refresh`] catches up.
     stale: Vec<bool>,
     stale_count: usize,
+    /// Bumped on every edit below a node, so a re-simplification computed from older data is discarded.
+    epoch: Vec<u32>,
+    /// Nodes handed to a [`RefreshBatch`] that has not come back yet.
+    in_flight: Vec<bool>,
     /// Pool ranges `(first, count)` rewritten since the renderer last asked.
     updates: Vec<(u32, u32)>,
 }
@@ -130,6 +134,70 @@ struct Subtree {
     indices: Vec<u32>,
     error: f32,
     inner: Vec<(u32, Vec<u32>, f32)>,
+}
+
+/// One patch to re-simplify, with private copies of its vertices.
+struct RefreshJob {
+    id: u32,
+    epoch: u32,
+    /// The children's triangles, in global vertex ids.
+    indices: Vec<u32>,
+    /// Position of each index's vertex, copied when the job was made.
+    corners: Vec<Vec3>,
+    target: usize,
+    child_error: f32,
+}
+
+struct RefreshResult {
+    id: u32,
+    epoch: u32,
+    indices: Vec<u32>,
+    error: f32,
+}
+
+/// Stale patches packaged for re-simplification on a background thread. Owns all its data.
+pub struct RefreshBatch {
+    jobs: Vec<RefreshJob>,
+}
+
+/// Finished patches, to hand back to [`LodTree::apply_refresh`].
+pub struct RefreshDone {
+    results: Vec<RefreshResult>,
+}
+
+impl RefreshBatch {
+    pub fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// The expensive part. Runs sequentially so a worker thread uses one core and leaves the rest to the brush.
+    pub fn run(self) -> RefreshDone {
+        let results = self
+            .jobs
+            .into_iter()
+            .map(|j| {
+                if j.indices.len() <= j.target {
+                    return RefreshResult { id: j.id, epoch: j.epoch, indices: j.indices, error: j.child_error };
+                }
+                // Compact to the patch's own vertices so simplification sees shared corners as shared.
+                let mut verts = j.indices.clone();
+                verts.sort_unstable();
+                verts.dedup();
+                let local_idx: Vec<u32> = j.indices.iter().map(|v| verts.binary_search(v).expect("vertex is in its own patch") as u32).collect();
+                let mut positions = vec![Vec3::ZERO; verts.len()];
+                for (&l, &p) in local_idx.iter().zip(&j.corners) {
+                    positions[l as usize] = p;
+                }
+                let (local, own) = Simplifier::new(&positions).run(&local_idx, j.target);
+                RefreshResult { id: j.id, epoch: j.epoch, indices: local.iter().map(|&v| verts[v as usize]).collect(), error: j.child_error + own }
+            })
+            .collect();
+        RefreshDone { results }
+    }
 }
 
 /// Everything a simplification call needs besides the triangles.
@@ -205,27 +273,49 @@ impl LodTree {
             }
         }
         let slot = nodes.iter().map(|n| n.count).collect();
-        let stale = vec![false; nodes.len()];
-        LodTree { nodes, indices, full_triangles, params, parent, depth, leaf_node, slot, stale, stale_count: 0, updates: Vec::new() }
+        let n = nodes.len();
+        LodTree {
+            nodes,
+            indices,
+            full_triangles,
+            params,
+            parent,
+            depth,
+            leaf_node,
+            slot,
+            stale: vec![false; n],
+            stale_count: 0,
+            epoch: vec![0; n],
+            in_flight: vec![false; n],
+            updates: Vec::new(),
+        }
     }
 
     /// Note that these leaves' vertices moved: every simplified patch above them is out of date.
     pub fn mark_leaves(&mut self, leaves: &[u32]) {
         for &l in leaves {
             let mut n = self.parent[self.leaf_node[l as usize] as usize];
-            while n != u32::MAX && !self.stale[n as usize] {
-                self.stale[n as usize] = true;
-                self.stale_count += 1;
-                n = self.parent[n as usize];
+            // Walk the whole path: ancestors that are already stale still need their epoch bumped.
+            while n != u32::MAX {
+                let i = n as usize;
+                self.epoch[i] = self.epoch[i].wrapping_add(1);
+                if !self.stale[i] {
+                    self.stale[i] = true;
+                    self.stale_count += 1;
+                }
+                n = self.parent[i];
             }
         }
     }
 
     pub fn mark_all(&mut self) {
         for (i, n) in self.nodes.iter().enumerate() {
-            if n.children.is_some() && !self.stale[i] {
-                self.stale[i] = true;
-                self.stale_count += 1;
+            if n.children.is_some() {
+                self.epoch[i] = self.epoch[i].wrapping_add(1);
+                if !self.stale[i] {
+                    self.stale[i] = true;
+                    self.stale_count += 1;
+                }
             }
         }
     }
@@ -240,51 +330,76 @@ impl LodTree {
         std::mem::take(&mut self.updates)
     }
 
-    /// Re-simplify out-of-date patches, deepest first, until `budget` is spent (a level always finishes).
-    /// Returns how many patches are still stale.
-    pub fn refresh(&mut self, positions: &[Vec3], budget: std::time::Duration) -> usize {
-        if self.stale_count == 0 {
-            return 0;
-        }
-        let start = std::time::Instant::now();
-        let mut ids: Vec<u32> = (0..self.nodes.len() as u32).filter(|&i| self.stale[i as usize]).collect();
-        ids.sort_by_key(|&i| std::cmp::Reverse(self.depth[i as usize]));
-        let simplifier = Simplifier::new(positions);
-        let mut at = 0;
-        while at < ids.len() && (at == 0 || start.elapsed() < budget) {
-            let d = self.depth[ids[at] as usize];
-            let end = at + ids[at..].iter().take_while(|&&i| self.depth[i as usize] == d).count();
-            let this = &*self;
-            let results: Vec<(u32, Vec<u32>, f32)> = ids[at..end]
-                .par_iter()
-                .map(|&id| {
-                    let [l, r] = this.nodes[id as usize].children.expect("only inner nodes are stale");
-                    let (nl, nr) = (&this.nodes[l as usize], &this.nodes[r as usize]);
-                    let mut merged = this.indices[nl.first as usize..(nl.first + nl.count) as usize].to_vec();
-                    merged.extend_from_slice(&this.indices[nr.first as usize..(nr.first + nr.count) as usize]);
-                    let target = this.params.node_tris * 3;
-                    let (out, own) = if merged.len() > target { simplifier.run(&merged, target.min(this.slot[id as usize] as usize)) } else { (merged, 0.0) };
-                    (id, out, nl.error.max(nr.error) + own)
-                })
-                .collect();
-            for (id, out, error) in results {
-                let node = &mut self.nodes[id as usize];
-                if out.len() <= self.slot[id as usize] as usize {
-                    let first = node.first as usize;
-                    self.indices[first..first + out.len()].copy_from_slice(&out);
-                    node.count = out.len() as u32;
-                    node.error = error;
-                    self.updates.push((node.first, node.count));
-                } else {
-                    // Did not fit its slot: always refine through it rather than draw a wrong patch.
-                    node.error = f32::INFINITY;
-                }
-                self.stale[id as usize] = false;
-                self.stale_count -= 1;
+    /// Re-simplify every out-of-date patch right here, on the calling thread. For tools and tests; the app
+    /// uses [`gather_refresh`](Self::gather_refresh) so the work runs off the UI thread.
+    pub fn refresh_now(&mut self, positions: &[Vec3]) {
+        loop {
+            let batch = self.gather_refresh(positions, usize::MAX);
+            if batch.is_empty() {
+                return;
             }
-            at = end;
+            let done = batch.run();
+            self.apply_refresh(done);
         }
-        self.stale_count
+    }
+
+    /// Package up to `max_triangles` worth of stale patches whose children are up to date, with copies of
+    /// everything simplification needs, so [`RefreshBatch::run`] can execute on another thread while editing
+    /// continues. Cheap: a copy of the inputs, no simplification.
+    pub fn gather_refresh(&mut self, positions: &[Vec3], max_triangles: usize) -> RefreshBatch {
+        let mut jobs = Vec::new();
+        let mut tris = 0usize;
+        if self.stale_count == 0 {
+            return RefreshBatch { jobs };
+        }
+        // Deepest first, so a parent is simplified from children that are already current.
+        let mut ids: Vec<u32> = (0..self.nodes.len() as u32)
+            .filter(|&i| {
+                let i = i as usize;
+                self.stale[i] && !self.in_flight[i] && self.nodes[i].children.is_some_and(|[l, r]| !self.stale[l as usize] && !self.stale[r as usize])
+            })
+            .collect();
+        ids.sort_by_key(|&i| std::cmp::Reverse(self.depth[i as usize]));
+        for id in ids {
+            if tris >= max_triangles {
+                break;
+            }
+            let [l, r] = self.nodes[id as usize].children.expect("filtered to inner nodes");
+            let (nl, nr) = (&self.nodes[l as usize], &self.nodes[r as usize]);
+            let mut merged = self.indices[nl.first as usize..(nl.first + nl.count) as usize].to_vec();
+            merged.extend_from_slice(&self.indices[nr.first as usize..(nr.first + nr.count) as usize]);
+            tris += merged.len() / 3;
+            // Plain copies only; the worker does the compaction, so the live mesh is never shared.
+            let corners: Vec<Vec3> = merged.iter().map(|&v| positions[v as usize]).collect();
+            let target = (self.params.node_tris * 3).min(self.slot[id as usize] as usize);
+            self.in_flight[id as usize] = true;
+            jobs.push(RefreshJob { id, epoch: self.epoch[id as usize], indices: merged, corners, target, child_error: nl.error.max(nr.error) });
+        }
+        RefreshBatch { jobs }
+    }
+
+    /// Write back finished patches. A patch edited again since it was gathered is dropped and stays stale.
+    pub fn apply_refresh(&mut self, done: RefreshDone) {
+        for r in done.results {
+            let i = r.id as usize;
+            self.in_flight[i] = false;
+            if r.epoch != self.epoch[i] || !self.stale[i] {
+                continue;
+            }
+            let node = &mut self.nodes[i];
+            if r.indices.len() <= self.slot[i] as usize {
+                let first = node.first as usize;
+                self.indices[first..first + r.indices.len()].copy_from_slice(&r.indices);
+                node.count = r.indices.len() as u32;
+                node.error = r.error;
+                self.updates.push((node.first, node.count));
+            } else {
+                // Did not fit its slot: always refine through it rather than draw a wrong patch.
+                node.error = f32::INFINITY;
+            }
+            self.stale[i] = false;
+            self.stale_count -= 1;
+        }
     }
 
     fn build_node(id: u32, bvh: &Bvh, leaf_tris: &[Vec<u32>], simplifier: &Simplifier<'_>, params: LodParams) -> Subtree {
