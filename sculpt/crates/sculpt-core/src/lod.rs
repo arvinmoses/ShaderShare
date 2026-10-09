@@ -110,6 +110,18 @@ pub struct LodTree {
     pub indices: Vec<u32>,
     pub full_triangles: u64,
     pub params: LodParams,
+    parent: Vec<u32>,
+    depth: Vec<u16>,
+    /// BVH node id of each leaf.
+    leaf_node: Vec<u32>,
+    /// Indices reserved for each node in the pool; a refreshed node must fit its slot.
+    slot: Vec<u32>,
+    /// Inner nodes whose subtree was edited since they were simplified. Selection refines through
+    /// them (down to the edited leaves) until [`LodTree::refresh`] catches up.
+    stale: Vec<bool>,
+    stale_count: usize,
+    /// Pool ranges `(first, count)` rewritten since the renderer last asked.
+    updates: Vec<(u32, u32)>,
 }
 
 /// Result of building one subtree: the node's own simplified triangles and error, plus the finished
@@ -118,6 +130,26 @@ struct Subtree {
     indices: Vec<u32>,
     error: f32,
     inner: Vec<(u32, Vec<u32>, f32)>,
+}
+
+/// Everything a simplification call needs besides the triangles.
+struct Simplifier<'a> {
+    positions: VertexDataAdapter<'a>,
+}
+
+impl<'a> Simplifier<'a> {
+    fn new(positions: &'a [Vec3]) -> Simplifier<'a> {
+        let bytes: &[u8] = bytemuck::cast_slice(positions);
+        Simplifier { positions: VertexDataAdapter::new(bytes, 12, 0).expect("positions are tightly packed f32x3") }
+    }
+
+    /// Reduce `indices` to about `target` indices, keeping patch borders, and report the error introduced.
+    fn run(&self, indices: &[u32], target: usize) -> (Vec<u32>, f32) {
+        let mut err = 0.0f32;
+        let opts = SimplifyOptions::LockBorder | SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute;
+        let out = meshopt::simplify(indices, &self.positions, target, f32::MAX, opts, Some(&mut err));
+        (out, err)
+    }
 }
 
 impl LodTree {
@@ -139,9 +171,8 @@ impl LodTree {
             .collect();
         let full_triangles = leaf_tris.iter().map(|t| t.len() as u64 / 3).sum();
 
-        let bytes: &[u8] = bytemuck::cast_slice(positions);
-        let adapter = VertexDataAdapter::new(bytes, 12, 0).expect("positions are tightly packed f32x3");
-        let root = Self::build_node(0, bvh, &leaf_tris, &adapter, params);
+        let simplifier = Simplifier::new(positions);
+        let root = Self::build_node(0, bvh, &leaf_tris, &simplifier, params);
 
         // Lay the pool out: leaves first, so a cut made only of leaves is the plain mesh.
         let mut indices: Vec<u32> = Vec::with_capacity(leaf_tris.iter().map(Vec::len).sum::<usize>() + root.inner.iter().map(|(_, i, _)| i.len()).sum::<usize>());
@@ -158,28 +189,117 @@ impl LodTree {
             nodes[id as usize] = LodNode { first: indices.len() as u32, count: idx.len() as u32, error, children: Some([left, right]) };
             indices.extend_from_slice(&idx);
         }
-        LodTree { nodes, indices, full_triangles, params }
+        let mut parent = vec![u32::MAX; nodes.len()];
+        let mut depth = vec![0u16; nodes.len()];
+        let mut leaf_node = vec![0u32; bvh.leaves.len()];
+        // BVH children always come after their parent, so one forward pass fills depths.
+        for (i, n) in bvh.nodes.iter().enumerate() {
+            match n.kind {
+                NodeKind::Inner { left, right } => {
+                    for c in [left, right] {
+                        parent[c as usize] = i as u32;
+                        depth[c as usize] = depth[i] + 1;
+                    }
+                }
+                NodeKind::Leaf { leaf } => leaf_node[leaf as usize] = i as u32,
+            }
+        }
+        let slot = nodes.iter().map(|n| n.count).collect();
+        let stale = vec![false; nodes.len()];
+        LodTree { nodes, indices, full_triangles, params, parent, depth, leaf_node, slot, stale, stale_count: 0, updates: Vec::new() }
     }
 
-    fn build_node(id: u32, bvh: &Bvh, leaf_tris: &[Vec<u32>], adapter: &VertexDataAdapter<'_>, params: LodParams) -> Subtree {
+    /// Note that these leaves' vertices moved: every simplified patch above them is out of date.
+    pub fn mark_leaves(&mut self, leaves: &[u32]) {
+        for &l in leaves {
+            let mut n = self.parent[self.leaf_node[l as usize] as usize];
+            while n != u32::MAX && !self.stale[n as usize] {
+                self.stale[n as usize] = true;
+                self.stale_count += 1;
+                n = self.parent[n as usize];
+            }
+        }
+    }
+
+    pub fn mark_all(&mut self) {
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.children.is_some() && !self.stale[i] {
+                self.stale[i] = true;
+                self.stale_count += 1;
+            }
+        }
+    }
+
+    /// Patches still waiting to be re-simplified.
+    pub fn stale_nodes(&self) -> usize {
+        self.stale_count
+    }
+
+    /// Pool ranges rewritten by [`refresh`](Self::refresh) since the last call, for the GPU copy.
+    pub fn take_updates(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.updates)
+    }
+
+    /// Re-simplify out-of-date patches, deepest first, until `budget` is spent (a level always finishes).
+    /// Returns how many patches are still stale.
+    pub fn refresh(&mut self, positions: &[Vec3], budget: std::time::Duration) -> usize {
+        if self.stale_count == 0 {
+            return 0;
+        }
+        let start = std::time::Instant::now();
+        let mut ids: Vec<u32> = (0..self.nodes.len() as u32).filter(|&i| self.stale[i as usize]).collect();
+        ids.sort_by_key(|&i| std::cmp::Reverse(self.depth[i as usize]));
+        let simplifier = Simplifier::new(positions);
+        let mut at = 0;
+        while at < ids.len() && (at == 0 || start.elapsed() < budget) {
+            let d = self.depth[ids[at] as usize];
+            let end = at + ids[at..].iter().take_while(|&&i| self.depth[i as usize] == d).count();
+            let this = &*self;
+            let results: Vec<(u32, Vec<u32>, f32)> = ids[at..end]
+                .par_iter()
+                .map(|&id| {
+                    let [l, r] = this.nodes[id as usize].children.expect("only inner nodes are stale");
+                    let (nl, nr) = (&this.nodes[l as usize], &this.nodes[r as usize]);
+                    let mut merged = this.indices[nl.first as usize..(nl.first + nl.count) as usize].to_vec();
+                    merged.extend_from_slice(&this.indices[nr.first as usize..(nr.first + nr.count) as usize]);
+                    let target = this.params.node_tris * 3;
+                    let (out, own) = if merged.len() > target { simplifier.run(&merged, target.min(this.slot[id as usize] as usize)) } else { (merged, 0.0) };
+                    (id, out, nl.error.max(nr.error) + own)
+                })
+                .collect();
+            for (id, out, error) in results {
+                let node = &mut self.nodes[id as usize];
+                if out.len() <= self.slot[id as usize] as usize {
+                    let first = node.first as usize;
+                    self.indices[first..first + out.len()].copy_from_slice(&out);
+                    node.count = out.len() as u32;
+                    node.error = error;
+                    self.updates.push((node.first, node.count));
+                } else {
+                    // Did not fit its slot: always refine through it rather than draw a wrong patch.
+                    node.error = f32::INFINITY;
+                }
+                self.stale[id as usize] = false;
+                self.stale_count -= 1;
+            }
+            at = end;
+        }
+        self.stale_count
+    }
+
+    fn build_node(id: u32, bvh: &Bvh, leaf_tris: &[Vec<u32>], simplifier: &Simplifier<'_>, params: LodParams) -> Subtree {
         match bvh.nodes[id as usize].kind {
             NodeKind::Leaf { leaf } => Subtree { indices: leaf_tris[leaf as usize].clone(), error: 0.0, inner: Vec::new() },
             NodeKind::Inner { left, right } => {
                 // The two halves are independent, so rayon splits the work down the tree.
-                let (l, r) = rayon::join(|| Self::build_node(left, bvh, leaf_tris, adapter, params), || Self::build_node(right, bvh, leaf_tris, adapter, params));
+                let (l, r) = rayon::join(|| Self::build_node(left, bvh, leaf_tris, simplifier, params), || Self::build_node(right, bvh, leaf_tris, simplifier, params));
                 let child_error = l.error.max(r.error);
                 let mut inner = l.inner;
                 inner.extend(r.inner);
                 let mut merged = l.indices;
                 merged.extend_from_slice(&r.indices);
                 let target = params.node_tris * 3;
-                let mut own = 0.0f32;
-                let indices = if merged.len() > target {
-                    let opts = SimplifyOptions::LockBorder | SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute;
-                    meshopt::simplify(&merged, adapter, target, f32::MAX, opts, Some(&mut own))
-                } else {
-                    merged
-                };
+                let (indices, own) = if merged.len() > target { simplifier.run(&merged, target) } else { (merged, 0.0) };
                 // A parent is never more accurate than its worst child, so selection stays consistent.
                 let error = child_error + own;
                 inner.push((id, indices.clone(), error));
@@ -192,17 +312,23 @@ impl LodTree {
     /// If the result would exceed `budget_tris`, the threshold is raised until it fits (a frame-time guard).
     pub fn select(&self, bvh: &Bvh, view: &View, tau_px: f32, budget_tris: u64) -> Cut {
         let mut tau = tau_px.max(0.01);
+        let mut honour_stale = true;
         loop {
             let mut cut = Cut { tau_px: tau, ..Default::default() };
-            self.visit(0, bvh, view, tau, &mut cut);
+            self.visit(0, bvh, view, tau, honour_stale && self.stale_count > 0, &mut cut);
             if cut.triangles <= budget_tris || tau > 1e4 {
                 return cut;
             }
-            tau *= 1.4;
+            // Over budget: stop forcing detail through out-of-date patches first, then loosen the tolerance.
+            if honour_stale {
+                honour_stale = false;
+            } else {
+                tau *= 1.4;
+            }
         }
     }
 
-    fn visit(&self, id: u32, bvh: &Bvh, view: &View, tau: f32, cut: &mut Cut) {
+    fn visit(&self, id: u32, bvh: &Bvh, view: &View, tau: f32, stale: bool, cut: &mut Cut) {
         let bounds = &bvh.nodes[id as usize].bounds;
         if bounds.is_empty() || !view.sees(bounds) {
             cut.culled += 1;
@@ -210,9 +336,9 @@ impl LodTree {
         }
         let node = &self.nodes[id as usize];
         match node.children {
-            Some([l, r]) if view.error_px(bounds, node.error) > tau => {
-                self.visit(l, bvh, view, tau, cut);
-                self.visit(r, bvh, view, tau, cut);
+            Some([l, r]) if (stale && self.stale[id as usize]) || view.error_px(bounds, node.error) > tau => {
+                self.visit(l, bvh, view, tau, stale, cut);
+                self.visit(r, bvh, view, tau, stale, cut);
             }
             _ => {
                 cut.nodes += 1;

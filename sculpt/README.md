@@ -93,6 +93,19 @@ render path and prints percentiles:
 cargo run --release -p sculpt-app -- --level 10 --test-strokes 180 --screenshot test.png
 ```
 
+### Very dense meshes (20M triangles)
+
+Meshes of 1.5M triangles or more get a level-of-detail tree (built in the background, see
+[`docs/PERFORMANCE_20M.md`](docs/PERFORMANCE_20M.md)) and are drawn at about one triangle per pixel. Try it and
+measure your GPU:
+
+```sh
+cargo run --release -p sculpt-app -- --quads 1291 --bench-orbit 120 --size 1920x1080   # 20M triangles, LOD on
+SCULPT_NO_LOD=1 cargo run --release -p sculpt-app -- --quads 1291 --bench-orbit 20 --size 1920x1080  # baseline
+```
+
+`--quads N` makes a sphere with 6·N² quads. The HUD shows the triangles drawn and cut-selection time.
+
 ## Build & run
 
 ```sh

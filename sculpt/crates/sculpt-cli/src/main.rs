@@ -21,7 +21,7 @@ use sculpt_core::io::{obj, project, read_channel_file};
 use sculpt_core::mask::{BlendMode, Levels, MaskLayer, MaskSource, MaskStack};
 use sculpt_core::noise::{NoiseKind, NoiseParams};
 use sculpt_core::pose::PoseTransform;
-use sculpt_core::primitives::quad_sphere;
+use sculpt_core::primitives::{quad_sphere, quad_sphere_res};
 use sculpt_core::{Document, PaintTarget};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -30,6 +30,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("demo") => demo(Path::new(args.get(1).map_or("out", |s| s.as_str()))),
+        Some("lod-bench") => lod_bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000_000), args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0)),
         Some("bench") => bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9)),
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("import-channel") if args.len() == 4 => import_channel(Path::new(&args[1]), &args[2], Path::new(&args[3])),
@@ -305,5 +306,56 @@ fn render_project(dir: &Path, png: &Path) -> Res<()> {
     }
     render::render(&doc, &views, 512, png)?;
     println!("rendered {}", png.display());
+    Ok(())
+}
+
+/// Level-of-detail cost at scale: build the tree for a sphere of about `quads` quads and report what a
+/// frame would draw from several distances. Triangle counts are what a GPU-independent budget needs.
+fn lod_bench(quads: u32, detail: f32) -> Res<()> {
+    use sculpt_core::lod::{LodParams, View};
+    println!("threads: {}", rayon::current_num_threads());
+    let res = ((quads as f64 / 6.0).sqrt().round() as u32).max(2);
+    let t = Instant::now();
+    let mut mesh = quad_sphere_res(res, 1.0);
+    if detail > 0.0 {
+        // Fine fbm relief, the kind of detail a sculpt actually has (about 40 to 640 cycles per unit).
+        let noise = sculpt_core::noise::Noise::new(&NoiseParams { scale: 40.0, octaves: 5, ..Default::default() });
+        for p in &mut mesh.positions {
+            let n = p.normalize();
+            *p = n * (1.0 + detail * (noise.sample(n) - 0.5));
+        }
+    }
+    step(&format!("generate {} quads (relief {detail})", mesh.faces.len()), t);
+    let t = Instant::now();
+    let mut doc = Document::from_mesh(mesh)?;
+    step(&format!("document + BVH: {} leaves", doc.bvh().leaves.len()), t);
+    let t = Instant::now();
+    doc.build_lod(LodParams::default());
+    step("LOD tree build", t);
+    let tree = doc.lod().expect("built").clone();
+    println!(
+        "  full {:>10} tris   pool {:>10} tris ({:.2}x)   {:.0} MB of indices   {} nodes",
+        tree.full_triangles,
+        tree.pool_triangles(),
+        tree.pool_triangles() as f64 / tree.full_triangles as f64,
+        tree.indices.len() as f64 * 4.0 / 1e6,
+        tree.nodes.len()
+    );
+    // 1080p vertical field of view 35 degrees, like the app camera.
+    let (h, fov) = (1080.0f32, 35f32.to_radians());
+    let focal = h / (2.0 * (fov / 2.0).tan());
+    println!("  view                      tau 1px: tris   nodes  culled  select ms | tau 2px: tris | budget 3M: tris  tau");
+    for (name, dist) in [("whole model", 4.0f32), ("close", 2.0), ("very close", 1.3), ("zoomed in", 1.08)] {
+        let eye = Vec3::new(0.0, 0.0, dist);
+        let proj = glam::camera::rh::proj::directx::perspective(fov, 16.0 / 9.0, dist * 0.01, dist * 100.0);
+        let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+        let v = View::from_view_proj(proj * view, eye, focal);
+        let t = Instant::now();
+        let a = tree.select(doc.bvh(), &v, 1.0, u64::MAX);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let b = tree.select(doc.bvh(), &v, 2.0, u64::MAX);
+        let c = tree.select(doc.bvh(), &v, 1.0, 3_000_000);
+        println!("  {name:<22} {:>14} {:>7} {:>7} {:>8.3}    | {:>14}  | {:>14} {:>5.1}", a.triangles, a.nodes, a.culled, ms, b.triangles, c.triangles, c.tau_px);
+    }
     Ok(())
 }

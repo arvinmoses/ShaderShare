@@ -31,6 +31,8 @@ use crate::viewport::{OverlayKind, UploadStats, Viewport};
 const DAB_BUDGET: Duration = Duration::from_millis(12);
 
 pub struct Options {
+    /// Start on a synthetic quad sphere with this many quads per cube edge (6·n² quads).
+    pub sphere_res: Option<u32>,
     pub project: Option<PathBuf>,
     pub level: u32,
     pub theme: Option<String>,
@@ -38,6 +40,8 @@ pub struct Options {
     pub screenshot: Option<PathBuf>,
     /// Create a masked detail layer on startup (for demos and screenshots).
     pub demo_layers: bool,
+    /// Orbit the camera for this many frames and report timings, waiting for the GPU each frame.
+    pub bench_orbit: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +91,7 @@ pub struct FrameStats {
     pub dabs: usize,
     pub upload: UploadStats,
     pub render_ms: f32,
+    pub lod: crate::viewport::LodStats,
     pub pending: usize,
 }
 
@@ -102,6 +107,8 @@ pub enum Selection {
 pub struct SculptApp {
     pub doc: Option<Document>,
     job: Option<Job>,
+    /// Screen-space error tolerance for the LOD cut, in pixels.
+    pub lod_tau: f32,
     viewport: Option<Viewport>,
     pub camera: Camera,
     pub themes: ThemeLibrary,
@@ -174,6 +181,7 @@ impl SculptApp {
         let mut app = SculptApp {
             doc: None,
             job: None,
+            lod_tau: std::env::var("SCULPT_LOD_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
             camera: Camera::default(),
             themes,
@@ -203,7 +211,11 @@ impl SculptApp {
             tray: Tray::Sculpt,
             mask_dirty: false,
             pen: Pen::new(cc),
-            test: opts.test_frames.map(|f| crate::test_driver::TestDriver::new(f, opts.screenshot.clone())),
+            test: opts.bench_orbit.or(opts.test_frames).map(|f| {
+                let mut d = crate::test_driver::TestDriver::new(f, opts.screenshot.clone());
+                d.orbit = opts.bench_orbit.is_some();
+                d
+            }),
             cursor: None,
             viewport_rect: Rect::NOTHING,
             last_theme_poll: Instant::now(),
@@ -215,9 +227,12 @@ impl SculptApp {
         for e in app.themes.errors.iter().chain(&app.keymap.errors) {
             eprintln!("config: {e}");
         }
-        match opts.project {
-            Some(p) => app.start_job("Opening project", move || project::load(&p).map_err(|e| e.to_string())),
-            None => {
+        match (opts.project, opts.sphere_res) {
+            (None, Some(n)) => app.start_job(&format!("Creating {n}x{n}-per-face sphere"), move || {
+                Document::from_mesh(sculpt_core::primitives::quad_sphere_res(n, 1.0)).map_err(|e| e.to_string())
+            }),
+            (Some(p), _) => app.start_job("Opening project", move || project::load(&p).map_err(|e| e.to_string())),
+            (None, None) => {
                 let level = opts.level;
                 app.start_job(&format!("Creating level {level} sphere"), move || new_sphere(level));
             }
@@ -269,13 +284,25 @@ impl SculptApp {
                     if std::mem::take(&mut self.demo_layers) {
                         self.setup_demo_layers();
                     }
+                    self.maybe_build_lod();
                 }
                 Ok(Err(e)) => self.status = format!("{} failed: {e}", job.label),
                 Err(_) => self.status = format!("{} crashed", job.label),
             }
-            if self.doc.is_none() {
+            if self.doc.is_none() && self.job.is_none() {
                 self.start_job("Creating sphere", || new_sphere(6));
             }
+        }
+    }
+
+    /// Dense meshes get a level-of-detail tree so drawing costs pixels, not triangles.
+    fn maybe_build_lod(&mut self) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        if doc.lod().is_none() && std::env::var_os("SCULPT_NO_LOD").is_none() && doc.face_count() * 2 >= LOD_MIN_TRIANGLES {
+            self.start_doc_job("Building level of detail", |d| {
+                d.build_lod(sculpt_core::lod::LodParams::default());
+                Ok(())
+            });
         }
     }
 
@@ -737,12 +764,25 @@ impl SculptApp {
         let px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
             if let Some(doc) = self.doc.as_mut() {
+                // Catch simplified patches up with edits, but never while a stroke is landing dabs.
+                if self.stats.dabs == 0 && doc.refresh_lod(std::time::Duration::from_millis(4)) > 0 {
+                    ctx.request_repaint();
+                }
                 let custom = self.pose_weights.as_deref();
                 vp.sync(rs, doc, &self.overlay, custom, std::mem::take(&mut self.pose_weights_changed));
                 self.stats.upload = vp.last_upload;
             }
             let t = Instant::now();
-            let tex = vp.render(rs, px, &self.camera, &self.theme, self.overlay_strength, self.cursor);
+            let tau = if navigating { self.lod_tau * 2.0 } else { self.lod_tau };
+            let lod = self.doc.as_ref().and_then(|d| {
+                d.lod().map(|tree| crate::viewport::LodInput { tree, bvh: d.bvh(), topology_id: d.topology_id(), tau_px: tau, budget: LOD_BUDGET })
+            });
+            let tex = vp.render(rs, px, &self.camera, &self.theme, self.overlay_strength, self.cursor, lod);
+            self.stats.lod = vp.lod_stats;
+            if std::env::var_os("SCULPT_LOD_LOG").is_some() && self.stats.lod.active {
+                let stale = self.doc.as_ref().and_then(|d| d.lod()).map_or(0, |t| t.stale_nodes());
+                eprintln!("lod: {} tris, {} patches, tau {:.2}px, select {:.2} ms, stale {}, encode {:.1} ms", self.stats.lod.triangles, self.stats.lod.nodes, self.stats.lod.tau_px, self.stats.lod.select_ms, stale, t.elapsed().as_secs_f32() * 1e3);
+            }
             self.stats.render_ms = t.elapsed().as_secs_f32() * 1e3;
             if let Some(tex) = tex {
                 ui.painter().image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
@@ -826,6 +866,9 @@ impl SculptApp {
             s.frame_ms
         )];
         lines.push(format!("input+dabs {:>5.2} ms ({} dabs, {} queued)   render {:>4.2} ms", s.input_ms, s.dabs, s.pending, s.render_ms));
+        if s.lod.active {
+            lines.push(format!("LOD {} tris in {} patches, tau {:.1}px, select {:.2} ms", fmt_count(s.lod.triangles as usize), s.lod.nodes, s.lod.tau_px, s.lod.select_ms));
+        }
         lines.push(format!("upload {:>7.1} KB in {} ranges ({:.2} ms)", s.upload.bytes as f32 / 1024.0, s.upload.ranges, s.upload.ms));
         lines.push(format!("pen: {}  pressure {:.2}", self.pen.source.label(), self.pen.pressure));
         if let Some(doc) = &self.doc {
@@ -866,6 +909,11 @@ impl SculptApp {
         self.keymap.shortcut_text(ctx, t.command()).unwrap_or_default()
     }
 }
+
+/// Meshes at or above this many triangles are drawn through the LOD tree.
+const LOD_MIN_TRIANGLES: usize = 1_500_000;
+/// Most triangles drawn per frame, whatever the pixel tolerance asks for.
+const LOD_BUDGET: u64 = 6_000_000;
 
 pub fn fmt_count(n: usize) -> String {
     if n >= 1_000_000 {
@@ -937,7 +985,8 @@ impl eframe::App for SculptApp {
         if let Some(test) = &mut self.test {
             let doc_ready = self.doc.is_some() && self.job.is_none();
             test.record(&self.stats, doc_ready, self.doc.as_ref());
-            test.finish_if_done(&ctx);
+            let settled = self.doc.as_ref().and_then(|d| d.lod()).is_none_or(|t| t.stale_nodes() == 0);
+            test.finish_if_done(&ctx, settled);
             for e in ctx.input(|i| i.events.clone()) {
                 if let egui::Event::Screenshot { image, .. } = e {
                     test.save_screenshot(&image);

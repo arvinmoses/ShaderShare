@@ -32,6 +32,8 @@ struct Rec {
     render_ms: f32,
     upload_kb: f32,
     dabs: usize,
+    lod_tris: f32,
+    lod_select_ms: f32,
 }
 
 pub struct TestDriver {
@@ -44,6 +46,8 @@ pub struct TestDriver {
     active: bool,
     last_time: Option<Instant>,
     mesh: String,
+    /// Orbit benchmark: no strokes, the camera turns instead.
+    pub orbit: bool,
 }
 
 impl TestDriver {
@@ -58,6 +62,7 @@ impl TestDriver {
             active: false,
             last_time: None,
             mesh: String::new(),
+            orbit: false,
         }
     }
 
@@ -70,7 +75,7 @@ impl TestDriver {
 
     /// Queue this frame's synthetic pen samples.
     pub fn drive(&mut self, rect: Rect, pending: &mut std::collections::VecDeque<crate::app::SampleIn>) {
-        if self.frame < WARMUP {
+        if self.frame < WARMUP || self.orbit {
             return;
         }
         let local = self.frame - WARMUP;
@@ -115,13 +120,17 @@ impl TestDriver {
                 render_ms: s.render_ms,
                 upload_kb: s.upload.bytes as f32 / 1024.0,
                 dabs: s.dabs,
+                lod_tris: s.lod.triangles as f32,
+                lod_select_ms: s.lod.select_ms,
             });
         }
         self.frame += 1;
     }
 
-    pub fn finish_if_done(&mut self, ctx: &egui::Context) {
-        if self.requested || self.frame < WARMUP + self.total + 5 {
+    /// Ends the run a few frames after the last stroke, once any level-of-detail refresh has caught up (or after a cap).
+    pub fn finish_if_done(&mut self, ctx: &egui::Context, settled: bool) {
+        let tail = if settled { 5 } else { 300 };
+        if self.requested || self.frame < WARMUP + self.total + tail {
             return;
         }
         self.requested = true;
@@ -155,6 +164,8 @@ impl TestDriver {
             ("CPU: viewport encode+submit (ms)", col(&|r| r.render_ms)),
             ("GPU upload (KB)", col(&|r| r.upload_kb)),
             ("dabs", col(&|r| r.dabs as f32)),
+            ("LOD: triangles drawn", col(&|r| r.lod_tris)),
+            ("LOD: cut selection (ms)", col(&|r| r.lod_select_ms)),
         ] {
             println!("{name:<34} {a:>9.2} {b:>9.2} {c:>9.2}");
         }

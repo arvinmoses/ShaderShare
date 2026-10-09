@@ -57,22 +57,36 @@ pub fn grid(n: u32, size: f32) -> PolyMesh {
 /// Unlike [`quad_sphere`] the size is not tied to powers of four, so benchmarks can ask for 10M quads.
 pub fn quad_sphere_res(res: u32, radius: f32) -> PolyMesh {
     let n = res as usize;
-    let side = n + 1;
-    // Lattice point (x, y, z) on the cube surface, each in 0..=n, is shared by every face that touches it.
-    let key = |x: usize, y: usize, z: usize| (x * side + y) * side + z;
-    let on_surface = |x: usize, y: usize, z: usize| x == 0 || x == n || y == 0 || y == n || z == 0 || z == n;
-    let mut index = vec![u32::MAX; side * side * side];
-    let mut positions = Vec::with_capacity(6 * n * n + 2);
-    let mut vert = |x: usize, y: usize, z: usize| -> u32 {
-        debug_assert!(on_surface(x, y, z));
-        let k = key(x, y, z);
-        if index[k] == u32::MAX {
-            index[k] = positions.len() as u32;
-            let p = Vec3::new(x as f32, y as f32, z as f32) / n as f32 * 2.0 - Vec3::ONE;
-            positions.push(p.normalize() * radius);
-        }
-        index[k]
+    let m = n.saturating_sub(1);
+    let vertex_count = 6 * n * n + 2;
+    // Vertex ids: 8 cube corners, then 12 edges of `n - 1` points, then six faces of `(n - 1)^2` points.
+    let edge_base = 8;
+    let face_base = edge_base + 12 * m;
+    // Id of lattice point (x, y, z), each in 0..=n and at least one on the cube surface (0 or n).
+    let id = |p: [usize; 3]| -> u32 {
+        let hi = |a: usize| p[a] == n;
+        let on = |a: usize| p[a] == 0 || p[a] == n;
+        let count = (0..3).filter(|&a| on(a)).count();
+        (match count {
+            3 => (hi(0) as usize) | (hi(1) as usize) << 1 | (hi(2) as usize) << 2,
+            2 => {
+                let free = (0..3).find(|&a| !on(a)).unwrap();
+                let fixed: Vec<usize> = (0..3).filter(|&a| a != free).collect();
+                let bits = (hi(fixed[0]) as usize) | (hi(fixed[1]) as usize) << 1;
+                edge_base + free * 4 * m + bits * m + (p[free] - 1)
+            }
+            _ => {
+                let k = (0..3).find(|&a| on(a)).unwrap();
+                let (a, b) = match k {
+                    0 => (1, 2),
+                    1 => (0, 2),
+                    _ => (0, 1),
+                };
+                face_base + (k * 2 + hi(k) as usize) * m * m + (p[a] - 1) * m + (p[b] - 1)
+            }
+        }) as u32
     };
+    let mut positions = vec![Vec3::ZERO; vertex_count];
     let mut faces: Vec<Face> = Vec::with_capacity(6 * n * n);
     // Each cube face: a fixed axis value, and two free axes (a, b), wound so the quad faces outward.
     for (fixed, at, flip) in [(0usize, 0usize, true), (0, n, false), (1, 0, false), (1, n, true), (2, 0, true), (2, n, false)] {
@@ -88,7 +102,9 @@ pub fn quad_sphere_res(res: u32, radius: f32) -> PolyMesh {
                     c[fixed] = at;
                     c[a] = i + di;
                     c[b] = j + dj;
-                    vert(c[0], c[1], c[2])
+                    let v = id(c);
+                    positions[v as usize] = (Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32) / n as f32 * 2.0 - Vec3::ONE).normalize() * radius;
+                    v
                 };
                 let mut q = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)];
                 if flip {

@@ -246,6 +246,26 @@ impl Document {
         self.lod = Some((self.topology_id, std::sync::Arc::new(tree)));
     }
 
+    /// Re-simplify level-of-detail patches that edits have outdated, for at most `budget`. Returns how many remain.
+    pub fn refresh_lod(&mut self, budget: std::time::Duration) -> usize {
+        let Some((t, tree)) = self.lod.as_mut() else { return 0 };
+        if *t != self.topology_id {
+            return 0;
+        }
+        match std::sync::Arc::get_mut(tree) {
+            Some(tree) => tree.refresh(&self.positions, budget),
+            None => 0,
+        }
+    }
+
+    /// Pool ranges the last [`refresh_lod`](Self::refresh_lod) rewrote, for the renderer to copy.
+    pub fn take_lod_updates(&mut self) -> Vec<(u32, u32)> {
+        match self.lod.as_mut().and_then(|(_, t)| std::sync::Arc::get_mut(t)) {
+            Some(tree) => tree.take_updates(),
+            None => Vec::new(),
+        }
+    }
+
     /// The level-of-detail tree, if one was built for the current topology.
     pub fn lod(&self) -> Option<&std::sync::Arc<crate::lod::LodTree>> {
         self.lod.as_ref().filter(|(t, _)| *t == self.topology_id).map(|(_, tree)| tree)
@@ -884,6 +904,9 @@ impl Document {
         let nleaves = self.bvh.leaves.len();
         for &l in &set {
             self.geometry_dirty.mark(l, nleaves);
+        }
+        if let Some(tree) = self.lod.as_mut().filter(|(t, _)| *t == self.topology_id).and_then(|(_, tree)| std::sync::Arc::get_mut(tree)) {
+            tree.mark_leaves(&set);
         }
         for list in normals {
             for (v, n) in list {

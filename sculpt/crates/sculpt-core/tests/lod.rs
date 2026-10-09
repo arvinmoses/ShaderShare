@@ -153,3 +153,40 @@ fn frustum_culls_what_is_behind_or_beside_the_camera() {
     assert_eq!(hidden.triangles, 0, "nothing is visible when looking away");
     assert!(hidden.culled > 0);
 }
+
+#[test]
+fn edits_make_patches_stale_and_refresh_catches_up() {
+    let mut doc = big_doc();
+    doc.build_lod(LodParams::default());
+    assert_eq!(doc.lod().unwrap().stale_nodes(), 0);
+
+    // A bump on one side of the sphere.
+    let centre = Vec3::new(0.0, 0.0, 1.0);
+    let d = doc.compute_displacements(centre, 0.25, |_, _, dist| Some(Vec3::Z * 0.1 * (1.0 - dist / 0.25)));
+    doc.begin_stroke("bump");
+    doc.apply_displacements(&d).unwrap();
+    doc.end_stroke();
+    let stale = doc.lod().unwrap().stale_nodes();
+    assert!(stale > 0, "an edit must outdate the patches above it");
+
+    // While stale, a distant view still refines through the edited area, so the bump is drawn at full detail.
+    let eye = Vec3::new(0.0, 0.0, 30.0);
+    let view = view_from(eye, 35.0, 1080.0);
+    let before = doc.lod().unwrap().select(doc.bvh(), &view, 1.0, u64::MAX);
+    assert_watertight(doc.lod().unwrap(), &before.ranges);
+
+    let left = doc.refresh_lod(std::time::Duration::from_secs(60));
+    assert_eq!(left, 0);
+    let updates = doc.take_lod_updates();
+    assert!(!updates.is_empty() && updates.len() <= stale);
+    assert!(doc.take_lod_updates().is_empty(), "updates are handed out once");
+
+    let tree = doc.lod().unwrap();
+    let after = tree.select(doc.bvh(), &view, 1.0, u64::MAX);
+    assert!(after.triangles <= before.triangles, "a refreshed tree draws no more than the stale one");
+    assert_watertight(tree, &after.ranges);
+    for t in [0.2, 2.0, 8.0] {
+        let cut = tree.select(doc.bvh(), &view_from(Vec3::new(0.0, 0.0, 3.0), 35.0, 1080.0), t, u64::MAX);
+        assert_watertight(tree, &cut.ranges);
+    }
+}

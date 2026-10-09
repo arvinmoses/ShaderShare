@@ -222,6 +222,9 @@ action-line / gizmo is UI work (§8) that calls these functions.
 Also at 6.29M faces: undo 6.6 ms, layer slider 16 ms, whole-mesh fbm mask
 0.39 s, peak RSS 1.7 GB.
 
+**Dense meshes (20M+ triangles):** drawing is made independent of mesh size by a hierarchical LOD that mirrors the
+BVH (`sculpt-core/src/lod.rs`); see [`PERFORMANCE_20M.md`](PERFORMANCE_20M.md).
+
 **Next performance work, in priority order:**
 
 1. **GPU viewport fed by dirty leaves**: one vertex buffer range per leaf;

@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use eframe::egui_wgpu::{self, wgpu};
 use glam::{Mat4, Vec3, Vec4};
+use sculpt_core::bvh::Bvh;
+use sculpt_core::lod::{LodTree, View};
 use sculpt_core::{DirtySet, Document};
 
 use crate::camera::Camera;
@@ -68,8 +70,39 @@ struct MeshBuffers {
     positions: wgpu::Buffer,
     normals: wgpu::Buffer,
     overlay: wgpu::Buffer,
-    indices: wgpu::Buffer,
+    /// Plain full-detail indices. Dropped once the LOD pool (whose leaf prefix is the same mesh) is resident.
+    indices: Option<wgpu::Buffer>,
     index_count: u32,
+}
+
+/// The LOD pool on the GPU plus the buffer that holds this frame's draw list.
+struct LodGpu {
+    topology_id: u64,
+    /// Identity of the uploaded tree, so a rebuilt one is noticed.
+    tree: usize,
+    pool: wgpu::Buffer,
+    indirect: wgpu::Buffer,
+    capacity: u32,
+}
+
+/// What the renderer needs to draw a dense mesh through its LOD tree.
+pub struct LodInput<'a> {
+    pub tree: &'a std::sync::Arc<LodTree>,
+    pub bvh: &'a Bvh,
+    pub topology_id: u64,
+    /// Screen-space error tolerance, in pixels.
+    pub tau_px: f32,
+    /// Hard cap on triangles per frame.
+    pub budget: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LodStats {
+    pub active: bool,
+    pub triangles: u64,
+    pub nodes: u32,
+    pub tau_px: f32,
+    pub select_ms: f32,
 }
 
 pub struct Viewport {
@@ -82,6 +115,10 @@ pub struct Viewport {
     pub texture_id: Option<egui::TextureId>,
     overlay_kind: OverlayKind,
     pub last_upload: UploadStats,
+    lod: Option<LodGpu>,
+    pub lod_stats: LodStats,
+    /// Block until the GPU finishes each frame (benchmarking).
+    pub wait_gpu: bool,
 }
 
 fn linear(c: egui::Color32) -> [f32; 4] {
@@ -173,6 +210,9 @@ impl Viewport {
             texture_id: None,
             overlay_kind: OverlayKind::None,
             last_upload: UploadStats::default(),
+            lod: None,
+            lod_stats: LodStats::default(),
+            wait_gpu: false,
         }
     }
 
@@ -241,6 +281,16 @@ impl Viewport {
                 }
             }
         }
+        if self.lod.as_ref().is_some_and(|l| l.topology_id == doc.topology_id()) {
+            for (first, count) in doc.take_lod_updates() {
+                if let (Some(l), Some(tree)) = (&self.lod, doc.lod()) {
+                    let r = first as usize..(first + count) as usize;
+                    queue.write_buffer(&l.pool, first as u64 * 4, bytemuck::cast_slice(&tree.indices[r]));
+                    stats.bytes += count as usize * 4;
+                    stats.ranges += 1;
+                }
+            }
+        }
         let scalar = doc.take_scalar_dirty();
         let kind_changed = *overlay != self.overlay_kind;
         let partial = match (&scalar, overlay) {
@@ -293,9 +343,54 @@ impl Viewport {
         }
     }
 
+    /// Upload the LOD pool when needed, choose this frame's cut and write the draw list.
+    /// Returns the number of draws, or `None` when the plain mesh should be drawn.
+    fn prepare_lod(&mut self, rs: &egui_wgpu::RenderState, input: Option<LodInput<'_>>, cam: &Camera, size: [u32; 2], view_proj: Mat4) -> Option<u32> {
+        self.lod_stats = LodStats::default();
+        let input = input?;
+        let mesh = self.mesh.as_mut()?;
+        if mesh.topology_id != input.topology_id {
+            return None;
+        }
+        let key = std::sync::Arc::as_ptr(input.tree) as usize;
+        if self.lod.as_ref().is_none_or(|l| l.tree != key || l.topology_id != input.topology_id) {
+            let bytes = (input.tree.indices.len() * 4) as u64;
+            if bytes > rs.device.limits().max_buffer_size {
+                return None;
+            }
+            use wgpu::util::DeviceExt;
+            let pool = rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("lod pool"),
+                contents: bytemuck::cast_slice(&input.tree.indices),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            });
+            let capacity = input.tree.nodes.len() as u32;
+            let indirect = rs.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("lod draws"),
+                size: capacity as u64 * 20,
+                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            mesh.indices = None;
+            self.lod = Some(LodGpu { topology_id: input.topology_id, tree: key, pool, indirect, capacity });
+        }
+        let lod = self.lod.as_ref()?;
+        let t = Instant::now();
+        let focal_px = size[1] as f32 / (2.0 * (cam.fov_y * 0.5).tan());
+        let view = View::from_view_proj(view_proj, cam.eye(), focal_px);
+        let cut = input.tree.select(input.bvh, &view, input.tau_px, input.budget);
+        // DrawIndexedIndirect: index_count, instance_count, first_index, base_vertex, first_instance.
+        let args: Vec<[u32; 5]> = cut.ranges.iter().take(lod.capacity as usize).map(|&(first, count)| [count, 1, first, 0, 0]).collect();
+        if !args.is_empty() {
+            rs.queue.write_buffer(&lod.indirect, 0, bytemuck::cast_slice(&args));
+        }
+        self.lod_stats = LodStats { active: true, triangles: cut.triangles, nodes: cut.nodes, tau_px: cut.tau_px, select_ms: t.elapsed().as_secs_f32() * 1e3 };
+        Some(args.len() as u32)
+    }
+
     /// Render into the offscreen texture. Returns the egui texture to display.
     #[allow(clippy::too_many_arguments)]
-    pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, theme: &Theme, overlay_strength: f32, cursor: Option<(Vec3, f32, f32)>) -> Option<egui::TextureId> {
+    pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, theme: &Theme, overlay_strength: f32, cursor: Option<(Vec3, f32, f32)>, lod_in: Option<LodInput<'_>>) -> Option<egui::TextureId> {
         let size = [size[0].max(1), size[1].max(1)];
         self.ensure_targets(rs, size);
         let vp = &theme.viewport;
@@ -325,6 +420,7 @@ impl Viewport {
         };
         rs.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
+        let draws = self.prepare_lod(rs, lod_in, cam, size, view_proj);
         let targets = self.targets.as_ref().unwrap();
         let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
         {
@@ -353,11 +449,26 @@ impl Viewport {
                 pass.set_vertex_buffer(0, m.positions.slice(..));
                 pass.set_vertex_buffer(1, m.normals.slice(..));
                 pass.set_vertex_buffer(2, m.overlay.slice(..));
-                pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..m.index_count, 0, 0..1);
+                match (&self.lod, draws) {
+                    (Some(l), Some(n)) => {
+                        pass.set_index_buffer(l.pool.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.multi_draw_indexed_indirect(&l.indirect, 0, n);
+                    }
+                    (lod, _) => {
+                        // Without a cut the whole mesh is the pool's leaf prefix (or the plain buffer).
+                        let buf = m.indices.as_ref().or(lod.as_ref().filter(|l| l.topology_id == m.topology_id).map(|l| &l.pool));
+                        if let Some(buf) = buf {
+                            pass.set_index_buffer(buf.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..m.index_count, 0, 0..1);
+                        }
+                    }
+                }
             }
         }
         rs.queue.submit([enc.finish()]);
+        if self.wait_gpu {
+            let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
+        }
         self.texture_id
     }
 }
@@ -385,7 +496,7 @@ fn create_mesh_buffers(device: &wgpu::Device, doc: &Document) -> MeshBuffers {
         contents: bytemuck::cast_slice(&idx),
         usage: wgpu::BufferUsages::INDEX,
     });
-    MeshBuffers { topology_id: doc.topology_id(), positions, normals, overlay, indices, index_count: idx.len() as u32 }
+    MeshBuffers { topology_id: doc.topology_id(), positions, normals, overlay, indices: Some(indices), index_count: idx.len() as u32 }
 }
 
 /// Merge the owned vertex ranges of sorted leaves into contiguous runs.
