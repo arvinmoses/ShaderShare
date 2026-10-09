@@ -32,6 +32,7 @@ pub enum Icon {
     Solo,
     Duplicate,
     Merge,
+    Density,
 }
 
 impl Icon {
@@ -162,6 +163,11 @@ impl Icon {
                 p.line_segment([at(0.5, 0.5), at(0.5, 0.78)], s);
                 p.add(Shape::line(vec![at(0.34, 0.64), at(0.5, 0.8), at(0.66, 0.64)], s));
                 p.line_segment([at(0.2, 0.9), at(0.8, 0.9)], Stroke::new(1.8, c));
+            }
+            Icon::Density => {
+                for y in [0.25, 0.5, 0.75] {
+                    p.line_segment([at(0.2, y), at(0.8, y)], Stroke::new(1.6, c));
+                }
             }
             Icon::Base => {
                 // Little shaded clay ball: dark core, lit cap, specular dot.

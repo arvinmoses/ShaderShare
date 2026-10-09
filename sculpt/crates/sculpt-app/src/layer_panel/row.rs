@@ -11,6 +11,7 @@ use super::command::{self, LayerCommand, MetaEdit};
 use super::dragdrop::RowGeom;
 use super::menus;
 use super::selection::ClickMods;
+use super::thumbs::{Kind, Palette};
 use super::state::DragState;
 use super::tree::Node;
 use crate::app::{SculptApp, Selection};
@@ -18,9 +19,20 @@ use crate::icons::Icon;
 use crate::theme::bold;
 use crate::viewport::OverlayKind;
 
-pub const ROW_H: f32 = 36.0;
 pub const INDENT: f32 = 14.0;
-const THUMB: f32 = 26.0;
+
+/// Row sizes for the two densities.
+#[derive(Clone, Copy)]
+pub struct Metrics {
+    pub row_h: f32,
+    pub thumb: f32,
+}
+
+impl Metrics {
+    pub fn of(compact: bool) -> Metrics {
+        if compact { Metrics { row_h: 28.0, thumb: 20.0 } } else { Metrics { row_h: 36.0, thumb: 26.0 } }
+    }
+}
 const SMALL: f32 = 16.0;
 
 /// Cut `text` to `max` pixels, keeping both ends ("Wrinkle…_v2").
@@ -69,7 +81,9 @@ impl Cell {
 }
 
 pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms: &mut Vec<RowGeom>) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+    let metrics = Metrics::of(app.layers.compact);
+    let thumb = metrics.thumb;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), metrics.row_h), Sense::hover());
     geoms.push(RowGeom { id: n.id, rect, is_folder: n.is_folder });
     let row = ui.interact(rect, ui.id().with(("row", n.id)), Sense::click_and_drag());
 
@@ -100,10 +114,10 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
     x += 22.0 + n.depth as f32 * INDENT;
     let disc_rect = square(x, 16.0);
     x += 18.0;
-    let content_rect = Rect::from_min_size(Pos2::new(x, cy - THUMB / 2.0 - 1.0), vec2(THUMB, THUMB));
-    x += THUMB + 4.0;
-    let mask_rect = Rect::from_min_size(Pos2::new(x, content_rect.top()), vec2(THUMB, THUMB));
-    x += THUMB + 6.0;
+    let content_rect = Rect::from_min_size(Pos2::new(x, cy - thumb / 2.0 - 1.0), vec2(thumb, thumb));
+    x += thumb + 4.0;
+    let mask_rect = Rect::from_min_size(Pos2::new(x, content_rect.top()), vec2(thumb, thumb));
+    x += thumb + 6.0;
     let name_left = x;
 
     // Right cluster, built from the edge inward.
@@ -152,9 +166,14 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
     let target_mask = primary && n.has_mask && doc_active == Some(n.id) && matches!(app.selection, Selection::Mask | Selection::Effect(_));
     let thumb_bg = app.theme.viewport.background_bottom.0.gamma_multiply(dim);
     painter.rect_filled(content_rect, 3.0, thumb_bg);
+    let palette = Palette { background: app.theme.viewport.background_bottom.0, delta: ui_colors.target_delta() };
+    let stroking = app.is_stroking();
+    let delta_tex = if n.is_folder { None } else { app.doc.as_ref().and_then(|d| app.layers.thumbs.texture(ui.ctx(), d, n.id, Kind::Delta, stroking, palette)) };
     if n.is_folder {
         let icon = if n.collapsed { Icon::Folder } else { Icon::FolderOpen };
         icon.paint(&painter, content_rect.shrink(4.0), ui_colors.text_weak.0.gamma_multiply(dim + 0.3));
+    } else if let Some(tex) = delta_tex {
+        painter.image(tex, content_rect.shrink(1.0), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(dim));
     } else {
         Icon::Base.paint(&painter, content_rect.shrink(3.0), ui_colors.target_delta().gamma_multiply(dim));
     }
@@ -176,13 +195,19 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
         if n.has_mask {
             let base = app.mask_edit.as_ref().filter(|(i, _)| *i == n.id).map(|(_, s)| s.base).or_else(|| app.doc.as_ref().and_then(|d| d.layer(n.id)).and_then(|l| l.mask.as_ref()).map(|m| m.base)).unwrap_or(1.0);
             let g = (base.clamp(0.0, 1.0) * 255.0) as u8;
+            let mask_tex = app.doc.as_ref().and_then(|d| app.layers.thumbs.texture(ui.ctx(), d, n.id, Kind::Mask, stroking, palette));
             painter.rect_filled(mask_rect, 3.0, Color32::from_gray(g).gamma_multiply(dim));
-            Icon::Mask.paint(&painter, mask_rect.shrink(6.0), if g > 140 { Color32::from_gray(60) } else { Color32::from_gray(190) }.gamma_multiply(dim));
+            match mask_tex.filter(|_| n.mask_enabled) {
+                Some(tex) => {
+                    painter.image(tex, mask_rect.shrink(1.0), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE.gamma_multiply(dim));
+                }
+                None => Icon::Mask.paint(&painter, mask_rect.shrink(6.0), if g > 140 { Color32::from_gray(60) } else { Color32::from_gray(190) }.gamma_multiply(dim)),
+            }
             if target_mask {
                 painter.rect_stroke(mask_rect.expand(1.0), 3.0, Stroke::new(2.0, ui_colors.target_mask()), StrokeKind::Outside);
             }
             // Bar under the thumbnail: lit when the mask has ops, like Painter's effects line.
-            let bar = Rect::from_min_size(Pos2::new(mask_rect.left(), mask_rect.bottom() + 2.0), vec2(THUMB, 2.0));
+            let bar = Rect::from_min_size(Pos2::new(mask_rect.left(), mask_rect.bottom() + 2.0), vec2(thumb, 2.0));
             painter.rect_filled(bar, 1.0, if n.mask_ops > 0 { ui_colors.target_mask() } else { ui_colors.separator.0 });
             if !n.mask_enabled {
                 painter.line_segment([mask_rect.left_bottom(), mask_rect.right_top()], Stroke::new(2.0, ui_colors.danger()));
@@ -208,7 +233,7 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
         }
     }
     // Bar under the content thumbnail (content effects do not exist yet, so it stays quiet).
-    painter.rect_filled(Rect::from_min_size(Pos2::new(content_rect.left(), content_rect.bottom() + 2.0), vec2(THUMB, 2.0)), 1.0, ui_colors.separator.0);
+    painter.rect_filled(Rect::from_min_size(Pos2::new(content_rect.left(), content_rect.bottom() + 2.0), vec2(thumb, 2.0)), 1.0, ui_colors.separator.0);
 
     // Name, inline rename, or elided label.
     let name_rect = Rect::from_min_max(Pos2::new(name_left, rect.top()), Pos2::new(name_right.max(name_left + 20.0), rect.bottom()));
@@ -221,15 +246,17 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
     }
 
     // Solo and lock: always visible when on, otherwise only while the row is hovered or selected.
+    // Always drawn so every row shows its state; faint until hovered, selected or on.
     let show_idle = row.hovered() || selected;
-    if n.soloed || show_idle {
-        let tint = if n.soloed { ui_colors.accent.0 } else { weak };
+    let idle = if show_idle { 1.0 } else { 0.4 };
+    {
+        let tint = if n.soloed { ui_colors.accent.0 } else { weak.gamma_multiply(idle) };
         if (Cell { rect: solo_rect, key: (n.id, "solo"), icon: Icon::Solo, on: n.soloed, tint, tip: "Solo: show only this layer (S)" }).show(ui).clicked() {
             command::execute(app, LayerCommand::ToggleSolo(n.id));
         }
     }
-    if n.locked || show_idle {
-        let tint = if n.locked { text_color } else { weak };
+    {
+        let tint = if n.locked { text_color } else { weak.gamma_multiply(idle) };
         if (Cell { rect: lock_rect, key: (n.id, "lock"), icon: if n.locked { Icon::Lock } else { Icon::Unlock }, on: n.locked, tint, tip: "Lock (Shift+L)" }).show(ui).clicked() {
             command::execute(app, LayerCommand::Edit { id: n.id, edit: MetaEdit::Locked(!n.locked), coalesce: false });
         }

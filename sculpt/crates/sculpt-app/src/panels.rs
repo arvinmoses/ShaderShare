@@ -21,7 +21,6 @@ use crate::theme::{Hex, bold};
 use crate::tools::{PoseMode, Tool, Tray};
 use crate::viewport::OverlayKind;
 
-const ROW_H: f32 = 36.0;
 const EFFECT_ROW_H: f32 = 24.0;
 
 // ------------------------------------------------------------------ helpers
@@ -413,7 +412,7 @@ pub fn right_panel(app: &mut SculptApp, ui: &mut Ui) {
         let total = ui.available_height();
         egui::Panel::top("layers_panel")
             .resizable(true)
-            .default_size(total * 0.45)
+            .default_size(total * 0.55)
             .min_size((total * 0.3).max(160.0))
             .frame(egui::Frame::NONE.fill(fill))
             .show(ui, |ui| crate::layer_panel::layers_panel(app, ui));
@@ -582,7 +581,7 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
 
 pub(crate) fn base_row(app: &mut SculptApp, ui: &mut Ui) {
     let selected = app.doc.as_ref().unwrap().active_layer().is_none();
-    let (resp, mut row) = row_frame(ui, app, ROW_H, 0.0, selected);
+    let (resp, mut row) = row_frame(ui, app, crate::layer_panel::row::Metrics::of(app.layers.compact).row_h, 0.0, selected);
     row.add_space(40.0);
     let (sw, _) = row.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
     row.painter().rect_filled(sw, 2.0, app.theme.viewport.background_bottom.0);
@@ -606,6 +605,7 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
             match (app.selection, target) {
+                _ if app.layers.selection.len() > 1 => multi_props(app, ui),
                 (Selection::Effect(i), Some((id, false))) if active == Some(id) => effect_props(app, ui, i),
                 (Selection::Mask, Some((id, false))) if active == Some(id) => mask_props(app, ui),
                 (_, Some((id, _))) => layer_props(app, ui, id),
@@ -615,6 +615,64 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
             }
             ui.add_space(6.0);
             brush_props(app, ui);
+        });
+    });
+}
+
+/// Several rows selected: shared fields, with a mixed state where they differ. Each change applies to all.
+fn multi_props(app: &mut SculptApp, ui: &mut Ui) {
+    use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
+    let Some(doc) = app.doc.as_ref() else { return };
+    let order: Vec<LayerId> = doc.layer_tree().iter().map(|r| r.id).collect();
+    let ids = app.layers.selection.in_order(&order);
+    let metas: Vec<_> = ids.iter().filter_map(|id| doc.layer(*id)).map(|l| (l.is_folder(), l.meta())).collect();
+    let Some(first) = metas.first().map(|(_, m)| m.clone()) else { return };
+    let all = |f: &dyn Fn(&sculpt_core::LayerMeta) -> bool| metas.iter().all(|(_, m)| f(m));
+    let (mixed_strength, mixed_vis, mixed_lock) = (!all(&|m| m.opacity == first.opacity), !all(&|m| m.visible == first.visible), !all(&|m| m.locked == first.locked));
+    let sculpt: Vec<_> = metas.iter().filter(|(f, _)| !f).map(|(_, m)| m.blend).collect();
+    let mixed_blend = sculpt.windows(2).any(|w| w[0] != w[1]);
+    let blend = sculpt.first().copied();
+    let fs = app.theme.metrics.font_size;
+    section(ui, fs, "multi", &format!("{} LAYERS", ids.len()), |ui| {
+        // Strength is applied when the drag ends, so one gesture is one undo step.
+        let key = ui.id().with("multi_strength");
+        let shown = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(first.opacity * 100.0);
+        let mut pct = shown;
+        let r = prop(ui, if mixed_strength { "Strength (mixed)" } else { "Strength" }, |ui| ui.add(egui::Slider::new(&mut pct, -100.0..=200.0).suffix("%").max_decimals(0)));
+        if r.dragged() || r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(key, pct));
+        }
+        if r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus()) {
+            ui.data_mut(|d| d.remove_temp::<f32>(key));
+            command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Strength(pct / 100.0) });
+        }
+        if let Some(current) = blend {
+            prop(ui, "Blend", |ui| {
+                egui::ComboBox::from_id_salt("multi_blend").selected_text(if mixed_blend { "Mixed" } else { current.label() }).show_ui(ui, |ui| {
+                    for mode in sculpt_core::LayerBlend::ALL {
+                        if ui.selectable_label(!mixed_blend && current == mode, mode.label()).clicked() {
+                            command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Blend(mode) });
+                        }
+                    }
+                })
+            });
+        }
+        let (mut v, mut lk) = (first.visible, first.locked);
+        prop(ui, "", |ui| {
+            if ui.add(egui::Checkbox::new(&mut v, "Visible").indeterminate(mixed_vis)).changed() {
+                command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Visible(v) });
+            }
+            if ui.add(egui::Checkbox::new(&mut lk, "Locked").indeterminate(mixed_lock)).changed() {
+                command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Locked(lk) });
+            }
+        });
+        prop(ui, "", |ui| {
+            if ui.button("Group").on_hover_text("Put the selection in a new folder (Ctrl+G)").clicked() {
+                command::execute(app, LayerCommand::Group);
+            }
+            if ui.button("Duplicate").clicked() {
+                command::execute(app, LayerCommand::Duplicate);
+            }
         });
     });
 }

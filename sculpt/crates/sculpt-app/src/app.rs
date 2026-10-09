@@ -211,6 +211,7 @@ impl SculptApp {
             mask_edit: None,
             demo_layers: opts.demo_layers,
         };
+        app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
         for e in app.themes.errors.iter().chain(&app.keymap.errors) {
             eprintln!("config: {e}");
         }
@@ -227,7 +228,7 @@ impl SculptApp {
     pub fn save_settings(&self) {
         let cfg = config_dir();
         let _ = std::fs::create_dir_all(&cfg);
-        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools });
+        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools, "layers_compact": self.layers.compact });
         let _ = std::fs::write(cfg.join("settings.json"), serde_json::to_string_pretty(&v).unwrap());
     }
 
@@ -367,6 +368,11 @@ impl SculptApp {
             _ => {}
         }
         let _ = ctx;
+    }
+
+    /// True while a brush, move or pose stroke is in progress.
+    pub fn is_stroking(&self) -> bool {
+        !matches!(self.stroke, Stroke::None)
     }
 
     pub fn select_tool(&mut self, t: Tool) {

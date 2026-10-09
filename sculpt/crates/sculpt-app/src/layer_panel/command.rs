@@ -51,6 +51,8 @@ pub enum LayerCommand {
     Rename,
     ToggleSolo(LayerId),
     Edit { id: LayerId, edit: MetaEdit, coalesce: bool },
+    /// The same edit on every selected row, as one undo step.
+    EditMany { ids: Vec<LayerId>, edit: MetaEdit },
     /// Build a mask, or add an op to it, in one step.
     AddMask { id: LayerId, preset: Preset },
     Mask { id: LayerId, action: MaskAction },
@@ -240,6 +242,26 @@ pub fn execute(app: &mut SculptApp, cmd: LayerCommand) {
             }
             if let Err(e) = doc.set_layer_meta(id, meta, coalesce) {
                 fail(app, "Edit layer", e);
+            }
+            return;
+        }
+        LayerCommand::EditMany { ids, edit } => {
+            let doc = app.doc.as_mut().unwrap();
+            let edits = ids
+                .into_iter()
+                .filter_map(|id| {
+                    let layer = doc.layer(id)?;
+                    // Folders have no blend mode.
+                    if matches!(edit, MetaEdit::Blend(_)) && layer.is_folder() {
+                        return None;
+                    }
+                    let mut meta = layer.meta();
+                    edit.apply(&mut meta);
+                    Some((id, meta))
+                })
+                .collect();
+            if let Err(e) = doc.set_layers_meta(edits) {
+                fail(app, "Edit layers", e);
             }
             return;
         }

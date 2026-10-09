@@ -21,6 +21,9 @@ pub struct PanelState {
     /// Row being renamed inline, with its edit buffer.
     pub rename: Option<(LayerId, String)>,
     pub drag: Option<DragState>,
+    /// Dense rows (28 px) instead of comfortable ones (36 px). Saved in settings.
+    pub compact: bool,
+    pub thumbs: super::thumbs::ThumbCache,
     /// Tab quick-switcher, when open.
     pub switcher: Option<super::switcher::Switcher>,
     /// Last copied mask, for Paste mask.

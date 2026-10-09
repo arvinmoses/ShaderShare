@@ -210,6 +210,7 @@ impl Document {
                     leaves.extend(self.layers[i].allocated_leaves());
                 }
                 if mask_changed {
+                    self.serial += 1;
                     let values = self.layers[i].mask.clone().and_then(|s| self.mask_values_for(&s).ok().flatten());
                     self.layers[i].mask_values = values;
                     self.scalar_dirty.mark_all();
@@ -516,6 +517,25 @@ impl Document {
             self.recomposite(&leaves.into_iter().collect::<Vec<_>>());
         } else {
             self.exec("Edit layer", vec![StructOp::Meta { id, meta }]);
+        }
+        Ok(())
+    }
+
+    /// Edit several layers at once as a single undo step (the Properties panel with a multi-selection).
+    pub fn set_layers_meta(&mut self, edits: Vec<(LayerId, LayerMeta)>) -> Result<()> {
+        let mut ops = Vec::new();
+        for (id, meta) in edits {
+            let layer = &self.layers[self.layer_index(id)?];
+            if layer.meta() == meta {
+                continue;
+            }
+            if layer.is_folder() && meta.mask.is_some() {
+                return Err(Error::InvalidData("folders cannot carry a mask yet".into()));
+            }
+            ops.push(StructOp::Meta { id, meta });
+        }
+        if !ops.is_empty() {
+            self.exec("Edit layers", ops);
         }
         Ok(())
     }

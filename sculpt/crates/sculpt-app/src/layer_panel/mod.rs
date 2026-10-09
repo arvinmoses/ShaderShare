@@ -19,6 +19,7 @@ pub mod selection;
 pub mod state;
 pub mod switcher;
 pub mod target;
+pub mod thumbs;
 pub mod tree;
 
 use egui::{Rect, Sense, Ui, vec2};
@@ -29,7 +30,20 @@ pub use state::PanelState;
 use crate::app::{SculptApp, Selection};
 
 pub fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
+    let header = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 24.0));
     crate::panels::panel_header(ui, app, "LAYERS", |_| {});
+    let toggle = Rect::from_min_size(header.right_top() + vec2(-30.0, 2.0), vec2(22.0, 20.0));
+    let tip = if app.layers.compact { "Comfortable rows" } else { "Compact rows" };
+    let on = app.layers.compact;
+    let density = ui.interact(toggle, ui.id().with("density"), Sense::click());
+    if density.hovered() {
+        ui.painter().rect_filled(toggle, 3.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    crate::icons::Icon::Density.paint(ui.painter(), toggle.shrink(3.0), if on { app.theme.ui.accent.0 } else { app.theme.weak_text() });
+    if density.on_hover_text(tip).clicked() {
+        app.layers.compact = !app.layers.compact;
+        app.save_settings();
+    }
     if crate::panels::sync_mask_edit(app) {
         app.selection = Selection::Layer;
     }
@@ -38,6 +52,10 @@ pub fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         return;
     }
     seed_selection(app);
+    app.layers.thumbs.begin_frame();
+    if let Some(d) = app.doc.as_ref() {
+        app.layers.thumbs.retain(d);
+    }
 
     // Reserve the bar plus the spacing egui adds around it. Under-reserving makes the panel
     // grow by the shortfall every frame, because its height comes from this content.

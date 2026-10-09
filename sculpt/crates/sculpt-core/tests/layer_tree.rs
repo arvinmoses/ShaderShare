@@ -432,3 +432,54 @@ fn disabled_mask_applies_everywhere_and_undoes() {
     assert!(d.undo());
     assert!((top_y(&d) - full).abs() < 1e-5, "undo removes the mask");
 }
+
+#[test]
+fn previews_show_the_footprint_and_track_edits() {
+    let mut d = doc();
+    let l = d.insert_layer("Bump", Placement::Top).unwrap();
+    let empty = d.delta_preview(l, 16).unwrap();
+    assert!(empty.covered.iter().all(|c| !c), "an untouched layer has no footprint");
+    let before = d.edit_serial();
+    bump(&mut d);
+    assert!(d.edit_serial() > before, "a stroke bumps the edit counter");
+    let p = d.delta_preview(l, 16).unwrap();
+    assert!(p.covered.iter().any(|c| *c) && p.covered.iter().any(|c| !c), "covers part of the grid");
+    assert!(p.values.iter().cloned().fold(0.0, f32::max) > 0.9, "peak is normalised to 1");
+    // Looking down -Z at a unit sphere, the +Y bump is in the top rows.
+    let top: f32 = p.values[..16 * 8].iter().sum();
+    let bottom: f32 = p.values[16 * 8..].iter().sum();
+    assert!(top > bottom, "bump sits in the upper half of the preview");
+    let f = d.insert_folder("F", Placement::Top).unwrap();
+    assert!(d.delta_preview(f, 16).is_none());
+
+    assert!(d.mask_preview(l, 16).is_none(), "no mask, no mask preview");
+    let mut m = d.layer(l).unwrap().meta();
+    m.mask = Some(sculpt_core::mask::MaskStack::new(0.25));
+    d.set_layer_meta(l, m, false).unwrap();
+    let mp = d.mask_preview(l, 16).unwrap();
+    let covered: Vec<f32> = mp.values.iter().zip(&mp.covered).filter(|(_, c)| **c).map(|(v, _)| *v).collect();
+    assert!(!covered.is_empty() && covered.iter().all(|v| (v - 0.25).abs() < 1e-5));
+}
+
+#[test]
+fn batch_edit_is_one_undo_step() {
+    let mut d = doc();
+    let a = d.insert_layer("A", Placement::Top).unwrap();
+    let b = d.insert_layer("B", Placement::Top).unwrap();
+    let edits: Vec<_> = [a, b]
+        .iter()
+        .map(|id| {
+            let mut m = d.layer(*id).unwrap().meta();
+            m.opacity = 0.5;
+            m.locked = true;
+            (*id, m)
+        })
+        .collect();
+    d.set_layers_meta(edits).unwrap();
+    assert!(d.layer(a).unwrap().locked && d.layer(b).unwrap().locked);
+    assert!(d.undo());
+    assert!(!d.layer(a).unwrap().locked && !d.layer(b).unwrap().locked, "one undo reverts both");
+    assert_eq!(d.layer(a).unwrap().opacity, 1.0);
+    assert!(d.redo());
+    assert_eq!(d.layer(b).unwrap().opacity, 0.5);
+}

@@ -129,6 +129,8 @@ pub struct Document {
     pub(crate) layers: Vec<SculptLayer>,
     pub(crate) active: Option<LayerId>,
     pub(crate) solo: Option<LayerId>,
+    /// Bumped on every change a cache could care about (see `edit_serial`).
+    pub(crate) serial: u64,
     pub(crate) next_layer_id: u32,
     /// `canonical index -> internal index`.
     pub(crate) canonical_to_internal: Vec<u32>,
@@ -167,6 +169,7 @@ impl Document {
             layers: Vec::new(),
             active: None,
             solo: None,
+            serial: 0,
             next_layer_id: 1,
             canonical_to_internal: perm,
             undo: UndoStack::default(),
@@ -837,6 +840,7 @@ impl Document {
 
     /// Normals and bounds after positions of vertices owned by `leaves` moved.
     pub(crate) fn geometry_changed(&mut self, leaves: &[u32]) {
+        self.serial += 1;
         let mut mark = vec![false; self.bvh.leaves.len()];
         for &l in leaves {
             mark[l as usize] = true;
