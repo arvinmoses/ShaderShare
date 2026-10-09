@@ -13,6 +13,10 @@ pub struct Crumbs {
 
 /// Path to the paint target for the current tool, and the colour of what a stroke would edit.
 pub fn crumbs(app: &SculptApp) -> Option<Crumbs> {
+    let n = app.layers.selection.len();
+    if n > 1 {
+        return Some(Crumbs { parts: vec![format!("{n} layers selected")], color: app.theme.weak_text(), verb: "changes apply to all of them".into() });
+    }
     let t = super::target::resolve(app)?;
     let verb = match (&t.refusal, t.kind) {
         (Some(why), _) => format!("⊘ {why}"),

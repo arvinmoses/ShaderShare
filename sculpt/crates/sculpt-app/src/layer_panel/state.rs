@@ -21,6 +21,8 @@ pub struct PanelState {
     /// Row being renamed inline, with its edit buffer.
     pub rename: Option<(LayerId, String)>,
     pub drag: Option<DragState>,
+    /// What the current tool would edit, refreshed each frame (drives the thumbnail frames).
+    pub paint_kind: Option<super::target::TargetKind>,
     /// Dense rows (28 px) instead of comfortable ones (36 px). Saved in settings.
     pub compact: bool,
     pub thumbs: super::thumbs::ThumbCache,

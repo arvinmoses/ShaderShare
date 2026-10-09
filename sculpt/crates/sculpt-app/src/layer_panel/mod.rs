@@ -52,6 +52,7 @@ pub fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         return;
     }
     seed_selection(app);
+    app.layers.paint_kind = target::resolve(app).filter(|t| t.refusal.is_none()).map(|t| t.kind);
     app.layers.thumbs.begin_frame();
     if let Some(d) = app.doc.as_ref() {
         app.layers.thumbs.retain(d);

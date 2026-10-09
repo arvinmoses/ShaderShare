@@ -13,6 +13,7 @@ use super::menus;
 use super::selection::ClickMods;
 use super::thumbs::{Kind, Palette};
 use super::state::DragState;
+use super::target::TargetKind;
 use super::tree::Node;
 use crate::app::{SculptApp, Selection};
 use crate::icons::Icon;
@@ -124,9 +125,9 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
     let mut rx = rect.right() - 6.0;
     let strength_rect = Rect::from_min_size(Pos2::new(rx - 50.0, cy - 10.0), vec2(50.0, 20.0));
     rx -= 54.0;
-    let blend_rect = Rect::from_min_size(Pos2::new(rx - 46.0, cy - 10.0), vec2(46.0, 20.0));
+    let blend_rect = Rect::from_min_size(Pos2::new(rx - 50.0, cy - 10.0), vec2(46.0, 20.0));
     if !n.is_folder {
-        rx -= 48.0;
+        rx -= 52.0;
     }
     let lock_rect = square(rx - SMALL, SMALL);
     rx -= SMALL + 2.0;
@@ -162,8 +163,10 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
 
     // Content thumbnail (or the folder glyph).
     let doc_active = app.doc.as_ref().and_then(|d| d.active_layer());
-    let target_content = primary && !n.is_folder && doc_active == Some(n.id) && app.selection == Selection::Layer;
-    let target_mask = primary && n.has_mask && doc_active == Some(n.id) && matches!(app.selection, Selection::Mask | Selection::Effect(_));
+    let paint = app.layers.paint_kind;
+    let target_content = primary && !n.is_folder && doc_active == Some(n.id) && paint == Some(TargetKind::Delta);
+    let target_mask = primary && n.has_mask && doc_active == Some(n.id) && paint == Some(TargetKind::Mask);
+    let mask_selected = primary && n.has_mask && doc_active == Some(n.id) && matches!(app.selection, Selection::Mask | Selection::Effect(_));
     let thumb_bg = app.theme.viewport.background_bottom.0.gamma_multiply(dim);
     painter.rect_filled(content_rect, 3.0, thumb_bg);
     let palette = Palette { background: app.theme.viewport.background_bottom.0, delta: ui_colors.target_delta() };
@@ -205,6 +208,9 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
             }
             if target_mask {
                 painter.rect_stroke(mask_rect.expand(1.0), 3.0, Stroke::new(2.0, ui_colors.target_mask()), StrokeKind::Outside);
+            } else if mask_selected {
+                // Selected but not what strokes edit: a thin outline, so it cannot be mistaken for the target.
+                painter.rect_stroke(mask_rect.expand(1.0), 3.0, Stroke::new(1.0, ui_colors.target_mask().gamma_multiply(0.6)), StrokeKind::Outside);
             }
             // Bar under the thumbnail: lit when the mask has ops, like Painter's effects line.
             let bar = Rect::from_min_size(Pos2::new(mask_rect.left(), mask_rect.bottom() + 2.0), vec2(thumb, 2.0));
@@ -248,7 +254,7 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
     // Solo and lock: always visible when on, otherwise only while the row is hovered or selected.
     // Always drawn so every row shows its state; faint until hovered, selected or on.
     let show_idle = row.hovered() || selected;
-    let idle = if show_idle { 1.0 } else { 0.4 };
+    let idle = if show_idle { 1.0 } else { 0.6 };
     {
         let tint = if n.soloed { ui_colors.accent.0 } else { weak.gamma_multiply(idle) };
         if (Cell { rect: solo_rect, key: (n.id, "solo"), icon: Icon::Solo, on: n.soloed, tint, tip: "Solo: show only this layer (S)" }).show(ui).clicked() {
@@ -264,7 +270,7 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
     if !n.is_folder {
         blend_button(app, ui, blend_rect, n, weak);
     }
-    strength_field(app, ui, strength_rect, n, weak);
+    strength_field(app, ui, strength_rect, n, text_color);
 
     // Row-level interaction (lowest priority: sub-widgets above took their clicks).
     if row.double_clicked() {
@@ -318,14 +324,14 @@ fn rename_field(app: &mut SculptApp, ui: &mut Ui, rect: Rect, n: &Node) {
 }
 
 /// Drag to scrub, click to type. Range is -100% to 200% like the engine's strength.
-fn strength_field(app: &mut SculptApp, ui: &mut Ui, rect: Rect, n: &Node, weak: Color32) {
+fn strength_field(app: &mut SculptApp, ui: &mut Ui, rect: Rect, n: &Node, color: Color32) {
     let mut pct = n.strength * 100.0;
     let mut child = ui.new_child(UiBuilder::new().max_rect(rect));
     let v = child.visuals_mut();
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
     v.widgets.inactive.bg_fill = Color32::TRANSPARENT;
     v.widgets.inactive.bg_stroke = Stroke::NONE;
-    v.override_text_color = Some(weak.gamma_multiply(1.6));
+    v.override_text_color = Some(color);
     let dv = child.add_sized(rect.size(), egui::DragValue::new(&mut pct).range(-100.0..=200.0).speed(0.5).suffix("%").max_decimals(0));
     if dv.changed() {
         // A drag is one undo step; typed values are separate steps.

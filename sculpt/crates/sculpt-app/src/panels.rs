@@ -410,10 +410,11 @@ pub fn right_panel(app: &mut SculptApp, ui: &mut Ui) {
     let fill = app.theme.ui.panel.0;
     egui::Panel::right("dock").default_size(340.0).min_size(280.0).frame(egui::Frame::side_top_panel(ui.style()).fill(fill).inner_margin(0)).show(ui, |ui| {
         let total = ui.available_height();
+        // The stack keeps 42% to 75% of the dock whatever the window size, so it never collapses to a few rows.
         egui::Panel::top("layers_panel")
             .resizable(true)
             .default_size(total * 0.55)
-            .min_size((total * 0.3).max(160.0))
+            .size_range((total * 0.42).max(200.0)..=(total * 0.75))
             .frame(egui::Frame::NONE.fill(fill))
             .show(ui, |ui| crate::layer_panel::layers_panel(app, ui));
         egui::CentralPanel::no_frame().show(ui, |ui| properties_panel(app, ui));
@@ -560,7 +561,7 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
         let title = if e.name.is_empty() { source_label(&e.source).to_string() } else { e.name.clone() };
         row.label(RichText::new(title).size(app.theme.metrics.font_size * 0.92));
         row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(format!("{} {:.0}", blend_short(e.blend), e.opacity * 100.0)).size(app.theme.metrics.font_size * 0.85).color(weak));
+            ui.label(RichText::new(format!("{} {:.0}%", blend_short(e.blend), e.opacity * 100.0)).size(app.theme.metrics.font_size * 0.85).color(weak));
         });
         if resp.clicked() {
             select_layer(app, Some(id), Selection::Effect(i));

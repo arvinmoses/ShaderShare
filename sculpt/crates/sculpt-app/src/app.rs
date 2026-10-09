@@ -725,6 +725,7 @@ impl SculptApp {
         if matches!(self.stroke, Stroke::None)
             && !navigating
             && !busy
+            && !egui::Popup::is_any_open(&ctx)
             && let (Some(hover), Some(target)) = (resp.hover_pos(), crate::layer_panel::target::resolve(self))
         {
             crate::layer_panel::hud::chip(&ui.painter_at(rect), hover, &target, &self.theme.ui, self.theme.metrics.font_size, rect);
@@ -797,6 +798,17 @@ impl SculptApp {
             painter.text(c, egui::Align2::CENTER_CENTER, format!("{label}…  {secs:.1}s"), egui::FontId::proportional(16.0), Color32::WHITE);
         }
         self.paint_axis_gizmo(&painter, rect);
+        if self.overlay == OverlayKind::LayerMask {
+            // Make the mode unmistakable, and say how to leave it.
+            let name = self.doc.as_ref().and_then(|d| d.active_layer().and_then(|id| d.layer(id))).map_or("mask", |l| l.name.as_str()).to_string();
+            let text = format!("Viewing mask: {name}   ·   Alt+M or Esc to exit");
+            let font = egui::FontId::proportional(self.theme.metrics.font_size);
+            let galley = painter.layout_no_wrap(text, font.clone(), Color32::WHITE);
+            let pill = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 22.0), galley.size() + Vec2::new(26.0, 10.0));
+            painter.rect_filled(pill, 12.0, Color32::from_black_alpha(185));
+            painter.rect_stroke(pill, 12.0, egui::Stroke::new(1.5, self.theme.ui.target_mask()), egui::StrokeKind::Inside);
+            painter.text(pill.center(), egui::Align2::CENTER_CENTER, galley.text(), font, Color32::WHITE);
+        }
         if !self.hud {
             // Minimal Mudbox-style readout; H shows the full performance HUD.
             if let Some(doc) = &self.doc {
@@ -896,6 +908,10 @@ impl eframe::App for SculptApp {
             }
         }
 
+        let esc_free = self.layers.drag.is_none() && self.layers.rename.is_none() && self.layers.switcher.is_none();
+        if self.overlay == OverlayKind::LayerMask && esc_free && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.overlay = OverlayKind::None;
+        }
         for cmd in self.keymap.poll(&ctx) {
             self.run(&ctx, cmd);
         }

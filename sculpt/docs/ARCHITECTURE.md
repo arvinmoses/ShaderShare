@@ -81,7 +81,9 @@ the lower one), `set_solo` (not undoable, view state) and `set_layer_meta`
 (name, strength, visibility, lock, collapse, mask; `coalesce` joins a slider drag
 into one step). Each command is a list of reversible `StructOp`s recorded in the
 same undo stack as strokes, so removed layers keep their data in the stack and
-undo/redo are exact. Project format v2 adds `kind`, `parent` and `collapsed`;
+undo/redo are exact. **Previews** (`preview.rs`): `delta_preview` and `mask_preview` sample at most 96 vertices per spatial leaf into a front-view grid, so cost follows the leaf count, not the face count. `edit_serial` bumps on every geometry or mask change; the UI cache (`layer_panel/thumbs.rs`) rebuilds a thumbnail only when the serial moved, it is over 0.5 s old, no stroke is in progress, and fewer than two were built this frame.
+
+Project format v2 adds `kind`, `parent` and `collapsed`;
 v1 files load unchanged (fixture `tests/fixtures/v1_project`).
 
 * The **strength slider** (`opacity`) and the **layer mask** both scale a
@@ -306,7 +308,7 @@ an add bar (+ Layer, Folder, Mask, Op, duplicate, merge, delete) that inserts
 above the selection. The module is split by responsibility: `selection`
 (multi-select model), `tree` (rows read from the document), `row`, `menus`,
 `add_bar`, `dragdrop` (pure drop-zone math) with `drag_ui`, `breadcrumb`, and
-`target` (what a stroke edits, and when it is refused; drives the viewport chip, breadcrumb and stroke guard), `switcher` (Tab) and `command`, the only path by which the UI changes layers, so undo stays
+`target` (what a stroke edits, and when it is refused; drives the viewport chip, breadcrumb and stroke guard), `switcher` (Tab), `thumbs` and `command`, the only path by which the UI changes layers, so undo stays
 consistent and hotkeys, menus and buttons share one behaviour. **PROPERTIES** edits the selection (layer, mask base,
 or a single effect: blend, opacity, source parameters, levels, blur, order)
 and then the brush; selecting a Paint effect retargets Mask Paint to that

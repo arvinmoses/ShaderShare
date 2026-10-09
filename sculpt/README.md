@@ -60,7 +60,7 @@ The layout is a Substance Painter / Mudbox hybrid:
 - **LAYERS** (right): a Painter-style stack. Each row has an eye, a content thumbnail, a mask
   thumbnail (hover an empty slot for **+**), the name, solo, lock and a strength you scrub or type
   (−100% to 200%). **Folders** nest layers and scale them together; click the chevron to collapse.
-  Each layer has a **blend mode** next to its strength (Normal, Add, Subtract, Min, Max; click it to change). Click selects, Ctrl+click toggles, Shift+click selects a range, double-click or `F2` renames.
+  The **≡** button at the panel's top right switches between comfortable and compact rows. Thumbnails are live: the left one shows where the layer sculpts, the right one is the mask. Each layer has a **blend mode** next to its strength (Normal, Add, Subtract, Min, Max; click it to change). Click selects, Ctrl+click toggles, Shift+click selects a range (Properties then edits all of them at once, as one undo step), double-click or `F2` renames.
   Drag rows to reorder or into a folder (blue line = between, outline = into, red = refused,
   Ctrl+drag copies, Esc cancels, hovering a closed folder opens it). Right-click any row for a menu
   that lists hotkeys. The bar under the list (**+ Layer, Folder, Mask, Op**, duplicate, merge, delete)
