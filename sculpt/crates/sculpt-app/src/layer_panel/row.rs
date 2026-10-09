@@ -110,6 +110,10 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
     let mut rx = rect.right() - 6.0;
     let strength_rect = Rect::from_min_size(Pos2::new(rx - 50.0, cy - 10.0), vec2(50.0, 20.0));
     rx -= 54.0;
+    let blend_rect = Rect::from_min_size(Pos2::new(rx - 46.0, cy - 10.0), vec2(46.0, 20.0));
+    if !n.is_folder {
+        rx -= 48.0;
+    }
     let lock_rect = square(rx - SMALL, SMALL);
     rx -= SMALL + 2.0;
     let solo_rect = square(rx - SMALL, SMALL);
@@ -224,6 +228,9 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
             command::execute(app, LayerCommand::Edit { id: n.id, edit: MetaEdit::Locked(!n.locked), coalesce: false });
         }
     }
+    if !n.is_folder {
+        blend_button(app, ui, blend_rect, n, weak);
+    }
     strength_field(app, ui, strength_rect, n, weak);
 
     // Row-level interaction (lowest priority: sub-widgets above took their clicks).
@@ -293,4 +300,28 @@ fn strength_field(app: &mut SculptApp, ui: &mut Ui, rect: Rect, n: &Node, weak: 
         command::execute(app, LayerCommand::Edit { id: n.id, edit: MetaEdit::Strength(pct / 100.0), coalesce });
     }
     dv.on_hover_text("Strength: drag to scrub, click to type");
+}
+
+/// Blend mode of a sculpt layer: a short label that opens the list of modes.
+fn blend_button(app: &mut SculptApp, ui: &mut Ui, rect: Rect, n: &Node, weak: Color32) {
+    let resp = ui.interact(rect, ui.id().with((n.id, "blend")), Sense::click());
+    let hot = resp.hovered() || n.blend != sculpt_core::LayerBlend::Add;
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let color = if hot { weak.gamma_multiply(1.6) } else { weak };
+    let font = FontId::proportional(app.theme.metrics.font_size * 0.88);
+    ui.painter().text(rect.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, n.blend.short(), font, color);
+    Icon::ChevronDown.paint(ui.painter(), Rect::from_center_size(rect.right_center() - vec2(8.0, 0.0), vec2(10.0, 10.0)), color);
+    let resp = resp.on_hover_text(format!("Blend: {}. {}", n.blend.label(), n.blend.hint()));
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.set_min_width(150.0);
+        for mode in sculpt_core::LayerBlend::ALL {
+            let r = ui.selectable_label(n.blend == mode, mode.label()).on_hover_text(mode.hint());
+            if r.clicked() {
+                command::execute(app, LayerCommand::Edit { id: n.id, edit: MetaEdit::Blend(mode), coalesce: false });
+                ui.close();
+            }
+        }
+    });
 }

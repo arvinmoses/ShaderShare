@@ -56,6 +56,16 @@ Document
 P(v) = base(v) + Σ_layers  scale · mask(v) · delta(v)
 ```
 
+Each layer also has a **blend mode** that says how its offset combines with the
+offsets below it (`A` = offset so far, `L` = the layer's offset, `s` = scale·mask):
+Add `A+sL` (default, and how old projects behave), Subtract `A−sL`, Normal
+`A+s·c·(L−A)` where `c` is footprint coverage (the layer replaces what is below
+inside the area it touches), Max (apply only where `L·n>0`) and Min (only where
+`L·n<0`). Add and Subtract keep the fast incremental stroke path; the others
+re-composite the touched leaves per dab. Because Normal, Min and Max make order
+matter, the composite walks the layer tree bottom to top (`composite_order`).
+Folders have no blend mode; they only scale their children.
+
 `scale` is the layer's strength times every ancestor folder's strength, and is
 zero when the layer or an ancestor is hidden or another layer is soloed. The
 document refreshes it whenever structure, strength or visibility change, so the

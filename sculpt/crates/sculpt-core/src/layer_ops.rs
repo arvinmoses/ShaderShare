@@ -94,6 +94,23 @@ impl Document {
         true
     }
 
+    /// Layer indices in the order they composite: bottom of the stack first, a folder's children
+    /// where the folder sits. Folders themselves contribute only their strength.
+    pub(crate) fn composite_order(&self) -> Vec<usize> {
+        fn visit(doc: &Document, parent: Option<LayerId>, out: &mut Vec<usize>) {
+            for (i, l) in doc.layers.iter().enumerate().filter(|(_, l)| l.parent == parent) {
+                if l.is_folder() {
+                    visit(doc, Some(l.id), out);
+                } else {
+                    out.push(i);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(self.layers.len());
+        visit(self, None, &mut out);
+        out
+    }
+
     // ------------------------------------------------------------------- solo
 
     /// Show base plus only this layer (and its subtree). Non-destructive; not undoable.
@@ -172,6 +189,10 @@ impl Document {
                 StructOp::Insert { index, layer: Box::new(layer) }
             }
             StructOp::Place { id, parent, index } => {
+                // Order decides how layers blend, so everything the moved subtree touches is redone.
+                for member in self.subtree(id) {
+                    leaves.extend(self.layers[self.layer_index_of(member)].allocated_leaves());
+                }
                 let from = self.layer_index_of(id);
                 let mut layer = self.layers.remove(from);
                 let inverse = StructOp::Place { id, parent: layer.parent, index: from };
@@ -183,7 +204,11 @@ impl Document {
                 let i = self.layer_index_of(id);
                 let before = self.layers[i].meta();
                 let mask_changed = before.mask != meta.mask;
+                let blend_changed = before.blend != meta.blend;
                 self.layers[i].set_meta(meta);
+                if blend_changed {
+                    leaves.extend(self.layers[i].allocated_leaves());
+                }
                 if mask_changed {
                     let values = self.layers[i].mask.clone().and_then(|s| self.evaluate_mask(&s).ok());
                     self.layers[i].mask_values = values;
@@ -419,6 +444,9 @@ impl Document {
             return Err(Error::InvalidData("the layer below is a folder".into()));
         }
         for l in [dst, src] {
+            if l.blend != crate::layers::LayerBlend::Add {
+                return Err(Error::InvalidData(format!("'{}' is not in Add mode, so it cannot be merged", l.name)));
+            }
             if l.locked {
                 return Err(Error::LayerLocked(l.name.clone()));
             }

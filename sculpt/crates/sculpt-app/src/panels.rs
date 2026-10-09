@@ -620,7 +620,7 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
 fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
     let Some(l) = app.doc.as_ref().and_then(|d| d.layer(id)) else { return };
-    let (name, opacity, visible, locked, has_mask, is_folder) = (l.name.clone(), l.opacity, l.visible, l.locked, l.mask.is_some(), l.is_folder());
+    let (name, opacity, visible, locked, has_mask, is_folder, blend) = (l.name.clone(), l.opacity, l.visible, l.locked, l.mask.is_some(), l.is_folder(), l.blend);
     let fs = app.theme.metrics.font_size;
     section(ui, fs, "layer", if is_folder { "FOLDER" } else { "LAYER" }, |ui| {
         let mut n = name.clone();
@@ -631,6 +631,17 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         let slider = prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut pct, -100.0..=200.0).suffix("%").max_decimals(0)));
         if slider.changed() {
             command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Strength(pct / 100.0), coalesce: slider.dragged() && !slider.drag_started() });
+        }
+        if !is_folder {
+            prop(ui, "Blend", |ui| {
+                egui::ComboBox::from_id_salt(("layer_blend", id)).selected_text(blend.label()).show_ui(ui, |ui| {
+                    for mode in sculpt_core::LayerBlend::ALL {
+                        if ui.selectable_label(blend == mode, mode.label()).on_hover_text(mode.hint()).clicked() {
+                            command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Blend(mode), coalesce: false });
+                        }
+                    }
+                })
+            });
         }
         let (mut v, mut lk) = (visible, locked);
         prop(ui, "", |ui| {

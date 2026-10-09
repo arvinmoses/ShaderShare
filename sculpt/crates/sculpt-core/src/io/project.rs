@@ -22,14 +22,15 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
-use crate::layers::{LayerId, LayerKind};
+use crate::layers::{LayerBlend, LayerId, LayerKind};
 use crate::mask::MaskStack;
 use crate::mesh::Face;
 use crate::{Error, Result};
 
 pub const FORMAT: &str = "sculpt-project";
-/// 2 added layer folders (`kind`, `parent`, `collapsed`). Version 1 projects load unchanged.
-pub const VERSION: u32 = 2;
+/// 2 added layer folders (`kind`, `parent`, `collapsed`); 3 added per-layer `blend`.
+/// Older projects load unchanged.
+pub const VERSION: u32 = 3;
 pub const MANIFEST: &str = "project.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +104,9 @@ pub struct LayerEntry {
     pub parent: Option<u32>,
     #[serde(default)]
     pub collapsed: bool,
+    /// Absent in older projects, which always added layers.
+    #[serde(default)]
+    pub blend: LayerBlend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<MaskStack>,
     /// Sparse: vertex indices (u32) and matching deltas (f32 x 3).
@@ -125,6 +129,7 @@ pub(crate) struct PartLayer {
     pub kind: LayerKind,
     pub parent: Option<LayerId>,
     pub collapsed: bool,
+    pub blend: LayerBlend,
     pub mask: Option<MaskStack>,
     pub indices: Vec<u32>,
     pub deltas: Vec<Vec3>,
@@ -220,6 +225,7 @@ pub fn save(doc: &Document, dir: &Path) -> Result<()> {
             kind: layer.kind,
             parent: layer.parent.map(|p| p.0),
             collapsed: layer.collapsed,
+            blend: layer.blend,
             mask: layer.mask.clone(),
             indices: Some(write_blob(dir, &format!("{tag}_indices"), DType::U32, 1, &idx)?),
             deltas: Some(write_blob(dir, &format!("{tag}_deltas"), DType::F32, 3, &deltas)?),
@@ -302,6 +308,7 @@ pub fn load(dir: &Path) -> Result<Document> {
             kind: l.kind,
             parent: l.parent.map(LayerId),
             collapsed: l.collapsed,
+            blend: l.blend,
             mask: l.mask,
             indices,
             deltas,

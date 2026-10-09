@@ -454,6 +454,9 @@ impl Document {
         if self.layers[i].is_folder() {
             return Err(Error::InvalidData("flatten works on layers, not folders".into()));
         }
+        if self.layers[i].blend != crate::layers::LayerBlend::Add {
+            return Err(Error::InvalidData("only layers in Add mode can be flattened into the base".into()));
+        }
         let layer = self.layers.remove(i);
         for l in layer.allocated_leaves() {
             let r = self.bvh.leaves[l as usize].owned_range();
@@ -681,7 +684,8 @@ impl Document {
                     let len = leaves[l as usize].owned_len();
                     layer.chunks[l as usize].get_or_insert_with(|| vec![Vec3::ZERO; len].into_boxed_slice());
                 }
-                let scale = layer.scale;
+                let (scale, blend) = (layer.scale, layer.blend);
+                let sign = if blend == crate::layers::LayerBlend::Subtract { -1.0 } else { 1.0 };
                 let mask_values = layer.mask_values.as_deref();
                 let mut chunk_refs: Vec<&mut Box<[Vec3]>> = Vec::with_capacity(leaf_ids.len());
                 let mut wanted = leaf_ids.iter().peekable();
@@ -697,13 +701,23 @@ impl Document {
                             let v = r.start + k as usize;
                             let w = scale * mask_values.map_or(1.0, |m| m[v]);
                             chunk[k as usize] += d;
-                            pos[k as usize] += d * w;
+                            if blend.is_linear() {
+                                pos[k as usize] += d * (w * sign);
+                            }
                         }
                     },
                 );
             }
         }
-        self.geometry_changed(&leaf_ids);
+        // Layers whose blend is not a plain add/subtract are re-composited, since a dab can change
+        // what is shown in ways that depend on the layers beneath.
+        if let SculptTarget::Layer(i) = target
+            && !self.layers[i].blend.is_linear()
+        {
+            self.recomposite(&leaf_ids);
+        } else {
+            self.geometry_changed(&leaf_ids);
+        }
         Ok(())
     }
 
@@ -783,14 +797,24 @@ impl Document {
         leaves.sort_unstable();
         leaves.dedup();
         let ranges: Vec<Range<usize>> = leaves.iter().map(|&l| self.bvh.leaves[l as usize].owned_range()).collect();
+        let order = self.composite_order();
+        let eps = (self.bvh.bounds().extent().length() * 1e-4).max(1e-9);
         let slices = split_ranges_mut(&mut self.positions, ranges.iter().cloned());
-        let (base, layers) = (&self.base, &self.layers);
+        let (base, layers, normals) = (&self.base, &self.layers, &self.normals);
         slices.into_par_iter().zip(leaves.par_iter()).zip(ranges.par_iter()).for_each(|((pos, &l), r)| {
             pos.copy_from_slice(&base[r.clone()]);
-            for layer in layers {
-                if let Some(chunk) = &layer.chunks[l as usize] {
+            for &i in &order {
+                let layer = &layers[i];
+                let Some(chunk) = &layer.chunks[l as usize] else { continue };
+                if layer.blend == crate::layers::LayerBlend::Add {
                     for (k, p) in pos.iter_mut().enumerate() {
                         *p += chunk[k] * layer.weight(r.start + k);
+                    }
+                } else {
+                    for (k, p) in pos.iter_mut().enumerate() {
+                        let v = r.start + k;
+                        let acc = *p - base[v];
+                        *p = base[v] + layer.blend.apply(acc, chunk[k], layer.weight(v), normals[v], eps);
                     }
                 }
             }
@@ -1062,6 +1086,7 @@ impl Document {
             layer.kind = pl.kind;
             layer.parent = pl.parent;
             layer.collapsed = pl.collapsed;
+            layer.blend = pl.blend;
             layer.mask = pl.mask;
             for (ci, d) in pl.indices.iter().zip(pl.deltas) {
                 let v = doc.canonical_index(*ci as usize);
@@ -1106,6 +1131,7 @@ impl SculptLayer {
             kind: self.kind,
             parent: self.parent,
             collapsed: self.collapsed,
+            blend: self.blend,
             scale: self.scale,
             name: self.name.clone(),
             opacity: self.opacity,

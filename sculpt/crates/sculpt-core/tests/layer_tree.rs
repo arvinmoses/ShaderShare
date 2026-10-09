@@ -298,3 +298,113 @@ fn corrupt_parent_links_are_rejected() {
     assert!(project::load(&dir).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------- blend modes
+
+fn set_blend(d: &mut Document, id: LayerId, blend: sculpt_core::LayerBlend) {
+    let mut m = d.layer(id).unwrap().meta();
+    m.blend = blend;
+    d.set_layer_meta(id, m, false).unwrap();
+}
+
+#[test]
+fn blend_modes_shape_the_surface_as_documented() {
+    use sculpt_core::LayerBlend::*;
+    let mut d = doc();
+    let l = d.insert_layer("Bump", Placement::Top).unwrap();
+    let flat = top_y(&d);
+    bump(&mut d); // raises the top
+    let raised = top_y(&d);
+    assert!(raised > flat + 0.01);
+
+    set_blend(&mut d, l, Subtract);
+    assert!(top_y(&d) < flat - 0.01, "subtract turns the bump into a dent");
+    set_blend(&mut d, l, Min);
+    assert!((top_y(&d) - flat).abs() < 1e-5, "min ignores the raising layer");
+    set_blend(&mut d, l, Max);
+    assert!((top_y(&d) - raised).abs() < 1e-5, "max keeps the raising layer");
+    set_blend(&mut d, l, Normal);
+    assert!((top_y(&d) - raised).abs() < 1e-4, "normal over a bare base looks like add");
+    set_blend(&mut d, l, Add);
+    assert!((top_y(&d) - raised).abs() < 1e-5);
+
+    // Undo walks back through every mode change.
+    assert!(d.undo());
+    assert!((top_y(&d) - raised).abs() < 1e-4, "back to Normal");
+    assert!(d.undo());
+    assert!((top_y(&d) - raised).abs() < 1e-5, "back to Max");
+    assert!(d.undo());
+    assert!((top_y(&d) - flat).abs() < 1e-5, "back to Min");
+}
+
+#[test]
+fn normal_replaces_what_is_below_inside_its_footprint() {
+    use sculpt_core::LayerBlend::*;
+    let mut d = doc();
+    let low = d.insert_layer("Low", Placement::Top).unwrap();
+    bump(&mut d);
+    let low_only = top_y(&d);
+    let high = d.insert_layer("High", Placement::Top).unwrap();
+    // A second, smaller bump over the first.
+    let s = BrushSettings { radius: 0.15, strength: 1.0, ..Default::default() };
+    brush::stroke(&mut d, &mut ClayBuildup::default(), &s, &[(Vec3::new(0.0, 1.0, 0.0), 1.0), (Vec3::new(0.02, 1.0, 0.0), 1.0)]).unwrap();
+    let stacked = top_y(&d);
+    assert!(stacked > low_only, "add stacks the second bump on the first");
+    set_blend(&mut d, high, Normal);
+    let replaced = top_y(&d);
+    assert!(replaced < stacked, "normal drops the lower layer's contribution under its footprint");
+    let _ = low;
+}
+
+#[test]
+fn old_projects_load_in_add_mode_and_new_modes_round_trip() {
+    use sculpt_core::LayerBlend::*;
+    let old = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_project");
+    let v1 = project::load(&old).unwrap();
+    assert!(v1.layers().iter().all(|l| l.blend == Add));
+
+    let mut d = doc();
+    let l = d.insert_layer("A", Placement::Top).unwrap();
+    bump(&mut d);
+    set_blend(&mut d, l, Max);
+    let dir = std::env::temp_dir().join(format!("sculpt-blend-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    project::save(&d, &dir).unwrap();
+    let back = project::load(&dir).unwrap();
+    assert_eq!(back.layer(l).unwrap().blend, Max);
+    assert!(max_diff(d.positions(), back.positions()) < 1e-5);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn stroking_on_a_subtract_layer_shows_immediately_and_flatten_needs_add() {
+    use sculpt_core::LayerBlend::*;
+    let mut d = doc();
+    let l = d.insert_layer("Dig", Placement::Top).unwrap();
+    set_blend(&mut d, l, Subtract);
+    let flat = top_y(&d);
+    bump(&mut d); // positive delta, subtracted: a dent appears right away
+    assert!(top_y(&d) < flat - 0.01);
+    assert!(d.flatten_layer(l).is_err());
+    let m = d.insert_layer("Other", Placement::Top).unwrap();
+    assert!(d.merge_down(m).is_err(), "merge needs both layers in Add mode");
+}
+
+#[test]
+fn blend_order_follows_the_folder_tree() {
+    use sculpt_core::LayerBlend::*;
+    let mut d = doc();
+    let f = d.insert_folder("F", Placement::Top).unwrap();
+    let inside = d.insert_layer("Inside", Placement::Into(f)).unwrap();
+    bump(&mut d);
+    let outside = d.insert_layer("Outside", Placement::Top).unwrap();
+    let s = BrushSettings { radius: 0.3, strength: 1.0, ..Default::default() };
+    brush::stroke(&mut d, &mut ClayBuildup::default(), &s, &[(Vec3::new(0.0, 1.0, 0.0), 1.0), (Vec3::new(0.05, 1.0, 0.0), 1.0)]).unwrap();
+    set_blend(&mut d, outside, Normal);
+    let over = top_y(&d);
+    // Moving the Normal layer under the folder lets the folder's layer win instead.
+    d.move_layer(outside, Placement::Below(f)).unwrap();
+    let under = top_y(&d);
+    assert!((over - under).abs() > 1e-3, "order matters once a layer replaces: {over} vs {under}");
+    let _ = inside;
+}

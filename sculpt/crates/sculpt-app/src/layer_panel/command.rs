@@ -4,7 +4,7 @@
 //! document directly. That keeps undo consistent (each command is one engine
 //! step) and gives hotkeys, menus and buttons a single behaviour to share.
 
-use sculpt_core::{LayerId, LayerMeta, Placement};
+use sculpt_core::{LayerBlend, LayerId, LayerMeta, Placement};
 
 use crate::app::{SculptApp, Selection};
 use crate::keymap::Command;
@@ -16,6 +16,7 @@ pub enum MetaEdit {
     Visible(bool),
     Locked(bool),
     Collapsed(bool),
+    Blend(LayerBlend),
 }
 
 impl MetaEdit {
@@ -26,6 +27,7 @@ impl MetaEdit {
             MetaEdit::Visible(v) => m.visible = *v,
             MetaEdit::Locked(l) => m.locked = *l,
             MetaEdit::Collapsed(c) => m.collapsed = *c,
+            MetaEdit::Blend(b) => m.blend = *b,
         }
     }
 }

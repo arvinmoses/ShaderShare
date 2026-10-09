@@ -1,6 +1,6 @@
 //! The rows the layer list shows, read once per frame from the document.
 
-use sculpt_core::{Document, LayerId};
+use sculpt_core::{Document, LayerBlend, LayerId};
 
 use crate::app::SculptApp;
 
@@ -14,6 +14,7 @@ pub struct Node {
     pub visible: bool,
     pub locked: bool,
     pub strength: f32,
+    pub blend: LayerBlend,
     pub collapsed: bool,
     pub has_children: bool,
     pub has_mask: bool,
@@ -47,6 +48,7 @@ pub fn visible_nodes(app: &SculptApp, doc: &Document) -> Vec<Node> {
             visible: l.visible,
             locked: l.locked,
             strength: l.opacity,
+            blend: l.blend,
             collapsed: l.collapsed,
             has_children,
             has_mask: l.mask.is_some() || editing.is_some(),

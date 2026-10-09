@@ -22,7 +22,7 @@ mod undo;
 pub use document::{DirtySet, Displacements, Document, PaintTarget, SurfaceHit};
 pub use glam;
 pub use layer_ops::{Placement, TreeRow};
-pub use layers::{LayerId, LayerKind, LayerMeta, SculptLayer};
+pub use layers::{LayerBlend, LayerId, LayerKind, LayerMeta, SculptLayer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
