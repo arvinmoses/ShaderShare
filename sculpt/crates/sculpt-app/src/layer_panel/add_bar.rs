@@ -10,6 +10,8 @@ use crate::icons::Icon;
 use crate::keymap::Command;
 
 pub const BAR_H: f32 = 30.0;
+/// Extra height below the list for item spacing around the bar.
+pub const SLACK: f32 = 12.0;
 
 /// Icon plus short label; `menu` adds a drop-down chevron.
 struct BarButton {

@@ -1,6 +1,6 @@
 //! The paint target, spelled out: `Wrinkles › Mask › Breakup`, coloured like the target frame.
 
-use egui::{Align, Color32, Layout, RichText, Ui};
+use egui::{Color32, RichText, Ui};
 
 use crate::app::{SculptApp, Selection};
 
@@ -62,8 +62,6 @@ pub fn show(app: &SculptApp, ui: &mut Ui) {
             let t = RichText::new(p).size(fs);
             ui.label(if last { t.strong() } else { t.color(app.theme.weak_text()) });
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(c.verb).size(fs * 0.85).color(app.theme.weak_text()));
-        });
     });
+    ui.label(RichText::new(c.verb).size(fs * 0.85).color(app.theme.weak_text()));
 }

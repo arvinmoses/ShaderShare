@@ -35,7 +35,9 @@ pub fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
     }
     seed_selection(app);
 
-    let list_h = (ui.available_height() - add_bar::BAR_H).max(40.0);
+    // Reserve the bar plus the spacing egui adds around it. Under-reserving makes the panel
+    // grow by the shortfall every frame, because its height comes from this content.
+    let list_h = (ui.available_height() - add_bar::BAR_H - add_bar::SLACK).max(40.0);
     let list_rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), list_h));
     let mut rows = Vec::new();
     egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
