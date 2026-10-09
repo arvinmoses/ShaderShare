@@ -184,8 +184,14 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
             // Bar under the thumbnail: lit when the mask has ops, like Painter's effects line.
             let bar = Rect::from_min_size(Pos2::new(mask_rect.left(), mask_rect.bottom() + 2.0), vec2(THUMB, 2.0));
             painter.rect_filled(bar, 1.0, if n.mask_ops > 0 { ui_colors.target_mask() } else { ui_colors.separator.0 });
+            if !n.mask_enabled {
+                painter.line_segment([mask_rect.left_bottom(), mask_rect.right_top()], Stroke::new(2.0, ui_colors.danger()));
+            }
             if mask_resp.clicked() {
-                if ui.input(|i| i.modifiers.alt) {
+                let m = ui.input(|i| i.modifiers);
+                if m.shift {
+                    command::execute(app, LayerCommand::Mask { id: n.id, action: super::mask_ops::MaskAction::Toggle });
+                } else if m.alt {
                     app.overlay = if app.overlay == OverlayKind::LayerMask { OverlayKind::None } else { OverlayKind::LayerMask };
                 } else {
                     select(app, n, order, ClickMods::default());
@@ -193,7 +199,7 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
                 }
             }
             menus::mask_menu_on(app, &mask_resp, n.id);
-            mask_resp.on_hover_text("Mask. Click: paint target. Alt+click: view in viewport");
+            mask_resp.on_hover_text("Mask. Click: paint target. Alt+click: view in viewport. Shift+click: disable / enable");
         } else if row.hovered() || mask_resp.hovered() {
             painter.rect_stroke(mask_rect, 3.0, Stroke::new(1.0, weak), StrokeKind::Inside);
             Icon::Plus.paint(&painter, mask_rect.shrink(7.0), weak);

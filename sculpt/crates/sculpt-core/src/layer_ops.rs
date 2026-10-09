@@ -210,7 +210,7 @@ impl Document {
                     leaves.extend(self.layers[i].allocated_leaves());
                 }
                 if mask_changed {
-                    let values = self.layers[i].mask.clone().and_then(|s| self.evaluate_mask(&s).ok());
+                    let values = self.layers[i].mask.clone().and_then(|s| self.mask_values_for(&s).ok().flatten());
                     self.layers[i].mask_values = values;
                     self.scalar_dirty.mark_all();
                     leaves.extend(self.layers[i].allocated_leaves());

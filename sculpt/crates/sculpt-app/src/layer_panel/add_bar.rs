@@ -76,11 +76,11 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui) {
         if BarButton::new(Icon::Folder, "Folder", "New folder").key(Command::NewFolder).show(ui, app).clicked() {
             command::execute(app, LayerCommand::NewFolder);
         }
-        let mask = BarButton::new(Icon::Mask, "Mask", "Add or remove a mask").enabled(active.is_some()).menu().show(ui, app);
+        let mask = BarButton::new(Icon::Mask, "Mask", if active.is_some() { "Add a mask in one step, or edit this layer's mask" } else { "Select a sculpt layer to add a mask (folders and Base cannot have one)" }).enabled(active.is_some()).menu().show(ui, app);
         if let Some(id) = active {
             super::menus::add_mask_menu_on(app, &mask, id);
         }
-        let op = BarButton::new(Icon::Effect, "Op", "Add a mask op").enabled(active.is_some()).menu().show(ui, app);
+        let op = BarButton::new(Icon::Effect, "Op", if active.is_some() { "Add an op to the mask" } else { "Select a sculpt layer first" }).enabled(active.is_some()).menu().show(ui, app);
         egui::Popup::menu(&op).show(|ui| crate::panels::effect_menu(app, ui));
         if BarButton::new(Icon::Duplicate, "", "Duplicate").key(Command::LayerDuplicate).enabled(has_sel).show(ui, app).clicked() {
             command::execute(app, LayerCommand::Duplicate);

@@ -11,6 +11,7 @@ pub mod breadcrumb;
 pub mod command;
 pub mod drag_ui;
 pub mod dragdrop;
+pub mod mask_ops;
 pub mod menus;
 pub mod row;
 pub mod selection;

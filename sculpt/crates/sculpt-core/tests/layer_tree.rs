@@ -408,3 +408,27 @@ fn blend_order_follows_the_folder_tree() {
     assert!((over - under).abs() > 1e-3, "order matters once a layer replaces: {over} vs {under}");
     let _ = inside;
 }
+
+#[test]
+fn disabled_mask_applies_everywhere_and_undoes() {
+    use sculpt_core::mask::MaskStack;
+    let mut d = doc();
+    let l = d.insert_layer("A", Placement::Top).unwrap();
+    bump(&mut d);
+    let full = top_y(&d);
+    let flat = {
+        let mut m = d.layer(l).unwrap().meta();
+        m.mask = Some(MaskStack::new(0.0)); // black: hides the layer
+        d.set_layer_meta(l, m, false).unwrap();
+        top_y(&d)
+    };
+    assert!(flat < full - 0.01, "black mask hides the bump");
+    let mut m = d.layer(l).unwrap().meta();
+    m.mask.as_mut().unwrap().enabled = false;
+    d.set_layer_meta(l, m, false).unwrap();
+    assert!((top_y(&d) - full).abs() < 1e-5, "disabled mask is ignored");
+    assert!(d.undo());
+    assert!((top_y(&d) - flat).abs() < 1e-5, "undo re-enables the mask");
+    assert!(d.undo());
+    assert!((top_y(&d) - full).abs() < 1e-5, "undo removes the mask");
+}

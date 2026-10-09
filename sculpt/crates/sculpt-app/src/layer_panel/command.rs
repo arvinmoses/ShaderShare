@@ -8,6 +8,7 @@ use sculpt_core::{LayerBlend, LayerId, LayerMeta, Placement};
 
 use crate::app::{SculptApp, Selection};
 use crate::keymap::Command;
+use super::mask_ops::{self, MaskAction, OpAction, Preset};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MetaEdit {
@@ -50,6 +51,10 @@ pub enum LayerCommand {
     Rename,
     ToggleSolo(LayerId),
     Edit { id: LayerId, edit: MetaEdit, coalesce: bool },
+    /// Build a mask, or add an op to it, in one step.
+    AddMask { id: LayerId, preset: Preset },
+    Mask { id: LayerId, action: MaskAction },
+    Op { id: LayerId, index: usize, action: OpAction },
     /// Move rows, or copy them there when `copy` is set (Ctrl+drag).
     Move { ids: Vec<LayerId>, at: Placement, copy: bool },
 }
@@ -134,6 +139,18 @@ pub fn execute(app: &mut SculptApp, cmd: LayerCommand) {
                 }
                 Err(e) => fail(app, "New folder", e),
             }
+        }
+        LayerCommand::AddMask { id, preset } => {
+            mask_ops::apply_preset(app, id, preset);
+            return;
+        }
+        LayerCommand::Mask { id, action } => {
+            mask_ops::mask_action(app, id, action);
+            return;
+        }
+        LayerCommand::Op { id, index, action } => {
+            mask_ops::op_action(app, id, index, action);
+            return;
         }
         LayerCommand::Duplicate => {
             let ids = targets(app);

@@ -7,8 +7,9 @@ use egui::{Response, Ui};
 use sculpt_core::LayerId;
 
 use super::command::{self, LayerCommand};
+use super::mask_ops::{self, MaskAction, OpAction, Preset};
 use super::tree::Node;
-use crate::app::{SculptApp, Selection};
+use crate::app::SculptApp;
 use crate::keymap::Command;
 
 /// One menu entry: label, optional hotkey from the keymap, enabled flag. Returns true when clicked.
@@ -86,24 +87,92 @@ pub fn empty_menu(app: &mut SculptApp, ui: &mut Ui) {
     }
 }
 
-/// White / black / remove. One step each, then the mask is the paint target.
+/// Everything about a layer's mask in one menu. Without a mask it builds one in a single step
+/// (white, black, from a bake, from noise, hand-painted); with one it adds ops and edits the mask.
 pub fn add_mask_items(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
-    let has_mask = app.doc.as_ref().and_then(|d| d.layer(id)).is_some_and(|l| l.mask.is_some()) || app.mask_edit.as_ref().is_some_and(|(i, _)| *i == id);
-    if item(app, ui, "White mask (shows everything)", None, !has_mask) {
-        crate::panels::select_layer(app, Some(id), Selection::Layer);
-        crate::panels::add_mask(app, 1.0);
-    }
-    if item(app, ui, "Black mask (hides everything)", None, !has_mask) {
-        crate::panels::select_layer(app, Some(id), Selection::Layer);
-        crate::panels::add_mask(app, 0.0);
-    }
-    if item(app, ui, "Remove mask", None, has_mask) {
-        crate::panels::select_layer(app, Some(id), Selection::Layer);
-        if let Some(d) = app.doc.as_mut() {
-            let _ = d.set_layer_mask(id, None);
+    let stack = app.mask_edit.as_ref().filter(|(i, _)| *i == id).map(|(_, s)| s.clone()).or_else(|| app.doc.as_ref().and_then(|d| d.layer(id)).and_then(|l| l.mask.clone()));
+    let has_mask = stack.is_some();
+    ui.set_min_width(200.0);
+    let go = |app: &mut SculptApp, ui: &mut Ui, cmd: LayerCommand| {
+        command::execute(app, cmd);
+        ui.close();
+    };
+    if !has_mask {
+        if item(app, ui, "White mask (shows everything)", None, true) {
+            go(app, ui, LayerCommand::AddMask { id, preset: Preset::White });
         }
-        app.mask_edit = None;
-        app.selection = Selection::Layer;
+        if item(app, ui, "Black mask (hides everything)", None, true) {
+            go(app, ui, LayerCommand::AddMask { id, preset: Preset::Black });
+        }
+        ui.separator();
+    } else {
+        ui.label(egui::RichText::new("ADD OP").small().weak());
+    }
+    ui.menu_button("From bake", |ui| {
+        for (attr, label) in mask_ops::BAKES {
+            if item(app, ui, label, None, true) {
+                go(app, ui, LayerCommand::AddMask { id, preset: Preset::Bake(attr) });
+            }
+        }
+    });
+    ui.menu_button("From noise", |ui| {
+        for (kind, label) in mask_ops::NOISES {
+            if item(app, ui, label, None, true) {
+                go(app, ui, LayerCommand::AddMask { id, preset: Preset::Noise(kind) });
+            }
+        }
+    });
+    if item(app, ui, "Hand-painted", None, true) {
+        go(app, ui, LayerCommand::AddMask { id, preset: Preset::Paint });
+    }
+    ui.separator();
+    let clip = app.layers.mask_clip.is_some();
+    if has_mask {
+        let enabled = stack.as_ref().is_none_or(|s| s.enabled);
+        if item(app, ui, if enabled { "Disable mask" } else { "Enable mask" }, None, true) {
+            go(app, ui, LayerCommand::Mask { id, action: MaskAction::Toggle });
+        }
+        if item(app, ui, "Invert mask", None, true) {
+            go(app, ui, LayerCommand::Mask { id, action: MaskAction::Invert });
+        }
+        if item(app, ui, "Copy mask", None, true) {
+            go(app, ui, LayerCommand::Mask { id, action: MaskAction::Copy });
+        }
+    }
+    if item(app, ui, "Paste mask", None, clip) {
+        go(app, ui, LayerCommand::Mask { id, action: MaskAction::Paste });
+    }
+    if has_mask {
+        ui.separator();
+        if item(app, ui, "Remove mask", None, true) {
+            go(app, ui, LayerCommand::Mask { id, action: MaskAction::Remove });
+        }
+    }
+}
+
+/// Right-click menu on a mask op row. `index` counts from the bottom of the mask stack.
+pub fn op_menu(app: &mut SculptApp, ui: &mut Ui, id: LayerId, index: usize, count: usize, enabled: bool) {
+    ui.set_min_width(170.0);
+    let go = |app: &mut SculptApp, ui: &mut Ui, action: OpAction| {
+        command::execute(app, LayerCommand::Op { id, index, action });
+        ui.close();
+    };
+    if item(app, ui, if enabled { "Disable" } else { "Enable" }, None, true) {
+        go(app, ui, OpAction::Toggle);
+    }
+    if item(app, ui, "Duplicate", None, true) {
+        go(app, ui, OpAction::Duplicate);
+    }
+    ui.separator();
+    if item(app, ui, "Move up", None, index + 1 < count) {
+        go(app, ui, OpAction::Raise);
+    }
+    if item(app, ui, "Move down", None, index > 0) {
+        go(app, ui, OpAction::Lower);
+    }
+    ui.separator();
+    if item(app, ui, "Delete", None, true) {
+        go(app, ui, OpAction::Delete);
     }
 }
 

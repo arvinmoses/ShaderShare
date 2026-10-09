@@ -21,6 +21,8 @@ pub struct PanelState {
     /// Row being renamed inline, with its edit buffer.
     pub rename: Option<(LayerId, String)>,
     pub drag: Option<DragState>,
+    /// Last copied mask, for Paste mask.
+    pub mask_clip: Option<sculpt_core::mask::MaskStack>,
     /// Collapsed folder the drag is hovering, and since when (spring-open).
     pub spring: Option<(LayerId, Instant)>,
     /// Rows as drawn last frame (hit testing for drops, headless checks).

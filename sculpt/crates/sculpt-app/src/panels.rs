@@ -468,7 +468,7 @@ pub(crate) fn add_mask(app: &mut SculptApp, base: f32) {
     app.overlay = OverlayKind::LayerMask;
 }
 
-fn add_effect(app: &mut SculptApp, label: &str, src: MaskSource) {
+pub(crate) fn add_effect(app: &mut SculptApp, label: &str, src: MaskSource) {
     if app.mask_edit.is_none() {
         add_mask(app, 1.0);
     }
@@ -566,6 +566,8 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
         if resp.clicked() {
             select_layer(app, Some(id), Selection::Effect(i));
         }
+        let (count, enabled) = (stack.layers.len(), e.enabled);
+        egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::op_menu(app, ui, id, i, count, enabled));
     }
     // Mask base value row.
     let selected = active && app.selection == Selection::Mask;
@@ -871,15 +873,21 @@ fn brush_props(app: &mut SculptApp, ui: &mut Ui) {
 
 /// Push the edited mask stack to the document (deferred until mouse release
 /// so slider drags don't re-evaluate the mask every frame).
+/// Write the mask editing copy back to the document as one undoable step.
 pub fn apply_mask_edit(app: &mut SculptApp) {
     let Some((id, stack)) = app.mask_edit.clone() else { return };
-    let big = app.doc.as_ref().is_some_and(|d| d.vertex_count() > 400_000);
-    if big {
-        app.start_doc_job("Evaluating mask", move |d| d.set_layer_mask(id, Some(stack)).map_err(|e| e.to_string()));
+    let write = move |d: &mut sculpt_core::Document| -> Result<(), String> {
+        let Some(layer) = d.layer(id) else { return Ok(()) };
+        let mut meta = layer.meta();
+        meta.mask = Some(stack);
+        d.set_layer_meta(id, meta, false).map_err(|e| e.to_string())
+    };
+    if app.doc.as_ref().is_some_and(|d| d.vertex_count() > 400_000) {
+        app.start_doc_job("Evaluating mask", write);
     } else if let Some(d) = app.doc.as_mut()
-        && let Err(e) = d.set_layer_mask(id, Some(stack))
+        && let Err(e) = write(d)
     {
-        app.status = e.to_string();
+        app.status = e;
     }
 }
 

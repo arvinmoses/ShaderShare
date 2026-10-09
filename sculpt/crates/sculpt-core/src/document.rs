@@ -400,7 +400,7 @@ impl Document {
     pub fn set_layer_mask(&mut self, id: LayerId, stack: Option<MaskStack>) -> Result<()> {
         let i = self.layer_index(id)?;
         let values = match &stack {
-            Some(s) => Some(self.evaluate_mask(s)?),
+            Some(s) => self.mask_values_for(s)?,
             None => None,
         };
         let layer = &mut self.layers[i];
@@ -417,8 +417,8 @@ impl Document {
         let mut leaves = BTreeSet::new();
         for i in 0..self.layers.len() {
             if let Some(stack) = self.layers[i].mask.clone() {
-                let values = self.evaluate_mask(&stack)?;
-                self.layers[i].mask_values = Some(values);
+                let values = self.mask_values_for(&stack)?;
+                self.layers[i].mask_values = values;
                 leaves.extend(self.layers[i].allocated_leaves());
                 self.scalar_dirty.mark_all();
             }
@@ -439,8 +439,8 @@ impl Document {
             stack.channels(&mut used);
             if used.iter().any(|c| dirty.contains(c)) {
                 self.scalar_dirty.mark_all();
-                let values = self.evaluate_mask(&stack)?;
-                self.layers[i].mask_values = Some(values);
+                let values = self.mask_values_for(&stack)?;
+                self.layers[i].mask_values = values;
                 leaves.extend(self.layers[i].allocated_leaves());
             }
         }
@@ -478,6 +478,14 @@ impl Document {
     /// Evaluate a mask stack, baking any mesh attributes it needs first.
     /// Procedural sources read the rest pose (positions and normals), so the
     /// result is deterministic and unaffected by sculpting or posing.
+    /// Per-vertex values for a layer's mask, or `None` (applies everywhere) when the mask is disabled.
+    pub fn mask_values_for(&mut self, stack: &MaskStack) -> Result<Option<Vec<f32>>> {
+        if !stack.enabled {
+            return Ok(None);
+        }
+        self.evaluate_mask(stack).map(Some)
+    }
+
     pub fn evaluate_mask(&mut self, stack: &MaskStack) -> Result<Vec<f32>> {
         let mut bakes = Vec::new();
         stack.required_bakes(&mut bakes);
@@ -1061,7 +1069,7 @@ impl Document {
         self.stroke_origin.clear();
         for i in 0..self.layers.len() {
             if let Some(stack) = self.layers[i].mask.clone() {
-                self.layers[i].mask_values = Some(self.evaluate_mask(&stack)?);
+                self.layers[i].mask_values = self.mask_values_for(&stack)?;
             }
         }
         self.recomposite_all();
@@ -1115,7 +1123,7 @@ impl Document {
         doc.refresh_scales_into(&mut Default::default());
         for i in 0..doc.layers.len() {
             if let Some(stack) = doc.layers[i].mask.clone() {
-                doc.layers[i].mask_values = Some(doc.evaluate_mask(&stack)?);
+                doc.layers[i].mask_values = doc.mask_values_for(&stack)?;
             }
         }
         doc.recomposite_all();

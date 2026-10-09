@@ -64,6 +64,11 @@ The layout is a Substance Painter / Mudbox hybrid:
   Ctrl+drag copies, Esc cancels, hovering a closed folder opens it). Right-click any row for a menu
   that lists hotkeys. The bar under the list (**+ Layer, Folder, Mask, Op**, duplicate, merge, delete)
   inserts above the selection. Every layer action is undoable with `Ctrl+Z`.
+  **Masks** are one step: **Mask ▾** (or the **+** slot beside a layer's thumbnail, or right-click) offers
+  White, Black, *From bake* (Curvature, Cavity, AO, Thickness), *From noise* and *Hand-painted*. A layer
+  with a mask lists its ops beneath it; right-click an op to disable, duplicate, move or delete it.
+  Click the mask thumbnail to paint it, Alt+click to view it in the viewport, Shift+click to disable or
+  enable it (a red slash shows it is off). Mask menus also copy, paste, invert and remove masks.
 - **PROPERTIES** (right, below): edits whatever is selected (layer, mask or effect), then the brush.
   Selecting a Paint effect makes Mask Paint draw into it.
 - **Tray** (bottom, Mudbox): Sculpt / Paint / Pose tools and a Falloff tray of curve presets.

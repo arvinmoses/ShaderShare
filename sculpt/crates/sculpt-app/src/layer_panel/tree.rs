@@ -20,6 +20,7 @@ pub struct Node {
     pub has_mask: bool,
     /// Number of ops in the mask stack.
     pub mask_ops: usize,
+    pub mask_enabled: bool,
     pub soloed: bool,
     /// Contributes nothing right now (hidden ancestor or another layer soloed).
     pub excluded: bool,
@@ -53,6 +54,7 @@ pub fn visible_nodes(app: &SculptApp, doc: &Document) -> Vec<Node> {
             has_children,
             has_mask: l.mask.is_some() || editing.is_some(),
             mask_ops,
+            mask_enabled: app.mask_edit.as_ref().filter(|(i, _)| *i == l.id).map(|(_, s)| s.enabled).or_else(|| l.mask.as_ref().map(|m| m.enabled)).unwrap_or(true),
             soloed: doc.solo() == Some(l.id),
             excluded: l.effective_scale() == 0.0 && l.opacity != 0.0 && l.visible,
         });
