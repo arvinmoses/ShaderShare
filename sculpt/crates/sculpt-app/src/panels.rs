@@ -98,20 +98,6 @@ fn source_label(s: &MaskSource) -> &'static str {
     }
 }
 
-fn blend_short(b: BlendMode) -> &'static str {
-    match b {
-        BlendMode::Normal => "Norm",
-        BlendMode::Multiply => "Mul",
-        BlendMode::Add => "Add",
-        BlendMode::Subtract => "Sub",
-        BlendMode::Screen => "Scrn",
-        BlendMode::Overlay => "Ovr",
-        BlendMode::Max => "Max",
-        BlendMode::Min => "Min",
-        BlendMode::Difference => "Diff",
-    }
-}
-
 const BLENDS: [BlendMode; 9] = [
     BlendMode::Normal,
     BlendMode::Multiply,
@@ -518,9 +504,14 @@ pub(crate) fn effect_menu(app: &mut SculptApp, ui: &mut Ui) {
 
 /// Row background + a child Ui for its contents.
 fn row_frame(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: bool) -> (egui::Response, Ui) {
+    row_frame_tinted(ui, app, height, indent, selected, None)
+}
+
+/// Like `row_frame`, with an optional selection fill (mask rows use the mask colour so they read differently from layers).
+fn row_frame_tinted(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: bool, tint: Option<Color32>) -> (egui::Response, Ui) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
     let bg = if selected {
-        app.theme.ui.row_selected()
+        tint.unwrap_or_else(|| app.theme.ui.row_selected())
     } else if resp.hovered() {
         ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5)
     } else {
@@ -528,10 +519,12 @@ fn row_frame(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: b
     };
     ui.painter().rect_filled(rect, 0.0, bg);
     if selected {
-        ui.painter().rect_filled(Rect::from_min_max(rect.left_top(), rect.left_bottom() + vec2(2.0, 0.0)), 0.0, app.theme.ui.accent.0);
+        let bar = if tint.is_some() { app.theme.ui.target_mask() } else { app.theme.ui.accent.0 };
+        ui.painter().rect_filled(Rect::from_min_max(rect.left_top(), rect.left_bottom() + vec2(2.0, 0.0)), 0.0, bar);
     }
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
-    let inner = rect.shrink2(vec2(4.0, 0.0)).with_min_x(rect.left() + 4.0 + indent);
+    // Same right edge as the layer rows' strength column, so numbers line up down the list.
+    let inner = rect.shrink2(vec2(4.0, 0.0)).with_min_x(rect.left() + 4.0 + indent).with_max_x(rect.right() - 6.0);
     let child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
     (resp, child)
 }
@@ -548,7 +541,8 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
     for i in (0..stack.layers.len()).rev() {
         let e = &stack.layers[i];
         let selected = active && app.selection == Selection::Effect(i);
-        let (resp, mut row) = row_frame(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected);
+        let tint = app.theme.ui.target_mask().gamma_multiply(0.32);
+        let (resp, mut row) = row_frame_tinted(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected, Some(tint));
         op_rows.push((i, resp.rect));
         if resp.drag_started() && active {
             app.layers.op_drag = Some((id, i));
@@ -566,7 +560,7 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
         let title = if e.name.is_empty() { source_label(&e.source).to_string() } else { e.name.clone() };
         row.label(RichText::new(title).size(app.theme.metrics.font_size * 0.92));
         row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(format!("{} {:.0}%", blend_short(e.blend), e.opacity * 100.0)).size(app.theme.metrics.font_size * 0.85).color(weak));
+            ui.label(RichText::new(format!("{:?} {:.0}%", e.blend, e.opacity * 100.0)).size(app.theme.metrics.font_size * 0.85).color(weak));
         });
         if resp.clicked() {
             select_layer(app, Some(id), Selection::Effect(i));
@@ -577,13 +571,14 @@ pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: us
     crate::layer_panel::op_drag::update(app, ui, id, &op_rows);
     // Mask base value row.
     let selected = active && app.selection == Selection::Mask;
-    let (resp, mut row) = row_frame(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected);
+    let (resp, mut row) = row_frame_tinted(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected, Some(app.theme.ui.target_mask().gamma_multiply(0.32)));
     let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
     Icon::Mask.paint(row.painter(), r, row.visuals().text_color());
     row.label(RichText::new(if stack.base >= 0.5 { "White mask" } else { "Black mask" }).size(app.theme.metrics.font_size * 0.92).color(weak));
     if resp.clicked() {
         select_layer(app, Some(id), Selection::Mask);
     }
+    egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::add_mask_items(app, ui, id));
 }
 
 pub(crate) fn base_row(app: &mut SculptApp, ui: &mut Ui) {

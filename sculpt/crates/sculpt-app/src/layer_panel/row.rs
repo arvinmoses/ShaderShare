@@ -190,6 +190,10 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
             crate::panels::select_layer(app, Some(n.id), Selection::Layer);
         }
     }
+    if content.hovered() {
+        painter.rect_stroke(content_rect, 3.0, Stroke::new(1.0, text_color), StrokeKind::Inside);
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
     content.on_hover_text(if n.is_folder { "Folder" } else { "Sculpt delta: click to sculpt on this layer" });
 
     // Mask thumbnail, or an empty slot that offers "+" on hover.
@@ -228,6 +232,10 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui, n: &Node, order: &[LayerId], geoms
                     select(app, n, order, ClickMods::default());
                     crate::panels::select_layer(app, Some(n.id), Selection::Mask);
                 }
+            }
+            if mask_resp.hovered() {
+                painter.rect_stroke(mask_rect, 3.0, Stroke::new(1.0, text_color), StrokeKind::Inside);
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
             menus::mask_menu_on(app, &mask_resp, n.id);
             mask_resp.on_hover_text("Mask. Click: paint target. Alt+click: view in viewport. Shift+click: disable / enable");
