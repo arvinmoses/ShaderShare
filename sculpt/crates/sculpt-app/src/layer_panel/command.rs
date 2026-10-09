@@ -40,8 +40,10 @@ pub enum LayerCommand {
     /// Duplicate the selection.
     Duplicate,
     MergeDown,
-    /// Bake the layer into the base mesh. Not undoable: clears history.
+    /// Bake the layer into the base mesh.
     Flatten,
+    /// Bake a folder into one new layer above it and hide the folder (Ctrl+M).
+    FlattenFolder,
     /// Delete the selection.
     Delete,
     /// Group the selection into a new folder.
@@ -79,6 +81,7 @@ pub fn from_keymap(cmd: Command, app: &SculptApp) -> Option<LayerCommand> {
             let locked = app.doc.as_ref()?.layer(id)?.locked;
             LayerCommand::Edit { id, edit: MetaEdit::Locked(!locked), coalesce: false }
         }
+        Command::LayerFlatten => LayerCommand::FlattenFolder,
         Command::LayerHide => {
             let id = primary?;
             let visible = app.doc.as_ref()?.layer(id)?.visible;
@@ -181,8 +184,18 @@ pub fn execute(app: &mut SculptApp, cmd: LayerCommand) {
         LayerCommand::Flatten => {
             let Some(id) = targets(app).first().copied() else { return };
             match app.doc.as_mut().unwrap().flatten_layer(id) {
-                Ok(()) => app.status = "Flattened into the base mesh (undo history cleared)".into(),
+                Ok(()) => app.status = "Flattened into the base mesh".into(),
                 Err(e) => fail(app, "Flatten", e),
+            }
+        }
+        LayerCommand::FlattenFolder => {
+            let Some(id) = targets(app).first().copied() else { return };
+            match app.doc.as_mut().unwrap().flatten_folder(id) {
+                Ok(flat) => {
+                    app.layers.selection.select_only(flat);
+                    app.status = "Folder flattened into a new layer; the folder is hidden".into();
+                }
+                Err(e) => fail(app, "Flatten folder", e),
             }
         }
         LayerCommand::Delete => {

@@ -111,15 +111,23 @@ pub fn mask_action(app: &mut SculptApp, id: LayerId, action: MaskAction) {
             return;
         }
         MaskAction::Copy => {
-            app.layers.mask_clip = app.mask_edit.as_ref().map(|(_, s)| s.clone());
+            app.layers.mask_clip = app.mask_edit.as_ref().map(|(_, s)| (id, s.clone()));
             app.status = if app.layers.mask_clip.is_some() { "Mask copied".into() } else { "This layer has no mask".into() };
             return;
         }
         MaskAction::Paste => {
-            let Some(clip) = app.layers.mask_clip.clone() else { return };
-            app.mask_edit = Some((id, clip));
+            let Some((from, clip)) = app.layers.mask_clip.clone() else { return };
+            // One undoable step that also copies the hand-painted data, so the two masks stay independent.
+            if let Some(Err(e)) = app.doc.as_mut().map(|d| d.paste_mask(id, from, &clip)) {
+                app.status = format!("Paste mask: {e}");
+                return;
+            }
+            app.mask_edit = None;
+            app.last_active = None;
+            crate::panels::sync_mask_edit(app);
             app.expanded.insert(id);
             app.selection = Selection::Mask;
+            return;
         }
         MaskAction::Toggle | MaskAction::Invert => {
             let Some((_, stack)) = app.mask_edit.as_mut() else { return };

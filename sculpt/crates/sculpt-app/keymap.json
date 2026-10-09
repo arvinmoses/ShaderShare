@@ -28,6 +28,7 @@
   { "keys": "S", "command": "layer_solo" },
   { "keys": "Shift+L", "command": "layer_lock" },
   { "keys": "Shift+H", "command": "layer_hide" },
+  { "keys": "Ctrl+M", "command": "layer_flatten" },
   { "keys": "Tab", "command": "layer_switcher" },
   { "keys": "M", "command": "toggle_target" },
   { "keys": "Alt+M", "command": "view_mask" },

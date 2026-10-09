@@ -13,7 +13,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::document::Document;
-use crate::layers::{LayerId, LayerKind, LayerMeta, SculptLayer};
+use crate::layers::{LayerBlend, LayerId, LayerKind, LayerMeta, SculptLayer};
+use crate::mask::{MaskSource, MaskStack};
 use crate::undo::{self, Data, Record, StructOp};
 use crate::{Error, Result};
 
@@ -235,7 +236,7 @@ impl Document {
         self.end_stroke();
     }
 
-    fn exec_in_open(&mut self, ops: Vec<StructOp>) {
+    pub(crate) fn exec_in_open(&mut self, ops: Vec<StructOp>) {
         let mut leaves = BTreeSet::new();
         for op in ops {
             let inverse = self.apply_struct(op, &mut leaves);
@@ -335,10 +336,10 @@ impl Document {
         self.layer_index(id)?;
         let sources = self.subtree(id);
         let mut remap: HashMap<LayerId, LayerId> = HashMap::new();
-        let mut ops = Vec::new();
+        let mut copies = Vec::new();
         let first_slot = self.layer_index_of(id) + 1;
         let root_name = self.unique_name(&format!("{} copy", self.layers[self.layer_index_of(id)].name));
-        for (n, (src, at)) in sources.iter().zip(first_slot..).enumerate() {
+        for (n, src) in sources.iter().enumerate() {
             let new_id = self.next_id();
             remap.insert(*src, new_id);
             let mut copy = self.layers[self.layer_index_of(*src)].clone();
@@ -347,16 +348,114 @@ impl Document {
             if n == 0 {
                 copy.name = root_name.clone();
             }
-            ops.push(StructOp::Insert { index: at, layer: Box::new(copy) });
+            copies.push((*src, copy));
         }
         let new_root = remap[&id];
-        if !self.layers[self.layer_index_of(id)].is_folder() {
+        let is_folder = self.layers[self.layer_index_of(id)].is_folder();
+        self.begin_stroke("Duplicate layer");
+        let mut ops = Vec::new();
+        for ((src, mut copy), at) in copies.into_iter().zip(first_slot..) {
+            // A hand-painted mask must not share its paint with the original.
+            if let Some(stack) = copy.mask.as_mut() {
+                self.clone_paint_channels(stack, src, copy.id);
+            }
+            ops.push(StructOp::Insert { index: at, layer: Box::new(copy) });
+        }
+        if !is_folder {
             ops.push(StructOp::Active { id: Some(new_root) });
         }
-        self.exec("Duplicate layer", ops);
+        self.exec_in_open(ops);
+        self.end_stroke();
         Ok(new_root)
     }
 
+    /// Point `stack`'s paint ops (`paint.layer<from>`) at fresh copies named for `to`. Recorded in the open undo group.
+    pub(crate) fn clone_paint_channels(&mut self, stack: &mut MaskStack, from: LayerId, to: LayerId) {
+        let (old, new) = (paint_channel(from), paint_channel(to));
+        for op in &mut stack.layers {
+            if let MaskSource::Channel { name } = &mut op.source
+                && *name == old
+            {
+                if let Some(values) = self.channels.get(&old).cloned() {
+                    self.snapshot_absent_channel(&new);
+                    self.channels.insert(new.clone(), values);
+                    self.dirty_channels.insert(new.clone());
+                    self.scalar_dirty.mark_all();
+                }
+                *name = new.clone();
+            }
+            if let Some(nested) = op.mask.as_mut() {
+                self.clone_paint_channels(nested, from, to);
+            }
+        }
+    }
+
+    /// Replace `id`'s mask with a copy of `stack`, which was made on layer `from` (so its paint is copied). Undoable.
+    pub fn paste_mask(&mut self, id: LayerId, from: LayerId, stack: &MaskStack) -> Result<()> {
+        let i = self.layer_index(id)?;
+        if self.layers[i].is_folder() {
+            return Err(Error::InvalidData("folders cannot carry a mask yet".into()));
+        }
+        let mut stack = stack.clone();
+        self.begin_stroke("Paste mask");
+        if from != id {
+            self.clone_paint_channels(&mut stack, from, id);
+        }
+        let mut meta = self.layers[i].meta();
+        meta.mask = Some(stack);
+        self.exec_in_open(vec![StructOp::Meta { id, meta }]);
+        self.end_stroke();
+        Ok(())
+    }
+
+    /// Bake `folder` into one new layer above it and hide the folder (Painter's Flatten group). Undoable.
+    /// Only visible layers count, and every one must be in Add mode so the surface is exactly preserved.
+    pub fn flatten_folder(&mut self, folder: LayerId) -> Result<LayerId> {
+        let fi = self.layer_index(folder)?;
+        if !self.layers[fi].is_folder() {
+            return Err(Error::InvalidData("not a folder".into()));
+        }
+        let members: Vec<usize> = self.subtree(folder).into_iter().map(|m| self.layer_index_of(m)).filter(|&i| !self.layers[i].is_folder()).collect();
+        if members.is_empty() {
+            return Err(Error::InvalidData("the folder has no layers".into()));
+        }
+        if let Some(bad) = members.iter().find(|&&i| self.layers[i].blend != LayerBlend::Add) {
+            return Err(Error::InvalidData(format!("'{}' is not in Add mode, so the folder cannot be flattened", self.layers[*bad].name)));
+        }
+        // Everything above the folder scales the new layer too, so divide it out of the members' weights.
+        let mut outer = 1.0f32;
+        let mut cur = self.layers[fi].parent;
+        while let Some(p) = cur.and_then(|id| self.layer(id)) {
+            outer *= p.opacity;
+            cur = p.parent;
+        }
+        if outer == 0.0 || !self.layers[fi].visible {
+            return Err(Error::InvalidData("the folder or one of its parents is hidden or at zero strength".into()));
+        }
+        let leaves = self.bvh.leaves.len();
+        let id = self.next_id();
+        let name = self.unique_name(&format!("{} flattened", self.layers[fi].name));
+        let mut flat = SculptLayer::new(id, &name, leaves);
+        flat.parent = self.layers[fi].parent;
+        for &i in &members {
+            for l in self.layers[i].allocated_leaves() {
+                let range = self.bvh.leaves[l as usize].owned_range();
+                let chunk = self.layers[i].chunks[l as usize].as_ref().unwrap();
+                let out = flat.chunks[l as usize].get_or_insert_with(|| vec![glam::Vec3::ZERO; range.len()].into_boxed_slice());
+                for (k, v) in range.enumerate() {
+                    out[k] += chunk[k] * (self.layers[i].weight(v) / outer);
+                }
+            }
+        }
+        let mut hidden = self.layers[fi].meta();
+        hidden.visible = false;
+        let slot = self.layers.len();
+        self.exec(
+            "Flatten folder",
+            vec![StructOp::Insert { index: slot, layer: Box::new(flat) }, StructOp::Meta { id: folder, meta: hidden }, StructOp::Active { id: Some(id) }],
+        );
+        Ok(id)
+    }
     /// Move a node (with its subtree) to a new place. Refuses moves that would nest a folder inside itself.
     pub fn move_layer(&mut self, id: LayerId, at: Placement) -> Result<()> {
         self.layer_index(id)?;
@@ -539,4 +638,9 @@ impl Document {
         }
         Ok(())
     }
+}
+
+/// Name of the channel a layer's Paint op writes into.
+pub fn paint_channel(id: LayerId) -> String {
+    format!("paint.layer{}", id.0)
 }

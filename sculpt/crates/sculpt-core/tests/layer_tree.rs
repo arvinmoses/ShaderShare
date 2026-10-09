@@ -483,3 +483,107 @@ fn batch_edit_is_one_undo_step() {
     assert!(d.redo());
     assert_eq!(d.layer(b).unwrap().opacity, 0.5);
 }
+
+// ------------------------------------------------- undoable flatten, own paint, folder flatten
+
+fn paint_into(d: &mut Document, channel: &str) {
+    let s = BrushSettings { radius: 0.4, strength: 1.0, ..Default::default() };
+    brush::stroke(d, &mut sculpt_core::brush::PaintBrush { target: sculpt_core::PaintTarget::Channel(channel.into()), value: 1.0 }, &s, &[(Vec3::new(0.0, 1.0, 0.0), 1.0)]).unwrap();
+}
+
+#[test]
+fn flatten_layer_is_one_undo_step_and_keeps_history() {
+    let mut d = doc();
+    let keep = d.insert_layer("Keep", Placement::Top).unwrap();
+    bump(&mut d);
+    let l = d.insert_layer("Flat", Placement::Top).unwrap();
+    let s = BrushSettings { radius: 0.3, strength: 1.0, ..Default::default() };
+    brush::stroke(&mut d, &mut ClayBuildup::default(), &s, &[(Vec3::new(0.1, 1.0, 0.0), 1.0), (Vec3::new(0.2, 1.0, 0.0), 1.0)]).unwrap();
+    d.set_layer_opacity(l, 0.7).unwrap();
+    let before = d.positions().to_vec();
+    d.flatten_layer(l).unwrap();
+    assert_eq!(names(&d), ["Keep"]);
+    assert!(max_diff(&before, d.positions()) < 1e-4, "the surface is unchanged");
+    assert!(d.undo(), "history survives a flatten");
+    assert_eq!(names(&d), ["Flat", "Keep"]);
+    assert!(max_diff(&before, d.positions()) < 1e-4);
+    assert_eq!(d.layer(l).unwrap().opacity, 0.7);
+    assert!(d.redo());
+    assert_eq!(names(&d), ["Keep"]);
+    let _ = keep;
+}
+
+#[test]
+fn duplicate_and_paste_give_the_copy_its_own_paint() {
+    use sculpt_core::mask::{MaskLayer, MaskSource, MaskStack};
+    let mut d = doc();
+    let a = d.insert_layer("A", Placement::Top).unwrap();
+    bump(&mut d);
+    let chan = sculpt_core::layer_ops::paint_channel(a);
+    let stack = MaskStack::new(0.0).with(MaskLayer::new("Paint", MaskSource::Channel { name: chan.clone() }));
+    let mut m = d.layer(a).unwrap().meta();
+    m.mask = Some(stack);
+    d.set_layer_meta(a, m, false).unwrap();
+    paint_into(&mut d, &chan);
+
+    let b = d.duplicate_layer(a).unwrap();
+    let copy_chan = sculpt_core::layer_ops::paint_channel(b);
+    assert_ne!(chan, copy_chan);
+    let MaskSource::Channel { name } = &d.layer(b).unwrap().mask.as_ref().unwrap().layers[0].source else { panic!() };
+    assert_eq!(name, &copy_chan, "the copy's Paint op points at its own channel");
+    assert_eq!(d.channels()[&chan], d.channels()[&copy_chan], "and starts with the same paint");
+
+    // Painting the original leaves the copy alone.
+    d.set_active_layer(Some(a)).unwrap();
+    let before_copy = d.channels()[&copy_chan].clone();
+    let s = BrushSettings { radius: 0.3, strength: 1.0, ..Default::default() };
+    brush::stroke(&mut d, &mut sculpt_core::brush::PaintBrush { target: sculpt_core::PaintTarget::Channel(chan.clone()), value: 0.0 }, &s, &[(Vec3::new(0.0, 1.0, 0.0), 1.0)]).unwrap();
+    assert_eq!(d.channels()[&copy_chan], before_copy);
+
+    // Undo removes the copy and its channel.
+    assert!(d.undo(), "first undo reverts the erase stroke");
+    assert!(d.layer(b).is_some());
+    assert!(d.undo());
+    assert!(d.layer(b).is_none());
+    assert!(!d.channels().contains_key(&copy_chan), "no orphan paint after undo");
+
+    // Paste does the same for a mask that came from another layer.
+    let c = d.insert_layer("C", Placement::Top).unwrap();
+    let clip = d.layer(a).unwrap().mask.clone().unwrap();
+    d.paste_mask(c, a, &clip).unwrap();
+    let paste_chan = sculpt_core::layer_ops::paint_channel(c);
+    assert!(d.channels().contains_key(&paste_chan));
+    assert!(d.undo());
+    assert!(d.layer(c).unwrap().mask.is_none());
+}
+
+#[test]
+fn flatten_folder_keeps_the_surface_hides_the_folder_and_undoes() {
+    let mut d = doc();
+    let f = d.insert_folder("Face", Placement::Top).unwrap();
+    let a = d.insert_layer("A", Placement::Into(f)).unwrap();
+    bump(&mut d);
+    d.set_layer_opacity(a, 0.8).unwrap();
+    let b = d.insert_layer("B", Placement::Into(f)).unwrap();
+    let s = BrushSettings { radius: 0.3, strength: 1.0, ..Default::default() };
+    brush::stroke(&mut d, &mut ClayBuildup::default(), &s, &[(Vec3::new(0.1, 1.0, 0.0), 1.0), (Vec3::new(0.2, 1.0, 0.0), 1.0)]).unwrap();
+    d.set_layer_opacity(f, 0.6).unwrap();
+    let before = d.positions().to_vec();
+
+    let flat = d.flatten_folder(f).unwrap();
+    assert_eq!(d.layer(flat).unwrap().name, "Face flattened");
+    assert!(!d.layer(f).unwrap().visible, "the source folder is hidden, not deleted");
+    assert!(max_diff(&before, d.positions()) < 1e-4, "the surface is unchanged");
+    assert_eq!(d.active_layer(), Some(flat));
+
+    assert!(d.undo());
+    assert!(d.layer(flat).is_none() && d.layer(f).unwrap().visible);
+    assert!(max_diff(&before, d.positions()) < 1e-4);
+    let _ = (a, b);
+
+    // A non-Add layer inside refuses the flatten.
+    let mut m = d.layer(a).unwrap().meta();
+    m.blend = sculpt_core::LayerBlend::Max;
+    d.set_layer_meta(a, m, false).unwrap();
+    assert!(d.flatten_folder(f).is_err());
+}

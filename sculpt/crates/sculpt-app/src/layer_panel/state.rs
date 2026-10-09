@@ -29,7 +29,8 @@ pub struct PanelState {
     /// Tab quick-switcher, when open.
     pub switcher: Option<super::switcher::Switcher>,
     /// Last copied mask, for Paste mask.
-    pub mask_clip: Option<sculpt_core::mask::MaskStack>,
+    /// The layer it came from (so its paint can be copied) and the mask.
+    pub mask_clip: Option<(sculpt_core::LayerId, sculpt_core::mask::MaskStack)>,
     /// Collapsed folder the drag is hovering, and since when (spring-open).
     pub spring: Option<(LayerId, Instant)>,
     /// Rows as drawn last frame (hit testing for drops, headless checks).

@@ -460,19 +460,26 @@ impl Document {
         if self.layers[i].blend != crate::layers::LayerBlend::Add {
             return Err(Error::InvalidData("only layers in Add mode can be flattened into the base".into()));
         }
-        let layer = self.layers.remove(i);
-        for l in layer.allocated_leaves() {
+        // One undo step: the touched base leaves are snapshotted, then the layer leaves the stack.
+        self.begin_stroke("Flatten layer");
+        let leaves = self.layers[i].allocated_leaves();
+        for &l in &leaves {
+            self.snapshot(&undo::Target::Base, l);
+        }
+        for &l in &leaves {
             let r = self.bvh.leaves[l as usize].owned_range();
-            let chunk = layer.chunks[l as usize].as_ref().unwrap();
+            let chunk = self.layers[i].chunks[l as usize].as_ref().unwrap();
             for (k, v) in r.enumerate() {
-                self.base[v] += chunk[k] * layer.weight(v);
+                self.base[v] += chunk[k] * self.layers[i].weight(v);
             }
         }
+        let mut ops = vec![undo::StructOp::Remove { index: i }];
         if self.active == Some(id) {
-            self.active = self.layers.last().map(|l| l.id);
+            let next = self.layers.iter().rev().find(|l| !l.is_folder() && l.id != id).map(|l| l.id);
+            ops.push(undo::StructOp::Active { id: next });
         }
-        self.undo.clear();
-        self.recomposite(&layer.allocated_leaves());
+        self.exec_in_open(ops);
+        self.end_stroke();
         Ok(())
     }
 
@@ -895,7 +902,7 @@ impl Document {
         group.records.push(Record { target: target.clone(), leaf, data });
     }
 
-    fn snapshot_absent_channel(&mut self, name: &str) {
+    pub(crate) fn snapshot_absent_channel(&mut self, name: &str) {
         let group = self.undo.open.get_or_insert_with(|| Group::new("Edit"));
         let target = undo::Target::Channel(name.into());
         // Leaf u32::MAX marks "whole channel".

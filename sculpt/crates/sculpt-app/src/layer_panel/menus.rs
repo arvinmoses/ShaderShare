@@ -69,6 +69,9 @@ pub fn row_menu(app: &mut SculptApp, ui: &mut Ui, n: &Node) {
         run(app, ui, LayerCommand::Edit { id: n.id, edit: command::MetaEdit::Visible(!n.visible), coalesce: false });
     }
     ui.separator();
+    if n.is_folder && item(app, ui, "Flatten folder", Some(Command::LayerFlatten), !multi) {
+        run(app, ui, LayerCommand::FlattenFolder);
+    }
     if !n.is_folder && !multi && item(app, ui, "Flatten into base mesh", None, true) {
         run(app, ui, LayerCommand::Flatten);
     }
