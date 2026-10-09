@@ -306,7 +306,7 @@ an add bar (+ Layer, Folder, Mask, Op, duplicate, merge, delete) that inserts
 above the selection. The module is split by responsibility: `selection`
 (multi-select model), `tree` (rows read from the document), `row`, `menus`,
 `add_bar`, `dragdrop` (pure drop-zone math) with `drag_ui`, `breadcrumb`, and
-`command`, the only path by which the UI changes layers, so undo stays
+`target` (what a stroke edits, and when it is refused; drives the viewport chip, breadcrumb and stroke guard), `switcher` (Tab) and `command`, the only path by which the UI changes layers, so undo stays
 consistent and hotkeys, menus and buttons share one behaviour. **PROPERTIES** edits the selection (layer, mask base,
 or a single effect: blend, opacity, source parameters, levels, blur, order)
 and then the brush; selecting a Paint effect retargets Mask Paint to that

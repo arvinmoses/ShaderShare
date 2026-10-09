@@ -65,6 +65,9 @@ pub struct UiColors {
     /// Paint target: layer mask (purple by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_mask: Option<Hex>,
+    /// Paint target: freeze (blue by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_freeze: Option<Hex>,
     /// Refused drops, disabled masks, destructive items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub danger: Option<Hex>,
@@ -79,6 +82,9 @@ impl UiColors {
     }
     pub fn target_mask(&self) -> Color32 {
         self.target_mask.map_or(Color32::from_rgb(0xb0, 0x7c, 0xe8), |h| h.0)
+    }
+    pub fn target_freeze(&self) -> Color32 {
+        self.target_freeze.map_or(Color32::from_rgb(0x4c, 0x7c, 0xf0), |h| h.0)
     }
     pub fn danger(&self) -> Color32 {
         self.danger.map_or(Color32::from_rgb(0xe0, 0x4a, 0x4a), |h| h.0)

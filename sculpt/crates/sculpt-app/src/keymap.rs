@@ -40,6 +40,9 @@ pub enum Command {
     LayerSolo,
     LayerLock,
     LayerHide,
+    LayerSwitcher,
+    ToggleTarget,
+    ViewMask,
     ToggleHud,
     CycleOverlay,
     InvertFreeze,
@@ -77,6 +80,9 @@ impl Command {
             Command::LayerSolo => "Solo layer",
             Command::LayerLock => "Lock layer",
             Command::LayerHide => "Hide layer",
+            Command::LayerSwitcher => "Switch layer…",
+            Command::ToggleTarget => "Toggle layer / mask target",
+            Command::ViewMask => "View mask",
             Command::ToggleHud => "Toggle HUD",
             Command::CycleOverlay => "Cycle overlay",
             Command::InvertFreeze => "Invert freeze",
@@ -169,5 +175,26 @@ impl Keymap {
             }
         });
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_keymap_parses_and_has_no_clashes() {
+        let km = Keymap::load(std::path::Path::new("/nonexistent/keymap.json"));
+        assert!(km.errors.is_empty(), "{:?}", km.errors);
+        let mut seen = std::collections::HashMap::new();
+        for (shortcut, b) in &km.bindings {
+            if let Some(prev) = seen.insert(format!("{shortcut:?}"), b.command) {
+                assert!(prev == b.command, "{:?} and {:?} share {}", prev, b.command, b.keys);
+            }
+        }
+        // The layer commands people reach for from the viewport are all bound.
+        for cmd in [Command::LayerDuplicate, Command::LayerGroup, Command::LayerSolo, Command::LayerSwitcher, Command::ToggleTarget, Command::ViewMask, Command::LayerMergeDown] {
+            assert!(km.bindings.iter().any(|(_, b)| b.command == cmd), "{cmd:?} has no default key");
+        }
     }
 }

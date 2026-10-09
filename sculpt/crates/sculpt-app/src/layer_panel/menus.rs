@@ -77,6 +77,20 @@ pub fn row_menu(app: &mut SculptApp, ui: &mut Ui, n: &Node) {
     }
 }
 
+/// Right-click menu in the viewport: the active layer's menu, then the global adds. Same items as the
+/// panel, so nothing needs the pointer to leave the model.
+pub fn viewport_menu(app: &mut SculptApp, ui: &mut Ui) {
+    let id = app.layers.selection.primary().or_else(|| app.doc.as_ref().and_then(|d| d.active_layer()));
+    let node = app.doc.as_ref().and_then(|d| super::tree::visible_nodes(app, d).into_iter().find(|n| Some(n.id) == id));
+    if let Some(n) = node {
+        ui.label(egui::RichText::new(&n.name).strong());
+        ui.separator();
+        row_menu(app, ui, &n);
+        ui.separator();
+    }
+    empty_menu(app, ui);
+}
+
 /// Menu for empty space below the rows.
 pub fn empty_menu(app: &mut SculptApp, ui: &mut Ui) {
     if item(app, ui, "New layer", Some(Command::NewLayer), true) {

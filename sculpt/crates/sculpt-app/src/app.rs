@@ -312,6 +312,9 @@ impl SculptApp {
             self.select_tool(t);
             return;
         }
+        if crate::layer_panel::switcher::run(self, ctx, cmd) {
+            return;
+        }
         if let Some(lc) = crate::layer_panel::command::from_keymap(cmd, self) {
             crate::layer_panel::command::execute(self, lc);
             return;
@@ -447,6 +450,11 @@ impl SculptApp {
     }
 
     fn begin_stroke(&mut self, pos: Pos2, modifiers: egui::Modifiers) {
+        // A stroke that would change nothing is refused up front, with the reason in the status bar.
+        if let Some(why) = crate::layer_panel::target::resolve(self).and_then(|t| t.refusal) {
+            self.status = why;
+            return;
+        }
         let Some(doc) = self.doc.as_mut() else { return };
         let size = self.viewport_rect.size();
         let local = pos - self.viewport_rect.min;
@@ -707,6 +715,16 @@ impl SculptApp {
                 }
             }
 
+        // What a stroke would edit, next to the brush.
+        if matches!(self.stroke, Stroke::None)
+            && !navigating
+            && !busy
+            && let (Some(hover), Some(target)) = (resp.hover_pos(), crate::layer_panel::target::resolve(self))
+        {
+            crate::layer_panel::hud::chip(&ui.painter_at(rect), hover, &target, &self.theme.ui, self.theme.metrics.font_size, rect);
+        }
+        egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::viewport_menu(self, ui));
+
         // Upload + render.
         let ppp = ctx.pixels_per_point();
         let px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
@@ -880,6 +898,7 @@ impl eframe::App for SculptApp {
         crate::panels::status_bar(self, ui);
         crate::panels::tray(self, ui);
         crate::panels::right_panel(self, ui);
+        crate::layer_panel::switcher::show(self, &ctx);
         crate::panels::dialogs(self, &ctx);
         crate::panels::theme_editor(self, &ctx);
         crate::panels::keymap_window(self, &ctx);

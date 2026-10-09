@@ -10,12 +10,15 @@ pub mod add_bar;
 pub mod breadcrumb;
 pub mod command;
 pub mod drag_ui;
+pub mod hud;
 pub mod dragdrop;
 pub mod mask_ops;
 pub mod menus;
 pub mod row;
 pub mod selection;
 pub mod state;
+pub mod switcher;
+pub mod target;
 pub mod tree;
 
 use egui::{Rect, Sense, Ui, vec2};
