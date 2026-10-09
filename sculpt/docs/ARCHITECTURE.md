@@ -83,6 +83,8 @@ into one step). Each command is a list of reversible `StructOp`s recorded in the
 same undo stack as strokes, so removed layers keep their data in the stack and
 undo/redo are exact. **Previews** (`preview.rs`): `delta_preview` and `mask_preview` sample at most 96 vertices per spatial leaf into a front-view grid, so cost follows the leaf count, not the face count. `edit_serial` bumps on every geometry or mask change; the UI cache (`layer_panel/thumbs.rs`) rebuilds a thumbnail only when the serial moved, it is over 0.5 s old, no stroke is in progress, and fewer than two were built this frame.
 
+Duplicating a layer or pasting a mask gives the copy its own hand-painted channels (`paint.layer<id>`), recorded in the same undo step. `flatten_layer` is undoable (touched base leaves are snapshotted); `flatten_folder` bakes Add-mode layers into one new layer and hides the folder.
+
 Project format v2 adds `kind`, `parent` and `collapsed`;
 v1 files load unchanged (fixture `tests/fixtures/v1_project`).
 

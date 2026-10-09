@@ -42,7 +42,7 @@ cargo run --release -p sculpt-app --features tablet      # + octotablet pen pres
 | `[` `]` / Shift+`[` `]` | brush size / strength |
 | `F` frame · `Shift+D` subdivide · `O` cycle overlay · `H` HUD | |
 | `Ctrl+L` new layer · `Ctrl+Shift+N` new folder · `Ctrl+D` duplicate · `Ctrl+G` / `Ctrl+Shift+G` group / ungroup | layers act on the selection |
-| `Tab` switch layer at the cursor · `M` paint target layer ⇄ mask · `Alt+M` view mask · right-click the viewport for the layer menu | |
+| `Tab` switch layer at the cursor · `Q` radial menu at the cursor · `Ctrl+M` flatten folder · `Shift+M` disable/enable mask · `Ctrl+Shift+C` / `Ctrl+Shift+V` copy / paste mask · `M` paint target layer ⇄ mask · `Alt+M` view mask · right-click the viewport for the layer menu | |
 | `Ctrl+E` merge down · `S` solo · `Shift+L` lock · `Shift+H` hide · `F2` rename · `Delete` delete | work while hovering the viewport too |
 
 Everything above is data: **themes** are JSON files (built-ins in
@@ -67,7 +67,7 @@ The layout is a Substance Painter / Mudbox hybrid:
   inserts above the selection. Every layer action is undoable with `Ctrl+Z`.
   **Masks** are one step: **Mask ▾** (or the **+** slot beside a layer's thumbnail, or right-click) offers
   White, Black, *From bake* (Curvature, Cavity, AO, Thickness), *From noise* and *Hand-painted*. A layer
-  with a mask lists its ops beneath it; right-click an op to disable, duplicate, move or delete it.
+  with a mask lists its ops beneath it; right-click an op to disable, duplicate, move or delete it, or drag it to reorder (a purple line shows where it lands).
   Click the mask thumbnail to paint it, Alt+click to view it in the viewport, Shift+click to disable or
   enable it (a red slash shows it is off). Mask menus also copy, paste, invert and remove masks.
 - **Paint target**: a chip beside the brush names what a stroke would change (orange = layer, purple = mask,

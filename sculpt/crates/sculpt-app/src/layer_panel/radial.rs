@@ -8,8 +8,8 @@ use super::mask_ops::{MaskAction, Preset};
 use crate::app::SculptApp;
 use crate::keymap::Command;
 
-const RADIUS: f32 = 82.0;
-const ITEM: egui::Vec2 = vec2(86.0, 30.0);
+const RADIUS: f32 = 120.0;
+const ITEM: egui::Vec2 = vec2(88.0, 30.0);
 
 /// What a radial item does when picked.
 #[derive(Clone, Debug, PartialEq)]
