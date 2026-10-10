@@ -45,9 +45,25 @@ fn generated_sphere_is_closed_and_has_the_requested_size() {
 }
 
 #[test]
+fn generated_sphere_faces_all_point_outward() {
+    // Two inside-out cube faces once made normals cancel along the cube edges: seams in the viewport.
+    let m = quad_sphere_res(24, 1.0);
+    for f in &m.faces {
+        for t in sculpt_core::mesh::face_triangles(f) {
+            let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
+            assert!((b - a).cross(c - a).dot(a + b + c) > 0.0, "triangle {t:?} faces inward");
+        }
+    }
+    let doc = Document::from_mesh(m).unwrap();
+    for (p, n) in doc.positions().iter().zip(doc.normals()) {
+        assert!(p.normalize().dot(*n) > 0.99, "vertex normal {n} is not radial at {p}");
+    }
+}
+
+#[test]
 fn leaf_only_cut_is_the_whole_mesh_and_the_root_alone_is_small() {
     let doc = big_doc();
-    let tree = LodTree::build(doc.positions(), doc.faces(), doc.bvh(), LodParams::default());
+    let tree = LodTree::build(doc.positions(), doc.normals(), doc.faces(), doc.bvh(), LodParams::default());
     let eye = Vec3::new(0.0, 0.0, 3.0);
     let view = view_from(eye, 45.0, 1000.0);
     // Threshold zero: descend everywhere. Back faces and the far side still count, so use the whole pool.
@@ -65,7 +81,7 @@ fn leaf_only_cut_is_the_whole_mesh_and_the_root_alone_is_small() {
 #[test]
 fn every_random_cut_through_the_tree_is_watertight() {
     let doc = big_doc();
-    let tree = LodTree::build(doc.positions(), doc.faces(), doc.bvh(), LodParams::default());
+    let tree = LodTree::build(doc.positions(), doc.normals(), doc.faces(), doc.bvh(), LodParams::default());
     // A cheap deterministic generator, so the test needs no extra crate.
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut rnd = move || {
@@ -95,7 +111,7 @@ fn every_random_cut_through_the_tree_is_watertight() {
 #[test]
 fn errors_never_shrink_towards_the_root() {
     let doc = big_doc();
-    let tree = LodTree::build(doc.positions(), doc.faces(), doc.bvh(), LodParams::default());
+    let tree = LodTree::build(doc.positions(), doc.normals(), doc.faces(), doc.bvh(), LodParams::default());
     for n in &tree.nodes {
         if let Some([l, r]) = n.children {
             assert!(n.error >= tree.nodes[l as usize].error && n.error >= tree.nodes[r as usize].error);
@@ -107,7 +123,7 @@ fn errors_never_shrink_towards_the_root() {
 #[test]
 fn the_triangle_budget_is_honoured_and_far_views_draw_less() {
     let doc = big_doc();
-    let tree = LodTree::build(doc.positions(), doc.faces(), doc.bvh(), LodParams::default());
+    let tree = LodTree::build(doc.positions(), doc.normals(), doc.faces(), doc.bvh(), LodParams::default());
     let near = view_from(Vec3::new(0.0, 0.0, 1.6), 45.0, 1000.0);
     let far = view_from(Vec3::new(0.0, 0.0, 40.0), 45.0, 1000.0);
     let near_cut = tree.select(doc.bvh(), &near, 1.0, u64::MAX);
@@ -140,7 +156,7 @@ fn coarse_levels_follow_edits_because_they_share_vertices() {
 #[test]
 fn frustum_culls_what_is_behind_or_beside_the_camera() {
     let doc = big_doc();
-    let tree = LodTree::build(doc.positions(), doc.faces(), doc.bvh(), LodParams::default());
+    let tree = LodTree::build(doc.positions(), doc.normals(), doc.faces(), doc.bvh(), LodParams::default());
     let eye = Vec3::new(0.0, 0.0, 1.5);
     let looking_at = view_from(eye, 45.0, 1000.0);
     let seen = tree.select(doc.bvh(), &looking_at, 0.2, u64::MAX);

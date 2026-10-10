@@ -178,6 +178,15 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 cmd_button(app, ui, Command::FrameMesh);
                 cmd_button(app, ui, Command::ToggleHud);
                 ui.add(egui::Slider::new(&mut app.overlay_strength, 0.0..=1.0).text("Overlay opacity"));
+                ui.separator();
+                ui.label("Viewport detail (dense meshes)");
+                for d in crate::app::ViewDetail::ALL {
+                    if ui.radio(app.view_detail == d, d.name()).on_hover_text(d.hint()).clicked() {
+                        app.view_detail = d;
+                        app.save_settings();
+                    }
+                }
+                ui.separator();
                 if ui.button("Mesh info…").clicked() {
                     app.show_mesh_info = true;
                     ui.close();

@@ -42,6 +42,8 @@ pub struct Options {
     pub demo_layers: bool,
     /// Orbit the camera for this many frames and report timings, waiting for the GPU each frame.
     pub bench_orbit: Option<u32>,
+    /// Multiply the initial framing distance (below 1 zooms in), for close-up tests and screenshots.
+    pub zoom: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -109,8 +111,11 @@ pub enum Selection {
 pub struct SculptApp {
     pub doc: Option<Document>,
     job: Option<Job>,
-    /// Screen-space error tolerance for the LOD cut, in pixels.
-    pub lod_tau: f32,
+    start_zoom: f32,
+    /// How faithfully dense meshes are drawn (Display menu).
+    pub view_detail: ViewDetail,
+    /// `SCULPT_LOD_TAU` overrides the preset's tolerance (benchmarks).
+    lod_tau_override: Option<f32>,
     /// Background re-simplification of patches outdated by edits: (topology id, result channel).
     lod_refresh: Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>,
     /// Triangles per background batch; grows while the worker outpaces frames, shrinks when it lags.
@@ -189,10 +194,12 @@ impl SculptApp {
         let mut app = SculptApp {
             doc: None,
             job: None,
+            start_zoom: opts.zoom,
             lod_refresh: None,
             lod_batch: LOD_REFRESH_BATCH_MIN,
             last_edit: Instant::now(),
-            lod_tau: std::env::var("SCULPT_LOD_TAU").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            view_detail: ViewDetail::Balanced,
+            lod_tau_override: std::env::var("SCULPT_LOD_TAU").ok().and_then(|v| v.parse().ok()),
             viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
             camera: Camera::default(),
             themes,
@@ -235,6 +242,7 @@ impl SculptApp {
             demo_layers: opts.demo_layers,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
+        app.view_detail = settings["view_detail"].as_str().and_then(ViewDetail::from_name).unwrap_or(ViewDetail::Balanced);
         for e in app.themes.errors.iter().chain(&app.keymap.errors) {
             eprintln!("config: {e}");
         }
@@ -254,7 +262,7 @@ impl SculptApp {
     pub fn save_settings(&self) {
         let cfg = config_dir();
         let _ = std::fs::create_dir_all(&cfg);
-        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools, "layers_compact": self.layers.compact });
+        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools, "layers_compact": self.layers.compact, "view_detail": self.view_detail.name() });
         let _ = std::fs::write(cfg.join("settings.json"), serde_json::to_string_pretty(&v).unwrap());
     }
 
@@ -291,6 +299,7 @@ impl SculptApp {
                     self.doc = Some(doc);
                     if first {
                         self.camera.frame(&self.doc.as_ref().unwrap().bounds());
+                        self.camera.distance *= self.start_zoom;
                     }
                     if std::mem::take(&mut self.demo_layers) {
                         self.setup_demo_layers();
@@ -310,8 +319,12 @@ impl SculptApp {
     fn maybe_build_lod(&mut self) {
         let Some(doc) = self.doc.as_ref() else { return };
         if doc.lod().is_none() && std::env::var_os("SCULPT_NO_LOD").is_none() && doc.face_count() * 2 >= LOD_MIN_TRIANGLES {
-            self.start_doc_job("Building level of detail", |d| {
-                d.build_lod(sculpt_core::lod::LodParams::default());
+            let mut params = sculpt_core::lod::LodParams::default();
+            if let Some(w) = std::env::var("SCULPT_LOD_NORMAL_WEIGHT").ok().and_then(|v| v.parse().ok()) {
+                params.normal_weight = w;
+            }
+            self.start_doc_job("Building level of detail", move |d| {
+                d.build_lod(params);
                 Ok(())
             });
         }
@@ -789,8 +802,9 @@ impl SculptApp {
                 self.stats.upload = vp.last_upload;
             }
             let t = Instant::now();
-            let tau = if navigating { self.lod_tau * 2.0 } else { self.lod_tau };
-            let lod = self.doc.as_ref().and_then(|d| {
+            let tau = self.lod_tau_override.or(self.view_detail.tau_px());
+            let tau = tau.map(|t| if navigating { t * 2.0 } else { t });
+            let lod = self.doc.as_ref().zip(tau).and_then(|(d, tau)| {
                 d.lod().map(|tree| crate::viewport::LodInput { tree, bvh: d.bvh(), topology_id: d.topology_id(), tau_px: tau, budget: LOD_BUDGET })
             });
             let tex = vp.render(rs, px, &self.camera, &self.theme, self.overlay_strength, self.cursor, lod);
@@ -883,7 +897,9 @@ impl SculptApp {
         )];
         lines.push(format!("input+dabs {:>5.2} ms ({} dabs, {} queued)   render {:>4.2} ms", s.input_ms, s.dabs, s.pending, s.render_ms));
         if s.lod.active {
-            lines.push(format!("LOD {} tris in {} patches, tau {:.1}px, select {:.2} ms", fmt_count(s.lod.triangles as usize), s.lod.nodes, s.lod.tau_px, s.lod.select_ms));
+            lines.push(format!("{} detail: {} tris in {} patches, tau {:.1}px, select {:.2} ms", self.view_detail.name(), fmt_count(s.lod.triangles as usize), s.lod.nodes, s.lod.tau_px, s.lod.select_ms));
+        } else if self.view_detail == ViewDetail::Full && self.doc.as_ref().is_some_and(|d| d.lod().is_some()) {
+            lines.push("Full detail: every triangle (Display > Viewport detail)".to_string());
         }
         lines.push(format!("upload {:>7.1} KB in {} ranges ({:.2} ms)", s.upload.bytes as f32 / 1024.0, s.upload.ranges, s.upload.ms));
         lines.push(format!("pen: {}  pressure {:.2}", self.pen.source.label(), self.pen.pressure));
@@ -923,6 +939,52 @@ impl SculptApp {
 
     pub fn tool_hotkey(&self, ctx: &egui::Context, t: Tool) -> String {
         self.keymap.shortcut_text(ctx, t.command()).unwrap_or_default()
+    }
+}
+
+/// How faithfully dense meshes are drawn: the level-of-detail tolerance, or the full mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewDetail {
+    Draft,
+    Balanced,
+    Sharp,
+    /// Every triangle, no level of detail: the reference for what the mesh really is.
+    Full,
+}
+
+impl ViewDetail {
+    pub const ALL: [ViewDetail; 4] = [ViewDetail::Draft, ViewDetail::Balanced, ViewDetail::Sharp, ViewDetail::Full];
+
+    /// Screen-space error tolerance in pixels; `None` draws every triangle.
+    pub fn tau_px(self) -> Option<f32> {
+        match self {
+            ViewDetail::Draft => Some(2.0),
+            ViewDetail::Balanced => Some(1.0),
+            ViewDetail::Sharp => Some(0.5),
+            ViewDetail::Full => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ViewDetail::Draft => "Draft",
+            ViewDetail::Balanced => "Balanced",
+            ViewDetail::Sharp => "Sharp",
+            ViewDetail::Full => "Full",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            ViewDetail::Draft => "Fastest; up to 2 px of simplification",
+            ViewDetail::Balanced => "About one pixel of simplification",
+            ViewDetail::Sharp => "Half-pixel; roughly twice the triangles",
+            ViewDetail::Full => "Every triangle; slow on very dense meshes",
+        }
+    }
+
+    fn from_name(s: &str) -> Option<ViewDetail> {
+        ViewDetail::ALL.into_iter().find(|d| d.name() == s)
     }
 }
 

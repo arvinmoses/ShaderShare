@@ -242,7 +242,7 @@ impl Document {
 
     /// Build (or rebuild) the level-of-detail tree for the current topology. Takes seconds on tens of millions of triangles.
     pub fn build_lod(&mut self, params: crate::lod::LodParams) {
-        let tree = crate::lod::LodTree::build(&self.positions, &self.faces, &self.bvh, params);
+        let tree = crate::lod::LodTree::build(&self.positions, &self.normals, &self.faces, &self.bvh, params);
         self.lod = Some((self.topology_id, std::sync::Arc::new(tree)));
     }
 
@@ -253,19 +253,19 @@ impl Document {
 
     /// Re-simplify every level-of-detail patch that edits have outdated, on this thread.
     pub fn refresh_lod_now(&mut self) {
-        let positions = std::mem::take(&mut self.positions);
+        let (positions, normals) = (std::mem::take(&mut self.positions), std::mem::take(&mut self.normals));
         if let Some(tree) = self.lod_tree_mut() {
-            tree.refresh_now(&positions);
+            tree.refresh_now(&positions, &normals);
         }
-        self.positions = positions;
+        (self.positions, self.normals) = (positions, normals);
     }
 
     /// Copy out up to `max_triangles` of outdated level-of-detail patches for a background thread.
     /// Returns `None` when nothing is ready. The returned batch's topology id must match on apply.
     pub fn gather_lod_refresh(&mut self, max_triangles: usize) -> Option<(u64, crate::lod::RefreshBatch)> {
-        let positions = std::mem::take(&mut self.positions);
-        let batch = self.lod_tree_mut().map(|tree| tree.gather_refresh(&positions, max_triangles));
-        self.positions = positions;
+        let (positions, normals) = (std::mem::take(&mut self.positions), std::mem::take(&mut self.normals));
+        let batch = self.lod_tree_mut().map(|tree| tree.gather_refresh(&positions, &normals, max_triangles));
+        (self.positions, self.normals) = (positions, normals);
         batch.filter(|b| !b.is_empty()).map(|b| (self.topology_id, b))
     }
 

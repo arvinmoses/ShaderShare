@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sculpt-app [project.sculpt] [--level N] [--quads N] [--theme NAME]
-//!            [--test-strokes FRAMES] [--bench-orbit FRAMES] [--screenshot out.png] [--size WxH]
+//!            [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--size WxH]
 //!            [--demo-layers]
 //! ```
 
@@ -39,12 +39,13 @@ fn gpu_setup() -> WgpuSetup {
 
 fn main() -> eframe::Result {
     let mut args = std::env::args().skip(1);
-    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, bench_orbit: None };
+    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, bench_orbit: None, zoom: 1.0 };
     let mut size = [1600.0f32, 1000.0];
     while let Some(a) = args.next() {
         match a.as_str() {
             "--level" => opts.level = args.next().and_then(|v| v.parse().ok()).unwrap_or(7).clamp(1, 11),
             "--quads" => opts.sphere_res = args.next().and_then(|v| v.parse().ok()).map(|n: u32| n.clamp(2, 2000)),
+            "--zoom" => opts.zoom = args.next().and_then(|v| v.parse().ok()).unwrap_or(1.0f32).clamp(0.05, 20.0),
             "--bench-orbit" => opts.bench_orbit = args.next().and_then(|v| v.parse().ok()),
             "--theme" => opts.theme = args.next(),
             "--test-strokes" => opts.test_frames = args.next().and_then(|v| v.parse().ok()),
@@ -56,7 +57,7 @@ fn main() -> eframe::Result {
                 }
             }
             "-h" | "--help" => {
-                println!("sculpt-app [project.sculpt] [--level N] [--theme NAME] [--test-strokes FRAMES] [--bench-orbit FRAMES] [--screenshot out.png] [--size WxH]");
+                println!("sculpt-app [project.sculpt] [--level N] [--theme NAME] [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--size WxH]");
                 return Ok(());
             }
             p => opts.project = Some(PathBuf::from(p)),

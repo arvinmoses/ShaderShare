@@ -88,8 +88,10 @@ pub fn quad_sphere_res(res: u32, radius: f32) -> PolyMesh {
     };
     let mut positions = vec![Vec3::ZERO; vertex_count];
     let mut faces: Vec<Face> = Vec::with_capacity(6 * n * n);
-    // Each cube face: a fixed axis value, and two free axes (a, b), wound so the quad faces outward.
-    for (fixed, at, flip) in [(0usize, 0usize, true), (0, n, false), (1, 0, false), (1, n, true), (2, 0, true), (2, n, false)] {
+    // Each cube face: a fixed axis value and two free axes (a, b) in cyclic order, so `a x b` is the
+    // fixed axis and a quad walked (0,0) -> (1,0) -> (1,1) faces +axis; the faces at 0 are reversed.
+    for (fixed, at) in [(0usize, 0usize), (0, n), (1, 0), (1, n), (2, 0), (2, n)] {
+        let flip = at == 0;
         let (a, b) = match fixed {
             0 => (1, 2),
             1 => (2, 0),

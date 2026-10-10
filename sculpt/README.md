@@ -104,7 +104,9 @@ cargo run --release -p sculpt-app -- --quads 1291 --bench-orbit 120 --size 1920x
 SCULPT_NO_LOD=1 cargo run --release -p sculpt-app -- --quads 1291 --bench-orbit 20 --size 1920x1080  # baseline
 ```
 
-`--quads N` makes a sphere with 6·N² quads. The HUD shows the triangles drawn and cut-selection time.
+`--quads N` makes a sphere with 6·N² quads and `--zoom F` starts closer (below 1) or farther. The HUD shows
+the triangles drawn and cut-selection time. **Display > Viewport detail** trades speed for fidelity (Draft,
+Balanced, Sharp) or shows every triangle (Full) when you want to check the real mesh.
 
 ## Build & run
 

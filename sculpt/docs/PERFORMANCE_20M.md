@@ -31,11 +31,20 @@ Goal: sculpt and orbit a 20M-triangle mesh smoothly on a laptop RTX 3070 (target
   different levels share exactly the same border edges. The test suite checks this directly: for many random
   cuts through the tree every undirected edge is used by exactly two triangles.
 * Each node stores a world-space error (monotone toward the root: `max(child errors) + own simplification error`).
+* **Normals count as error** (`LodParams::normal_weight`, default 0.3). Shading comes from the full-resolution
+  normals of the vertices a patch keeps, so a purely geometric simplifier happily keeps a vertex from a stroke's
+  steep rim as the corner of a large flat triangle, smearing the rim's dark shading across it: spiky seams and a
+  preview that looks off from the real mesh. With normals as simplification attributes, rims survive as narrow
+  strips and patches whose shading would change report a larger error, so they are drawn finer. Measured by
+  rendering the same clay stroke with and without LOD (4.3M triangles, zoomed in): 99th-percentile pixel
+  difference 13 grey levels without, 2 with, for 12% more triangles; on a 20M mesh covered in fine noise it
+  costs 1.5x the triangles, on smooth forms nothing. (`examples/lod_error.rs` compares stored and true error.)
 
 ### Per-frame selection (CPU, ~0.02-0.25 ms)
 
 Walk the tree from the root. Skip nodes outside the frustum. Stop descending where
-`error * focal_px / distance_to_box <= tau` (default 1 px; 2 px while orbiting). A triangle budget guard raises
+`error * focal_px / distance_to_box <= tau` (Display > Viewport detail: Draft 2 px, Balanced 1 px,
+Sharp 0.5 px, or Full to draw every triangle as a reference; the tolerance doubles while orbiting). A triangle budget guard raises
 `tau` if the cut would exceed it. Adjacent index ranges are merged, written to an indirect buffer, and drawn
 with `multi_draw_indexed_indirect` (needs only the downlevel `INDIRECT_EXECUTION` flag, so it works on any
 Vulkan, DX12 or Metal device that wgpu supports).
@@ -44,8 +53,12 @@ Vulkan, DX12 or Metal device that wgpu supports).
 
 An edit marks the leaves it touched and all their ancestors **stale**. Selection ignores the error of a stale
 node and descends through it, so the edited area is drawn at full detail immediately and is always correct.
-When no dab landed this frame, the app re-simplifies stale patches deepest-first within a ~4 ms budget per frame,
-rewrites those ranges of the GPU pool, and the cut coarsens again. If the stale area is so large that the
+Once the pen has rested for 250 ms, the UI thread copies a few stale patches (their indices and corner
+positions and normals, ~0.5 ms) to a single-core worker thread that compacts and re-simplifies them; finished
+patches are installed only if no edit touched them meanwhile (a per-node epoch), the GPU pool ranges are
+rewritten and the cut coarsens again. The batch grows while the worker outpaces frames. (An earlier version
+did this on the UI thread and stalled small strokes for up to 284 ms; the stroke test's `SCULPT_TEST_TAPS=1`
+mode reproduces that pattern.) If the stale area is so large that the
 budget guard trips, selection stops forcing detail first, then loosens `tau`.
 
 ### Building it
@@ -80,8 +93,8 @@ That is a 57x reduction for a smooth sphere. Real GPU numbers need your machine 
 
 1. `cargo test -p sculpt-core --test lod`: watertight cuts, monotone errors, budget honoured, frustum culling,
    stale/refresh correctness.
-2. `sculpt-cli lod-bench 10` (about 6.3M quads) or `lod-bench 1291` (20M triangles): build time, pool size,
-   cut size at several distances.
+2. `sculpt-cli lod-bench 10000000 [relief]` (10M quads = 20M triangles; relief 0.04 adds fine noise): build
+   time, pool size, cut size at several distances. `SCULPT_LOD_NORMAL_WEIGHT` overrides the normal weight.
 3. **On your GPU:** `sculpt-app --quads 1291 --bench-orbit 120 --size 1920x1080` prints median/p95/max for the
    whole frame, CPU encode+submit **including waiting for the GPU to finish** (so it is true GPU frame time),
    triangles drawn and selection time. Run it again with `SCULPT_NO_LOD=1` for the full-mesh baseline.

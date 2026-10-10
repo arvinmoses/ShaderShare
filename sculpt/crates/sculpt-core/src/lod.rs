@@ -22,7 +22,7 @@
 //! drawing stays faithful; only the shape of the collapsed-away detail drifts until a rebuild.
 
 use glam::{Vec3, Vec4};
-use meshopt::{SimplifyOptions, VertexDataAdapter};
+use meshopt::SimplifyOptions;
 use rayon::prelude::*;
 
 use crate::bvh::{Bvh, NodeKind};
@@ -33,11 +33,17 @@ use crate::mesh::{Face, face_triangles};
 pub struct LodParams {
     /// Triangles an inner node is simplified to.
     pub node_tris: usize,
+    /// How much a change of surface normal counts as error (meshoptimizer attribute weight; it scales the
+    /// term by the patch's extent). Tuned by rendering clay strokes with and without LOD: 0 left smeared,
+    /// spiky rims (99th-percentile pixel difference 13 levels); 0.3 brings that to 2 and costs about 1.5x
+    /// the triangles on a mesh covered in fine noise, nothing extra on smooth forms; 1.0 reached 1 level but
+    /// tripled the triangles on the noisy mesh.
+    pub normal_weight: f32,
 }
 
 impl Default for LodParams {
     fn default() -> Self {
-        LodParams { node_tris: 4096 }
+        LodParams { node_tris: 4096, normal_weight: 0.3 }
     }
 }
 
@@ -142,8 +148,10 @@ struct RefreshJob {
     epoch: u32,
     /// The children's triangles, in global vertex ids.
     indices: Vec<u32>,
-    /// Position of each index's vertex, copied when the job was made.
+    /// Position and normal of each index's vertex, copied when the job was made.
     corners: Vec<Vec3>,
+    corner_normals: Vec<Vec3>,
+    params: LodParams,
     target: usize,
     child_error: f32,
 }
@@ -189,10 +197,12 @@ impl RefreshBatch {
                 verts.dedup();
                 let local_idx: Vec<u32> = j.indices.iter().map(|v| verts.binary_search(v).expect("vertex is in its own patch") as u32).collect();
                 let mut positions = vec![Vec3::ZERO; verts.len()];
-                for (&l, &p) in local_idx.iter().zip(&j.corners) {
+                let mut normals = vec![Vec3::ZERO; verts.len()];
+                for ((&l, &p), &n) in local_idx.iter().zip(&j.corners).zip(&j.corner_normals) {
                     positions[l as usize] = p;
+                    normals[l as usize] = n;
                 }
-                let (local, own) = Simplifier::new(&positions).run(&local_idx, j.target);
+                let (local, own) = Simplifier::new(&positions, &normals, j.params).run(&local_idx, j.target);
                 RefreshResult { id: j.id, epoch: j.epoch, indices: local.iter().map(|&v| verts[v as usize]).collect(), error: j.child_error + own }
             })
             .collect();
@@ -202,27 +212,59 @@ impl RefreshBatch {
 
 /// Everything a simplification call needs besides the triangles.
 struct Simplifier<'a> {
-    positions: VertexDataAdapter<'a>,
+    positions: &'a [Vec3],
+    normals: &'a [Vec3],
+    weights: [f32; 3],
 }
 
 impl<'a> Simplifier<'a> {
-    fn new(positions: &'a [Vec3]) -> Simplifier<'a> {
-        let bytes: &[u8] = bytemuck::cast_slice(positions);
-        Simplifier { positions: VertexDataAdapter::new(bytes, 12, 0).expect("positions are tightly packed f32x3") }
+    fn new(positions: &'a [Vec3], normals: &'a [Vec3], params: LodParams) -> Simplifier<'a> {
+        assert_eq!(positions.len(), normals.len());
+        Simplifier { positions, normals, weights: [params.normal_weight; 3] }
     }
 
     /// Reduce `indices` to about `target` indices, keeping patch borders, and report the error introduced.
+    ///
+    /// Normals take part as attributes. The shading of a simplified patch comes from the full-resolution
+    /// normals of the vertices it keeps, so keeping a vertex from a stroke's steep rim as the corner of a
+    /// large flat triangle smears the rim's dark shading across it (spiky seams). Weighting normals keeps
+    /// rims as narrow strips, and the reported error grows where shading would change, so selection draws
+    /// such areas finer. meshoptimizer scales the attribute term by the patch's extent, which makes it the
+    /// geometric deviation a tilt of that size would cause.
     fn run(&self, indices: &[u32], target: usize) -> (Vec<u32>, f32) {
         let mut err = 0.0f32;
         let opts = SimplifyOptions::LockBorder | SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute;
-        let out = meshopt::simplify(indices, &self.positions, target, f32::MAX, opts, Some(&mut err));
+        let mut out = vec![0u32; indices.len()];
+        // SAFETY: every pointer covers `positions.len()` tightly packed f32x3 (asserted equal in `new`), the
+        // indices reference only those vertices, `out` holds `indices.len()` entries, a null lock array is
+        // allowed by the API, and nothing is retained after the call.
+        let n = unsafe {
+            meshopt::ffi::meshopt_simplifyWithAttributes(
+                out.as_mut_ptr(),
+                indices.as_ptr(),
+                indices.len(),
+                self.positions.as_ptr().cast(),
+                self.positions.len(),
+                12,
+                self.normals.as_ptr().cast(),
+                12,
+                self.weights.as_ptr(),
+                3,
+                std::ptr::null(),
+                target,
+                f32::MAX,
+                opts.bits(),
+                &mut err,
+            )
+        };
+        out.truncate(n);
         (out, err)
     }
 }
 
 impl LodTree {
     /// Builds the tree. `positions` and `faces` are in the engine's internal order, matching `bvh`.
-    pub fn build(positions: &[Vec3], faces: &[Face], bvh: &Bvh, params: LodParams) -> LodTree {
+    pub fn build(positions: &[Vec3], normals: &[Vec3], faces: &[Face], bvh: &Bvh, params: LodParams) -> LodTree {
         // Leaf triangles, in leaf order, are the start of the pool.
         let leaf_tris: Vec<Vec<u32>> = bvh
             .leaves
@@ -239,7 +281,7 @@ impl LodTree {
             .collect();
         let full_triangles = leaf_tris.iter().map(|t| t.len() as u64 / 3).sum();
 
-        let simplifier = Simplifier::new(positions);
+        let simplifier = Simplifier::new(positions, normals, params);
         let root = Self::build_node(0, bvh, &leaf_tris, &simplifier, params);
 
         // Lay the pool out: leaves first, so a cut made only of leaves is the plain mesh.
@@ -332,9 +374,9 @@ impl LodTree {
 
     /// Re-simplify every out-of-date patch right here, on the calling thread. For tools and tests; the app
     /// uses [`gather_refresh`](Self::gather_refresh) so the work runs off the UI thread.
-    pub fn refresh_now(&mut self, positions: &[Vec3]) {
+    pub fn refresh_now(&mut self, positions: &[Vec3], normals: &[Vec3]) {
         loop {
-            let batch = self.gather_refresh(positions, usize::MAX);
+            let batch = self.gather_refresh(positions, normals, usize::MAX);
             if batch.is_empty() {
                 return;
             }
@@ -346,7 +388,7 @@ impl LodTree {
     /// Package up to `max_triangles` worth of stale patches whose children are up to date, with copies of
     /// everything simplification needs, so [`RefreshBatch::run`] can execute on another thread while editing
     /// continues. Cheap: a copy of the inputs, no simplification.
-    pub fn gather_refresh(&mut self, positions: &[Vec3], max_triangles: usize) -> RefreshBatch {
+    pub fn gather_refresh(&mut self, positions: &[Vec3], normals: &[Vec3], max_triangles: usize) -> RefreshBatch {
         let mut jobs = Vec::new();
         let mut tris = 0usize;
         if self.stale_count == 0 {
@@ -371,9 +413,10 @@ impl LodTree {
             tris += merged.len() / 3;
             // Plain copies only; the worker does the compaction, so the live mesh is never shared.
             let corners: Vec<Vec3> = merged.iter().map(|&v| positions[v as usize]).collect();
+            let corner_normals: Vec<Vec3> = merged.iter().map(|&v| normals[v as usize]).collect();
             let target = (self.params.node_tris * 3).min(self.slot[id as usize] as usize);
             self.in_flight[id as usize] = true;
-            jobs.push(RefreshJob { id, epoch: self.epoch[id as usize], indices: merged, corners, target, child_error: nl.error.max(nr.error) });
+            jobs.push(RefreshJob { id, epoch: self.epoch[id as usize], indices: merged, corners, corner_normals, params: self.params, target, child_error: nl.error.max(nr.error) });
         }
         RefreshBatch { jobs }
     }

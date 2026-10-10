@@ -330,8 +330,12 @@ fn lod_bench(quads: u32, detail: f32) -> Res<()> {
     let mut doc = Document::from_mesh(mesh)?;
     step(&format!("document + BVH: {} leaves", doc.bvh().leaves.len()), t);
     let t = Instant::now();
-    doc.build_lod(LodParams::default());
-    step("LOD tree build", t);
+    let mut params = LodParams::default();
+    if let Some(w) = std::env::var("SCULPT_LOD_NORMAL_WEIGHT").ok().and_then(|v| v.parse().ok()) {
+        params.normal_weight = w;
+    }
+    doc.build_lod(params);
+    step(&format!("LOD tree build (normal weight {})", params.normal_weight), t);
     let tree = doc.lod().expect("built").clone();
     println!(
         "  full {:>10} tris   pool {:>10} tris ({:.2}x)   {:.0} MB of indices   {} nodes",
