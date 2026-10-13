@@ -2135,6 +2135,8 @@ dependencies = [
  "glam",
  "octotablet",
  "png",
+ "pollster",
+ "rayon",
  "sculpt-core",
  "serde",
  "serde_json",

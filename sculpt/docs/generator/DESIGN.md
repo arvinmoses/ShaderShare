@@ -78,7 +78,7 @@ later behind the same data structure.
 
 ## Boolean
 
-See `spike_results.md` for the measured trade-off. The options:
+See `spike_results.md` for the measured trade-off and `spike5_gpu_sdf.md` for the GPU version of B (commit-only, not live). The options:
 
 - **Displacement boolean (A).** Evaluate each instance's signed distance at every
   vertex near it and move vertices onto the primitive surface. Same mesh, same

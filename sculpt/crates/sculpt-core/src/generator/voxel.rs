@@ -43,6 +43,17 @@ struct FineTree {
     faces: Vec<u32>,
 }
 
+/// Flattened closest-point tree for the GPU, see [`MeshSdf::flatten`].
+pub struct FlatBvh {
+    pub nodes: Vec<[u32; 8]>,
+    /// Triangle vertex indices, 3 per triangle.
+    pub tris: Vec<u32>,
+}
+
+impl FlatBvh {
+    pub const LEAF: u32 = 0x8000_0000;
+}
+
 /// Closest-point / signed distance acceleration structure over a [`Bvh`]'s leaves.
 pub struct MeshSdf<'a> {
     bvh: &'a Bvh,
@@ -174,6 +185,55 @@ impl<'a> MeshSdf<'a> {
             })
             .collect();
         MeshSdf { bvh, positions, faces, trees, pseudo }
+    }
+
+    /// Per-vertex angle-weighted pseudo-normals (the sign oracle of [`Self::signed_distance`]).
+    pub fn pseudo_normals(&self) -> &[Vec3] {
+        &self.pseudo
+    }
+
+    /// One flat binary tree for GPU upload: the engine BVH's inner nodes followed
+    /// by every leaf's fine tree, with leaves holding ranges of a triangle list
+    /// (quads split `[0,1,2]`, `[0,2,3]`, as in the CPU query).
+    ///
+    /// Node layout (8 words): `min.xyz` (f32 bits), `a`, `max.xyz` (f32 bits), `b`.
+    /// Inner node: `a` = left child, `b` = right child. Leaf: `a` = first triangle,
+    /// `b` = [`FlatBvh::LEAF`] | triangle count. Root is node 0.
+    pub fn flatten(&self) -> FlatBvh {
+        let core = &self.bvh.nodes;
+        let mut nodes: Vec<[u32; 8]> = vec![[0; 8]; core.len()];
+        let mut tris: Vec<u32> = Vec::new();
+        let put = |nodes: &mut Vec<[u32; 8]>, i: usize, b: &Aabb, a: u32, bb: u32| {
+            nodes[i] = [b.min.x.to_bits(), b.min.y.to_bits(), b.min.z.to_bits(), a, b.max.x.to_bits(), b.max.y.to_bits(), b.max.z.to_bits(), bb];
+        };
+        for (n, node) in core.iter().enumerate() {
+            match node.kind {
+                NodeKind::Inner { left, right } => put(&mut nodes, n, &node.bounds, left, right),
+                NodeKind::Leaf { leaf } => {
+                    let t = &self.trees[leaf as usize];
+                    let base = nodes.len();
+                    let map = |j: u32| if j == 0 { n } else { base + j as usize - 1 };
+                    nodes.resize(base + t.nodes.len() - 1, [0; 8]);
+                    for (j, fnode) in t.nodes.iter().enumerate() {
+                        let id = map(j as u32);
+                        if fnode.count == 0 {
+                            put(&mut nodes, id, &fnode.bounds, map(j as u32 + 1) as u32, map(fnode.right) as u32);
+                        } else {
+                            let start = tris.len() as u32 / 3;
+                            for &fi in &t.faces[fnode.start as usize..(fnode.start + fnode.count) as usize] {
+                                let f = &self.faces[fi as usize];
+                                tris.extend_from_slice(&[f[0], f[1], f[2]]);
+                                if f[3] != NO_VERT {
+                                    tris.extend_from_slice(&[f[0], f[2], f[3]]);
+                                }
+                            }
+                            put(&mut nodes, id, &fnode.bounds, start, FlatBvh::LEAF | (tris.len() as u32 / 3 - start));
+                        }
+                    }
+                }
+            }
+        }
+        FlatBvh { nodes, tris }
     }
 
     pub fn memory_bytes(&self) -> usize {

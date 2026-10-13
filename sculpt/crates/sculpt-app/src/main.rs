@@ -4,10 +4,12 @@
 //! sculpt-app [project.sculpt] [--level N] [--quads N] [--theme NAME]
 //!            [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--size WxH]
 //!            [--demo-layers]
+//! sculpt-app --gpu-sdf-bench | --gpu-sdf-check | --gpu-sdf-png <dir>      (headless GPU SDF boolean spike)
 //! ```
 
 mod app;
 mod camera;
+mod gpu_sdf;
 mod icons;
 mod layer_panel;
 mod keymap;
@@ -38,6 +40,15 @@ fn gpu_setup() -> WgpuSetup {
 }
 
 fn main() -> eframe::Result {
+    // Headless GPU SDF boolean spike (own device, no window): see gpu_sdf/mod.rs.
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if all.first().is_some_and(|a| gpu_sdf::is_gpu_sdf_command(a)) {
+        if let Err(e) = gpu_sdf::cli(&all) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let mut args = std::env::args().skip(1);
     let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, bench_orbit: None, zoom: 1.0 };
     let mut size = [1600.0f32, 1000.0];
