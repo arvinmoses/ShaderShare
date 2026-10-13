@@ -31,6 +31,8 @@ use crate::viewport::{OverlayKind, UploadStats, Viewport};
 const DAB_BUDGET: Duration = Duration::from_millis(12);
 
 pub struct Options {
+    /// Start on a synthetic quad sphere with this many quads per cube edge (6·n² quads).
+    pub sphere_res: Option<u32>,
     pub project: Option<PathBuf>,
     pub level: u32,
     pub theme: Option<String>,
@@ -38,6 +40,10 @@ pub struct Options {
     pub screenshot: Option<PathBuf>,
     /// Create a masked detail layer on startup (for demos and screenshots).
     pub demo_layers: bool,
+    /// Orbit the camera for this many frames and report timings, waiting for the GPU each frame.
+    pub bench_orbit: Option<u32>,
+    /// Multiply the initial framing distance (below 1 zooms in), for close-up tests and screenshots.
+    pub zoom: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +93,9 @@ pub struct FrameStats {
     pub dabs: usize,
     pub upload: UploadStats,
     pub render_ms: f32,
+    pub lod: crate::viewport::LodStats,
+    /// UI-thread time spent handing LOD patches to / from the background re-simplifier.
+    pub lod_refresh_ms: f32,
     pub pending: usize,
 }
 
@@ -102,6 +111,17 @@ pub enum Selection {
 pub struct SculptApp {
     pub doc: Option<Document>,
     job: Option<Job>,
+    start_zoom: f32,
+    /// How faithfully dense meshes are drawn (Display menu).
+    pub view_detail: ViewDetail,
+    /// `SCULPT_LOD_TAU` overrides the preset's tolerance (benchmarks).
+    lod_tau_override: Option<f32>,
+    /// Background re-simplification of patches outdated by edits: (topology id, result channel).
+    lod_refresh: Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>,
+    /// Triangles per background batch; grows while the worker outpaces frames, shrinks when it lags.
+    lod_batch: usize,
+    /// When the last dab landed; refresh waits for the pen to rest so it never competes with a stroke.
+    last_edit: Instant,
     viewport: Option<Viewport>,
     pub camera: Camera,
     pub themes: ThemeLibrary,
@@ -125,7 +145,7 @@ pub struct SculptApp {
     pub selection: Selection,
     /// Layers whose mask effects are shown in the stack.
     pub expanded: std::collections::HashSet<sculpt_core::LayerId>,
-    pub renaming: Option<(sculpt_core::LayerId, String)>,
+    pub layers: crate::layer_panel::PanelState,
     pub show_mesh_info: bool,
     /// Active layer when the mask editing copy was last synced.
     pub last_active: Option<sculpt_core::LayerId>,
@@ -174,6 +194,12 @@ impl SculptApp {
         let mut app = SculptApp {
             doc: None,
             job: None,
+            start_zoom: opts.zoom,
+            lod_refresh: None,
+            lod_batch: LOD_REFRESH_BATCH_MIN,
+            last_edit: Instant::now(),
+            view_detail: ViewDetail::Balanced,
+            lod_tau_override: std::env::var("SCULPT_LOD_TAU").ok().and_then(|v| v.parse().ok()),
             viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
             camera: Camera::default(),
             themes,
@@ -196,14 +222,18 @@ impl SculptApp {
             status: String::new(),
             selection: Selection::Layer,
             expanded: Default::default(),
-            renaming: None,
+            layers: Default::default(),
             show_mesh_info: false,
             last_active: None,
             status_seen: (String::new(), Instant::now()),
             tray: Tray::Sculpt,
             mask_dirty: false,
             pen: Pen::new(cc),
-            test: opts.test_frames.map(|f| crate::test_driver::TestDriver::new(f, opts.screenshot.clone())),
+            test: opts.bench_orbit.or(opts.test_frames).map(|f| {
+                let mut d = crate::test_driver::TestDriver::new(f, opts.screenshot.clone());
+                d.orbit = opts.bench_orbit.is_some();
+                d
+            }),
             cursor: None,
             viewport_rect: Rect::NOTHING,
             last_theme_poll: Instant::now(),
@@ -211,12 +241,17 @@ impl SculptApp {
             mask_edit: None,
             demo_layers: opts.demo_layers,
         };
+        app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
+        app.view_detail = settings["view_detail"].as_str().and_then(ViewDetail::from_name).unwrap_or(ViewDetail::Balanced);
         for e in app.themes.errors.iter().chain(&app.keymap.errors) {
             eprintln!("config: {e}");
         }
-        match opts.project {
-            Some(p) => app.start_job("Opening project", move || project::load(&p).map_err(|e| e.to_string())),
-            None => {
+        match (opts.project, opts.sphere_res) {
+            (None, Some(n)) => app.start_job(&format!("Creating {n}x{n}-per-face sphere"), move || {
+                Document::from_mesh(sculpt_core::primitives::quad_sphere_res(n, 1.0)).map_err(|e| e.to_string())
+            }),
+            (Some(p), _) => app.start_job("Opening project", move || project::load(&p).map_err(|e| e.to_string())),
+            (None, None) => {
                 let level = opts.level;
                 app.start_job(&format!("Creating level {level} sphere"), move || new_sphere(level));
             }
@@ -227,7 +262,7 @@ impl SculptApp {
     pub fn save_settings(&self) {
         let cfg = config_dir();
         let _ = std::fs::create_dir_all(&cfg);
-        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools });
+        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools, "layers_compact": self.layers.compact, "view_detail": self.view_detail.name() });
         let _ = std::fs::write(cfg.join("settings.json"), serde_json::to_string_pretty(&v).unwrap());
     }
 
@@ -264,17 +299,34 @@ impl SculptApp {
                     self.doc = Some(doc);
                     if first {
                         self.camera.frame(&self.doc.as_ref().unwrap().bounds());
+                        self.camera.distance *= self.start_zoom;
                     }
                     if std::mem::take(&mut self.demo_layers) {
                         self.setup_demo_layers();
                     }
+                    self.maybe_build_lod();
                 }
                 Ok(Err(e)) => self.status = format!("{} failed: {e}", job.label),
                 Err(_) => self.status = format!("{} crashed", job.label),
             }
-            if self.doc.is_none() {
+            if self.doc.is_none() && self.job.is_none() {
                 self.start_job("Creating sphere", || new_sphere(6));
             }
+        }
+    }
+
+    /// Dense meshes get a level-of-detail tree so drawing costs pixels, not triangles.
+    fn maybe_build_lod(&mut self) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        if doc.lod().is_none() && std::env::var_os("SCULPT_NO_LOD").is_none() && doc.face_count() * 2 >= LOD_MIN_TRIANGLES {
+            let mut params = sculpt_core::lod::LodParams::default();
+            if let Some(w) = std::env::var("SCULPT_LOD_NORMAL_WEIGHT").ok().and_then(|v| v.parse().ok()) {
+                params.normal_weight = w;
+            }
+            self.start_doc_job("Building level of detail", move |d| {
+                d.build_lod(params);
+                Ok(())
+            });
         }
     }
 
@@ -282,7 +334,15 @@ impl SculptApp {
         use sculpt_core::mask::{BlendMode, Levels, MaskLayer, MaskSource, MaskStack};
         use sculpt_core::noise::NoiseParams;
         let Some(doc) = self.doc.as_mut() else { return };
-        let id = doc.add_layer("Detail");
+        // A small hierarchy so the stack shows folders, nesting and a mask.
+        use sculpt_core::Placement;
+        let face = doc.insert_folder("Face", Placement::Top).ok();
+        if let Some(f) = face {
+            let _ = doc.insert_layer("Wrinkles", Placement::Into(f));
+            let _ = doc.insert_layer("Pores", Placement::Into(f));
+        }
+        let _ = doc.insert_layer("Skin tone variation", Placement::Top);
+        let id = doc.insert_layer("Detail", Placement::Top).expect("top-level layer");
         let stack = MaskStack::new(0.0)
             .with(MaskLayer::new("Breakup", MaskSource::Noise(NoiseParams { scale: 3.0, seed: 4, ..Default::default() })).levels(Levels::range(0.4, 0.6)))
             .with(MaskLayer::new("Top light", MaskSource::Direction { axis: Vec3::Y, sharpness: 2.0 }).blend(BlendMode::Screen).opacity(0.6));
@@ -304,13 +364,22 @@ impl SculptApp {
             self.select_tool(t);
             return;
         }
+        if crate::layer_panel::switcher::run(self, ctx, cmd) {
+            return;
+        }
+        if let Some(lc) = crate::layer_panel::command::from_keymap(cmd, self) {
+            crate::layer_panel::command::execute(self, lc);
+            return;
+        }
         let Some(doc) = self.doc.as_mut() else { return };
         match cmd {
             Command::Undo => {
                 self.status = if doc.undo() { "Undo".into() } else { "Nothing to undo".into() };
+                crate::layer_panel::command::after_change(self);
             }
             Command::Redo => {
                 self.status = if doc.redo() { "Redo".into() } else { "Nothing to redo".into() };
+                crate::layer_panel::command::after_change(self);
             }
             Command::Save => match &self.project_path {
                 Some(p) => self.save_to(p.clone()),
@@ -329,11 +398,6 @@ impl SculptApp {
             Command::Subdivide => {
                 let faces = doc.face_count() * 4;
                 self.start_doc_job(&format!("Subdividing to {faces} faces"), |d| d.subdivide().map_err(|e| e.to_string()));
-            }
-            Command::NewLayer => {
-                let n = doc.layers().len() + 1;
-                let id = doc.add_layer(&format!("Layer {n}"));
-                self.expanded.insert(id);
             }
             Command::ToggleHud => self.hud = !self.hud,
             Command::CycleOverlay => {
@@ -355,6 +419,11 @@ impl SculptApp {
             _ => {}
         }
         let _ = ctx;
+    }
+
+    /// True while a brush, move or pose stroke is in progress.
+    pub fn is_stroking(&self) -> bool {
+        !matches!(self.stroke, Stroke::None)
     }
 
     pub fn select_tool(&mut self, t: Tool) {
@@ -438,6 +507,11 @@ impl SculptApp {
     }
 
     fn begin_stroke(&mut self, pos: Pos2, modifiers: egui::Modifiers) {
+        // A stroke that would change nothing is refused up front, with the reason in the status bar.
+        if let Some(why) = crate::layer_panel::target::resolve(self).and_then(|t| t.refusal) {
+            self.status = why;
+            return;
+        }
         let Some(doc) = self.doc.as_mut() else { return };
         let size = self.viewport_rect.size();
         let local = pos - self.viewport_rect.min;
@@ -674,6 +748,9 @@ impl SculptApp {
 
         let last = resp.interact_pointer_pos();
         let dabs = self.process_samples(last);
+        if dabs > 0 {
+            self.last_edit = Instant::now();
+        }
         let released = resp.drag_stopped_by(egui::PointerButton::Primary) || (resp.clicked_by(egui::PointerButton::Primary) && self.test.is_none());
         if released && self.pending.is_empty() && !matches!(&self.stroke, Stroke::Brush { dabs, .. } if !dabs.is_empty()) {
             if matches!(self.stroke, Stroke::Pose { .. }) {
@@ -698,17 +775,44 @@ impl SculptApp {
                 }
             }
 
+        // What a stroke would edit, next to the brush.
+        if matches!(self.stroke, Stroke::None)
+            && !navigating
+            && !busy
+            && !egui::Popup::is_any_open(&ctx)
+            && let (Some(hover), Some(target)) = (resp.hover_pos(), crate::layer_panel::target::resolve(self))
+        {
+            crate::layer_panel::hud::chip(&ui.painter_at(rect), hover, &target, &self.theme.ui, self.theme.metrics.font_size, rect);
+        }
+        egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::viewport_menu(self, ui));
+
         // Upload + render.
         let ppp = ctx.pixels_per_point();
         let px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
             if let Some(doc) = self.doc.as_mut() {
+                let idle = matches!(self.stroke, Stroke::None) && self.pending.is_empty() && self.last_edit.elapsed() >= LOD_REFRESH_IDLE;
+                let tr = Instant::now();
+                if poll_lod_refresh(doc, &mut self.lod_refresh, &mut self.lod_batch, idle) {
+                    ctx.request_repaint();
+                }
+                self.stats.lod_refresh_ms = tr.elapsed().as_secs_f32() * 1e3;
                 let custom = self.pose_weights.as_deref();
                 vp.sync(rs, doc, &self.overlay, custom, std::mem::take(&mut self.pose_weights_changed));
                 self.stats.upload = vp.last_upload;
             }
             let t = Instant::now();
-            let tex = vp.render(rs, px, &self.camera, &self.theme, self.overlay_strength, self.cursor);
+            let tau = self.lod_tau_override.or(self.view_detail.tau_px());
+            let tau = tau.map(|t| if navigating { t * 2.0 } else { t });
+            let lod = self.doc.as_ref().zip(tau).and_then(|(d, tau)| {
+                d.lod().map(|tree| crate::viewport::LodInput { tree, bvh: d.bvh(), topology_id: d.topology_id(), tau_px: tau, budget: LOD_BUDGET })
+            });
+            let tex = vp.render(rs, px, &self.camera, &self.theme, self.overlay_strength, self.cursor, lod);
+            self.stats.lod = vp.lod_stats;
+            if std::env::var_os("SCULPT_LOD_LOG").is_some() && self.stats.lod.active {
+                let stale = self.doc.as_ref().and_then(|d| d.lod()).map_or(0, |t| t.stale_nodes());
+                eprintln!("lod: {} tris, {} patches, tau {:.2}px, select {:.2} ms, stale {}, refresh hand-off {:.2} ms, encode {:.1} ms", self.stats.lod.triangles, self.stats.lod.nodes, self.stats.lod.tau_px, self.stats.lod.select_ms, stale, self.stats.lod_refresh_ms, t.elapsed().as_secs_f32() * 1e3);
+            }
             self.stats.render_ms = t.elapsed().as_secs_f32() * 1e3;
             if let Some(tex) = tex {
                 ui.painter().image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
@@ -764,6 +868,17 @@ impl SculptApp {
             painter.text(c, egui::Align2::CENTER_CENTER, format!("{label}…  {secs:.1}s"), egui::FontId::proportional(16.0), Color32::WHITE);
         }
         self.paint_axis_gizmo(&painter, rect);
+        if self.overlay == OverlayKind::LayerMask {
+            // Make the mode unmistakable, and say how to leave it.
+            let name = self.doc.as_ref().and_then(|d| d.active_layer().and_then(|id| d.layer(id))).map_or("mask", |l| l.name.as_str()).to_string();
+            let text = format!("Viewing mask: {name}   ·   Alt+M or Esc to exit");
+            let font = egui::FontId::proportional(self.theme.metrics.font_size);
+            let galley = painter.layout_no_wrap(text, font.clone(), Color32::WHITE);
+            let pill = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 22.0), galley.size() + Vec2::new(26.0, 10.0));
+            painter.rect_filled(pill, 12.0, Color32::from_black_alpha(185));
+            painter.rect_stroke(pill, 12.0, egui::Stroke::new(1.5, self.theme.ui.target_mask()), egui::StrokeKind::Inside);
+            painter.text(pill.center(), egui::Align2::CENTER_CENTER, galley.text(), font, Color32::WHITE);
+        }
         if !self.hud {
             // Minimal Mudbox-style readout; H shows the full performance HUD.
             if let Some(doc) = &self.doc {
@@ -781,6 +896,11 @@ impl SculptApp {
             s.frame_ms
         )];
         lines.push(format!("input+dabs {:>5.2} ms ({} dabs, {} queued)   render {:>4.2} ms", s.input_ms, s.dabs, s.pending, s.render_ms));
+        if s.lod.active {
+            lines.push(format!("{} detail: {} tris in {} patches, tau {:.1}px, select {:.2} ms", self.view_detail.name(), fmt_count(s.lod.triangles as usize), s.lod.nodes, s.lod.tau_px, s.lod.select_ms));
+        } else if self.view_detail == ViewDetail::Full && self.doc.as_ref().is_some_and(|d| d.lod().is_some()) {
+            lines.push("Full detail: every triangle (Display > Viewport detail)".to_string());
+        }
         lines.push(format!("upload {:>7.1} KB in {} ranges ({:.2} ms)", s.upload.bytes as f32 / 1024.0, s.upload.ranges, s.upload.ms));
         lines.push(format!("pen: {}  pressure {:.2}", self.pen.source.label(), self.pen.pressure));
         if let Some(doc) = &self.doc {
@@ -821,6 +941,97 @@ impl SculptApp {
         self.keymap.shortcut_text(ctx, t.command()).unwrap_or_default()
     }
 }
+
+/// How faithfully dense meshes are drawn: the level-of-detail tolerance, or the full mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewDetail {
+    Draft,
+    Balanced,
+    Sharp,
+    /// Every triangle, no level of detail: the reference for what the mesh really is.
+    Full,
+}
+
+impl ViewDetail {
+    pub const ALL: [ViewDetail; 4] = [ViewDetail::Draft, ViewDetail::Balanced, ViewDetail::Sharp, ViewDetail::Full];
+
+    /// Screen-space error tolerance in pixels; `None` draws every triangle.
+    pub fn tau_px(self) -> Option<f32> {
+        match self {
+            ViewDetail::Draft => Some(2.0),
+            ViewDetail::Balanced => Some(1.0),
+            ViewDetail::Sharp => Some(0.5),
+            ViewDetail::Full => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ViewDetail::Draft => "Draft",
+            ViewDetail::Balanced => "Balanced",
+            ViewDetail::Sharp => "Sharp",
+            ViewDetail::Full => "Full",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            ViewDetail::Draft => "Fastest; up to 2 px of simplification",
+            ViewDetail::Balanced => "About one pixel of simplification",
+            ViewDetail::Sharp => "Half-pixel; roughly twice the triangles",
+            ViewDetail::Full => "Every triangle; slow on very dense meshes",
+        }
+    }
+
+    fn from_name(s: &str) -> Option<ViewDetail> {
+        ViewDetail::ALL.into_iter().find(|d| d.name() == s)
+    }
+}
+
+/// How long the pen must rest before outdated LOD patches are re-simplified.
+const LOD_REFRESH_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Triangles handed to the background re-simplifier at a time. The copy on the UI thread is about
+/// 0.5 ms per 32k triangles, so the batch only grows when frames are slow enough to hide it.
+const LOD_REFRESH_BATCH_MIN: usize = 32_768;
+const LOD_REFRESH_BATCH_MAX: usize = 262_144;
+
+/// Catch level-of-detail patches up with edits without ever blocking the UI thread on simplification:
+/// install a finished batch if one is back, and when `idle`, copy out the next batch for a worker thread.
+/// Edited areas draw at full detail until then, so the picture is always correct. Returns true while work remains.
+fn poll_lod_refresh(doc: &mut Document, slot: &mut Option<(u64, std::sync::mpsc::Receiver<sculpt_core::lod::RefreshDone>)>, batch_tris: &mut usize, idle: bool) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    if let Some((topo, rx)) = slot {
+        match rx.try_recv() {
+            Ok(done) => {
+                doc.apply_lod_refresh(*topo, done);
+                *slot = None;
+                // Finished within a frame: the worker sat idle, so give it more next time.
+                *batch_tris = (*batch_tris * 2).min(LOD_REFRESH_BATCH_MAX);
+            }
+            Err(TryRecvError::Empty) => {
+                *batch_tris = (*batch_tris / 2).max(LOD_REFRESH_BATCH_MIN);
+                return true;
+            }
+            Err(TryRecvError::Disconnected) => *slot = None,
+        }
+    }
+    let stale = doc.lod().is_some_and(|t| t.stale_nodes() > 0);
+    if idle && let Some((topo, batch)) = doc.gather_lod_refresh(*batch_tris) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("lod refresh".into()).spawn(move || {
+            let _ = tx.send(batch.run());
+        });
+        if spawned.is_ok() {
+            *slot = Some((topo, rx));
+        }
+    }
+    stale
+}
+
+/// Meshes at or above this many triangles are drawn through the LOD tree.
+const LOD_MIN_TRIANGLES: usize = 1_500_000;
+/// Most triangles drawn per frame, whatever the pixel tolerance asks for.
+const LOD_BUDGET: u64 = 6_000_000;
 
 pub fn fmt_count(n: usize) -> String {
     if n >= 1_000_000 {
@@ -863,6 +1074,10 @@ impl eframe::App for SculptApp {
             }
         }
 
+        let esc_free = self.layers.drag.is_none() && self.layers.rename.is_none() && self.layers.switcher.is_none();
+        if self.overlay == OverlayKind::LayerMask && esc_free && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.overlay = OverlayKind::None;
+        }
         for cmd in self.keymap.poll(&ctx) {
             self.run(&ctx, cmd);
         }
@@ -871,6 +1086,8 @@ impl eframe::App for SculptApp {
         crate::panels::status_bar(self, ui);
         crate::panels::tray(self, ui);
         crate::panels::right_panel(self, ui);
+        crate::layer_panel::switcher::show(self, &ctx);
+        crate::layer_panel::radial::show(self, &ctx);
         crate::panels::dialogs(self, &ctx);
         crate::panels::theme_editor(self, &ctx);
         crate::panels::keymap_window(self, &ctx);
@@ -886,7 +1103,8 @@ impl eframe::App for SculptApp {
         if let Some(test) = &mut self.test {
             let doc_ready = self.doc.is_some() && self.job.is_none();
             test.record(&self.stats, doc_ready, self.doc.as_ref());
-            test.finish_if_done(&ctx);
+            let settled = self.doc.as_ref().and_then(|d| d.lod()).is_none_or(|t| t.stale_nodes() == 0);
+            test.finish_if_done(&ctx, settled);
             for e in ctx.input(|i| i.events.clone()) {
                 if let egui::Event::Screenshot { image, .. } = e {
                     test.save_screenshot(&image);

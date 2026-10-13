@@ -13,7 +13,6 @@ pub enum Icon {
     Trash,
     Mask,
     Effect,
-    Flatten,
     ChevronRight,
     ChevronDown,
     ArrowUp,
@@ -28,6 +27,12 @@ pub enum Icon {
     Direction,
     Gradient,
     Base,
+    Folder,
+    FolderOpen,
+    Solo,
+    Duplicate,
+    Merge,
+    Density,
 }
 
 impl Icon {
@@ -81,12 +86,6 @@ impl Icon {
                 }
                 p.circle_filled(ctr, w * 0.08, c);
             }
-            Icon::Flatten => {
-                p.line_segment([at(0.5, 0.15), at(0.5, 0.6)], s);
-                p.line_segment([at(0.3, 0.42), at(0.5, 0.62)], s);
-                p.line_segment([at(0.7, 0.42), at(0.5, 0.62)], s);
-                p.line_segment([at(0.18, 0.82), at(0.82, 0.82)], Stroke::new(1.8, c));
-            }
             Icon::ChevronRight => {
                 p.add(Shape::line(vec![at(0.38, 0.25), at(0.64, 0.5), at(0.38, 0.75)], s));
             }
@@ -134,6 +133,40 @@ impl Icon {
                     let x0 = b.left() + b.width() * k as f32 / 5.0;
                     let cell = Rect::from_min_max(pos2(x0, b.top()), pos2(x0 + b.width() / 5.0, b.bottom()));
                     p.rect_filled(cell, 0.0, c.gamma_multiply(0.2 + 0.2 * k as f32));
+                }
+            }
+            Icon::Folder | Icon::FolderOpen => {
+                let body = Rect::from_min_max(at(0.1, 0.3), at(0.9, 0.82));
+                p.add(Shape::line(vec![at(0.1, 0.3), at(0.1, 0.2), at(0.4, 0.2), at(0.48, 0.3)], s));
+                if self == Icon::Folder {
+                    p.rect_filled(body, 1.5, c.gamma_multiply(0.85));
+                } else {
+                    p.rect_stroke(body, 1.5, s, egui::StrokeKind::Inside);
+                    p.add(Shape::convex_polygon(vec![at(0.2, 0.82), at(0.32, 0.5), at(0.96, 0.5), at(0.84, 0.82)], c.gamma_multiply(0.85), Stroke::NONE));
+                }
+            }
+            Icon::Solo => {
+                // Dot with a ring: "this one only".
+                p.circle_stroke(r.center(), w * 0.34, s);
+                p.circle_filled(r.center(), w * 0.14, c);
+            }
+            Icon::Duplicate => {
+                let a = Rect::from_min_max(at(0.14, 0.3), at(0.66, 0.86));
+                let b = Rect::from_min_max(at(0.34, 0.14), at(0.86, 0.7));
+                p.rect_stroke(a, 1.5, s, egui::StrokeKind::Inside);
+                p.rect_filled(b, 1.5, c.gamma_multiply(0.55));
+                p.rect_stroke(b, 1.5, s, egui::StrokeKind::Inside);
+            }
+            Icon::Merge => {
+                p.line_segment([at(0.25, 0.15), at(0.5, 0.5)], s);
+                p.line_segment([at(0.75, 0.15), at(0.5, 0.5)], s);
+                p.line_segment([at(0.5, 0.5), at(0.5, 0.78)], s);
+                p.add(Shape::line(vec![at(0.34, 0.64), at(0.5, 0.8), at(0.66, 0.64)], s));
+                p.line_segment([at(0.2, 0.9), at(0.8, 0.9)], Stroke::new(1.8, c));
+            }
+            Icon::Density => {
+                for y in [0.25, 0.5, 0.75] {
+                    p.line_segment([at(0.2, y), at(0.8, y)], Stroke::new(1.6, c));
                 }
             }
             Icon::Base => {

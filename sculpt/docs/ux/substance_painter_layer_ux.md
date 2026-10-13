@@ -4,14 +4,15 @@ Status: research and spec. Target is the egui layer panel for sculpt delta layer
 (`SculptLayer { opacity, visible, locked, mask: MaskStack }`, freeze, channels,
 bakes). See `../ARCHITECTURE.md`.
 
-**Confidence notes.** Adobe's documentation hosts (helpx, experienceleague,
-substance3d.adobe.com) were blocked by the research proxy. Facts marked **[doc]**
-come from search-indexed excerpts of the official pages (sources at the end).
-Facts marked **[obs]** come from long-standing, widely shown SP behaviour in
-tutorials (2021.x to 12.x). Pixel sizes are **[spec]**: values we choose to get
-the same density, not measurements of SP. Menu ordering changes between SP
-versions, so treat the ordering given here as the order *we* will ship, modelled
-on SP's grouping.
+**Confidence notes.** Verified in a second pass (see "Verified against" at the end)
+by reading the official Experience League pages directly. `helpx.adobe.com`
+returns "Access Denied" (the site's own bot protection, not the proxy), so the
+Experience League mirror was used instead. Facts marked **[doc]** are
+confirmed by those pages. **[obs]** marks long-standing SP behaviour seen in
+tutorials that the pages do not state. **[spec]** marks values we choose.
+Pixel sizes are always **[spec]**. Menu ordering changes between SP
+versions, so the ordering given here is the order *we* will ship, modelled on
+SP's grouping.
 
 ---
 
@@ -29,28 +30,29 @@ row composites last **[doc]**. Left to right, a layer row contains:
 | 3 | **Content thumbnail** | Square, about 32–40 px. Shows the layer's result *for the channel picked in the top-left view dropdown* **[doc]**. Paint layers carry a small brush badge and fill layers a bucket badge **[obs]**. Instanced layers carry an instance badge **[doc: layer instancing]**. |
 | 4 | **Mask thumbnail** | Shown only if a mask exists. Same size, directly to the right of the content thumbnail. Greyscale. **Alt+LMB**: view the mask in the viewport. **Shift+LMB**: disable the mask, which then shows a red X / crossed state **[doc]**. |
 | 5 | **Name** | Fills the remaining width. Double-click to rename inline **[obs]**. Elided with "…". |
-| 6 | **Blend mode** (short label, e.g. `Norm`, `Mul`, `Ovr`) | Right-aligned. Click opens the blend list. It is **per channel**: it shows the mode for the channel in the view dropdown **[doc]**. Right-click → *Apply to all channels* **[doc 8.2]**. |
-| 7 | **Opacity** (`100`) | Right-aligned under or next to the blend label. Click-drag scrubs, click types a value. Per channel **[doc]**. |
+| 6 | **Blend mode** (short label, e.g. `Norm`, `Mul`, `Ovr`) | Right-aligned, on the **top line** of a two-line right column, with a small ▾ **[screenshot]**. Click opens the blend list. It is **per channel**: it shows the mode for the channel in the view dropdown **[doc]**. Right-click → *Apply to all channels* **[doc 8.2]**. |
+| 7 | **Opacity** (`100`) | Right-aligned on the **second line, directly under the blend label**, with a ▾ **[screenshot]**. Click-drag scrubs, click types a value. Per channel **[doc]**. |
+
+A thin **bar under each thumbnail** (content and mask separately) is grey when that stack has no effects and coloured when it has at least one (dark red in older builds, amber under a content thumbnail in current ones) **[doc + screenshot]**. Folders show a folder icon between the eye and the thumbnail, and an open-folder icon when expanded **[screenshot]**. Panel header: `LAYERS` title, channel dropdown (`Base Color ▾`) on the left, icon-only toolbar on the right **[screenshot]**.
 
 When a layer is expanded, the **effect rows** sit under it, indented. There is an
 effect stack for the content and another for the mask **[doc]**. Each effect row
 has its own eye, a type icon (paint, fill, generator, levels, filter, anchor,
-compare mask, color selection), a name, and blend/opacity. Mask effects are drawn
-under a "mask" sub-header and use greyscale thumbnails **[obs]**.
+compare mask, color selection), a name, and blend/opacity. Effect rows are about two thirds of a layer row's height, indented one step, with a dark-red tint for mask effects, a brighter red for the active one, and an × delete button at the right edge **[screenshot]**. A fill/paint effect row shows `Norm  100 ×`; a levels row shows only `×`.
 
 ### 1.2 States
 
 | State | SP look | Our spec |
 |-------|---------|----------|
-| Selected | Whole row filled with a lighter or accent tint. The **active thumbnail** (content *or* mask) gets an accent outline, and that is the paint target **[obs]**. | Row fill `accent@25%`, plus a 2 px accent frame around the active sub-target thumbnail. |
-| Multi-selected | Same fill on every selected row. Only one row is the "active" one (shown by its thumbnail frame). | Same. The active row also gets a 2 px accent bar on its left edge. |
+| Selected | **1 px blue outline round the whole row, slightly darker row background, and the name turns blue** **[screenshot]**. The **active thumbnail** (content or mask) has its own frame: cyan on a mask thumbnail, blue or red on content depending on build **[screenshot]**. That is the paint target. | Row: 1 px accent outline, bg darkened 8%, name in accent. Plus a 2 px accent frame round the active sub-target thumbnail. Do not use a filled tint. |
+| Multi-selected | **Every selected row gets the blue outline**; only the active one has a blue name **[screenshot]**. | Same. The active row also gets a 2 px accent bar on its left edge. |
 | Hover | Subtle lighten. Thumbnails show a pointer cursor. | `bg + 6%`. A tooltip on a thumbnail gives the click modifiers. |
 | Hidden | Eye off. Row text and thumbnails dimmed to about 50% **[obs]**. | Eye off. Row alpha 0.45. Children inherit the dim. |
 | Locked | SP has no per-layer lock. | **New:** padlock in the icon column. Strokes are refused, and the cursor shows ⊘ over the viewport. |
 | Solo | Not native in SP (it is a common feature request) **[doc: community]**. | **New:** "S" pill, accent-filled when on. Every other row dims and shows a hollow eye. |
 | Mask disabled | Red cross over the mask thumbnail **[obs]**. | Red diagonal over the mask thumbnail. The tooltip reads "Mask disabled (Shift-click)". |
 | Mask viewed | Viewport shows the mask in greyscale. The thumbnail gets a highlight **[doc]**. | Mask thumbnail has a yellow frame. The viewport shows a banner "Viewing mask: <layer> — Esc to exit". |
-| Dragging | Ghost row follows the cursor. A horizontal **insertion bar** marks above, between, or below. Dropping onto a folder highlights the folder **[doc]**. | See §2.4. |
+| Dragging | Ghost row follows the cursor. A horizontal **insertion bar** marks above, between, or below. Dropping onto a folder highlights the folder **[doc]**. Screenshot: the ghost is a semi-transparent copy of the row, a thin **white line** marks the gap, and a copy cursor (⊞) shows while Ctrl is held. | See §2.4. |
 | Instance | Instance badge on the thumbnail **[doc]**. | Defer. |
 
 ### 1.3 Row geometry for egui [spec]
@@ -107,7 +109,7 @@ under a "mask" sub-header and use greyscale thumbnails **[obs]**.
 | Middle of a **layer**, while dragging a mask/effect | Mask thumb outlined | Move or copy into that layer's mask |
 | Invalid | Red line plus a ⊘ cursor | Nothing |
 
-- **Ctrl+drag = duplicate** **[doc]**.
+- **Ctrl+drag = duplicate** **[doc]**. SP's observed drops: a thin white insertion line between rows (reorder); dropping on a folder nests the layer one indent step in and the folder shows the open icon **[screenshot]**; dropping an asset onto a layer outlines the whole row in white; a ⊘ cursor means refused **[screenshot]**. SP draws no separate "into" zone: nesting is by dropping on the folder row itself.
 - Hover over a collapsed folder for 600 ms to spring it open.
 - Near the top or bottom edge of the panel, the list auto-scrolls.
 - Dragging a multi-selection moves the rows as a block and keeps their order.
@@ -119,12 +121,14 @@ under a "mask" sub-header and use greyscale thumbnails **[obs]**.
 
 ### 3.1 Toolbar (SP)
 
-SP puts a row of icon buttons on the Layers panel header, next to the channel/view
-dropdown **[doc + obs]**. The buttons are: *Add smart material*, *Add smart
-mask*, *Add effect* ▾, *Add mask* ▾, *Add fill layer*, *Add paint layer*,
-*Add folder*, *Delete*. Every button inserts **above the current selection**
-**[doc]**. Buttons with ▾ open a menu that lists the same items as the matching
-right-click submenu.
+SP puts a row of icon buttons at the top right of the Layers panel, next to
+the channel/view dropdown **[doc]**. Verified order, left to right: *Add effect*,
+*Create mask* ▾ (white, black, bitmap, color selection, height combination),
+*Create new paint layer*, *Create new fill layer*, *Add new smart materials*,
+*Add new folder*, *Delete layer*. The paint and fill buttons insert **above the
+current selection** **[doc]**; the pages do not state the insertion point for
+the other buttons. Buttons with ▾ open a menu that lists the same items as the
+matching right-click submenu.
 
 **Ours** [spec]: put the bar at the **bottom of the panel, directly under the
 list**, so the cursor travels a short way from the last-touched row. Left to
@@ -137,7 +141,23 @@ hotkey (§5).
 SP shows a context menu on any row. Its items depend on the kind of row clicked
 **[doc]**. Separators are shown as `---`.
 
-**Layer row**
+**What SP really shows** **[screenshot]** (layer row, top to bottom):
+`Cut layer(s) Ctrl+X` · `Copy layer(s) Ctrl+C` · `Paste layer(s) Ctrl+V` ·
+`Paste layer as instance` · `Duplicate layer(s) Ctrl+D` ·
+`Instantiate across texture sets…` · `Remove layer(s) Del` ·
+`Group layer(s) Ctrl+G`, then a **row of colour-tag swatches** at the bottom
+(layer colour labels). Unavailable items are greyed, not hidden. When the row
+has a mask, three items sit on top: `Export mask to file` · `Export mask to
+clipboard` · `Create smart mask`. Folder rows add `Add white / black / bitmap
+mask, with color selection, with height combination`, `Create smart material`,
+`Flatten group Ctrl+M`, `Export flattened group to files`. Mask right-click
+(older build): `Add white mask` · `Add black mask` · `Add bitmap mask` · `Add
+mask with color selection` · `✓ Toggle mask` · `Invert mask background`.
+Note there is no Merge down, Rename or Lock in SP's menu; ours adds them.
+Our adoptable idea: **colour tags** on rows, and greyed-out rather than hidden
+items.
+
+**Layer row (ours)**
 ```
 Add mask              ▸  Black (reveal by painting) | White (hide by painting) |
                          From bake ▸ Curvature / Cavity / AO / Thickness |
@@ -261,7 +281,7 @@ mask without moving the cursor.
 | Copy / paste | Ctrl+C / Ctrl+V for layers and effects **[doc 2021.1]** | Same, including mask ops between layers |
 | Duplicate | Ctrl+D, RMB → Duplicate, Ctrl+drag **[doc]** | Same |
 | Group | Ctrl+G **[doc]** | Same. Shift+Ctrl+G ungroups |
-| Merge / flatten | Ctrl+M flattens a group into a copy and disables the source **[doc 12.0]** | Ctrl+E merges down. *Flatten into base* (menu only, confirm). Ctrl+M flattens a folder to a new layer and hides the source |
+| Merge / flatten | Ctrl+M flattens a group into a copy and disables the source **[doc 12.0]** | Ctrl+E merges down (ours; not an SP binding). *Flatten into base* (menu only, confirm). Ctrl+M flattens a folder to a new layer and hides the source |
 | Rename | Double-click name **[obs]** | Double-click or F2. Enter commits, Esc cancels |
 | Delete | Del, or the trash button **[doc]** | Del. Undo restores everything, including mask ops |
 | New layer/folder | Toolbar | Ctrl+Shift+N for a layer, Ctrl+Shift+F for a folder |
@@ -449,8 +469,79 @@ only the layer area, its menus, and viewport hotkeys.
 - Release notes 2021.1 (geometry mask, effect copy/paste, multi-select): https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/release-notes/old-versions/version-2021-1-7-1-0
 - Release notes 8.2 (Apply to all channels): https://helpx.adobe.com/substance-3d-painter/release-notes/version-8-2.html
 - Release notes 12.0 (Flatten, Ctrl+M, export from layer stack): https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/release-notes/version-12-0
-- Shortcuts: https://helpx.adobe.com/substance-3d-painter/interface/settings/shortcuts.html
+- Shortcuts: https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/interface/settings/shortcuts
 - Interface overview (Properties follows selection): https://helpx.adobe.com/substance-3d-painter/using/interface-overview.html
 - Community request, isolate layer (solo not native): https://community.adobe.com/t5/substance-3d-painter-ideas/feature-suggestion-isolate-layer/idi-p/12850398
 - Community custom shortcut set (mask toggle/view habits): https://github.com/cbuliarca/BCM_SubstancePainter_shortcuts/blob/master/README.md
 - Adobe Substance magazine, smoother texturing UX: https://www.adobe.com/products/substance3d/magazine/a-smoother-texturing-experience-with-substance-3d-painter
+
+---
+
+## Verified against (second pass)
+
+Pages read in full from Experience League. Corrections to the first draft are
+listed under each.
+
+- **Layer stack**: row = eye, content thumbnail, mask thumbnail (greyscale),
+  name, opacity, blend mode, both **per channel** (top-left dropdown picks the
+  channel). Paint, Fill and Folder layer types. Bottom layer draws first.
+  Correction: toolbar order is as in 3.1 above. Our earlier order (smart
+  material, smart mask first) was wrong.
+- **Masking and effects**: Alt+LMB on a mask thumbnail isolates it in the
+  viewport. Shift+LMB disables it temporarily and toggles it back. Mask
+  right-click menu has copy, paste and invert. Re-adding or removing a mask
+  destroys its effects. Ctrl while dropping a fill layer creates a mask at once.
+  A bar under each thumbnail shows effects: **grey = none, coloured (red in older builds) = at least one**.
+  Smart masks: Ctrl while dropping overwrites the effect list.
+- **Managing layers**: drag shows a bar for the destination. Dropping on a
+  folder nests. Multi-select with Ctrl/Cmd+click and Shift+click range. Group
+  with right-click ▸ Group Layers or Ctrl+G.
+- **Creating layers**: duplicate by right-click, Ctrl+D, or Ctrl+drag. Dropping
+  assets (materials, smart materials, effects) onto the stack creates layers.
+  Insertion point is not specified for drops.
+- **Flatten layers**: Ctrl+M = merge selection. Flatten makes a new fill layer
+  and **disables** (does not delete) the source. Only visible layers count.
+  Correction: there is **no Ctrl+E merge down** in SP. It is our own shortcut.
+- **Layer instancing**: paste as instance (right-click, or Ctrl+Shift+V per this
+  page). Source and target icons act as navigation buttons. Only the source can
+  be edited. Cycles are refused. The shortcuts page instead lists Ctrl+Shift+C/V
+  as copy/paste layer *content*, so the two pages disagree; we do not copy
+  either binding blindly.
+- **Shortcuts**: Ctrl+C/X/V, Delete, Ctrl+D, Ctrl+G, Ctrl+Shift+C/V all work
+  **only while the mouse is over the layer stack** **[doc]**. Quick-mask edit:
+  U toggle, Y clear, I invert (global).
+
+### Screenshots reviewed
+
+Downloaded from the same Experience League pages (kept out of the repo,
+Adobe's copyright) and viewed frame by frame: layer stack (2 stills), managing
+layers (5 clips: reorder, nest into folder, multi-select, group), masking and
+effects (6 clips: add black mask, drop a material, mask effects, drop a smart
+mask), creating layers (menus, duplicate, drop material), flatten, instancing.
+Corrections found:
+
+- Blend mode and opacity are a **two-line right column**, not one value. We
+  still drop blend for sculpt layers and use that column for strength (top
+  line: kind or blend of ops; second line: strength).
+- Selection is a **blue outline plus blue name**, not a tinted fill.
+- The effects bar under each thumbnail is real and useful; adopt it as a
+  "has mask ops" cue.
+- The context menu is shorter than assumed and has **colour tags**.
+- Drop feedback is a thin white line, a ghost row, and a white outline when
+  dropping onto a row. There is no separate "into" band.
+
+### Not verified
+
+- `helpx.adobe.com` pages (blocked by the site), release-notes pages 2021.1, 8.2
+  and 12.0 (not re-read this pass), row pixel sizes, exact right-click menu
+  order, whether new items auto-expand, drop-zone proportions, spring-open timing
+  and auto-scroll. These stay **[obs]** or **[spec]**.
+- Row pixel sizes: screenshots are small (about 380 to 650 px wide) and scaled, so sizes stay **[spec]**.
+- `artstation.com` and `polycount.com` return 403 from a Cloudflare challenge,
+  not the proxy; they were not usable.
+
+### Implication for our design
+
+SP's layer-stack hotkeys only work over the layer panel. The cursor-local rule
+(hotkeys while hovering the viewport) is therefore a deliberate improvement,
+not a clone.

@@ -27,11 +27,14 @@ pub struct MaskStack {
     pub base: f32,
     #[serde(default)]
     pub layers: Vec<MaskLayer>,
+    /// A disabled mask is kept but ignored, so the layer applies everywhere (Shift+click on the thumbnail).
+    #[serde(default = "yes")]
+    pub enabled: bool,
 }
 
 impl MaskStack {
     pub fn new(base: f32) -> MaskStack {
-        MaskStack { base, layers: Vec::new() }
+        MaskStack { base, layers: Vec::new(), enabled: true }
     }
 
     pub fn with(mut self, layer: MaskLayer) -> MaskStack {

@@ -7,7 +7,7 @@
 //! * bottom: Mudbox **tool tray** (Sculpt / Paint / Pose / Falloff) and a
 //!   status bar.
 
-use egui::{Align, Color32, Layout, Popup, Rect, RichText, Sense, Ui, UiBuilder, vec2};
+use egui::{Align, Color32, Layout, Rect, RichText, Sense, Ui, UiBuilder, vec2};
 use sculpt_core::LayerId;
 use sculpt_core::bake::MeshAttribute;
 use sculpt_core::brush::{Falloff, SmoothMode};
@@ -21,7 +21,6 @@ use crate::theme::{Hex, bold};
 use crate::tools::{PoseMode, Tool, Tray};
 use crate::viewport::OverlayKind;
 
-const ROW_H: f32 = 30.0;
 const EFFECT_ROW_H: f32 = 24.0;
 
 // ------------------------------------------------------------------ helpers
@@ -39,7 +38,7 @@ fn cmd_button(app: &mut SculptApp, ui: &mut Ui, cmd: Command) {
 }
 
 /// Uppercase panel title bar with optional right-aligned controls.
-fn panel_header(ui: &mut Ui, app: &SculptApp, title: &str, right: impl FnOnce(&mut Ui)) {
+pub(crate) fn panel_header(ui: &mut Ui, app: &SculptApp, title: &str, right: impl FnOnce(&mut Ui)) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, app.theme.ui.header());
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
@@ -96,20 +95,6 @@ fn source_label(s: &MaskSource) -> &'static str {
         MaskSource::Mesh { attribute: MeshAttribute::Thickness } => "Thickness",
         MaskSource::Direction { .. } => "Direction",
         MaskSource::Gradient { .. } => "Gradient",
-    }
-}
-
-fn blend_short(b: BlendMode) -> &'static str {
-    match b {
-        BlendMode::Normal => "Norm",
-        BlendMode::Multiply => "Mul",
-        BlendMode::Add => "Add",
-        BlendMode::Subtract => "Sub",
-        BlendMode::Screen => "Scrn",
-        BlendMode::Overlay => "Ovr",
-        BlendMode::Max => "Max",
-        BlendMode::Min => "Min",
-        BlendMode::Difference => "Diff",
     }
 }
 
@@ -193,6 +178,15 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 cmd_button(app, ui, Command::FrameMesh);
                 cmd_button(app, ui, Command::ToggleHud);
                 ui.add(egui::Slider::new(&mut app.overlay_strength, 0.0..=1.0).text("Overlay opacity"));
+                ui.separator();
+                ui.label("Viewport detail (dense meshes)");
+                for d in crate::app::ViewDetail::ALL {
+                    if ui.radio(app.view_detail == d, d.name()).on_hover_text(d.hint()).clicked() {
+                        app.view_detail = d;
+                        app.save_settings();
+                    }
+                }
+                ui.separator();
                 if ui.button("Mesh info…").clicked() {
                     app.show_mesh_info = true;
                     ui.close();
@@ -290,8 +284,10 @@ pub fn status_bar(app: &mut SculptApp, ui: &mut Ui) {
                 if let Some(d) = &app.doc {
                     ui.label(RichText::new(format!("{} faces", fmt_count(d.face_count()))).color(weak));
                     ui.separator();
-                    let layer = d.active_layer().and_then(|id| d.layer(id)).map_or("Base".to_string(), |l| l.name.clone());
-                    ui.label(RichText::new(format!("Sculpting on {layer}")).color(weak));
+                    let _ = d;
+                    if let Some(c) = crate::layer_panel::breadcrumb::crumbs(app) {
+                        ui.label(RichText::new(format!("{} — {}", c.parts.join(" › "), c.verb)).color(c.color));
+                    }
                     ui.separator();
                 }
                 ui.label(RichText::new(format!("Pen: {} {:.2}", app.pen.source.label(), app.pen.pressure)).color(weak));
@@ -409,19 +405,20 @@ pub fn right_panel(app: &mut SculptApp, ui: &mut Ui) {
     let fill = app.theme.ui.panel.0;
     egui::Panel::right("dock").default_size(340.0).min_size(280.0).frame(egui::Frame::side_top_panel(ui.style()).fill(fill).inner_margin(0)).show(ui, |ui| {
         let total = ui.available_height();
+        // The stack keeps 42% to 75% of the dock whatever the window size, so it never collapses to a few rows.
         egui::Panel::top("layers_panel")
             .resizable(true)
-            .default_size(total * 0.45)
-            .min_size((total * 0.3).max(160.0))
+            .default_size(total * 0.55)
+            .size_range((total * 0.42).max(200.0)..=(total * 0.75))
             .frame(egui::Frame::NONE.fill(fill))
-            .show(ui, |ui| layers_panel(app, ui));
+            .show(ui, |ui| crate::layer_panel::layers_panel(app, ui));
         egui::CentralPanel::no_frame().show(ui, |ui| properties_panel(app, ui));
     });
 }
 
 /// Keep the mask editing copy pointed at the active layer. Returns true if
 /// the active layer changed since the copy was made.
-fn sync_mask_edit(app: &mut SculptApp) -> bool {
+pub(crate) fn sync_mask_edit(app: &mut SculptApp) -> bool {
     let Some(doc) = app.doc.as_ref() else { return false };
     let active = doc.active_layer();
     if app.mask_edit.as_ref().map(|(id, _)| *id) == active && active.is_some() {
@@ -434,7 +431,7 @@ fn sync_mask_edit(app: &mut SculptApp) -> bool {
     changed
 }
 
-fn select_layer(app: &mut SculptApp, id: Option<LayerId>, sel: Selection) {
+pub(crate) fn select_layer(app: &mut SculptApp, id: Option<LayerId>, sel: Selection) {
     if let Some(d) = app.doc.as_mut() {
         let _ = d.set_active_layer(id);
     }
@@ -457,7 +454,7 @@ fn select_layer(app: &mut SculptApp, id: Option<LayerId>, sel: Selection) {
     }
 }
 
-fn add_mask(app: &mut SculptApp, base: f32) {
+pub(crate) fn add_mask(app: &mut SculptApp, base: f32) {
     let Some(id) = app.doc.as_ref().and_then(|d| d.active_layer()) else { return };
     app.mask_edit = Some((id, MaskStack::new(base)));
     app.expanded.insert(id);
@@ -466,7 +463,7 @@ fn add_mask(app: &mut SculptApp, base: f32) {
     app.overlay = OverlayKind::LayerMask;
 }
 
-fn add_effect(app: &mut SculptApp, label: &str, src: MaskSource) {
+pub(crate) fn add_effect(app: &mut SculptApp, label: &str, src: MaskSource) {
     if app.mask_edit.is_none() {
         add_mask(app, 1.0);
     }
@@ -489,7 +486,7 @@ fn add_effect(app: &mut SculptApp, label: &str, src: MaskSource) {
     }
 }
 
-fn effect_menu(app: &mut SculptApp, ui: &mut Ui) {
+pub(crate) fn effect_menu(app: &mut SculptApp, ui: &mut Ui) {
     let items: [(&str, MaskSource); 9] = [
         ("Paint", MaskSource::Channel { name: String::new() }),
         ("Fill", MaskSource::Fill { value: 1.0 }),
@@ -514,114 +511,16 @@ fn effect_menu(app: &mut SculptApp, ui: &mut Ui) {
     }
 }
 
-fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
-    panel_header(ui, app, "LAYERS", |_| {});
-    if sync_mask_edit(app) {
-        app.selection = Selection::Layer;
-    }
-    let Some(doc) = app.doc.as_ref() else {
-        ui.label("Loading…");
-        return;
-    };
-    let active = doc.active_layer();
-    let has_mask = app.mask_edit.is_some();
-
-    // Toolbar (Painter: add layer / add mask / add effect / delete).
-    ui.horizontal(|ui| {
-        ui.add_space(6.0);
-        ui.spacing_mut().item_spacing.x = 2.0;
-        if icon_button(ui, Icon::Plus, 24.0, false, "New sculpt layer (Ctrl+L)").clicked() {
-            if let Some(d) = app.doc.as_mut() {
-                let n = d.layers().len() + 1;
-                let id = d.add_layer(&format!("Layer {n}"));
-                app.expanded.insert(id);
-            }
-            app.selection = Selection::Layer;
-            sync_mask_edit(app);
-        }
-        ui.add_enabled_ui(active.is_some(), |ui| {
-            let r = icon_button(ui, Icon::Mask, 24.0, false, "Add mask");
-            Popup::menu(&r).show(|ui| {
-                ui.add_enabled_ui(!has_mask, |ui| {
-                    if ui.button("Add white mask").clicked() {
-                        add_mask(app, 1.0);
-                    }
-                    if ui.button("Add black mask").clicked() {
-                        add_mask(app, 0.0);
-                    }
-                });
-                ui.add_enabled_ui(has_mask, |ui| {
-                    if ui.button("Remove mask").clicked() {
-                        if let (Some(d), Some(id)) = (app.doc.as_mut(), active) {
-                            let _ = d.set_layer_mask(id, None);
-                        }
-                        app.mask_edit = None;
-                        app.selection = Selection::Layer;
-                    }
-                });
-            });
-            let r = icon_button(ui, Icon::Effect, 24.0, false, "Add mask effect");
-            Popup::menu(&r).show(|ui| effect_menu(app, ui));
-            ui.separator();
-            if icon_button(ui, Icon::Flatten, 24.0, false, "Flatten layer into the base mesh").clicked() {
-                if let (Some(d), Some(id)) = (app.doc.as_mut(), active) {
-                    let _ = d.flatten_layer(id);
-                }
-                app.mask_edit = None;
-            }
-            if icon_button(ui, Icon::Trash, 24.0, false, "Delete").clicked() {
-                delete_selection(app);
-            }
-        });
-    });
-    ui.add_space(2.0);
-
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 1.0;
-        let ids: Vec<LayerId> = app.doc.as_ref().unwrap().layers().iter().rev().map(|l| l.id).collect();
-        for id in ids {
-            layer_row(app, ui, id);
-            if app.expanded.contains(&id) {
-                mask_rows(app, ui, id);
-            }
-        }
-        base_row(app, ui);
-    });
-}
-
-fn delete_selection(app: &mut SculptApp) {
-    let Some(id) = app.doc.as_ref().and_then(|d| d.active_layer()) else { return };
-    match app.selection {
-        Selection::Effect(i) => {
-            if let Some((_, s)) = app.mask_edit.as_mut()
-                && i < s.layers.len() {
-                    s.layers.remove(i);
-                    app.mask_dirty = true;
-                }
-            app.selection = Selection::Mask;
-        }
-        Selection::Mask => {
-            if let Some(d) = app.doc.as_mut() {
-                let _ = d.set_layer_mask(id, None);
-            }
-            app.mask_edit = None;
-            app.selection = Selection::Layer;
-        }
-        Selection::Layer => {
-            if let Some(d) = app.doc.as_mut() {
-                let _ = d.remove_layer(id);
-            }
-            app.mask_edit = None;
-            sync_mask_edit(app);
-        }
-    }
-}
-
 /// Row background + a child Ui for its contents.
 fn row_frame(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: bool) -> (egui::Response, Ui) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    row_frame_tinted(ui, app, height, indent, selected, None)
+}
+
+/// Like `row_frame`, with an optional selection fill (mask rows use the mask colour so they read differently from layers).
+fn row_frame_tinted(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: bool, tint: Option<Color32>) -> (egui::Response, Ui) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
     let bg = if selected {
-        app.theme.ui.row_selected()
+        tint.unwrap_or_else(|| app.theme.ui.row_selected())
     } else if resp.hovered() {
         ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5)
     } else {
@@ -629,90 +528,34 @@ fn row_frame(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: b
     };
     ui.painter().rect_filled(rect, 0.0, bg);
     if selected {
-        ui.painter().rect_filled(Rect::from_min_max(rect.left_top(), rect.left_bottom() + vec2(2.0, 0.0)), 0.0, app.theme.ui.accent.0);
+        let bar = if tint.is_some() { app.theme.ui.target_mask() } else { app.theme.ui.accent.0 };
+        ui.painter().rect_filled(Rect::from_min_max(rect.left_top(), rect.left_bottom() + vec2(2.0, 0.0)), 0.0, bar);
     }
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
-    let inner = rect.shrink2(vec2(4.0, 0.0)).with_min_x(rect.left() + 4.0 + indent);
+    // Same right edge as the layer rows' strength column, so numbers line up down the list.
+    let inner = rect.shrink2(vec2(4.0, 0.0)).with_min_x(rect.left() + 4.0 + indent).with_max_x(rect.right() - 6.0);
     let child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
     (resp, child)
 }
 
-fn layer_row(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
-    let doc = app.doc.as_ref().unwrap();
-    let Some(l) = doc.layer(id) else { return };
-    let (name, visible, locked, opacity, has_mask) = (l.name.clone(), l.visible, l.locked, l.opacity, l.mask.is_some() || (app.mask_edit.as_ref().is_some_and(|(i, _)| *i == id)));
-    let selected = doc.active_layer() == Some(id) && app.selection == Selection::Layer;
-    let (resp, mut row) = row_frame(ui, app, ROW_H, 0.0, selected);
-    row.spacing_mut().item_spacing.x = 4.0;
-
-    let expanded = app.expanded.contains(&id);
-    if has_mask {
-        if icon_button(&mut row, if expanded { Icon::ChevronDown } else { Icon::ChevronRight }, 16.0, false, "").clicked() {
-            if expanded {
-                app.expanded.remove(&id);
-            } else {
-                app.expanded.insert(id);
-            }
-        }
-    } else {
-        row.add_space(16.0);
-    }
-    if icon_button(&mut row, if visible { Icon::Eye } else { Icon::EyeOff }, 20.0, false, "Visibility").clicked() {
-        let _ = app.doc.as_mut().unwrap().set_layer_visible(id, !visible);
-    }
-    // Thumbnail: clay swatch (sculpt layer).
-    let (sw, _) = row.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-    row.painter().rect_filled(sw, 2.0, app.theme.viewport.background_bottom.0);
-    Icon::Base.paint(row.painter(), sw.shrink(2.0), app.theme.viewport.clay.0);
-
-    let renaming = app.renaming.as_ref().is_some_and(|(r, _)| *r == id);
-    if renaming {
-        let (_, text) = app.renaming.as_mut().unwrap();
-        let te = row.add(egui::TextEdit::singleline(text).desired_width(110.0));
-        te.request_focus();
-        if te.lost_focus() {
-            let (_, text) = app.renaming.take().unwrap();
-            let _ = app.doc.as_mut().unwrap().rename_layer(id, text.trim());
-        }
-    } else {
-        row.label(if selected { RichText::new(&name).family(bold()) } else { RichText::new(&name) });
-    }
-
-    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let mut pct = opacity * 100.0;
-        let dv = ui.add(egui::DragValue::new(&mut pct).range(-100.0..=200.0).speed(0.5).suffix("%").max_decimals(0)).on_hover_text("Strength (drag)");
-        if dv.changed() {
-            let _ = app.doc.as_mut().unwrap().set_layer_opacity(id, pct / 100.0);
-        }
-        if icon_button(ui, if locked { Icon::Lock } else { Icon::Unlock }, 18.0, locked, "Lock").clicked() {
-            let _ = app.doc.as_mut().unwrap().set_layer_locked(id, !locked);
-        }
-        if has_mask {
-            let mask_sel = app.doc.as_ref().unwrap().active_layer() == Some(id) && app.selection == Selection::Mask;
-            if icon_button(ui, Icon::Mask, 20.0, mask_sel, "Select mask").clicked() {
-                select_layer(app, Some(id), Selection::Mask);
-            }
-        }
-    });
-
-    if resp.double_clicked() {
-        app.renaming = Some((id, name));
-    } else if resp.clicked() {
-        select_layer(app, Some(id), Selection::Layer);
-    }
-}
-
-fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
+pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: usize) {
+    let base_indent = depth as f32 * crate::layer_panel::row::INDENT;
     let active = app.doc.as_ref().unwrap().active_layer() == Some(id);
     let stack = if active { app.mask_edit.as_ref().map(|(_, s)| s.clone()) } else { app.doc.as_ref().unwrap().layer(id).and_then(|l| l.mask.clone()) };
     let Some(stack) = stack else { return };
     let weak = app.theme.weak_text();
 
     // Effects, top of the stack first.
+    let mut op_rows: Vec<crate::layer_panel::op_drag::OpRow> = Vec::new();
     for i in (0..stack.layers.len()).rev() {
         let e = &stack.layers[i];
         let selected = active && app.selection == Selection::Effect(i);
-        let (resp, mut row) = row_frame(ui, app, EFFECT_ROW_H, 22.0, selected);
+        let tint = app.theme.ui.target_mask().gamma_multiply(0.32);
+        let (resp, mut row) = row_frame_tinted(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected, Some(tint));
+        op_rows.push((i, resp.rect));
+        if resp.drag_started() && active {
+            app.layers.op_drag = Some((id, i));
+        }
         row.spacing_mut().item_spacing.x = 4.0;
         if icon_button(&mut row, if e.enabled { Icon::Eye } else { Icon::EyeOff }, 18.0, false, "Enable").clicked() {
             select_layer(app, Some(id), Selection::Effect(i));
@@ -726,33 +569,37 @@ fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         let title = if e.name.is_empty() { source_label(&e.source).to_string() } else { e.name.clone() };
         row.label(RichText::new(title).size(app.theme.metrics.font_size * 0.92));
         row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(format!("{} {:.0}", blend_short(e.blend), e.opacity * 100.0)).size(app.theme.metrics.font_size * 0.85).color(weak));
+            ui.label(RichText::new(format!("{:?} {:.0}%", e.blend, e.opacity * 100.0)).size(app.theme.metrics.font_size * 0.85).color(weak));
         });
         if resp.clicked() {
             select_layer(app, Some(id), Selection::Effect(i));
         }
+        let (count, enabled) = (stack.layers.len(), e.enabled);
+        egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::op_menu(app, ui, id, i, count, enabled));
     }
+    crate::layer_panel::op_drag::update(app, ui, id, &op_rows);
     // Mask base value row.
     let selected = active && app.selection == Selection::Mask;
-    let (resp, mut row) = row_frame(ui, app, EFFECT_ROW_H, 22.0, selected);
-    row.add_space(22.0);
+    let (resp, mut row) = row_frame_tinted(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected, Some(app.theme.ui.target_mask().gamma_multiply(0.32)));
     let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
     Icon::Mask.paint(row.painter(), r, row.visuals().text_color());
     row.label(RichText::new(if stack.base >= 0.5 { "White mask" } else { "Black mask" }).size(app.theme.metrics.font_size * 0.92).color(weak));
     if resp.clicked() {
         select_layer(app, Some(id), Selection::Mask);
     }
+    egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::add_mask_items(app, ui, id));
 }
 
-fn base_row(app: &mut SculptApp, ui: &mut Ui) {
+pub(crate) fn base_row(app: &mut SculptApp, ui: &mut Ui) {
     let selected = app.doc.as_ref().unwrap().active_layer().is_none();
-    let (resp, mut row) = row_frame(ui, app, ROW_H, 0.0, selected);
+    let (resp, mut row) = row_frame(ui, app, crate::layer_panel::row::Metrics::of(app.layers.compact).row_h, 0.0, selected);
     row.add_space(40.0);
     let (sw, _) = row.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
     row.painter().rect_filled(sw, 2.0, app.theme.viewport.background_bottom.0);
     Icon::Base.paint(row.painter(), sw.shrink(2.0), app.theme.viewport.clay.0.gamma_multiply(0.7));
     row.label(RichText::new("Base").italics());
     if resp.clicked() {
+        app.layers.selection.clear();
         select_layer(app, None, Selection::Layer);
     }
 }
@@ -760,19 +607,18 @@ fn base_row(app: &mut SculptApp, ui: &mut Ui) {
 // --------------------------------------------------------------- properties
 
 fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
-    let doc_layer = app.doc.as_ref().and_then(|d| d.active_layer().and_then(|id| d.layer(id)).map(|l| (l.id, l.name.clone())));
-    let title = match (&app.selection, &doc_layer) {
-        (Selection::Effect(_), Some((_, n))) => format!("PROPERTIES — {} MASK EFFECT", n.to_uppercase()),
-        (Selection::Mask, Some((_, n))) => format!("PROPERTIES — {} MASK", n.to_uppercase()),
-        (_, Some((_, n))) => format!("PROPERTIES — {}", n.to_uppercase()),
-        _ => "PROPERTIES — BASE".into(),
-    };
-    panel_header(ui, app, &title, |_| {});
+    // Folders can be selected without becoming the sculpt target, so Properties follows the primary row.
+    let target = app.doc.as_ref().and_then(|d| app.layers.selection.primary().or(d.active_layer()).and_then(|id| d.layer(id)).map(|l| (l.id, l.is_folder())));
+    let active = app.doc.as_ref().and_then(|d| d.active_layer());
+    panel_header(ui, app, "PROPERTIES", |_| {});
+    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 5)).show(ui, |ui| crate::layer_panel::breadcrumb::show(app, ui));
+    ui.painter().line_segment([ui.cursor().left_top(), ui.cursor().right_top()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
-            match (app.selection, doc_layer) {
-                (Selection::Effect(i), Some(_)) => effect_props(app, ui, i),
-                (Selection::Mask, Some(_)) => mask_props(app, ui),
+            match (app.selection, target) {
+                _ if app.layers.selection.len() > 1 => multi_props(app, ui),
+                (Selection::Effect(i), Some((id, false))) if active == Some(id) => effect_props(app, ui, i),
+                (Selection::Mask, Some((id, false))) if active == Some(id) => mask_props(app, ui),
                 (_, Some((id, _))) => layer_props(app, ui, id),
                 _ => {
                     ui.label(RichText::new("Sculpting directly on the base mesh. Add a layer (+) to sculpt non-destructively.").color(app.theme.weak_text()));
@@ -784,28 +630,104 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
     });
 }
 
-fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
-    let Some(l) = app.doc.as_ref().and_then(|d| d.layer(id)) else { return };
-    let (name, opacity, visible, locked, has_mask) = (l.name.clone(), l.opacity, l.visible, l.locked, l.mask.is_some());
+/// Several rows selected: shared fields, with a mixed state where they differ. Each change applies to all.
+fn multi_props(app: &mut SculptApp, ui: &mut Ui) {
+    use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
+    let Some(doc) = app.doc.as_ref() else { return };
+    let order: Vec<LayerId> = doc.layer_tree().iter().map(|r| r.id).collect();
+    let ids = app.layers.selection.in_order(&order);
+    let metas: Vec<_> = ids.iter().filter_map(|id| doc.layer(*id)).map(|l| (l.is_folder(), l.meta())).collect();
+    let Some(first) = metas.first().map(|(_, m)| m.clone()) else { return };
+    let all = |f: &dyn Fn(&sculpt_core::LayerMeta) -> bool| metas.iter().all(|(_, m)| f(m));
+    let (mixed_strength, mixed_vis, mixed_lock) = (!all(&|m| m.opacity == first.opacity), !all(&|m| m.visible == first.visible), !all(&|m| m.locked == first.locked));
+    let sculpt: Vec<_> = metas.iter().filter(|(f, _)| !f).map(|(_, m)| m.blend).collect();
+    let mixed_blend = sculpt.windows(2).any(|w| w[0] != w[1]);
+    let blend = sculpt.first().copied();
     let fs = app.theme.metrics.font_size;
-    section(ui, fs, "layer", "LAYER", |ui| {
+    section(ui, fs, "multi", &format!("{} LAYERS", ids.len()), |ui| {
+        // Strength is applied when the drag ends, so one gesture is one undo step.
+        let key = ui.id().with("multi_strength");
+        let shown = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(first.opacity * 100.0);
+        let mut pct = shown;
+        let r = prop(ui, if mixed_strength { "Strength (mixed)" } else { "Strength" }, |ui| ui.add(egui::Slider::new(&mut pct, -100.0..=200.0).suffix("%").max_decimals(0)));
+        if r.dragged() || r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(key, pct));
+        }
+        if r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus()) {
+            ui.data_mut(|d| d.remove_temp::<f32>(key));
+            command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Strength(pct / 100.0) });
+        }
+        if let Some(current) = blend {
+            prop(ui, "Blend", |ui| {
+                egui::ComboBox::from_id_salt("multi_blend").selected_text(if mixed_blend { "Mixed" } else { current.label() }).show_ui(ui, |ui| {
+                    for mode in sculpt_core::LayerBlend::ALL {
+                        if ui.selectable_label(!mixed_blend && current == mode, mode.label()).clicked() {
+                            command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Blend(mode) });
+                        }
+                    }
+                })
+            });
+        }
+        let (mut v, mut lk) = (first.visible, first.locked);
+        prop(ui, "", |ui| {
+            if ui.add(egui::Checkbox::new(&mut v, "Visible").indeterminate(mixed_vis)).changed() {
+                command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Visible(v) });
+            }
+            if ui.add(egui::Checkbox::new(&mut lk, "Locked").indeterminate(mixed_lock)).changed() {
+                command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Locked(lk) });
+            }
+        });
+        prop(ui, "", |ui| {
+            if ui.button("Group").on_hover_text("Put the selection in a new folder (Ctrl+G)").clicked() {
+                command::execute(app, LayerCommand::Group);
+            }
+            if ui.button("Duplicate").clicked() {
+                command::execute(app, LayerCommand::Duplicate);
+            }
+        });
+    });
+}
+
+fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
+    use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
+    let Some(l) = app.doc.as_ref().and_then(|d| d.layer(id)) else { return };
+    let (name, opacity, visible, locked, has_mask, is_folder, blend) = (l.name.clone(), l.opacity, l.visible, l.locked, l.mask.is_some(), l.is_folder(), l.blend);
+    let fs = app.theme.metrics.font_size;
+    section(ui, fs, "layer", if is_folder { "FOLDER" } else { "LAYER" }, |ui| {
         let mut n = name.clone();
         if prop(ui, "Name", |ui| ui.text_edit_singleline(&mut n)).lost_focus() && n != name {
-            let _ = app.doc.as_mut().unwrap().rename_layer(id, n.trim());
+            command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Name(n), coalesce: false });
         }
         let mut pct = opacity * 100.0;
-        if prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut pct, -100.0..=200.0).suffix("%").max_decimals(0))).changed() {
-            let _ = app.doc.as_mut().unwrap().set_layer_opacity(id, pct / 100.0);
+        let slider = prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut pct, -100.0..=200.0).suffix("%").max_decimals(0)));
+        if slider.changed() {
+            command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Strength(pct / 100.0), coalesce: slider.dragged() && !slider.drag_started() });
+        }
+        if !is_folder {
+            prop(ui, "Blend", |ui| {
+                egui::ComboBox::from_id_salt(("layer_blend", id)).selected_text(blend.label()).show_ui(ui, |ui| {
+                    for mode in sculpt_core::LayerBlend::ALL {
+                        if ui.selectable_label(blend == mode, mode.label()).on_hover_text(mode.hint()).clicked() {
+                            command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Blend(mode), coalesce: false });
+                        }
+                    }
+                })
+            });
         }
         let (mut v, mut lk) = (visible, locked);
         prop(ui, "", |ui| {
             if ui.checkbox(&mut v, "Visible").changed() {
-                let _ = app.doc.as_mut().unwrap().set_layer_visible(id, v);
+                command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Visible(v), coalesce: false });
             }
             if ui.checkbox(&mut lk, "Locked").changed() {
-                let _ = app.doc.as_mut().unwrap().set_layer_locked(id, lk);
+                command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Locked(lk), coalesce: false });
             }
         });
+        if is_folder {
+            let kids = app.doc.as_ref().map_or(0, |d| d.children(Some(id)).len());
+            prop(ui, "Contains", |ui| ui.label(RichText::new(format!("{kids} item{}", if kids == 1 { "" } else { "s" })).weak()));
+            return;
+        }
         prop(ui, "Mask", |ui| {
             if has_mask {
                 if ui.button("Edit mask").clicked() {
@@ -1020,15 +942,21 @@ fn brush_props(app: &mut SculptApp, ui: &mut Ui) {
 
 /// Push the edited mask stack to the document (deferred until mouse release
 /// so slider drags don't re-evaluate the mask every frame).
+/// Write the mask editing copy back to the document as one undoable step.
 pub fn apply_mask_edit(app: &mut SculptApp) {
     let Some((id, stack)) = app.mask_edit.clone() else { return };
-    let big = app.doc.as_ref().is_some_and(|d| d.vertex_count() > 400_000);
-    if big {
-        app.start_doc_job("Evaluating mask", move |d| d.set_layer_mask(id, Some(stack)).map_err(|e| e.to_string()));
+    let write = move |d: &mut sculpt_core::Document| -> Result<(), String> {
+        let Some(layer) = d.layer(id) else { return Ok(()) };
+        let mut meta = layer.meta();
+        meta.mask = Some(stack);
+        d.set_layer_meta(id, meta, false).map_err(|e| e.to_string())
+    };
+    if app.doc.as_ref().is_some_and(|d| d.vertex_count() > 400_000) {
+        app.start_doc_job("Evaluating mask", write);
     } else if let Some(d) = app.doc.as_mut()
-        && let Err(e) = d.set_layer_mask(id, Some(stack))
+        && let Err(e) = write(d)
     {
-        app.status = e.to_string();
+        app.status = e;
     }
 }
 

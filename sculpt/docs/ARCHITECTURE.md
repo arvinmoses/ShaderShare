@@ -53,8 +53,40 @@ Document
 **Composite rule (sculpt layers):**
 
 ```
-P(v) = base(v) + Σ_layers  visible · opacity · mask(v) · delta(v)
+P(v) = base(v) + Σ_layers  scale · mask(v) · delta(v)
 ```
+
+Each layer also has a **blend mode** that says how its offset combines with the
+offsets below it (`A` = offset so far, `L` = the layer's offset, `s` = scale·mask):
+Add `A+sL` (default, and how old projects behave), Subtract `A−sL`, Normal
+`A+s·c·(L−A)` where `c` is footprint coverage (the layer replaces what is below
+inside the area it touches), Max (apply only where `L·n>0`) and Min (only where
+`L·n<0`). Add and Subtract keep the fast incremental stroke path; the others
+re-composite the touched leaves per dab. Because Normal, Min and Max make order
+matter, the composite walks the layer tree bottom to top (`composite_order`).
+Folders have no blend mode; they only scale their children.
+
+`scale` is the layer's strength times every ancestor folder's strength, and is
+zero when the layer or an ancestor is hidden or another layer is soloed. The
+document refreshes it whenever structure, strength or visibility change, so the
+sculpting path reads one `f32` and never walks the tree.
+
+**Layer tree (`layer_ops.rs`).** Layers live in one flat `Vec`; each names its
+parent folder (`parent`, `kind = Layer | Folder`). Because deltas add, sibling
+order is organisational only: it never changes the surface. Commands:
+`insert_layer`, `insert_folder`, `delete_layer`, `duplicate_layer` (subtree),
+`move_layer(Placement::{Above, Below, Into, Top})` (refuses cycles),
+`group_layers`, `ungroup`, `merge_down` (bakes both layers' strength and masks into
+the lower one), `set_solo` (not undoable, view state) and `set_layer_meta`
+(name, strength, visibility, lock, collapse, mask; `coalesce` joins a slider drag
+into one step). Each command is a list of reversible `StructOp`s recorded in the
+same undo stack as strokes, so removed layers keep their data in the stack and
+undo/redo are exact. **Previews** (`preview.rs`): `delta_preview` and `mask_preview` sample at most 96 vertices per spatial leaf into a front-view grid, so cost follows the leaf count, not the face count. `edit_serial` bumps on every geometry or mask change; the UI cache (`layer_panel/thumbs.rs`) rebuilds a thumbnail only when the serial moved, it is over 0.5 s old, no stroke is in progress, and fewer than two were built this frame.
+
+Duplicating a layer or pasting a mask gives the copy its own hand-painted channels (`paint.layer<id>`), recorded in the same undo step. `flatten_layer` is undoable (touched base leaves are snapshotted); `flatten_folder` bakes Add-mode layers into one new layer and hides the folder.
+
+Project format v2 adds `kind`, `parent` and `collapsed`;
+v1 files load unchanged (fixture `tests/fixtures/v1_project`).
 
 * The **strength slider** (`opacity`) and the **layer mask** both scale a
   layer per vertex without changing its data. Moving the slider only
@@ -190,6 +222,9 @@ action-line / gizmo is UI work (§8) that calls these functions.
 Also at 6.29M faces: undo 6.6 ms, layer slider 16 ms, whole-mesh fbm mask
 0.39 s, peak RSS 1.7 GB.
 
+**Dense meshes (20M+ triangles):** drawing is made independent of mesh size by a hierarchical LOD that mirrors the
+BVH (`sculpt-core/src/lod.rs`); see [`PERFORMANCE_20M.md`](PERFORMANCE_20M.md).
+
 **Next performance work, in priority order:**
 
 1. **GPU viewport fed by dirty leaves**: one vertex buffer range per leaf;
@@ -270,17 +305,20 @@ brush ring drawn on the surface at the true world radius.
 **Layout (Substance Painter / Mudbox hybrid):** menu bar; Painter-style
 **context toolbar** (active tool, size, strength, falloff, front-faces,
 overlay, HUD toggle); right dock with **LAYERS** over **PROPERTIES**, both
-with uppercase title bars. The layer stack shows each sculpt layer (eye,
-clay thumbnail, name with double-click rename, mask button, lock, inline
-strength −100…200%) with its mask effects nested beneath as indented rows
-(eye, type icon, name, blend + opacity), then the mask base row, then
-*Base*. Its toolbar adds layers, white/black masks and effects, flattens and
-deletes the selection. **PROPERTIES** edits the selection (layer, mask base,
+with uppercase title bars. The layer stack (`crates/sculpt-app/src/layer_panel/`) shows each layer or
+folder as a 36 px row: eye, disclosure, content thumbnail, mask thumbnail
+(or a hover "+" slot), middle-elided name, solo, lock and strength column;
+mask ops nest beneath their layer, then *Base*. Directly under the list sits
+an add bar (+ Layer, Folder, Mask, Op, duplicate, merge, delete) that inserts
+above the selection. The module is split by responsibility: `selection`
+(multi-select model), `tree` (rows read from the document), `row`, `menus`,
+`add_bar`, `dragdrop` (pure drop-zone math) with `drag_ui`, `breadcrumb`, and
+`target` (what a stroke edits, and when it is refused; drives the viewport chip, breadcrumb and stroke guard), `switcher` (Tab), `thumbs` and `command`, the only path by which the UI changes layers, so undo stays
+consistent and hotkeys, menus and buttons share one behaviour. **PROPERTIES** edits the selection (layer, mask base,
 or a single effect: blend, opacity, source parameters, levels, blur, order)
 and then the brush; selecting a Paint effect retargets Mask Paint to that
 effect's channel. Bottom: Mudbox **tray** (Sculpt / Paint / Pose tools and a
-Falloff tray of curve presets) and a status bar (tool hint, pen, active
-layer, face count). All icons are vector-drawn, so nothing depends on font
+Falloff tray of curve presets) and a status bar (tool hint, pen, paint target, face count). All icons are vector-drawn, so nothing depends on font
 glyph coverage. Visual style: Inter typography (semibold
 letter-spaced section titles), accent-filled sliders with round handles,
 soft popup/window shadows, a camera-relative clay material (wrapped key,
