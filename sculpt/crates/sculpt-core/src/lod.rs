@@ -81,7 +81,7 @@ impl View {
         View { eye, planes, focal_px }
     }
 
-    fn sees(&self, b: &Aabb) -> bool {
+    pub fn sees(&self, b: &Aabb) -> bool {
         let c = b.center();
         let h = b.extent() * 0.5;
         self.planes.iter().all(|p| {
@@ -91,7 +91,7 @@ impl View {
     }
 
     /// Projected size, in pixels, of a world-space error `e` on the box nearest the eye.
-    fn error_px(&self, b: &Aabb, e: f32) -> f32 {
+    pub fn error_px(&self, b: &Aabb, e: f32) -> f32 {
         let d = (self.eye.clamp(b.min, b.max) - self.eye).length();
         e * self.focal_px / d.max(1e-4)
     }
@@ -102,6 +102,8 @@ impl View {
 pub struct Cut {
     /// `(first_index, index_count)` into the pool, with neighbouring ranges already merged.
     pub ranges: Vec<(u32, u32)>,
+    /// BVH/LOD node id of every drawn node, in traversal order (the generator scheduler schedules by node).
+    pub ids: Vec<u32>,
     pub triangles: u64,
     pub nodes: u32,
     /// Nodes rejected by the frustum.
@@ -500,6 +502,7 @@ impl LodTree {
             }
             _ => {
                 cut.nodes += 1;
+                cut.ids.push(id);
                 cut.triangles += node.count as u64 / 3;
                 match cut.ranges.last_mut() {
                     Some((first, count)) if *first + *count == node.first => *count += node.count,

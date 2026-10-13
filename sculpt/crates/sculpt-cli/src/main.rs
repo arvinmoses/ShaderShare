@@ -6,6 +6,7 @@
 //! sculpt-cli generator-bench [levels] [counts] [--no-voxel] [--mixed]   Generator Boolean spike timings
 //! sculpt-cli refine-bench <quality|time|cracks|dump> ...   Generator boundary refinement (spike 3)
 //! sculpt-cli adf-bench perf|quality [...]   Spike 6: adaptively sampled distance field boolean
+//! sculpt-cli generator-drag-sim [levels] [counts] [--view ..]           Generator slider-drag scheduler simulation
 //! sculpt-cli info  <project_dir>       summarize a project
 //! sculpt-cli import-channel <project_dir> <name> <file>
 //! sculpt-cli render <project_dir> <out.png>
@@ -14,6 +15,7 @@
 mod adf_bench;
 mod generator_bench;
 mod refine_bench;
+mod generator_drag_sim;
 mod render;
 mod render_mesh;
 
@@ -42,12 +44,13 @@ fn main() {
         Some("generator-bench") => generator_bench::run(&args[1..]),
         Some("refine-bench") => refine_bench::run(&args[1..]),
         Some("adf-bench") => adf_bench::run(&args[1..]),
+        Some("generator-drag-sim") => generator_drag_sim::run(&args[1..]),
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("import-channel") if args.len() == 4 => import_channel(Path::new(&args[1]), &args[2], Path::new(&args[3])),
         Some("render") if args.len() == 3 => render_project(Path::new(&args[1]), Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: sculpt-cli demo [out] | bench [level] | generator-bench [levels] [counts] | refine-bench <quality|time|cracks|dump> | adf-bench perf|quality | info <project> | import-channel <project> <name> <file> | render <project> <png>"
+                "usage: sculpt-cli demo [out] | bench [level] | generator-bench [levels] [counts] | refine-bench <quality|time|cracks|dump> | adf-bench perf|quality | generator-drag-sim [levels] [counts] | info <project> | import-channel <project> <name> <file> | render <project> <png>"
             );
             std::process::exit(2);
         }

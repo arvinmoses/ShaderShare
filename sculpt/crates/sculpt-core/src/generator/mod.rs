@@ -2,6 +2,7 @@
 //!
 //! * [`sdf`]: analytic primitive signed distance fields.
 //! * [`instances`]: instance transforms and the spatial hash over their AABBs.
+//! * [`schedule`]: LOD-aware, time-budgeted progressive evaluation (interactive drag scheduler).
 //! * [`place`]: mask-weighted surface sampling and sharp-edge sampling.
 //! * [`refine`]: SPIKE 3, adaptive boundary refinement (temporary crisp patches).
 //! * [`voxel`]: SPIKE B timing code (sparse brick SDF + surface nets). Measurement
@@ -34,13 +35,14 @@ pub mod adf;
 pub mod instances;
 pub mod place;
 pub mod refine;
+pub mod schedule;
 pub mod sdf;
 pub mod voxel;
 
 use glam::Vec3;
 use rayon::prelude::*;
 
-pub use instances::{Instance, InstanceSet, frame_from_edge, frame_from_normal};
+pub use instances::{Cands, Dirty, HashStats, Instance, InstanceSet, frame_from_edge, frame_from_normal};
 pub use sdf::Primitive;
 
 use crate::bvh::{Bvh, NodeKind, split_ranges_mut};

@@ -40,7 +40,7 @@ pub(crate) fn timed<T>(reps: usize, mut f: impl FnMut() -> T) -> (f64, T) {
     (median(times), last)
 }
 
-fn rng(i: u64, k: u64) -> f32 {
+pub(crate) fn rng(i: u64, k: u64) -> f32 {
     let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ k.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

@@ -1,5 +1,7 @@
 # Generator Boolean: spike results
 
+Follow-up: `spike4_lod_progressive.md` (LOD-aware evaluation, progressive refinement, incremental hash).
+
 Measured on the sculpt engine at `crates/sculpt-core/src/generator/` (spike code, not wired into
 `Document`). Design context: `DESIGN.md` in this folder.
 
