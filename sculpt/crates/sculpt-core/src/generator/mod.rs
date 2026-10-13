@@ -29,6 +29,7 @@
 //!   therefore never make an overhang or undercut; the result is single-valued
 //!   along each vertex normal.
 
+pub mod adf;
 pub mod instances;
 pub mod place;
 pub mod sdf;

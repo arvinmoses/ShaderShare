@@ -230,6 +230,14 @@ impl InstanceSet {
     /// Replace a subset of instances; returns the old and new inflated AABBs
     /// (feed them to [`super::affected_leaves`]). The grid is rebuilt.
     pub fn update(&mut self, changes: &[(usize, Instance)]) -> Vec<Aabb> {
+        let dirty = self.update_bake_only(changes);
+        self.rebuild_grid();
+        dirty
+    }
+
+    /// Like [`InstanceSet::update`] but leaves the spatial hash stale (callers that never use
+    /// [`InstanceSet::candidates`], such as the ADF boolean, skip its rebuild).
+    pub fn update_bake_only(&mut self, changes: &[(usize, Instance)]) -> Vec<Aabb> {
         let mut dirty = Vec::with_capacity(changes.len() * 2);
         for &(i, inst) in changes {
             dirty.push(self.aabbs[i]);
@@ -238,8 +246,15 @@ impl InstanceSet {
             self.aabbs[i] = inflate(inst.aabb(), self.margin);
             dirty.push(self.aabbs[i]);
         }
-        self.rebuild_grid();
         dirty
+    }
+
+    /// Bake transforms and AABBs only; no spatial hash (see [`InstanceSet::update_bake_only`]).
+    pub fn bake_only(instances: Vec<Instance>, margin: f32) -> InstanceSet {
+        let mut s = InstanceSet { instances, baked: Vec::new(), aabbs: Vec::new(), margin, bounds: Aabb::EMPTY, grid: Grid::default() };
+        s.baked = s.instances.par_iter().map(Baked::new).collect();
+        s.aabbs = s.instances.par_iter().map(|i| inflate(i.aabb(), margin)).collect();
+        s
     }
 
     /// Re-bake every instance and rebuild the grid.

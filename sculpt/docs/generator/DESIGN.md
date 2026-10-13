@@ -89,7 +89,8 @@ See `spike_results.md` for the measured trade-off. The options:
   arbitrary shape. Changes topology, so per-vertex layers, masks and undo do not map
   across without a transfer step.
 - **Hybrid.** Live preview with A, then an explicit Apply that bakes with B and
-  resamples layers onto the new surface.
+  resamples layers onto the new surface. Spike 6 (`spike6_adf.md`) replaces B with an
+  adaptively sampled distance field: seconds instead of minutes cold, incremental, exact corners.
 
 Whichever is chosen, the layer stores parameters only. The result is procedural and
 recomputed after subdivision, so detail follows the mesh density.
