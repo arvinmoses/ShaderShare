@@ -7,6 +7,7 @@ pub mod bake;
 pub mod brush;
 pub mod bvh;
 pub mod document;
+pub mod generator;
 pub mod geom;
 pub mod io;
 pub mod layer_ops;
