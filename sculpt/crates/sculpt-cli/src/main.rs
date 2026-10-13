@@ -4,13 +4,16 @@
 //! sculpt-cli demo  [out_dir]           scripted session -> project + OBJs
 //! sculpt-cli bench [level]             brush latency on a dense sphere
 //! sculpt-cli generator-bench [levels] [counts] [--no-voxel] [--mixed]   Generator Boolean spike timings
+//! sculpt-cli refine-bench <quality|time|cracks|dump> ...   Generator boundary refinement (spike 3)
 //! sculpt-cli info  <project_dir>       summarize a project
 //! sculpt-cli import-channel <project_dir> <name> <file>
 //! sculpt-cli render <project_dir> <out.png>
 //! ```
 
 mod generator_bench;
+mod refine_bench;
 mod render;
+mod render_mesh;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -35,12 +38,13 @@ fn main() {
         Some("lod-bench") => lod_bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000_000), args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0)),
         Some("bench") => bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9)),
         Some("generator-bench") => generator_bench::run(&args[1..]),
+        Some("refine-bench") => refine_bench::run(&args[1..]),
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("import-channel") if args.len() == 4 => import_channel(Path::new(&args[1]), &args[2], Path::new(&args[3])),
         Some("render") if args.len() == 3 => render_project(Path::new(&args[1]), Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: sculpt-cli demo [out] | bench [level] | generator-bench [levels] [counts] | info <project> | import-channel <project> <name> <file> | render <project> <png>"
+                "usage: sculpt-cli demo [out] | bench [level] | generator-bench [levels] [counts] | refine-bench <quality|time|cracks|dump> | info <project> | import-channel <project> <name> <file> | render <project> <png>"
             );
             std::process::exit(2);
         }
