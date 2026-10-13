@@ -366,6 +366,38 @@ impl InstanceSet {
         }
     }
 
+    /// Instances whose inflated AABB overlaps `b` (sorted, unique).
+    pub fn candidates_in_box(&self, b: &Aabb, out: &mut Vec<u32>) {
+        out.clear();
+        if self.grid.keys.is_empty() || b.is_empty() || b.min.cmpgt(self.bounds.max).any() || b.max.cmplt(self.bounds.min).any() {
+            return;
+        }
+        let (lo, hi) = self.grid.cell_range(b);
+        let cells = (hi[0] - lo[0] + 1) as u64 * (hi[1] - lo[1] + 1) as u64 * (hi[2] - lo[2] + 1) as u64;
+        if cells > 100_000 {
+            out.extend((0..self.aabbs.len() as u32).filter(|&i| self.aabb_overlaps(i, b)));
+            return;
+        }
+        for z in lo[2]..=hi[2] {
+            for y in lo[1]..=hi[1] {
+                for x in lo[0]..=hi[0] {
+                    if let Some(s) = self.grid.find(pack(x, y, z)) {
+                        out.extend_from_slice(&self.grid.items[self.grid.start[s] as usize..(self.grid.start[s] + self.grid.len[s]) as usize]);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.retain(|&i| self.aabb_overlaps(i, b));
+    }
+
+    #[inline]
+    fn aabb_overlaps(&self, i: u32, b: &Aabb) -> bool {
+        let a = &self.aabbs[i as usize];
+        !(a.min.cmpgt(b.max).any() || a.max.cmplt(b.min).any())
+    }
+
     /// Does any instance (inflated) potentially overlap this box?
     pub fn touches(&self, b: &Aabb) -> bool {
         if self.grid.keys.is_empty() || b.is_empty() || b.min.cmpgt(self.bounds.max).any() || b.max.cmplt(self.bounds.min).any() {

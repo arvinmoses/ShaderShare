@@ -67,6 +67,27 @@ impl Leaf {
     pub fn owned_len(&self) -> usize {
         (self.owned.end - self.owned.start) as usize
     }
+
+    /// Append the faces of the fine ray tree nodes whose bounds overlap `b`
+    /// (a superset of the faces overlapping `b`, in tree order).
+    pub fn faces_overlapping(&self, b: &Aabb, out: &mut Vec<u32>) {
+        if self.tree.is_empty() {
+            return;
+        }
+        let mut stack: smallvec::SmallVec<[u32; 32]> = smallvec::smallvec![0];
+        while let Some(i) = stack.pop() {
+            let node = &self.tree[i as usize];
+            if node.bounds.min.cmpgt(b.max).any() || node.bounds.max.cmplt(b.min).any() {
+                continue;
+            }
+            if node.count == 0 {
+                stack.push(node.right);
+                stack.push(i + 1);
+            } else {
+                out.extend_from_slice(&self.faces[node.start as usize..(node.start + node.count) as usize]);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

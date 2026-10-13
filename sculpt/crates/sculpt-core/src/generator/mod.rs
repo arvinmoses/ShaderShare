@@ -3,6 +3,7 @@
 //! * [`sdf`]: analytic primitive signed distance fields.
 //! * [`instances`]: instance transforms and the spatial hash over their AABBs.
 //! * [`place`]: mask-weighted surface sampling and sharp-edge sampling.
+//! * [`refine`]: SPIKE 3, adaptive boundary refinement (temporary crisp patches).
 //! * [`voxel`]: SPIKE B timing code (sparse brick SDF + surface nets). Measurement
 //!   only, not a feature implementation.
 //!
@@ -31,6 +32,7 @@
 
 pub mod instances;
 pub mod place;
+pub mod refine;
 pub mod sdf;
 pub mod voxel;
 
