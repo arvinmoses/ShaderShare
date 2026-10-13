@@ -19,11 +19,11 @@ use sculpt_core::primitives::quad_sphere;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-fn ms(t: Instant) -> f64 {
+pub(crate) fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
+pub(crate) fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.total_cmp(b));
     v[v.len() / 2]
 }
@@ -40,7 +40,7 @@ fn timed<T>(reps: usize, mut f: impl FnMut() -> T) -> (f64, T) {
     (median(times), last)
 }
 
-fn rng(i: u64, k: u64) -> f32 {
+pub(crate) fn rng(i: u64, k: u64) -> f32 {
     let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ k.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -54,7 +54,7 @@ fn rss_mb(key: &str) -> f64 {
         .map_or(0.0, |kb| kb / 1024.0)
 }
 
-fn make_instances(samples: &[sculpt_core::generator::place::SurfaceSample], edge: f32, size: f32, mixed: bool) -> Vec<Instance> {
+pub(crate) fn make_instances(samples: &[sculpt_core::generator::place::SurfaceSample], edge: f32, size: f32, mixed: bool) -> Vec<Instance> {
     samples
         .iter()
         .enumerate()
