@@ -5,11 +5,13 @@
 //!            [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--size WxH]
 //!            [--demo-layers]
 //! sculpt-app --gpu-bench [LEVELS] [COUNTS] [--op subtract|add|intersect|all] [--mixed] [--reps N] [--cpu] [--check] [--png out.png]
+//! sculpt-app --gpu-sdf-bench | --gpu-sdf-check | --gpu-sdf-png <dir>      (headless GPU SDF boolean spike)
 //! ```
 
 mod app;
 mod camera;
 mod gpu_boolean;
+mod gpu_sdf;
 mod icons;
 mod layer_panel;
 mod keymap;
@@ -45,6 +47,15 @@ fn main() -> eframe::Result {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_boolean::bench::run(&args) {
             eprintln!("gpu-bench: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // Headless GPU SDF boolean spike (own device, no window): see gpu_sdf/mod.rs.
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if all.first().is_some_and(|a| gpu_sdf::is_gpu_sdf_command(a)) {
+        if let Err(e) = gpu_sdf::cli(&all) {
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
         return Ok(());
