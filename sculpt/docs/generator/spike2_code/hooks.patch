@@ -1,0 +1,183 @@
+diff --git a/sculpt/crates/sculpt-app/src/app.rs b/sculpt/crates/sculpt-app/src/app.rs
+index 38ef20e..24c3a8a 100644
+--- a/sculpt/crates/sculpt-app/src/app.rs
++++ b/sculpt/crates/sculpt-app/src/app.rs
+@@ -38,6 +38,8 @@ pub struct Options {
+     pub screenshot: Option<PathBuf>,
+     /// Create a masked detail layer on startup (for demos and screenshots).
+     pub demo_layers: bool,
++    /// Render-time CSG preview spike (`--csg-preview`).
++    pub csg: Option<crate::viewport_csg::CsgOptions>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -160,10 +162,14 @@ impl SculptApp {
+         let keymap = Keymap::load(&cfg.join("keymap.json"));
+         let tools = serde_json::from_value(settings["tools"].clone()).unwrap_or_default();
+ 
++        let mut viewport = cc.wgpu_render_state.as_ref().map(Viewport::new);
++        if let (Some(vp), Some(rs), Some(c)) = (viewport.as_mut(), cc.wgpu_render_state.as_ref(), opts.csg.clone()) {
++            vp.enable_csg(rs, c);
++        }
+         let mut app = SculptApp {
+             doc: None,
+             job: None,
+-            viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
++            viewport,
+             camera: Camera::default(),
+             themes,
+             theme,
+diff --git a/sculpt/crates/sculpt-app/src/main.rs b/sculpt/crates/sculpt-app/src/main.rs
+index 09628d5..51690de 100644
+--- a/sculpt/crates/sculpt-app/src/main.rs
++++ b/sculpt/crates/sculpt-app/src/main.rs
+@@ -4,6 +4,8 @@
+ //! sculpt-app [project.sculpt] [--level N] [--theme NAME]
+ //!            [--test-strokes FRAMES] [--screenshot out.png] [--size WxH]
+ //!            [--demo-layers]
++//!            [--csg-preview [subtract|add|intersect]] [--csg-count N] [--csg-size F]
++//!            [--csg-boxes] [--csg-seed N] [--csg-heat] [--csg-bench]
+ //! ```
+ 
+ mod app;
+@@ -15,6 +17,7 @@ mod test_driver;
+ mod theme;
+ mod tools;
+ mod viewport;
++mod viewport_csg;
+ 
+ use std::path::PathBuf;
+ 
+@@ -22,7 +25,9 @@ use eframe::egui_wgpu::{SurfaceConfig, WgpuConfiguration};
+ 
+ fn main() -> eframe::Result {
+     let mut args = std::env::args().skip(1);
+-    let mut opts = app::Options { project: None, level: 7, theme: None, test_frames: None, screenshot: None, demo_layers: false };
++    let mut opts = app::Options { project: None, level: 7, theme: None, test_frames: None, screenshot: None, demo_layers: false, csg: None };
++    let mut csg = viewport_csg::CsgOptions::default();
++    let mut csg_on = false;
+     let mut size = [1600.0f32, 1000.0];
+     while let Some(a) = args.next() {
+         match a.as_str() {
+@@ -31,6 +36,22 @@ fn main() -> eframe::Result {
+             "--test-strokes" => opts.test_frames = args.next().and_then(|v| v.parse().ok()),
+             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
+             "--demo-layers" => opts.demo_layers = true,
++            "--csg-preview" => {
++                csg_on = true;
++                // Optional mode word directly after the flag.
++                if let Some(m) = args.next() {
++                    match viewport_csg::Mode::parse(&m) {
++                        Some(mode) => csg.mode = mode,
++                        None => opts.project = Some(PathBuf::from(m)),
++                    }
++                }
++            }
++            "--csg-count" => csg.count = args.next().and_then(|v| v.parse().ok()).unwrap_or(csg.count),
++            "--csg-size" => csg.size = args.next().and_then(|v| v.parse().ok()).unwrap_or(csg.size),
++            "--csg-seed" => csg.seed = args.next().and_then(|v| v.parse().ok()).unwrap_or(csg.seed),
++            "--csg-boxes" => csg.boxes = true,
++            "--csg-heat" => csg.heat = true,
++            "--csg-bench" => csg.bench = true,
+             "--size" => {
+                 if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
+                     size = [w.parse().unwrap_or(size[0]), h.parse().unwrap_or(size[1])];
+@@ -44,6 +65,10 @@ fn main() -> eframe::Result {
+         }
+     }
+ 
++    if csg_on {
++        opts.csg = Some(csg);
++    }
++
+     let native = eframe::NativeOptions {
+         viewport: egui::ViewportBuilder::default().with_title("Sculpt").with_inner_size(size).with_min_inner_size([900.0, 600.0]),
+         renderer: eframe::Renderer::Wgpu,
+diff --git a/sculpt/crates/sculpt-app/src/viewport.rs b/sculpt/crates/sculpt-app/src/viewport.rs
+index e5ed731..bc5dbe7 100644
+--- a/sculpt/crates/sculpt-app/src/viewport.rs
++++ b/sculpt/crates/sculpt-app/src/viewport.rs
+@@ -18,6 +18,7 @@ use sculpt_core::{DirtySet, Document};
+ 
+ use crate::camera::Camera;
+ use crate::theme::Theme;
++use crate::viewport_csg::{CsgOptions, CsgPreview, MeshRefs};
+ 
+ const MSAA: u32 = 4;
+ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+@@ -82,6 +83,8 @@ pub struct Viewport {
+     pub texture_id: Option<egui::TextureId>,
+     overlay_kind: OverlayKind,
+     pub last_upload: UploadStats,
++    /// Opt-in render-time CSG preview (`--csg-preview`); `None` = default path.
++    csg: Option<CsgPreview>,
+ }
+ 
+ fn linear(c: egui::Color32) -> [f32; 4] {
+@@ -173,9 +176,15 @@ impl Viewport {
+             texture_id: None,
+             overlay_kind: OverlayKind::None,
+             last_upload: UploadStats::default(),
++            csg: None,
+         }
+     }
+ 
++    /// Switch on the render-time CSG preview spike.
++    pub fn enable_csg(&mut self, rs: &egui_wgpu::RenderState, opts: CsgOptions) {
++        self.csg = Some(CsgPreview::new(rs, opts, &self.uniforms, COLOR_FORMAT));
++    }
++
+     fn ensure_targets(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2]) {
+         if self.targets.as_ref().is_some_and(|t| t.size == size) {
+             return;
+@@ -212,6 +221,10 @@ impl Viewport {
+         let queue = &rs.queue;
+         if self.mesh.as_ref().is_none_or(|m| m.topology_id != doc.topology_id()) {
+             self.mesh = Some(create_mesh_buffers(&rs.device, doc));
++            if let Some(csg) = self.csg.as_mut() {
++                let b = doc.bounds();
++                csg.set_scene(&rs.device, b.center(), b.extent().max_element() * 0.5);
++            }
+             self.overlay_kind = OverlayKind::None;
+             doc.take_geometry_dirty();
+             doc.take_scalar_dirty();
+@@ -319,6 +332,12 @@ impl Viewport {
+ 
+         let targets = self.targets.as_ref().unwrap();
+         let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
++        let t_csg = Instant::now();
++        let mut use_csg = false;
++        if let (Some(csg), Some(m)) = (self.csg.as_mut(), &self.mesh) {
++            let refs = MeshRefs { positions: &m.positions, normals: &m.normals, indices: &m.indices, index_count: m.index_count };
++            use_csg = csg.prepare(rs, &mut enc, size, view_proj, &refs);
++        }
+         {
+             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("viewport"),
+@@ -340,7 +359,11 @@ impl Viewport {
+             pass.set_bind_group(0, &self.bind_group, &[]);
+             pass.set_pipeline(&self.bg_pipeline);
+             pass.draw(0..3, 0..1);
+-            if let Some(m) = &self.mesh {
++            if use_csg {
++                if let Some(csg) = &self.csg {
++                    csg.draw(&mut pass);
++                }
++            } else if let Some(m) = &self.mesh {
+                 pass.set_pipeline(&self.mesh_pipeline);
+                 pass.set_vertex_buffer(0, m.positions.slice(..));
+                 pass.set_vertex_buffer(1, m.normals.slice(..));
+@@ -350,6 +373,13 @@ impl Viewport {
+             }
+         }
+         rs.queue.submit([enc.finish()]);
++        if let Some(csg) = self.csg.as_mut()
++            && use_csg
++            && csg.opts.bench
++        {
++            let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
++            csg.record_frame(t_csg.elapsed().as_secs_f32() * 1e3);
++        }
+         self.texture_id
+     }
+ }
