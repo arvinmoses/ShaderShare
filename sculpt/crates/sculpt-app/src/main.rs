@@ -4,10 +4,12 @@
 //! sculpt-app [project.sculpt] [--level N] [--quads N] [--theme NAME]
 //!            [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--size WxH]
 //!            [--demo-layers]
+//! sculpt-app --gpu-bench [LEVELS] [COUNTS] [--op subtract|add|intersect|all] [--mixed] [--reps N] [--cpu] [--check] [--png out.png]
 //! ```
 
 mod app;
 mod camera;
+mod gpu_boolean;
 mod icons;
 mod layer_panel;
 mod keymap;
@@ -38,6 +40,15 @@ fn gpu_setup() -> WgpuSetup {
 }
 
 fn main() -> eframe::Result {
+    // Headless GPU boolean benchmark: no window, own wgpu device.
+    if std::env::args().nth(1).as_deref() == Some("--gpu-bench") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = gpu_boolean::bench::run(&args) {
+            eprintln!("gpu-bench: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let mut args = std::env::args().skip(1);
     let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, bench_orbit: None, zoom: 1.0 };
     let mut size = [1600.0f32, 1000.0];
