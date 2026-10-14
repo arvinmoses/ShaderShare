@@ -22,15 +22,16 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
+use crate::generator::layer::GeneratorSpec;
 use crate::layers::{LayerBlend, LayerId, LayerKind};
 use crate::mask::MaskStack;
 use crate::mesh::Face;
 use crate::{Error, Result};
 
 pub const FORMAT: &str = "sculpt-project";
-/// 2 added layer folders (`kind`, `parent`, `collapsed`); 3 added per-layer `blend`.
-/// Older projects load unchanged.
-pub const VERSION: u32 = 3;
+/// 2 added layer folders (`kind`, `parent`, `collapsed`); 3 added per-layer `blend`; 4 added generator layers
+/// (`kind: "generator"` with a `generator` spec). Older projects load unchanged.
+pub const VERSION: u32 = 4;
 pub const MANIFEST: &str = "project.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +110,9 @@ pub struct LayerEntry {
     pub blend: LayerBlend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<MaskStack>,
+    /// Generator layers only: the procedural parameters. Such a layer has no deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<GeneratorSpec>,
     /// Sparse: vertex indices (u32) and matching deltas (f32 x 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indices: Option<BlobRef>,
@@ -131,6 +135,7 @@ pub(crate) struct PartLayer {
     pub collapsed: bool,
     pub blend: LayerBlend,
     pub mask: Option<MaskStack>,
+    pub generator: Option<GeneratorSpec>,
     pub indices: Vec<u32>,
     pub deltas: Vec<Vec3>,
 }
@@ -227,6 +232,7 @@ pub fn save(doc: &Document, dir: &Path) -> Result<()> {
             collapsed: layer.collapsed,
             blend: layer.blend,
             mask: layer.mask.clone(),
+            generator: layer.generator.clone(),
             indices: Some(write_blob(dir, &format!("{tag}_indices"), DType::U32, 1, &idx)?),
             deltas: Some(write_blob(dir, &format!("{tag}_deltas"), DType::F32, 3, &deltas)?),
         });
@@ -310,6 +316,7 @@ pub fn load(dir: &Path) -> Result<Document> {
             collapsed: l.collapsed,
             blend: l.blend,
             mask: l.mask,
+            generator: l.generator,
             indices,
             deltas,
         });

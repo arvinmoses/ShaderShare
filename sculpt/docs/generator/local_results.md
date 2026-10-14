@@ -66,3 +66,13 @@ quads have vertexless cells, as before.
 - `csg_bench.sh` (spike 2): the app has no `--csg-preview` flag, since the spike is parked and not wired into the
   current LOD viewport. Needs the port first.
 - `adf-bench quality` / `refine-bench quality|cracks` (quality, not speed).
+
+## Sculpt latency guard (after milestone 1)
+
+`sculpt-app --level N --test-strokes 180` on this machine, discrete R9700, after adding the generator layer hook to
+`Document::recomposite` (no baseline run on this machine before the change, so compare with the cloud figures only):
+
+| faces | input + dabs median / p95 / max ms | whole frame incl. UI median ms |
+|---|---|---|
+| 98k | 1.18 / 1.99 / 4.97 | 1.63 |
+| 1.57M | 2.18 / 3.51 / 10.33 | 2.69 |

@@ -33,6 +33,7 @@
 
 pub mod adf;
 pub mod instances;
+pub mod layer;
 pub mod place;
 pub mod refine;
 pub mod schedule;
@@ -41,6 +42,7 @@ pub mod voxel;
 
 use glam::Vec3;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 pub use instances::{Cands, Dirty, HashStats, Instance, InstanceSet, frame_from_edge, frame_from_normal};
 pub use sdf::Primitive;
@@ -48,7 +50,8 @@ pub use sdf::Primitive;
 use crate::bvh::{Bvh, NodeKind, split_ranges_mut};
 use crate::geom::Aabb;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BoolOp {
     Add,
     Subtract,

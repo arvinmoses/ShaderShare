@@ -464,7 +464,7 @@ impl Document {
         layer.mask = stack;
         layer.mask_values = values;
         self.scalar_dirty.mark_all();
-        let leaves = layer.allocated_leaves();
+        let leaves = layer.touched_leaves();
         self.recomposite(&leaves);
         Ok(())
     }
@@ -476,7 +476,7 @@ impl Document {
             if let Some(stack) = self.layers[i].mask.clone() {
                 let values = self.mask_values_for(&stack)?;
                 self.layers[i].mask_values = values;
-                leaves.extend(self.layers[i].allocated_leaves());
+                leaves.extend(self.layers[i].touched_leaves());
                 self.scalar_dirty.mark_all();
             }
         }
@@ -498,7 +498,7 @@ impl Document {
                 self.scalar_dirty.mark_all();
                 let values = self.mask_values_for(&stack)?;
                 self.layers[i].mask_values = values;
-                leaves.extend(self.layers[i].allocated_leaves());
+                leaves.extend(self.layers[i].touched_leaves());
             }
         }
         self.recomposite(&leaves.into_iter().collect::<Vec<_>>());
@@ -510,6 +510,9 @@ impl Document {
         let i = self.layer_index(id)?;
         if self.layers[i].is_folder() {
             return Err(Error::InvalidData("flatten works on layers, not folders".into()));
+        }
+        if self.layers[i].is_generator() {
+            return Err(Error::InvalidData("a generator layer is procedural and cannot be flattened".into()));
         }
         if self.layers[i].blend != crate::layers::LayerBlend::Add {
             return Err(Error::InvalidData("only layers in Add mode can be flattened into the base".into()));
@@ -872,11 +875,16 @@ impl Document {
         let order = self.composite_order();
         let eps = (self.bvh.bounds().extent().length() * 1e-4).max(1e-9);
         let slices = split_ranges_mut(&mut self.positions, ranges.iter().cloned());
-        let (base, layers, normals) = (&self.base, &self.layers, &self.normals);
+        let (base, layers, normals, bvh) = (&self.base, &self.layers, &self.normals, &self.bvh);
         slices.into_par_iter().zip(leaves.par_iter()).zip(ranges.par_iter()).for_each(|((pos, &l), r)| {
             pos.copy_from_slice(&base[r.clone()]);
             for &i in &order {
                 let layer = &layers[i];
+                if let Some(g) = &layer.gen_cache {
+                    // A function layer: it displaces the positions accumulated so far.
+                    g.apply_leaf(&bvh.leaves[l as usize].bounds, pos, normals, r.start, |v| layer.weight(v));
+                    continue;
+                }
                 let Some(chunk) = &layer.chunks[l as usize] else { continue };
                 if layer.blend == crate::layers::LayerBlend::Add {
                     for (k, p) in pos.iter_mut().enumerate() {
@@ -892,6 +900,23 @@ impl Document {
             }
         });
         self.geometry_changed(&leaves);
+    }
+
+    /// Rebuild a generator layer's derived placement from its spec and the base surface.
+    pub(crate) fn rebuild_generator_cache(&mut self, i: usize) {
+        let cache = self.layers[i]
+            .generator
+            .as_ref()
+            .map(|s| std::sync::Arc::new(crate::generator::layer::GeneratorCache::build(s, &self.base, &self.faces, &self.topo, &self.bvh)));
+        self.layers[i].gen_cache = cache;
+    }
+
+    pub(crate) fn rebuild_generator_caches(&mut self) {
+        for i in 0..self.layers.len() {
+            if self.layers[i].is_generator() {
+                self.rebuild_generator_cache(i);
+            }
+        }
     }
 
     pub(crate) fn recomposite_all(&mut self) {
@@ -1140,6 +1165,7 @@ impl Document {
                 self.layers[i].mask_values = self.mask_values_for(&stack)?;
             }
         }
+        self.rebuild_generator_caches();
         self.recomposite_all();
         Ok(())
     }
@@ -1164,6 +1190,7 @@ impl Document {
             layer.collapsed = pl.collapsed;
             layer.blend = pl.blend;
             layer.mask = pl.mask;
+            layer.generator = pl.generator;
             for (ci, d) in pl.indices.iter().zip(pl.deltas) {
                 let v = doc.canonical_index(*ci as usize);
                 let l = doc.bvh.vert_leaf[v] as usize;
@@ -1194,6 +1221,7 @@ impl Document {
                 doc.layers[i].mask_values = doc.mask_values_for(&stack)?;
             }
         }
+        doc.rebuild_generator_caches();
         doc.recomposite_all();
         doc.dirty_channels.clear();
         Ok(doc)
@@ -1216,6 +1244,8 @@ impl SculptLayer {
             mask: self.mask.clone(),
             mask_values: None,
             chunks: Vec::new(),
+            generator: self.generator.clone(),
+            gen_cache: None,
         }
     }
 }

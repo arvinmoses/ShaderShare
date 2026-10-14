@@ -14,6 +14,7 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+use crate::generator::layer::{GeneratorCache, GeneratorSpec};
 use crate::mask::MaskStack;
 
 pub type Chunk = Option<Box<[Vec3]>>;
@@ -29,6 +30,8 @@ pub enum LayerKind {
     Layer,
     /// Organises other nodes. Its strength and visibility scale its subtree.
     Folder,
+    /// Procedural boolean: scatters a primitive and combines it with the layers below. Stores parameters only.
+    Generator,
 }
 
 /// How a sculpt layer's offset combines with the offsets of the layers below it.
@@ -116,6 +119,7 @@ pub struct LayerMeta {
     pub collapsed: bool,
     pub blend: LayerBlend,
     pub mask: Option<MaskStack>,
+    pub generator: Option<GeneratorSpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +142,10 @@ pub struct SculptLayer {
     pub mask: Option<MaskStack>,
     pub(crate) mask_values: Option<Vec<f32>>,
     pub(crate) chunks: Vec<Chunk>,
+    /// Generator parameters (`LayerKind::Generator` only).
+    pub generator: Option<GeneratorSpec>,
+    /// Derived placement for `generator`; rebuilt by the document, never saved.
+    pub(crate) gen_cache: Option<std::sync::Arc<GeneratorCache>>,
 }
 
 impl SculptLayer {
@@ -147,6 +155,10 @@ impl SculptLayer {
 
     pub fn is_folder(&self) -> bool {
         self.kind == LayerKind::Folder
+    }
+
+    pub fn is_generator(&self) -> bool {
+        self.kind == LayerKind::Generator
     }
 
     /// Effective strength: own strength times every ancestor's, zero when hidden or soloed out.
@@ -163,6 +175,7 @@ impl SculptLayer {
             collapsed: self.collapsed,
             blend: self.blend,
             mask: self.mask.clone(),
+            generator: self.generator.clone(),
         }
     }
 
@@ -174,6 +187,7 @@ impl SculptLayer {
         self.collapsed = m.collapsed;
         self.blend = m.blend;
         self.mask = m.mask;
+        self.generator = m.generator;
     }
 
     pub(crate) fn new(id: LayerId, name: &str, leaves: usize) -> SculptLayer {
@@ -191,6 +205,8 @@ impl SculptLayer {
             mask: None,
             mask_values: None,
             chunks: vec![None; leaves],
+            generator: None,
+            gen_cache: None,
         }
     }
 
@@ -207,6 +223,18 @@ impl SculptLayer {
     /// Leaves with stored deltas.
     pub fn allocated_leaves(&self) -> Vec<u32> {
         self.chunks.iter().enumerate().filter(|(_, c)| c.is_some()).map(|(i, _)| i as u32).collect()
+    }
+
+    /// Leaves this layer can change: those with stored deltas plus those a generator's instances reach. These are the
+    /// leaves to recomposite when the layer's strength, order or definition changes.
+    pub fn touched_leaves(&self) -> Vec<u32> {
+        let mut out = self.allocated_leaves();
+        if let Some(c) = &self.gen_cache {
+            out.extend(&c.leaves);
+            out.sort_unstable();
+            out.dedup();
+        }
+        out
     }
 
     /// Approximate memory held by deltas, in bytes.

@@ -1,0 +1,143 @@
+//! The generator layer inside the document: composition, strength, undo, save/load, subdivision.
+
+use glam::Vec3;
+use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::{BoolOp, Primitive};
+use sculpt_core::io::project;
+use sculpt_core::primitives::quad_sphere;
+use sculpt_core::{Document, LayerKind, Placement};
+
+fn sphere_doc(level: u32) -> Document {
+    Document::from_mesh(quad_sphere(level, 1.0)).unwrap()
+}
+
+fn dents() -> GeneratorSpec {
+    GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count: 30, seed: 7, size: 0.18, lift: 0.6, random_spin: true }
+}
+
+fn min_radius(doc: &Document) -> f32 {
+    doc.positions().iter().map(|p| p.length()).fold(f32::MAX, f32::min)
+}
+
+fn max_radius(doc: &Document) -> f32 {
+    doc.positions().iter().map(|p| p.length()).fold(0.0, f32::max)
+}
+
+fn moved(doc: &Document) -> usize {
+    doc.positions().iter().zip(doc.base_positions()).filter(|(p, b)| (**p - **b).length() > 1e-6).count()
+}
+
+fn same(a: &[Vec3], b: &[Vec3], tol: f32) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (*x - *y).length() <= tol)
+}
+
+#[test]
+fn subtract_cuts_into_the_surface_and_leaves_the_base_alone() {
+    let mut doc = sphere_doc(3);
+    let before = doc.positions().to_vec();
+    let id = doc.insert_generator("Dents", Placement::Top, dents()).unwrap();
+    assert_eq!(doc.layer(id).unwrap().kind, LayerKind::Generator);
+    assert!(min_radius(&doc) < 0.99, "the cutters should push vertices inward, min radius {}", min_radius(&doc));
+    assert!(moved(&doc) > 20);
+    assert!(max_radius(&doc) <= 1.0 + 1e-4, "subtract never raises the surface");
+    assert!(same(doc.base_positions(), &before, 0.0), "the base stays untouched");
+}
+
+#[test]
+fn add_raises_the_surface() {
+    let mut doc = sphere_doc(3);
+    let spec = GeneratorSpec { op: BoolOp::Add, lift: 0.4, ..dents() };
+    doc.insert_generator("Bumps", Placement::Top, spec).unwrap();
+    assert!(max_radius(&doc) > 1.01, "max radius {}", max_radius(&doc));
+}
+
+#[test]
+fn placement_is_deterministic_and_seed_dependent() {
+    let (mut a, mut b, mut c) = (sphere_doc(3), sphere_doc(3), sphere_doc(3));
+    a.insert_generator("g", Placement::Top, dents()).unwrap();
+    b.insert_generator("g", Placement::Top, dents()).unwrap();
+    c.insert_generator("g", Placement::Top, GeneratorSpec { seed: 8, ..dents() }).unwrap();
+    assert!(same(a.positions(), b.positions(), 0.0), "same spec, same result");
+    assert!(!same(a.positions(), c.positions(), 1e-6), "a different seed gives a different scatter");
+}
+
+#[test]
+fn strength_and_visibility_scale_the_effect() {
+    let mut doc = sphere_doc(3);
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    let full = min_radius(&doc);
+    doc.set_layer_opacity(id, 0.5).unwrap();
+    let half = min_radius(&doc);
+    assert!(half > full && half < 1.0, "half strength cuts less: {full} < {half} < 1");
+    doc.set_layer_opacity(id, 1.0).unwrap();
+    doc.set_layer_visible(id, false).unwrap();
+    assert!(same(doc.positions(), doc.base_positions(), 1e-6), "hidden means untouched");
+    doc.set_layer_visible(id, true).unwrap();
+    assert!((min_radius(&doc) - full).abs() < 1e-6, "showing it again restores the cut");
+}
+
+#[test]
+fn undo_and_redo_cover_insert_and_edit() {
+    let mut doc = sphere_doc(3);
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    let cut = doc.positions().to_vec();
+    doc.set_generator(id, GeneratorSpec { count: 80, seed: 3, ..dents() }).unwrap();
+    let edited = doc.positions().to_vec();
+    assert!(!same(&cut, &edited, 1e-6));
+
+    assert!(doc.undo());
+    assert!(same(doc.positions(), &cut, 1e-6), "undo of the edit restores the previous scatter");
+    assert!(doc.undo());
+    assert!(same(doc.positions(), doc.base_positions(), 1e-6), "undo of the insert removes the layer");
+    assert!(doc.redo() && doc.redo());
+    assert!(same(doc.positions(), &edited, 1e-6), "redo replays both steps");
+}
+
+#[test]
+fn incremental_edit_equals_a_fresh_build() {
+    let mut a = sphere_doc(3);
+    let id = a.insert_generator("g", Placement::Top, dents()).unwrap();
+    let final_spec = GeneratorSpec { count: 55, seed: 11, size: 0.12, primitive: Primitive::Cylinder, ..dents() };
+    a.set_generator(id, final_spec.clone()).unwrap();
+    let mut b = sphere_doc(3);
+    b.insert_generator("g", Placement::Top, final_spec).unwrap();
+    assert!(same(a.positions(), b.positions(), 1e-6), "only the touched leaves were redone, and the result is the same");
+}
+
+#[test]
+fn save_and_load_round_trip() {
+    let mut doc = sphere_doc(3);
+    let id = doc.insert_generator("Dents", Placement::Top, dents()).unwrap();
+    doc.set_layer_opacity(id, 0.75).unwrap();
+    let dir = std::env::temp_dir().join(format!("sculpt-gen-rt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    project::save(&doc, &dir).unwrap();
+    let loaded = project::load(&dir).unwrap();
+    let layer = loaded.layers().iter().find(|l| l.name == "Dents").expect("generator layer loads");
+    assert_eq!(layer.kind, LayerKind::Generator);
+    assert_eq!(layer.generator, Some(dents()));
+    assert!(same(loaded.positions(), doc.positions(), 1e-5), "the loaded surface matches");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn survives_subdivision() {
+    let mut doc = sphere_doc(2);
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    doc.subdivide().unwrap();
+    let layer = doc.layer(id).unwrap();
+    assert_eq!(layer.generator.as_ref(), Some(&dents()), "the spec is kept");
+    assert!(min_radius(&doc) < 0.99, "the cutters are re-placed on the denser surface");
+}
+
+#[test]
+fn procedural_layers_refuse_destructive_edits() {
+    let mut doc = sphere_doc(2);
+    let sculpt = doc.insert_layer("Sculpt", Placement::Top).unwrap();
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    assert!(doc.flatten_layer(id).is_err());
+    assert!(doc.merge_down(id).is_err());
+    let above = doc.insert_layer("Above", Placement::Top).unwrap();
+    assert!(doc.merge_down(above).is_err(), "merging into a generator layer is refused");
+    assert!(doc.set_generator(sculpt, dents()).is_err(), "a sculpt layer has no generator");
+}

@@ -13,6 +13,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::document::Document;
+use crate::generator::layer::{GeneratorCache, GeneratorSpec};
 use crate::layers::{LayerBlend, LayerId, LayerKind, LayerMeta, SculptLayer};
 use crate::mask::{MaskSource, MaskStack};
 use crate::undo::{self, Data, Record, StructOp};
@@ -167,7 +168,7 @@ impl Document {
             let layer = &mut self.layers[i];
             if layer.scale != scale {
                 layer.scale = scale;
-                leaves.extend(layer.allocated_leaves());
+                leaves.extend(layer.touched_leaves());
             }
         }
     }
@@ -178,21 +179,21 @@ impl Document {
     pub(crate) fn apply_struct(&mut self, op: StructOp, leaves: &mut BTreeSet<u32>) -> StructOp {
         let inverse = match op {
             StructOp::Insert { index, layer } => {
-                leaves.extend(layer.allocated_leaves());
+                leaves.extend(layer.touched_leaves());
                 self.layers.insert(index.min(self.layers.len()), *layer);
                 self.scalar_dirty.mark_all();
                 StructOp::Remove { index }
             }
             StructOp::Remove { index } => {
                 let layer = self.layers.remove(index);
-                leaves.extend(layer.allocated_leaves());
+                leaves.extend(layer.touched_leaves());
                 self.scalar_dirty.mark_all();
                 StructOp::Insert { index, layer: Box::new(layer) }
             }
             StructOp::Place { id, parent, index } => {
                 // Order decides how layers blend, so everything the moved subtree touches is redone.
                 for member in self.subtree(id) {
-                    leaves.extend(self.layers[self.layer_index_of(member)].allocated_leaves());
+                    leaves.extend(self.layers[self.layer_index_of(member)].touched_leaves());
                 }
                 let from = self.layer_index_of(id);
                 let mut layer = self.layers.remove(from);
@@ -206,16 +207,24 @@ impl Document {
                 let before = self.layers[i].meta();
                 let mask_changed = before.mask != meta.mask;
                 let blend_changed = before.blend != meta.blend;
+                let generator_changed = before.generator != meta.generator;
+                if generator_changed {
+                    leaves.extend(self.layers[i].touched_leaves());
+                }
                 self.layers[i].set_meta(meta);
+                if generator_changed {
+                    self.rebuild_generator_cache(i);
+                    leaves.extend(self.layers[i].touched_leaves());
+                }
                 if blend_changed {
-                    leaves.extend(self.layers[i].allocated_leaves());
+                    leaves.extend(self.layers[i].touched_leaves());
                 }
                 if mask_changed {
                     self.serial += 1;
                     let values = self.layers[i].mask.clone().and_then(|s| self.mask_values_for(&s).ok().flatten());
                     self.layers[i].mask_values = values;
                     self.scalar_dirty.mark_all();
-                    leaves.extend(self.layers[i].allocated_leaves());
+                    leaves.extend(self.layers[i].touched_leaves());
                 }
                 StructOp::Meta { id, meta: before }
             }
@@ -303,6 +312,7 @@ impl Document {
         let mut layer = match kind {
             LayerKind::Layer => SculptLayer::new(id, name, leaves),
             LayerKind::Folder => SculptLayer::new_folder(id, name, leaves),
+            LayerKind::Generator => SculptLayer::new(id, name, leaves),
         };
         layer.parent = parent;
         let mut ops = vec![StructOp::Insert { index, layer: Box::new(layer) }];
@@ -311,6 +321,35 @@ impl Document {
         }
         self.exec(label, ops);
         Ok(id)
+    }
+
+    /// New generator layer at `at`: scatters `spec.primitive` over the surface and combines it with the layers below.
+    /// Undoable. It does not become the sculpt target (it holds no deltas).
+    pub fn insert_generator(&mut self, name: &str, at: Placement, spec: GeneratorSpec) -> Result<LayerId> {
+        let (parent, index) = self.resolve(at, None)?;
+        let id = self.next_id();
+        let mut layer = SculptLayer::new(id, name, self.bvh.leaves.len());
+        layer.kind = LayerKind::Generator;
+        layer.parent = parent;
+        layer.gen_cache = Some(std::sync::Arc::new(GeneratorCache::build(&spec, &self.base, &self.faces, &self.topo, &self.bvh)));
+        layer.generator = Some(spec);
+        self.exec("Add generator", vec![StructOp::Insert { index, layer: Box::new(layer) }]);
+        Ok(id)
+    }
+
+    /// Change a generator layer's parameters. Undoable; only the leaves its old and new instances reach are redone.
+    pub fn set_generator(&mut self, id: LayerId, spec: GeneratorSpec) -> Result<()> {
+        let i = self.layer_index(id)?;
+        if !self.layers[i].is_generator() {
+            return Err(Error::InvalidData(format!("'{}' is not a generator layer", self.layers[i].name)));
+        }
+        if self.layers[i].generator.as_ref() == Some(&spec) {
+            return Ok(());
+        }
+        let mut meta = self.layers[i].meta();
+        meta.generator = Some(spec);
+        self.exec("Edit generator", vec![StructOp::Meta { id, meta }]);
+        Ok(())
     }
 
     /// Remove a node and everything under it. Undoable (the data moves into the undo stack).
@@ -418,6 +457,9 @@ impl Document {
         let members: Vec<usize> = self.subtree(folder).into_iter().map(|m| self.layer_index_of(m)).filter(|&i| !self.layers[i].is_folder()).collect();
         if members.is_empty() {
             return Err(Error::InvalidData("the folder has no layers".into()));
+        }
+        if let Some(g) = members.iter().find(|&&i| self.layers[i].is_generator()) {
+            return Err(Error::InvalidData(format!("'{}' is a generator layer, so the folder cannot be flattened", self.layers[*g].name)));
         }
         if let Some(bad) = members.iter().find(|&&i| self.layers[i].blend != LayerBlend::Add) {
             return Err(Error::InvalidData(format!("'{}' is not in Add mode, so the folder cannot be flattened", self.layers[*bad].name)));
@@ -535,6 +577,9 @@ impl Document {
         if src.is_folder() {
             return Err(Error::InvalidData("flatten a folder instead of merging it down".into()));
         }
+        if src.is_generator() {
+            return Err(Error::InvalidData("a generator layer is procedural and cannot be merged down".into()));
+        }
         let parent = src.parent;
         let Some(di) = (0..si).rev().find(|&i| self.layers[i].parent == parent) else {
             return Err(Error::InvalidData("nothing below to merge into".into()));
@@ -542,6 +587,9 @@ impl Document {
         let (dst, src) = (&self.layers[di], &self.layers[si]);
         if dst.is_folder() {
             return Err(Error::InvalidData("the layer below is a folder".into()));
+        }
+        if dst.is_generator() {
+            return Err(Error::InvalidData("the layer below is a generator layer".into()));
         }
         for l in [dst, src] {
             if l.blend != crate::layers::LayerBlend::Add {
