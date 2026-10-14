@@ -8,10 +8,11 @@ Branch `ccr-32ffc09b-o5mvh1` at `d45439e`.
 ## Build and tests
 
 - `cargo build --release --workspace`: clean, 1m33s cold.
-- `cargo test --release --workspace --no-fail-fast`: everything passes except two timing tests in
-  `sculpt-core/tests/schedule.rs`: `deadline_bounds_the_pass_and_work_carries_over` (line 197, `r1.deadline_hit`) and
-  `full_quality_job_waits_for_the_visible_cut` (line 278). Both pass an already-expired deadline (`Instant::now()`)
-  and expect the pass to stop early. On this machine the pass completes anyway. Needs a look (test or scheduler edge).
+- `cargo test --release --workspace --no-fail-fast`: all green after one test fix. Two timing tests in
+  `sculpt-core/tests/schedule.rs` failed at first. Cause: with no cost estimate yet, the scheduler's first batch packs
+  one slice per rayon thread before it checks the deadline, so with 24 threads (the cloud box had 4) one batch covered
+  every visible item and `deadline_hit` was false. A test-environment assumption, not a scheduler bug. The two tests
+  now run on a 2-thread pool.
 
 ## Spike 1: GPU displacement boolean vs CPU (`--gpu-bench 7,8,9,10 1000,10000,100000 --cpu`, Subtract)
 

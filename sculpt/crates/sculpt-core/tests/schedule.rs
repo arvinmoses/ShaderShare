@@ -54,6 +54,12 @@ fn full(mesh: &EvalMesh, set: &InstanceSet, p: &EvalParams) -> Vec<Vec3> {
     out
 }
 
+/// Cold-start packing is one slice per worker thread, so the tests that need a deadline to cut a pass short pin a small
+/// pool instead of depending on the host's core count.
+fn on_small_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap().install(f)
+}
+
 fn far() -> Instant {
     Instant::now() + Duration::from_secs(3600)
 }
@@ -190,22 +196,24 @@ fn view_aware_work_is_a_fraction_of_the_mesh() {
 
 #[test]
 fn deadline_bounds_the_pass_and_work_carries_over() {
-    let f = fixture(3000);
-    let mut s = sched(&f, SchedConfig::default());
-    let v = view(4.0);
-    let r1 = s.frame(&v, Instant::now(), Mode::Drag);
-    assert!(r1.deadline_hit);
-    assert!(r1.fresh_after < r1.visible_items);
-    let mut prev = r1.fresh_after;
-    for _ in 0..200 {
-        let r = s.frame(&v, Instant::now() + Duration::from_micros(500), Mode::Drag);
-        assert!(r.fresh_after >= prev.min(r.visible_items), "progress must not be lost without a change");
-        prev = r.fresh_after;
-        if !r.deadline_hit {
-            break;
+    on_small_pool(|| {
+        let f = fixture(3000);
+        let mut s = sched(&f, SchedConfig::default());
+        let v = view(4.0);
+        let r1 = s.frame(&v, Instant::now(), Mode::Drag);
+        assert!(r1.deadline_hit);
+        assert!(r1.fresh_after < r1.visible_items);
+        let mut prev = r1.fresh_after;
+        for _ in 0..200 {
+            let r = s.frame(&v, Instant::now() + Duration::from_micros(500), Mode::Drag);
+            assert!(r.fresh_after >= prev.min(r.visible_items), "progress must not be lost without a change");
+            prev = r.fresh_after;
+            if !r.deadline_hit {
+                break;
+            }
         }
-    }
-    assert!(s.visible_converged(&v));
+        assert!(s.visible_converged(&v));
+    });
 }
 
 #[test]
@@ -268,21 +276,23 @@ fn fixture_mesh(f: &Fixture) -> Arc<EvalMesh> {
 
 #[test]
 fn full_quality_job_waits_for_the_visible_cut() {
-    let f = fixture(2000);
-    let mut s = sched(&f, SchedConfig::default());
-    let v = view(4.0);
-    s.release();
-    assert!(s.job_deferred() && !s.job_running());
-    // No time: visible nodes stay stale, so the job must not start yet.
-    let r = s.frame(&v, Instant::now(), Mode::Settle);
-    assert!(r.fresh_after < r.visible_items && !s.job_running());
-    // Enough time: the visible cut finishes and the job starts in the same frame.
-    let r = s.frame(&v, far(), Mode::Settle);
-    assert_eq!(r.fresh_after, r.visible_items);
-    assert!(s.job_running() && !s.job_deferred());
-    s.wait_job();
-    assert!(s.is_fully_converged());
-    assert!(s.out() == full(&f.mesh, s.set(), s.params()).as_slice());
+    on_small_pool(|| {
+        let f = fixture(2000);
+        let mut s = sched(&f, SchedConfig::default());
+        let v = view(4.0);
+        s.release();
+        assert!(s.job_deferred() && !s.job_running());
+        // No time: visible nodes stay stale, so the job must not start yet.
+        let r = s.frame(&v, Instant::now(), Mode::Settle);
+        assert!(r.fresh_after < r.visible_items && !s.job_running());
+        // Enough time: the visible cut finishes and the job starts in the same frame.
+        let r = s.frame(&v, far(), Mode::Settle);
+        assert_eq!(r.fresh_after, r.visible_items);
+        assert!(s.job_running() && !s.job_deferred());
+        s.wait_job();
+        assert!(s.is_fully_converged());
+        assert!(s.out() == full(&f.mesh, s.set(), s.params()).as_slice());
+    });
 }
 
 #[test]
