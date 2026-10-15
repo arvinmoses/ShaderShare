@@ -114,6 +114,9 @@ enum SculptTarget {
     Layer(usize),
 }
 
+/// Normal cones of every leaf (axis and half angle), valid for one (topology id, base epoch).
+pub(crate) type LeafCones = (u64, u64, std::sync::Arc<Vec<(Vec3, f32)>>);
+
 pub struct Document {
     pub(crate) faces: Vec<Face>,
     pub(crate) base: Vec<Vec3>,
@@ -147,6 +150,16 @@ pub struct Document {
     /// When set, edits that go through `recomposite` leave vertex normals out of date instead of recomputing them; call
     /// [`Document::ensure_normals`] before reading them. Off by default.
     pub(crate) lazy_normals: bool,
+    /// When set, generator edits leave the surface update to [`Document::progress_pending`] instead of recompositing
+    /// every touched leaf before returning. Off by default.
+    pub(crate) progressive: bool,
+    /// Leaves a generator edit has touched but not yet recomposited (only ever non-empty while `progressive`).
+    pub(crate) pending: BTreeSet<u32>,
+    /// Smoothed milliseconds one leaf takes to recomposite, for sizing time-budgeted passes.
+    pub(crate) leaf_ms: f32,
+    /// Per-leaf normal cone (axis, half angle) of the base surface, for skipping leaves that face away from the camera.
+    /// Valid for one (topology, base epoch).
+    pub(crate) leaf_cones: Option<LeafCones>,
     /// Leaves whose vertex normals are out of date (only ever non-empty while `lazy_normals` is on).
     pub(crate) normals_stale: BTreeSet<u32>,
     /// Bumped whenever the base positions change, so caches derived from the base know to rebuild.
@@ -193,6 +206,10 @@ impl Document {
             base_epoch: 0,
             gen_basis: None,
             lazy_normals: false,
+            progressive: false,
+            pending: BTreeSet::new(),
+            leaf_ms: 0.0,
+            leaf_cones: None,
             normals_stale: BTreeSet::new(),
             lod: None,
             metadata: BTreeMap::new(),
@@ -587,6 +604,7 @@ impl Document {
 
     /// Bake a mesh attribute from the current composited surface into its channel.
     pub fn bake(&mut self, attribute: MeshAttribute, settings: &BakeSettings) {
+        self.finish_pending();
         self.ensure_normals();
         let input = BakeInput {
             positions: &self.positions,
@@ -892,6 +910,11 @@ impl Document {
         let mut leaves = leaves.to_vec();
         leaves.sort_unstable();
         leaves.dedup();
+        if !self.pending.is_empty() {
+            for l in &leaves {
+                self.pending.remove(l);
+            }
+        }
         let ranges: Vec<Range<usize>> = leaves.iter().map(|&l| self.bvh.leaves[l as usize].owned_range()).collect();
         let order = self.composite_order();
         let eps = (self.bvh.bounds().extent().length() * 1e-4).max(1e-9);
@@ -1026,6 +1049,118 @@ impl Document {
         }
     }
 
+    /// Choose whether generator edits update the surface straight away or a little each frame through
+    /// [`Document::progress_pending`]. Turning it off finishes what is pending.
+    pub fn set_progressive(&mut self, progressive: bool) {
+        self.progressive = progressive;
+        if !progressive {
+            self.finish_pending();
+        }
+    }
+
+    pub fn progressive(&self) -> bool {
+        self.progressive
+    }
+
+    /// Leaves still waiting for their generator update.
+    pub fn pending_leaves(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Send leaves that a generator layer's change reaches either to the pending queue (progressive) or to `now`.
+    pub(crate) fn queue_generator_leaves(&mut self, leaves: Vec<u32>, now: &mut BTreeSet<u32>) {
+        if self.progressive {
+            self.pending.extend(leaves);
+        } else {
+            now.extend(leaves);
+        }
+    }
+
+    /// Normal cone of every leaf on the base surface, built the first time a visibility test needs it.
+    fn leaf_cones(&mut self) -> std::sync::Arc<Vec<(Vec3, f32)>> {
+        if let Some((topology, epoch, cones)) = &self.leaf_cones
+            && (*topology, *epoch) == (self.topology_id, self.base_epoch)
+        {
+            return cones.clone();
+        }
+        let basis = self.generator_basis();
+        let normals = basis.normals();
+        let cones: Vec<(Vec3, f32)> = self
+            .bvh
+            .leaves
+            .par_iter()
+            .map(|leaf| {
+                let own = &normals[leaf.owned_range()];
+                let axis = own.iter().copied().sum::<Vec3>().normalize_or(Vec3::Y);
+                let min_dot = own.iter().map(|n| n.dot(axis)).fold(1.0f32, f32::min);
+                (axis, min_dot.clamp(-1.0, 1.0).acos())
+            })
+            .collect();
+        let cones = std::sync::Arc::new(cones);
+        self.leaf_cones = Some((self.topology_id, self.base_epoch, cones.clone()));
+        cones
+    }
+
+    /// Recomposite pending leaves for up to `budget`, most important first, and return how many remain.
+    ///
+    /// Importance follows the view: a leaf the camera cannot see waits (it is skipped when `visible_only`, else done
+    /// last), and visible leaves go largest-on-screen first, so zooming in or moving closer automatically puts the
+    /// work where the eye is. With no view every pending leaf counts equally. At least one chunk always runs, so a
+    /// stream of tiny budgets still finishes.
+    pub fn progress_pending(&mut self, budget: std::time::Duration, view: Option<&crate::lod::View>, visible_only: bool) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        let start = std::time::Instant::now();
+        let cones = if view.is_some() { Some(self.leaf_cones()) } else { None };
+        let mut order: Vec<(f32, u32)> = self
+            .pending
+            .iter()
+            .filter_map(|&l| {
+                let b = &self.bvh.leaves[l as usize].bounds;
+                match (view, &cones) {
+                    (Some(v), Some(cones)) => {
+                        if v.sees(b) && !facing_away(v.eye, b, cones[l as usize]) {
+                            Some((v.error_px(b, b.extent().length()), l))
+                        } else if visible_only {
+                            None
+                        } else {
+                            Some((-1.0, l))
+                        }
+                    }
+                    _ => Some((0.0, l)),
+                }
+            })
+            .collect();
+        order.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut at = 0;
+        while at < order.len() {
+            let left_ms = budget.saturating_sub(start.elapsed()).as_secs_f32() * 1e3;
+            if at > 0 && left_ms <= 0.0 {
+                break;
+            }
+            // Size the chunk from the measured cost per leaf (a guess until one has run), at least a few leaves.
+            let per = if self.leaf_ms > 0.0 { self.leaf_ms } else { 0.05 };
+            let take = ((left_ms / per) as usize).max(4).min(order.len() - at);
+            let chunk: Vec<u32> = order[at..at + take].iter().map(|x| x.1).collect();
+            let t = std::time::Instant::now();
+            self.recomposite(&chunk);
+            let ms = t.elapsed().as_secs_f32() * 1e3 / take as f32;
+            self.leaf_ms = if self.leaf_ms == 0.0 { ms } else { 0.6 * self.leaf_ms + 0.4 * ms };
+            at += take;
+        }
+        self.pending.len()
+    }
+
+    /// Recomposite everything still pending. Anything that needs the exact surface calls this first.
+    pub fn finish_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let leaves: Vec<u32> = std::mem::take(&mut self.pending).into_iter().collect();
+        self.recomposite(&leaves);
+    }
+
     /// Choose whether `recomposite` (generator and layer edits, undo) recomputes vertex normals straight away, or leaves
     /// them out of date until [`Document::ensure_normals`]. Turning it off brings them up to date. Strokes always keep
     /// the normals under the brush current, so sculpting is unaffected.
@@ -1092,7 +1227,14 @@ impl Document {
 
     /// Start an undoable operation (a brush stroke, a pose, ...).
     pub fn begin_stroke(&mut self, label: &str) {
+        self.finish_pending();
         self.ensure_normals();
+        self.open_group(label);
+    }
+
+    /// Open an undo group without bringing the surface or its normals up to date (structural edits use this; strokes, which
+    /// read both, use [`Document::begin_stroke`]).
+    pub(crate) fn open_group(&mut self, label: &str) {
         self.end_stroke();
         self.undo.open = Some(Group::new(label));
     }
@@ -1265,6 +1407,7 @@ impl Document {
                 self.layers[i].mask_values = self.mask_values_for(&stack)?;
             }
         }
+        self.pending.clear();
         self.rebuild_generator_caches();
         self.recomposite_all();
         Ok(())
@@ -1348,4 +1491,20 @@ impl SculptLayer {
             gen_cache: None,
         }
     }
+}
+
+/// True when a leaf with normal cone `(axis, half_angle)` and bounds `b` cannot be seen from `eye`: every normal in the
+/// cone points away from the eye, allowing for the leaf's size at that distance and a margin for sculpting that has bent
+/// the surface away from the base normals.
+fn facing_away(eye: Vec3, b: &Aabb, (axis, half_angle): (Vec3, f32)) -> bool {
+    const MARGIN: f32 = 0.35;
+    let centre = (b.min + b.max) * 0.5;
+    let to_eye = eye - centre;
+    let dist = to_eye.length();
+    let radius = b.extent().length() * 0.5;
+    if dist <= radius {
+        return false;
+    }
+    let angle = (axis.dot(to_eye / dist)).clamp(-1.0, 1.0).acos();
+    angle > std::f32::consts::FRAC_PI_2 + half_angle + (radius / dist).min(1.0).asin() + MARGIN
 }

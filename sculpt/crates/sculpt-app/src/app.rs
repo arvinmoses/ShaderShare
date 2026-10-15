@@ -513,7 +513,8 @@ impl SculptApp {
                 });
             }
             Dialog::ExportObj(p) => {
-                if let Some(doc) = &self.doc {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.finish_pending();
                     self.status = match obj::write(std::path::Path::new(&p), &doc.export_mesh(true)) {
                         Ok(()) => format!("Exported {p}"),
                         Err(e) => format!("Export failed: {e}"),
@@ -837,7 +838,32 @@ impl SculptApp {
         let px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
             if let Some(doc) = self.doc.as_mut() {
-                let idle = matches!(self.stroke, Stroke::None) && self.pending.is_empty() && self.last_edit.elapsed() >= LOD_REFRESH_IDLE;
+                // Meshes dense enough that a generator edit would not fit a frame update their surface a little each frame.
+                let want_progressive = match std::env::var("SCULPT_PROGRESSIVE").as_deref() {
+                    Ok("off") => false,
+                    Ok("on") => true,
+                    _ => doc.face_count() >= PROGRESSIVE_MIN_FACES,
+                };
+                if doc.progressive() != want_progressive {
+                    doc.set_progressive(want_progressive);
+                }
+                let editing = self.gen_timer.since_edit() < Duration::from_millis(150);
+                if doc.pending_leaves() > 0 || self.gen_timer.waiting() {
+                    // The camera decides what matters: visible and large on screen first, and while the edit is still being
+                    // dragged, only what can be seen. Zooming in or moving closer shifts the work with it.
+                    let aspect = px[0].max(1) as f32 / px[1].max(1) as f32;
+                    let view_proj = self.camera.proj(aspect) * self.camera.view();
+                    let focal_px = px[1] as f32 / (2.0 * (self.camera.fov_y * 0.5).tan());
+                    let view = sculpt_core::lod::View::from_view_proj(view_proj, self.camera.eye(), focal_px);
+                    let budget = Duration::from_millis(if editing { 6 } else { 14 });
+                    let tp = Instant::now();
+                    let left = doc.progress_pending(budget, Some(&view), editing);
+                    self.gen_timer.note_progress(tp.elapsed().as_secs_f32() * 1e3, left);
+                    if left > 0 {
+                        ctx.request_repaint();
+                    }
+                }
+                let idle = matches!(self.stroke, Stroke::None) && self.pending.is_empty() && self.last_edit.elapsed() >= LOD_REFRESH_IDLE && doc.pending_leaves() == 0 && !editing;
                 let tr = Instant::now();
                 if poll_lod_refresh(doc, &mut self.lod_refresh, &mut self.lod_batch, idle) {
                     ctx.request_repaint();
@@ -1083,6 +1109,8 @@ fn poll_lod_refresh(doc: &mut Document, slot: &mut Option<(u64, std::sync::mpsc:
 const LOD_MIN_TRIANGLES: usize = 1_500_000;
 /// Most triangles drawn per frame, whatever the pixel tolerance asks for.
 const LOD_BUDGET: u64 = 6_000_000;
+/// From this many faces up, generator edits update the surface progressively instead of all at once.
+const PROGRESSIVE_MIN_FACES: usize = 600_000;
 
 pub fn fmt_count(n: usize) -> String {
     if n >= 1_000_000 {

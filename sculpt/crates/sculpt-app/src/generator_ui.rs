@@ -18,21 +18,63 @@ use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
 use crate::panels::{prop, section};
 
 /// How long the edit calls took, so the panel can show how fast the surface answers.
+///
+/// With progressive updates an edit returns almost at once and the surface catches up over the next frames, so the timer
+/// also tracks how long that takes and the most any one frame spent on it.
 #[derive(Default)]
 pub struct EditTimer {
     recent: VecDeque<f32>,
     last_ms: f32,
     slowest_ms: f32,
+    last_edit: Option<Instant>,
+    /// When the current burst of edits began, until the surface has caught up.
+    burst_start: Option<Instant>,
+    settle_ms: Option<f32>,
+    work_max_ms: f32,
+    work_last_ms: f32,
 }
 
 impl EditTimer {
     pub fn record(&mut self, ms: f32) {
+        if self.burst_start.is_none() {
+            self.work_max_ms = 0.0;
+            self.settle_ms = None;
+        }
+        let now = Instant::now();
+        self.last_edit = Some(now);
+        self.burst_start.get_or_insert(now);
         self.last_ms = ms;
         self.slowest_ms = self.slowest_ms.max(ms);
         self.recent.push_back(ms);
         if self.recent.len() > 60 {
             self.recent.pop_front();
         }
+    }
+
+    /// Time since the last generator edit (an hour when there has been none).
+    pub fn since_edit(&self) -> std::time::Duration {
+        self.last_edit.map_or(std::time::Duration::from_secs(3600), |t| t.elapsed())
+    }
+
+    /// True from an edit until the surface has caught up with it.
+    pub fn waiting(&self) -> bool {
+        self.burst_start.is_some()
+    }
+
+    /// Note one frame's catch-up work (`ms`) and how many leaves are still waiting. Records the settle time at zero.
+    pub fn note_progress(&mut self, ms: f32, left: usize) {
+        self.work_last_ms = ms;
+        self.work_max_ms = self.work_max_ms.max(ms);
+        if left == 0
+            && let Some(start) = self.burst_start.take()
+        {
+            self.settle_ms = Some(start.elapsed().as_secs_f32() * 1e3);
+        }
+    }
+
+    /// (time to settle, work the last frame did, the most any frame did) for the latest burst of edits.
+    pub fn catch_up(&self) -> (Option<f32>, f32, f32) {
+        (self.settle_ms, self.work_last_ms, self.work_max_ms)
     }
 
     /// (last, average of the recent edits, slowest ever), in milliseconds.
@@ -61,9 +103,15 @@ fn primitive_label(p: Primitive) -> &'static str {
     }
 }
 
+/// True while the user is actually working the widget. egui widgets can report a change on their own (a slider rounding the
+/// value it is shown), and that must not become an edit: it would fight whatever else set the value.
+fn touched(r: &egui::Response) -> bool {
+    r.dragged() || r.drag_started() || r.drag_stopped() || r.has_focus() || r.lost_focus() || r.clicked() || r.is_pointer_button_down_on()
+}
+
 /// Record a widget edit. A drag in progress coalesces into one undo step.
 fn note(r: &egui::Response, changed: &mut bool, coalesce: &mut bool) {
-    if r.changed() {
+    if r.changed() && touched(r) {
         *changed = true;
         *coalesce = r.dragged() && !r.drag_started();
     }
@@ -75,6 +123,8 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     let fs = app.theme.metrics.font_size;
     let weak = app.theme.weak_text();
     let timing = app.gen_timer.summary();
+    let (settle, work_last, work_max) = app.gen_timer.catch_up();
+    let pending = app.doc.as_ref().map_or(0, |d| d.pending_leaves());
     let frame_ms = app.stats.frame_ms;
     let mut next = spec.clone();
     let (mut changed, mut coalesce) = (false, false);
@@ -117,7 +167,14 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
             None => "Edit to surface  (no edits yet)".to_string(),
         };
         ui.label(RichText::new(line).monospace().size(fs * 0.85));
-        ui.label(RichText::new(format!("Whole frame  {frame_ms:5.1} ms")).monospace().size(fs * 0.85).color(weak));
+        let settle_text = match (pending, settle) {
+            (0, Some(ms)) => format!("settled in {ms:5.0} ms"),
+            (0, None) => "settled".to_string(),
+            (n, _) => format!("catching up, {n} leaves left"),
+        };
+        ui.label(RichText::new(format!("Surface       {settle_text}")).monospace().size(fs * 0.85));
+        ui.label(RichText::new(format!("Catch-up work {work_last:5.1} ms/frame   most {work_max:5.1}")).monospace().size(fs * 0.85).color(weak));
+        ui.label(RichText::new(format!("Whole frame   {frame_ms:5.1} ms")).monospace().size(fs * 0.85).color(weak));
     });
     if changed && next != spec {
         command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Generator(next), coalesce });

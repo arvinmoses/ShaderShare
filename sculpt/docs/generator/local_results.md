@@ -197,3 +197,36 @@ Edit time against cutter count (`generator-edit-bench <levels> <count> <size> --
 
 The edit time grows with the number of vertices the cutters reach, so a cut at full density is the cost to remove: evaluate
 what the view shows first (the progressive scheduler from the spikes, `generator/schedule.rs`) and finish the rest at rest.
+
+## Progressive generator updates (automatic, view-driven)
+
+A generator edit now rebuilds its placement at once (under 1 ms) and queues the touched leaves. Each frame the app spends a
+fixed budget on the queue (6 ms while the edit is still being dragged, 14 ms once it pauses), most important first:
+only what the camera can see while dragging (frustum plus a per-leaf normal-cone backface test), largest on screen first, and
+everything else when the edit pauses. Moving closer or zooming in changes what is visible and how large it is, so the work
+follows the eye with no setting. Anything that needs the exact surface (`begin_stroke`, bakes, OBJ export, turning the mode
+off) finishes the queue first. Meshes of 600k faces and up use it by default; `SCULPT_PROGRESSIVE=on|off` overrides for a run.
+Core tests: converges bit-for-bit to the synchronous result, a visible-only pass leaves back faces waiting, undo while
+pending, begin_stroke finishes.
+
+6.3M faces, flat shading, scripted sweep, same five moments (fps in the viewport, panel readout):
+
+| moment | edit call | frame rate, off | frame rate, on | catch-up work per frame |
+|---|---|---|---|---|
+| count rising (8 s) | 21.4 ms | 21 fps | 56 fps | 6.0 ms (most 7.0) |
+| size growing (14 s) | 11.6 ms | 30 fps | 57 fps | 6.2 ms |
+| lift (20 s) | 12.0 ms | 50 fps | 60 fps | 0.1 ms |
+| primitives cycling (26 s) | 16.0 ms | 59 fps | 56 fps | 7.8 ms, settled 174 ms after the last edit |
+| 20,000 cutters (32 s) | 28.7 ms | 26 fps | 51 fps | 6.5 ms |
+
+The edit call itself is 0.6-0.9 ms in every row (against 11-29 ms), and the surface settles within about 0.2 s of the last
+edit. While dragging, the picture lags the parameters by a few frames and fills in visible-first.
+
+Two bugs found on the way, both in the app and not in the engine:
+1. The generator panel and the scripted sweep fought: an egui slider reported a change on its own (rounding the value it was
+   shown), the panel turned that into a second, non-coalescing edit, and every second edit took the full undo-group path.
+   Panel edits now require that the widget is actually being touched. Earlier in-app edit and frame numbers in this file
+   (including the flat-vs-smooth comparison) were inflated by this fight in all modes; the engine bench numbers were not.
+2. Opening an undo group for a structural edit no longer finishes pending work or normals (`open_group`); only strokes do.
+
+Screenshot of the readouts: `progressive_readouts.png` (left progressive off, right on).

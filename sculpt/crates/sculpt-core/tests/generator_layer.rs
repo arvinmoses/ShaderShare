@@ -6,7 +6,7 @@ use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::io::project;
 use sculpt_core::lod::{LodParams, View};
 use sculpt_core::primitives::{quad_sphere, quad_sphere_res};
-use sculpt_core::{Document, LayerKind, Placement};
+use sculpt_core::{Document, LayerId, LayerKind, Placement};
 
 fn sphere_doc(level: u32) -> Document {
     Document::from_mesh(quad_sphere(level, 1.0)).unwrap()
@@ -230,4 +230,81 @@ fn lazy_normals_defer_the_work_and_ensure_catches_up() {
     assert!(!doc.normals_stale() && fresh(&doc) < 1e-5);
     doc.set_generator(id, GeneratorSpec { count: 30, seed: 8, ..dents() }).unwrap();
     assert!(!doc.normals_stale() && fresh(&doc) < 1e-5);
+}
+
+fn dense_doc() -> Document {
+    // 6 * 110^2 = 72,600 quads: a few dozen leaves, enough for ordering and partial progress.
+    Document::from_mesh(quad_sphere_res(110, 1.0)).unwrap()
+}
+
+fn edited(progressive: bool) -> (Document, LayerId) {
+    let mut doc = dense_doc();
+    doc.set_progressive(progressive);
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    doc.set_generator(id, GeneratorSpec { count: 120, seed: 4, size: 0.1, ..dents() }).unwrap();
+    (doc, id)
+}
+
+#[test]
+fn progressive_edits_defer_then_converge_to_the_synchronous_result() {
+    let (reference, _) = edited(false);
+    let (mut doc, _) = edited(true);
+    assert!(doc.pending_leaves() > 0, "a progressive edit leaves leaves waiting");
+    assert!(!same(doc.positions(), reference.positions(), 1e-6), "the surface has not caught up yet");
+
+    // Even a zero budget makes progress (at least one chunk per call), so a stream of tiny budgets finishes.
+    let mut last = doc.pending_leaves();
+    let mut calls = 0;
+    while doc.pending_leaves() > 0 {
+        let left = doc.progress_pending(std::time::Duration::ZERO, None, false);
+        assert!(left < last, "every call retires some leaves ({last} -> {left})");
+        last = left;
+        calls += 1;
+        assert!(calls < 1000);
+    }
+    assert!(calls > 1, "a zero budget spreads the work over several calls");
+    assert!(same(doc.positions(), reference.positions(), 1e-6), "converged result equals the synchronous one");
+}
+
+#[test]
+fn a_visible_only_pass_leaves_what_the_camera_cannot_see() {
+    let (reference, _) = edited(false);
+    let (mut doc, _) = edited(true);
+    let before = doc.pending_leaves();
+    let front = view_from(Vec3::new(0.0, 0.0, 3.0), 35.0, 1000.0);
+    let left = doc.progress_pending(std::time::Duration::from_secs(5), Some(&front), true);
+    assert!(left > 0 && left < before, "the leaves facing the camera were done and the rest wait ({before} -> {left})");
+    // Later, with nothing hurrying, the same call without `visible_only` finishes the rest.
+    let left = doc.progress_pending(std::time::Duration::from_secs(5), Some(&front), false);
+    assert_eq!(left, 0);
+    assert!(same(doc.positions(), reference.positions(), 1e-6));
+}
+
+#[test]
+fn anything_that_needs_the_exact_surface_finishes_pending_work_first() {
+    let (reference, _) = edited(false);
+    let (mut doc, _) = edited(true);
+    assert!(doc.pending_leaves() > 0);
+    doc.begin_stroke("stroke");
+    assert_eq!(doc.pending_leaves(), 0, "begin_stroke finishes pending work");
+    doc.end_stroke();
+    assert!(same(doc.positions(), reference.positions(), 1e-6));
+
+    let (mut doc, id) = edited(true);
+    doc.set_layer_visible(id, false).unwrap();
+    doc.set_progressive(false);
+    assert_eq!(doc.pending_leaves(), 0, "turning progressive off finishes pending work");
+    assert!(same(doc.positions(), doc.base_positions(), 1e-6), "a hidden generator leaves the base surface");
+}
+
+#[test]
+fn undo_while_work_is_pending_still_ends_at_the_right_surface() {
+    let (mut doc, id) = edited(true);
+    doc.finish_pending();
+    let after_first = doc.positions().to_vec();
+    doc.set_generator(id, GeneratorSpec { count: 300, seed: 12, size: 0.07, ..dents() }).unwrap();
+    assert!(doc.pending_leaves() > 0);
+    assert!(doc.undo());
+    doc.finish_pending();
+    assert!(same(doc.positions(), &after_first, 1e-6), "undo restores the previous surface once caught up");
 }

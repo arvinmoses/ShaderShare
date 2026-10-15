@@ -59,6 +59,11 @@ pub struct SurfaceBasis {
 }
 
 impl SurfaceBasis {
+    /// Per-vertex normals of the base surface.
+    pub(crate) fn normals(&self) -> &[Vec3] {
+        &self.normals
+    }
+
     pub fn build(base: &[Vec3], faces: &[Face], topo: &Topology) -> SurfaceBasis {
         SurfaceBasis { normals: mesh::compute_normals(base, faces, topo), sampler: SurfaceSampler::new(base, faces, None) }
     }

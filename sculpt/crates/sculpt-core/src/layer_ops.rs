@@ -168,7 +168,12 @@ impl Document {
             let layer = &mut self.layers[i];
             if layer.scale != scale {
                 layer.scale = scale;
-                leaves.extend(layer.touched_leaves());
+                let touched = layer.touched_leaves();
+                if layer.is_generator() {
+                    self.queue_generator_leaves(touched, leaves);
+                } else {
+                    leaves.extend(touched);
+                }
             }
         }
     }
@@ -179,14 +184,24 @@ impl Document {
     pub(crate) fn apply_struct(&mut self, op: StructOp, leaves: &mut BTreeSet<u32>) -> StructOp {
         let inverse = match op {
             StructOp::Insert { index, layer } => {
-                leaves.extend(layer.touched_leaves());
+                let touched = layer.touched_leaves();
+                if layer.is_generator() {
+                    self.queue_generator_leaves(touched, leaves);
+                } else {
+                    leaves.extend(touched);
+                }
                 self.layers.insert(index.min(self.layers.len()), *layer);
                 self.scalar_dirty.mark_all();
                 StructOp::Remove { index }
             }
             StructOp::Remove { index } => {
                 let layer = self.layers.remove(index);
-                leaves.extend(layer.touched_leaves());
+                let touched = layer.touched_leaves();
+                if layer.is_generator() {
+                    self.queue_generator_leaves(touched, leaves);
+                } else {
+                    leaves.extend(touched);
+                }
                 self.scalar_dirty.mark_all();
                 StructOp::Insert { index, layer: Box::new(layer) }
             }
@@ -209,12 +224,14 @@ impl Document {
                 let blend_changed = before.blend != meta.blend;
                 let generator_changed = before.generator != meta.generator;
                 if generator_changed {
-                    leaves.extend(self.layers[i].touched_leaves());
+                    let old = self.layers[i].touched_leaves();
+                    self.queue_generator_leaves(old, leaves);
                 }
                 self.layers[i].set_meta(meta);
                 if generator_changed {
                     self.rebuild_generator_cache(i);
-                    leaves.extend(self.layers[i].touched_leaves());
+                    let new = self.layers[i].touched_leaves();
+                    self.queue_generator_leaves(new, leaves);
                 }
                 if blend_changed {
                     leaves.extend(self.layers[i].touched_leaves());
@@ -240,7 +257,7 @@ impl Document {
 
     /// Run `ops` as one undoable step.
     fn exec(&mut self, label: &str, ops: Vec<StructOp>) {
-        self.begin_stroke(label);
+        self.open_group(label);
         self.exec_in_open(ops);
         self.end_stroke();
     }
