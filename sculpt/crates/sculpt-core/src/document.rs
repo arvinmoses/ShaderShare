@@ -144,6 +144,11 @@ pub struct Document {
     /// Freeze / channels / layer masks changed (overlay upload tracking).
     pub(crate) scalar_dirty: DirtyTracker,
     pub(crate) topology_id: u64,
+    /// When set, edits that go through `recomposite` leave vertex normals out of date instead of recomputing them; call
+    /// [`Document::ensure_normals`] before reading them. Off by default.
+    pub(crate) lazy_normals: bool,
+    /// Leaves whose vertex normals are out of date (only ever non-empty while `lazy_normals` is on).
+    pub(crate) normals_stale: BTreeSet<u32>,
     /// Bumped whenever the base positions change, so caches derived from the base know to rebuild.
     pub(crate) base_epoch: u64,
     /// Generator stage 0 (see `generator::layer`), valid for one (topology, base epoch).
@@ -187,6 +192,8 @@ impl Document {
             topology_id: new_topology_id(),
             base_epoch: 0,
             gen_basis: None,
+            lazy_normals: false,
+            normals_stale: BTreeSet::new(),
             lod: None,
             metadata: BTreeMap::new(),
         })
@@ -248,6 +255,7 @@ impl Document {
 
     /// Build (or rebuild) the level-of-detail tree for the current topology. Takes seconds on tens of millions of triangles.
     pub fn build_lod(&mut self, params: crate::lod::LodParams) {
+        self.ensure_normals();
         let tree = crate::lod::LodTree::build(&self.positions, &self.normals, &self.faces, &self.bvh, params);
         self.lod = Some((self.topology_id, std::sync::Arc::new(tree)));
     }
@@ -259,6 +267,7 @@ impl Document {
 
     /// Re-simplify every level-of-detail patch that edits have outdated, on this thread.
     pub fn refresh_lod_now(&mut self) {
+        self.ensure_normals();
         let (positions, normals) = (std::mem::take(&mut self.positions), std::mem::take(&mut self.normals));
         if let Some(tree) = self.lod_tree_mut() {
             tree.refresh_now(&positions, &normals);
@@ -269,6 +278,7 @@ impl Document {
     /// Copy out up to `max_triangles` of outdated level-of-detail patches for a background thread.
     /// Returns `None` when nothing is ready. The returned batch's topology id must match on apply.
     pub fn gather_lod_refresh(&mut self, max_triangles: usize) -> Option<(u64, crate::lod::RefreshBatch)> {
+        self.ensure_normals();
         let (positions, normals) = (std::mem::take(&mut self.positions), std::mem::take(&mut self.normals));
         let batch = self.lod_tree_mut().map(|tree| tree.gather_refresh(&positions, &normals, max_triangles));
         (self.positions, self.normals) = (positions, normals);
@@ -577,6 +587,7 @@ impl Document {
 
     /// Bake a mesh attribute from the current composited surface into its channel.
     pub fn bake(&mut self, attribute: MeshAttribute, settings: &BakeSettings) {
+        self.ensure_normals();
         let input = BakeInput {
             positions: &self.positions,
             normals: &self.normals,
@@ -799,7 +810,7 @@ impl Document {
         {
             self.recomposite(&leaf_ids);
         } else {
-            self.geometry_changed(&leaf_ids);
+            self.geometry_changed(&leaf_ids, false);
         }
         Ok(())
     }
@@ -916,7 +927,7 @@ impl Document {
             (*pos != *before).then_some(l)
         })
         .collect();
-        self.geometry_changed(&changed);
+        self.geometry_changed(&changed, true);
     }
 
     /// The shared stage-0 data for generator layers, built the first time it is needed after the base or topology changed.
@@ -958,7 +969,7 @@ impl Document {
     }
 
     /// Normals and bounds after positions of vertices owned by `leaves` moved.
-    pub(crate) fn geometry_changed(&mut self, leaves: &[u32]) {
+    pub(crate) fn geometry_changed(&mut self, leaves: &[u32], defer_normals: bool) {
         self.serial += 1;
         let mut mark = vec![false; self.bvh.leaves.len()];
         for &l in leaves {
@@ -975,6 +986,17 @@ impl Document {
         if let Some(tree) = self.lod.as_mut().filter(|(t, _)| *t == self.topology_id).and_then(|(_, tree)| std::sync::Arc::get_mut(tree)) {
             tree.mark_leaves(&set);
         }
+        if defer_normals && self.lazy_normals {
+            self.normals_stale.extend(set.iter().copied());
+        } else {
+            self.update_normals(&set, &mark);
+        }
+        self.bvh.refit_leaves(&self.positions, &self.faces, &set);
+    }
+
+    /// Recompute the normals of every vertex a leaf in `set` uses. `in_set[l]` says whether leaf `l` is in `set`.
+    fn update_normals(&mut self, set: &[u32], in_set: &[bool]) {
+        let nleaves = self.bvh.leaves.len();
         // Most of the work is each leaf's own vertices: those are contiguous, so they are written in place in parallel.
         let ranges: Vec<Range<usize>> = set.iter().map(|&l| self.bvh.leaves[l as usize].owned_range()).collect();
         let (positions, faces, topo, bvh) = (&self.positions, &self.faces, &self.topo, &self.bvh);
@@ -991,7 +1013,7 @@ impl Document {
                 bvh.leaves[l as usize]
                     .verts
                     .iter()
-                    .filter(|&&v| !mark[bvh.vert_leaf[v as usize] as usize])
+                    .filter(|&&v| !in_set[bvh.vert_leaf[v as usize] as usize])
                     .map(|&v| (v, mesh::vertex_normal(positions, faces, topo, v as usize)))
                     .collect()
             })
@@ -1002,7 +1024,40 @@ impl Document {
                 self.geometry_dirty.mark(self.bvh.vert_leaf[v as usize], nleaves);
             }
         }
-        self.bvh.refit_leaves(&self.positions, &self.faces, &set);
+    }
+
+    /// Choose whether `recomposite` (generator and layer edits, undo) recomputes vertex normals straight away, or leaves
+    /// them out of date until [`Document::ensure_normals`]. Turning it off brings them up to date. Strokes always keep
+    /// the normals under the brush current, so sculpting is unaffected.
+    pub fn set_lazy_normals(&mut self, lazy: bool) {
+        self.lazy_normals = lazy;
+        if !lazy {
+            self.ensure_normals();
+        }
+    }
+
+    pub fn lazy_normals(&self) -> bool {
+        self.lazy_normals
+    }
+
+    /// True when some vertex normals are out of date.
+    pub fn normals_stale(&self) -> bool {
+        !self.normals_stale.is_empty()
+    }
+
+    /// Bring vertex normals up to date. Free when nothing is stale. Anything that reads normals calls this first.
+    pub fn ensure_normals(&mut self) {
+        if self.normals_stale.is_empty() {
+            return;
+        }
+        let set: Vec<u32> = std::mem::take(&mut self.normals_stale).into_iter().collect();
+        let mut in_set = vec![false; self.bvh.leaves.len()];
+        let nleaves = in_set.len();
+        for &l in &set {
+            in_set[l as usize] = true;
+            self.geometry_dirty.mark(l, nleaves);
+        }
+        self.update_normals(&set, &in_set);
     }
 
     // ------------------------------------------------------------------- undo
@@ -1037,6 +1092,7 @@ impl Document {
 
     /// Start an undoable operation (a brush stroke, a pose, ...).
     pub fn begin_stroke(&mut self, label: &str) {
+        self.ensure_normals();
         self.end_stroke();
         self.undo.open = Some(Group::new(label));
     }

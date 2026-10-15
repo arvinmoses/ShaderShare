@@ -120,6 +120,8 @@ pub struct SculptApp {
     start_zoom: f32,
     /// How faithfully dense meshes are drawn (Display menu).
     pub view_detail: ViewDetail,
+    /// Hard, per-triangle shading (nothing stored or uploaded for normals) instead of smooth per-vertex normals.
+    pub flat_shading: bool,
     /// `SCULPT_LOD_TAU` overrides the preset's tolerance (benchmarks).
     lod_tau_override: Option<f32>,
     /// Background re-simplification of patches outdated by edits: (topology id, result channel).
@@ -203,6 +205,9 @@ impl SculptApp {
         let keymap = Keymap::load(&cfg.join("keymap.json"));
         let tools = serde_json::from_value(settings["tools"].clone()).unwrap_or_default();
 
+        if let Ok(mode) = std::env::var("SCULPT_SHADING") {
+            println!("shading override: {mode}");
+        }
         let mut app = SculptApp {
             doc: None,
             job: None,
@@ -211,6 +216,11 @@ impl SculptApp {
             lod_batch: LOD_REFRESH_BATCH_MIN,
             last_edit: Instant::now(),
             view_detail: ViewDetail::Balanced,
+            flat_shading: match std::env::var("SCULPT_SHADING").as_deref() {
+                Ok("smooth") => false,
+                Ok("flat") => true,
+                _ => settings["flat_shading"].as_bool().unwrap_or(true),
+            },
             lod_tau_override: std::env::var("SCULPT_LOD_TAU").ok().and_then(|v| v.parse().ok()),
             viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
             camera: Camera::default(),
@@ -279,7 +289,13 @@ impl SculptApp {
     pub fn save_settings(&self) {
         let cfg = config_dir();
         let _ = std::fs::create_dir_all(&cfg);
-        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools, "layers_compact": self.layers.compact, "view_detail": self.view_detail.name() });
+        // SCULPT_SHADING overrides the shading for one run (benchmarks, screenshots) and is never saved.
+        let flat_shading = if std::env::var_os("SCULPT_SHADING").is_some() {
+            std::fs::read_to_string(cfg.join("settings.json")).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).and_then(|v| v["flat_shading"].as_bool()).unwrap_or(true)
+        } else {
+            self.flat_shading
+        };
+        let v = serde_json::json!({ "theme": self.theme.name, "tools": self.tools, "layers_compact": self.layers.compact, "view_detail": self.view_detail.name(), "flat_shading": flat_shading });
         let _ = std::fs::write(cfg.join("settings.json"), serde_json::to_string_pretty(&v).unwrap());
     }
 
@@ -828,6 +844,11 @@ impl SculptApp {
                 }
                 self.stats.lod_refresh_ms = tr.elapsed().as_secs_f32() * 1e3;
                 let custom = self.pose_weights.as_deref();
+                vp.shading = if self.flat_shading { crate::viewport::Shading::Flat } else { crate::viewport::Shading::Smooth };
+                // Flat shading never reads normals, so the engine can skip computing them after layer and generator edits.
+                if doc.lazy_normals() != self.flat_shading {
+                    doc.set_lazy_normals(self.flat_shading);
+                }
                 vp.sync(rs, doc, &self.overlay, custom, std::mem::take(&mut self.pose_weights_changed));
                 self.stats.upload = vp.last_upload;
             }

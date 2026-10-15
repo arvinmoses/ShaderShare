@@ -11,6 +11,9 @@ struct Uniforms {
     // xyz = center, w = radius (0 hides the cursor)
     cursor: vec4<f32>,
     cursor_color: vec4<f32>,
+    // xyz = corner, xyz = size of the box the 16-bit vertex positions are measured in
+    box_min: vec4<f32>,
+    box_size: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -22,13 +25,30 @@ struct MeshOut {
     @location(2) overlay: f32,
 };
 
+fn decode(q: vec4<f32>) -> vec3<f32> {
+    return u.box_min.xyz + q.xyz * u.box_size.xyz;
+}
+
+// Flat shading: one hard normal per triangle, taken from the screen derivatives of the position.
 @vertex
-fn vs_mesh(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) overlay: f32) -> MeshOut {
+fn vs_flat(@location(0) q: vec4<f32>) -> MeshOut {
     var o: MeshOut;
+    let pos = decode(q);
+    o.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    o.world = pos;
+    o.normal = vec3<f32>(0.0, 1.0, 0.0);
+    o.overlay = q.w;
+    return o;
+}
+
+@vertex
+fn vs_smooth(@location(0) q: vec4<f32>, @location(1) normal: vec3<f32>) -> MeshOut {
+    var o: MeshOut;
+    let pos = decode(q);
     o.clip = u.view_proj * vec4<f32>(pos, 1.0);
     o.world = pos;
     o.normal = normal;
-    o.overlay = overlay;
+    o.overlay = q.w;
     return o;
 }
 
@@ -36,9 +56,22 @@ fn vs_mesh(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @locatio
 // key light, cool sky / warm ground ambient, a little subsurface warmth in
 // the terminator, fresnel rim and a broad soft specular.
 @fragment
-fn fs_mesh(i: MeshOut) -> @location(0) vec4<f32> {
+fn fs_flat(i: MeshOut) -> @location(0) vec4<f32> {
+    // Derivatives need uniform control flow, so take them before anything branches.
+    let c = cross(dpdx(i.world), dpdy(i.world));
+    let l2 = dot(c, c);
+    let n = select(vec3<f32>(0.0, 1.0, 0.0), c * inverseSqrt(max(l2, 1e-30)), l2 > 1e-30);
+    return shade(i, n);
+}
+
+@fragment
+fn fs_smooth(i: MeshOut) -> @location(0) vec4<f32> {
+    return shade(i, normalize(i.normal));
+}
+
+fn shade(i: MeshOut, normal: vec3<f32>) -> vec4<f32> {
     let v = normalize(u.eye.xyz - i.world);
-    var n = normalize(i.normal);
+    var n = normal;
     if (dot(n, v) < 0.0) {
         n = -n;
     }

@@ -140,3 +140,40 @@ In the app at 6.3M faces (scripted sweep readout): edit to surface averages 16-2
 during the heaviest phases (count in the thousands, 20k stress) because stale level-of-detail areas now draw at full detail
 until the refresh catches up, and 2.7-2.9 ms (50-59 fps) in the lighter ones. A preview that does not touch mesh data during a
 drag, or a faster LOD refresh, is the way to remove that. Not yet done.
+
+## Flat shading with 8-byte vertices and lazy normals
+
+Viewport vertices are now one 8-byte record (position as three 16-bit values inside the model's box, plus the overlay
+scalar) instead of 28 bytes (position 12, normal 12, overlay 4). In flat shading (the default) there is no normals buffer:
+each triangle's normal comes from the screen derivatives of its position, and the CPU skips recomputing normals after
+generator, layer and undo edits (`Document::set_lazy_normals`; strokes, bakes, LOD refresh and `begin_stroke` call
+`ensure_normals` first). Smooth shading is still available from Display > Shading and uses the old normals buffer.
+A 16-bit step is about 1/65000 of the model's box, about 46 times finer than a triangle edge at 6.3M faces; the CPU copy
+of the surface stays full precision and the box refits (re-sending everything) if the model outgrows it.
+
+`generator-edit-bench` (median ms), eager normals against `--lazy`:
+
+| faces | eager (count / size / lift) | lazy (count / size / lift) |
+|---|---|---|
+| 393k | 2.0 / 1.8 / 1.7 | 1.7 / 1.3 / 1.2 |
+| 1.57M | 8.3 / 6.8 / 6.1 | 5.2 / 4.0 / 4.0 |
+| 6.29M | 22.5 / 17.0 / 14.9 | 14.3 / 10.9 / 10.2 |
+
+In the app at 6.3M faces (scripted sweep, same five moments, mode confirmed per run):
+
+| | smooth | flat |
+|---|---|---|
+| edit to surface, average | 17-54 ms | 13-45 ms |
+| whole frame in the heavy phases | 48.6 / 73.3 / 54.8 ms (14-20 fps) | 42.2 / 47.3 / 39.1 ms (17-24 fps) |
+| whole frame in the light phases | 2.3-3.7 ms (45-59 fps) | 2.5-2.9 ms (50-59 fps) |
+
+Sculpt strokes (level 9, 180 frames): input + dabs 1.68 ms median in both modes, GPU upload per frame 1981 KB (smooth)
+against 792 KB (flat).
+
+Look (`flat_vs_smooth.png`): at 393k faces flat is close to smooth, with slightly stair-stepped rims; at 98k faces seen
+close up flat is plainly faceted (a visible grid in the dents). At 6.3M faces the two cannot be told apart at normal
+distance. Rocks and rubble should suit hard normals; low-density meshes seen close up will want Smooth.
+
+Test-setup trap found on the way: the app saves its settings on exit, so a run with a shading override once wrote
+`flat_shading: false` into the real settings file and silently turned later "flat" runs smooth. `SCULPT_SHADING=flat|smooth`
+now overrides for one run and is never saved (the app prints `shading override: ...` so a run can be confirmed).

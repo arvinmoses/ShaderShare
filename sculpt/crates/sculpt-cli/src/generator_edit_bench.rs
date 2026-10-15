@@ -1,10 +1,11 @@
 //! `sculpt-cli generator-edit-bench`: how long each kind of generator parameter edit takes to reach the surface.
 //!
 //! ```text
-//! sculpt-cli generator-edit-bench [levels=8,10] [count=60]
+//! sculpt-cli generator-edit-bench [levels=8,10] [count=60] [--lazy]
 //! ```
 //! Each edit goes through `Document::set_layer_meta` with coalescing on, exactly as a slider drag does in the app, and
 //! the time is the whole call (placement, indexing and recompositing the leaves the cutters reach). Medians of 9 edits.
+//! `--lazy` leaves vertex normals out of date after each edit, as the app does with flat shading.
 
 use std::time::Instant;
 
@@ -32,6 +33,7 @@ fn alternate(doc: &mut Document, id: LayerId, a: &GeneratorSpec, b: &GeneratorSp
 
 pub(crate) fn run(args: &[String]) -> Res<()> {
     let levels: Vec<u32> = args.first().map_or(vec![8, 10], |s| s.split(',').filter_map(|v| v.parse().ok()).collect());
+    let lazy = args.iter().any(|a| a == "--lazy");
     let count: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
     let base = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count, seed: 7, size: 0.10, lift: 0.6, random_spin: true };
     println!("| faces | create ms | count ms | seed ms | size ms | lift ms | primitive ms | operation ms |");
@@ -40,6 +42,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         let t = Instant::now();
         let mut doc = Document::from_mesh(quad_sphere(level, 1.0))?;
         let build = t.elapsed().as_secs_f64() * 1e3;
+        doc.set_lazy_normals(lazy);
         let faces = doc.face_count();
         let t = Instant::now();
         let id = doc.insert_generator("g", Placement::Top, base.clone())?;

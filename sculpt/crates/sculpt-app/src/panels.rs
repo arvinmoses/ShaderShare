@@ -179,6 +179,14 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 cmd_button(app, ui, Command::ToggleHud);
                 ui.add(egui::Slider::new(&mut app.overlay_strength, 0.0..=1.0).text("Overlay opacity"));
                 ui.separator();
+                ui.label("Shading");
+                for (flat, name, hint) in [(true, "Flat (hard normals)", "One hard normal per triangle. Cheapest: nothing is stored, computed or uploaded for normals."), (false, "Smooth", "Smooth per-vertex normals. Costs time and memory on dense meshes.")] {
+                    if ui.radio(app.flat_shading == flat, name).on_hover_text(hint).clicked() {
+                        app.flat_shading = flat;
+                        app.save_settings();
+                    }
+                }
+                ui.separator();
                 ui.label("Viewport detail (dense meshes)");
                 for d in crate::app::ViewDetail::ALL {
                     if ui.radio(app.view_detail == d, d.name()).on_hover_text(d.hint()).clicked() {

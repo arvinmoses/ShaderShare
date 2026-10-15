@@ -202,3 +202,32 @@ fn normals_match_a_full_recompute_after_generator_edits() {
     doc.set_layer_visible(id, false).unwrap();
     check(&doc, "after hiding the layer");
 }
+
+#[test]
+fn lazy_normals_defer_the_work_and_ensure_catches_up() {
+    let mut doc = sphere_doc(4);
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    doc.set_lazy_normals(true);
+    doc.set_generator(id, GeneratorSpec { count: 90, seed: 3, ..dents() }).unwrap();
+    assert!(doc.normals_stale(), "a generator edit leaves normals out of date while lazy");
+    let fresh = |doc: &Document| {
+        let full = sculpt_core::mesh::compute_normals(doc.positions(), doc.faces(), doc.topology());
+        doc.normals().iter().zip(&full).map(|(a, b)| (*a - *b).length()).fold(0.0f32, f32::max)
+    };
+    assert!(fresh(&doc) > 1e-3, "the stored normals really are stale before ensure");
+    doc.ensure_normals();
+    assert!(!doc.normals_stale());
+    assert!(fresh(&doc) < 1e-5, "ensure brings them to a full recompute");
+    // Beginning a stroke is also a reader.
+    doc.set_generator(id, GeneratorSpec { count: 20, seed: 5, ..dents() }).unwrap();
+    assert!(doc.normals_stale());
+    doc.begin_stroke("stroke");
+    assert!(!doc.normals_stale(), "begin_stroke catches normals up");
+    doc.end_stroke();
+    // Turning laziness off also catches up, and later edits are eager again.
+    doc.set_generator(id, GeneratorSpec { count: 70, seed: 6, ..dents() }).unwrap();
+    doc.set_lazy_normals(false);
+    assert!(!doc.normals_stale() && fresh(&doc) < 1e-5);
+    doc.set_generator(id, GeneratorSpec { count: 30, seed: 8, ..dents() }).unwrap();
+    assert!(!doc.normals_stale() && fresh(&doc) < 1e-5);
+}
