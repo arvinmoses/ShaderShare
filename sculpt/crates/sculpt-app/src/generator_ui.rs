@@ -1,0 +1,189 @@
+//! Generator layer UI: the Properties section, the edit-to-update timer, and a scripted parameter sweep used to record
+//! demos (`--demo-sweep`).
+//!
+//! Every parameter change goes through the layer command path (`MetaEdit::Generator`), so undo, coalescing of slider
+//! drags and the timer all behave the same for the panel and for the sweep.
+
+use std::collections::VecDeque;
+use std::time::Instant;
+
+use egui::{RichText, Ui};
+use sculpt_core::LayerId;
+use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::{BoolOp, Primitive};
+
+use crate::app::SculptApp;
+use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
+use crate::panels::{prop, section};
+
+/// How long the edit calls took, so the panel can show how fast the surface answers.
+#[derive(Default)]
+pub struct EditTimer {
+    recent: VecDeque<f32>,
+    last_ms: f32,
+    slowest_ms: f32,
+}
+
+impl EditTimer {
+    pub fn record(&mut self, ms: f32) {
+        self.last_ms = ms;
+        self.slowest_ms = self.slowest_ms.max(ms);
+        self.recent.push_back(ms);
+        if self.recent.len() > 60 {
+            self.recent.pop_front();
+        }
+    }
+
+    /// (last, average of the recent edits, slowest ever), in milliseconds.
+    pub fn summary(&self) -> Option<(f32, f32, f32)> {
+        (!self.recent.is_empty()).then(|| (self.last_ms, self.recent.iter().sum::<f32>() / self.recent.len() as f32, self.slowest_ms))
+    }
+}
+
+fn op_label(op: BoolOp) -> &'static str {
+    match op {
+        BoolOp::Add => "Add",
+        BoolOp::Subtract => "Subtract",
+        BoolOp::Intersect => "Intersect",
+    }
+}
+
+fn primitive_label(p: Primitive) -> &'static str {
+    match p {
+        Primitive::Box => "Box",
+        Primitive::Sphere => "Sphere",
+        Primitive::Cylinder => "Cylinder",
+        Primitive::Cone => "Cone",
+        Primitive::Wedge => "Wedge",
+        Primitive::ChamferCutter => "Chamfer cutter",
+        Primitive::Torus => "Torus",
+    }
+}
+
+/// Record a widget edit. A drag in progress coalesces into one undo step.
+fn note(r: &egui::Response, changed: &mut bool, coalesce: &mut bool) {
+    if r.changed() {
+        *changed = true;
+        *coalesce = r.dragged() && !r.drag_started();
+    }
+}
+
+/// The Properties section for a generator layer.
+pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
+    let Some(spec) = app.doc.as_ref().and_then(|d| d.layer(id)).and_then(|l| l.generator.clone()) else { return };
+    let fs = app.theme.metrics.font_size;
+    let weak = app.theme.weak_text();
+    let timing = app.gen_timer.summary();
+    let frame_ms = app.stats.frame_ms;
+    let mut next = spec.clone();
+    let (mut changed, mut coalesce) = (false, false);
+    section(ui, fs, "generator", "GENERATOR", |ui| {
+        prop(ui, "Operation", |ui| {
+            egui::ComboBox::from_id_salt(("gen_op", id))
+                .selected_text(op_label(next.op))
+                .show_ui(ui, |ui| {
+                    for op in [BoolOp::Subtract, BoolOp::Add, BoolOp::Intersect] {
+                        if ui.selectable_label(next.op == op, op_label(op)).clicked() {
+                            next.op = op;
+                            changed = true;
+                        }
+                    }
+                })
+                .response
+        });
+        prop(ui, "Primitive", |ui| {
+            egui::ComboBox::from_id_salt(("gen_prim", id)).selected_text(primitive_label(next.primitive)).show_ui(ui, |ui| {
+                for p in Primitive::ALL {
+                    if ui.selectable_label(next.primitive == p, primitive_label(p)).clicked() {
+                        next.primitive = p;
+                        changed = true;
+                    }
+                }
+            })
+        });
+        note(&prop(ui, "Count", |ui| ui.add(egui::Slider::new(&mut next.count, 1..=100_000).logarithmic(true))), &mut changed, &mut coalesce);
+        note(&prop(ui, "Size", |ui| ui.add(egui::Slider::new(&mut next.size, 0.005..=0.5).logarithmic(true).max_decimals(3))), &mut changed, &mut coalesce);
+        note(&prop(ui, "Lift", |ui| ui.add(egui::Slider::new(&mut next.lift, -1.0..=1.5).max_decimals(2))), &mut changed, &mut coalesce);
+        note(&prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut next.seed).speed(0.2))), &mut changed, &mut coalesce);
+        prop(ui, "", |ui| {
+            if ui.checkbox(&mut next.random_spin, "Random spin").changed() {
+                changed = true;
+            }
+        });
+        ui.add_space(4.0);
+        let line = match timing {
+            Some((last, avg, slow)) => format!("Edit to surface  {last:5.1} ms   avg {avg:5.1}   slowest {slow:5.1}"),
+            None => "Edit to surface  (no edits yet)".to_string(),
+        };
+        ui.label(RichText::new(line).monospace().size(fs * 0.85));
+        ui.label(RichText::new(format!("Whole frame  {frame_ms:5.1} ms")).monospace().size(fs * 0.85).color(weak));
+    });
+    if changed && next != spec {
+        command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Generator(next), coalesce });
+    }
+}
+
+// ------------------------------------------------------------------- sweep
+
+/// Seconds the scripted sweep runs before the app closes itself.
+const SWEEP_SECONDS: f32 = 38.0;
+/// Quiet seconds before the first change, so a screen recorder can attach.
+const SWEEP_LEAD: f32 = 4.0;
+
+/// A timeline that moves one parameter at a time through its range and back, so a screen recording shows each control
+/// driving the surface.
+pub struct Sweep {
+    id: LayerId,
+    base: GeneratorSpec,
+    start: Instant,
+}
+
+impl Sweep {
+    pub fn new(id: LayerId, base: GeneratorSpec) -> Sweep {
+        Sweep { id, base, start: Instant::now() }
+    }
+}
+
+fn spec_at(t: f32, base: &GeneratorSpec) -> GeneratorSpec {
+    let mut s = base.clone();
+    // 0 -> 1 -> 0 over the phase, 0 outside it.
+    let wave = |from: f32, to: f32| {
+        let x = ((t - from) / (to - from)).clamp(0.0, 1.0);
+        0.5 - 0.5 * (x * std::f32::consts::TAU).cos()
+    };
+    let log_lerp = |a: f32, b: f32, w: f32| (a.ln() + (b.ln() - a.ln()) * w).exp();
+    let within = |from: f32, to: f32| t >= from && t < to;
+    if within(3.0, 9.0) {
+        s.count = log_lerp(base.count as f32, 3000.0, wave(3.0, 9.0)).round() as u32;
+    } else if within(9.0, 15.0) {
+        s.size = log_lerp(base.size, 0.2, wave(9.0, 15.0));
+    } else if within(15.0, 19.0) {
+        s.lift = base.lift - 0.9 * wave(15.0, 19.0);
+    } else if within(19.0, 23.0) {
+        s.seed = base.seed + ((t - 19.0) / 0.12) as u64;
+    } else if within(23.0, 27.0) {
+        s.primitive = Primitive::ALL[((t - 23.0) / 0.55) as usize % Primitive::ALL.len()];
+    } else if within(27.0, 31.0) {
+        s.op = [BoolOp::Subtract, BoolOp::Add, BoolOp::Intersect][((t - 27.0) / 1.3) as usize % 3];
+    } else if within(31.0, 37.0) {
+        s.count = log_lerp(base.count as f32, 20_000.0, wave(31.0, 37.0)).round() as u32;
+    }
+    s
+}
+
+/// Advance the sweep by one frame. Edits go through the same command as the sliders.
+pub(crate) fn tick_sweep(app: &mut SculptApp, ctx: &egui::Context) {
+    let Some(sweep) = app.sweep.as_ref() else { return };
+    let t = sweep.start.elapsed().as_secs_f32() - SWEEP_LEAD;
+    if t > SWEEP_SECONDS {
+        app.sweep = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    }
+    let (id, spec) = (sweep.id, spec_at(t, &sweep.base));
+    let current = app.doc.as_ref().and_then(|d| d.layer(id)).and_then(|l| l.generator.clone());
+    if current.as_ref() != Some(&spec) {
+        command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Generator(spec), coalesce: true });
+    }
+    ctx.request_repaint();
+}

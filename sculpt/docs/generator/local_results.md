@@ -76,3 +76,20 @@ quads have vertexless cells, as before.
 |---|---|---|
 | 98k | 1.18 / 1.99 / 4.97 | 1.63 |
 | 1.57M | 2.18 / 3.51 / 10.33 | 2.69 |
+
+## Edit-to-update speed in the app (milestone 1, scripted sweep)
+
+`scripts/record_generator_demo.ps1` runs `sculpt-app --demo-sweep` (count, size, lift, seed, primitive, operation and a
+20k-count stress, one at a time) and records the window in real time. The readout is the generator Properties
+section: time spent in the edit command (`set_layer_meta`, which rebuilds placement and recomposites the touched
+leaves), measured on the CPU. Whole-frame time and fps come from the app.
+
+| mesh | edit to surface, average / slowest | frame rate during the sweep |
+|---|---|---|
+| 393k faces | 6.4 / 35 ms | 60 fps |
+| 6.29M faces | 106 / 382 ms (about 65 ms in the ordinary phases; the 20k-count stress phase is the slow end) | drops to about 7 fps while editing |
+
+Why it is slow at 6.3M: every edit rebuilds the whole placement (`SurfaceSampler` CDF over all faces and base normals
+over all vertices) even when only the size or lift changed, and only then evaluates the touched leaves. Milestone 4
+(staged caches: resample only when count, seed or the mask change; rebuild instances only for primitive, size, lift;
+evaluate progressively) is what brings this back to the interactive budget.

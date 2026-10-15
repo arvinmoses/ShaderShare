@@ -161,6 +161,11 @@ impl SculptLayer {
         self.kind == LayerKind::Generator
     }
 
+    /// Only plain layers hold sculpt deltas, so only they can be the stroke target.
+    pub fn is_sculpt_target(&self) -> bool {
+        self.kind == LayerKind::Layer
+    }
+
     /// Effective strength: own strength times every ancestor's, zero when hidden or soloed out.
     pub fn effective_scale(&self) -> f32 {
         self.scale

@@ -48,7 +48,7 @@ pub(crate) fn panel_header(ui: &mut Ui, app: &SculptApp, title: &str, right: imp
 }
 
 /// Section header inside Properties.
-fn section(ui: &mut Ui, font_size: f32, id: &str, title: &str, body: impl FnOnce(&mut Ui)) {
+pub(crate) fn section(ui: &mut Ui, font_size: f32, id: &str, title: &str, body: impl FnOnce(&mut Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).size(font_size * 0.82).family(bold()).extra_letter_spacing(0.5))
         .id_salt(id)
         .default_open(true)
@@ -61,7 +61,7 @@ fn section(ui: &mut Ui, font_size: f32, id: &str, title: &str, body: impl FnOnce
 }
 
 /// Label column + widget, like Painter's property rows.
-fn prop<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+pub(crate) fn prop<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(78.0, ui.spacing().interact_size.y), Sense::hover());
         ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(ui.style().text_styles[&egui::TextStyle::Body].size * 0.92), ui.visuals().weak_text_color());
@@ -692,6 +692,7 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
     let Some(l) = app.doc.as_ref().and_then(|d| d.layer(id)) else { return };
     let (name, opacity, visible, locked, has_mask, is_folder, blend) = (l.name.clone(), l.opacity, l.visible, l.locked, l.mask.is_some(), l.is_folder(), l.blend);
+    let is_generator = l.is_generator();
     let fs = app.theme.metrics.font_size;
     section(ui, fs, "layer", if is_folder { "FOLDER" } else { "LAYER" }, |ui| {
         let mut n = name.clone();
@@ -703,7 +704,7 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         if slider.changed() {
             command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Strength(pct / 100.0), coalesce: slider.dragged() && !slider.drag_started() });
         }
-        if !is_folder {
+        if !is_folder && !is_generator {
             prop(ui, "Blend", |ui| {
                 egui::ComboBox::from_id_salt(("layer_blend", id)).selected_text(blend.label()).show_ui(ui, |ui| {
                     for mode in sculpt_core::LayerBlend::ALL {
@@ -728,6 +729,9 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
             prop(ui, "Contains", |ui| ui.label(RichText::new(format!("{kids} item{}", if kids == 1 { "" } else { "s" })).weak()));
             return;
         }
+        if is_generator {
+            return;
+        }
         prop(ui, "Mask", |ui| {
             if has_mask {
                 if ui.button("Edit mask").clicked() {
@@ -745,6 +749,9 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         let mb = app.doc.as_ref().unwrap().layer(id).map_or(0, |l| l.delta_bytes());
         prop(ui, "Data", |ui| ui.label(RichText::new(format!("{:.1} MB sparse", mb as f64 / 1e6)).weak()));
     });
+    if is_generator {
+        crate::generator_ui::generator_props(app, ui, id);
+    }
 }
 
 fn mask_props(app: &mut SculptApp, ui: &mut Ui) {

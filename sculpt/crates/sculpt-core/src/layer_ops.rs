@@ -360,7 +360,7 @@ impl Document {
         idx.sort_unstable_by(|a, b| b.cmp(a));
         let mut ops: Vec<StructOp> = idx.into_iter().map(|index| StructOp::Remove { index }).collect();
         if self.active.is_some_and(|a| doomed.contains(&a)) {
-            let next = self.layers.iter().rev().find(|l| !l.is_folder() && !doomed.contains(&l.id)).map(|l| l.id);
+            let next = self.layers.iter().rev().find(|l| l.is_sculpt_target() && !doomed.contains(&l.id)).map(|l| l.id);
             ops.push(StructOp::Active { id: next });
         }
         if self.solo.is_some_and(|s| doomed.contains(&s)) {
@@ -390,7 +390,7 @@ impl Document {
             copies.push((*src, copy));
         }
         let new_root = remap[&id];
-        let is_folder = self.layers[self.layer_index_of(id)].is_folder();
+        let is_target = self.layers[self.layer_index_of(id)].is_sculpt_target();
         self.begin_stroke("Duplicate layer");
         let mut ops = Vec::new();
         for ((src, mut copy), at) in copies.into_iter().zip(first_slot..) {
@@ -400,7 +400,7 @@ impl Document {
             }
             ops.push(StructOp::Insert { index: at, layer: Box::new(copy) });
         }
-        if !is_folder {
+        if is_target {
             ops.push(StructOp::Active { id: Some(new_root) });
         }
         self.exec_in_open(ops);

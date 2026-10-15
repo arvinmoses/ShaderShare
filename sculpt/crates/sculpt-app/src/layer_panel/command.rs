@@ -18,6 +18,7 @@ pub enum MetaEdit {
     Locked(bool),
     Collapsed(bool),
     Blend(LayerBlend),
+    Generator(sculpt_core::generator::layer::GeneratorSpec),
 }
 
 impl MetaEdit {
@@ -29,6 +30,7 @@ impl MetaEdit {
             MetaEdit::Locked(l) => m.locked = *l,
             MetaEdit::Collapsed(c) => m.collapsed = *c,
             MetaEdit::Blend(b) => m.blend = *b,
+            MetaEdit::Generator(g) => m.generator = Some(g.clone()),
         }
     }
 }
@@ -256,7 +258,13 @@ pub fn execute(app: &mut SculptApp, cmd: LayerCommand) {
                     return;
                 }
             }
-            if let Err(e) = doc.set_layer_meta(id, meta, coalesce) {
+            let timed = matches!(edit, MetaEdit::Generator(_));
+            let started = std::time::Instant::now();
+            let result = doc.set_layer_meta(id, meta, coalesce);
+            if timed {
+                app.gen_timer.record(started.elapsed().as_secs_f32() * 1e3);
+            }
+            if let Err(e) = result {
                 fail(app, "Edit layer", e);
             }
             return;

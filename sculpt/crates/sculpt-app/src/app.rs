@@ -42,6 +42,8 @@ pub struct Options {
     pub demo_layers: bool,
     /// Add a generator layer on startup (for demos and screenshots): see `parse_generator_demo`.
     pub demo_generator: Option<sculpt_core::generator::layer::GeneratorSpec>,
+    /// Sweep the demo generator's parameters on a timeline, then close (for screen recordings).
+    pub demo_sweep: bool,
     /// Orbit the camera for this many frames and report timings, waiting for the GPU each frame.
     pub bench_orbit: Option<u32>,
     /// Multiply the initial framing distance (below 1 zooms in), for close-up tests and screenshots.
@@ -165,6 +167,10 @@ pub struct SculptApp {
     pub mask_edit: Option<(sculpt_core::LayerId, sculpt_core::mask::MaskStack)>,
     demo_layers: bool,
     demo_generator: Option<sculpt_core::generator::layer::GeneratorSpec>,
+    demo_sweep: bool,
+    /// How long generator edits took, shown in the generator Properties section.
+    pub gen_timer: crate::generator_ui::EditTimer,
+    pub sweep: Option<crate::generator_ui::Sweep>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -244,6 +250,9 @@ impl SculptApp {
             mask_edit: None,
             demo_layers: opts.demo_layers,
             demo_generator: opts.demo_generator,
+            demo_sweep: opts.demo_sweep,
+            gen_timer: Default::default(),
+            sweep: None,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
         app.view_detail = settings["view_detail"].as_str().and_then(ViewDetail::from_name).unwrap_or(ViewDetail::Balanced);
@@ -308,8 +317,14 @@ impl SculptApp {
                     if std::mem::take(&mut self.demo_layers) {
                         self.setup_demo_layers();
                     }
-                    if let (Some(spec), Some(doc)) = (self.demo_generator.take(), self.doc.as_mut()) {
-                        let _ = doc.insert_generator("Generator", sculpt_core::Placement::Top, spec);
+                    if let (Some(spec), Some(doc)) = (self.demo_generator.take(), self.doc.as_mut())
+                        && let Ok(id) = doc.insert_generator("Generator", sculpt_core::Placement::Top, spec.clone())
+                    {
+                        // Select the row so Properties shows it (it can never become the sculpt target).
+                        self.layers.selection.select_only(id);
+                        if self.demo_sweep {
+                            self.sweep = Some(crate::generator_ui::Sweep::new(id, spec));
+                        }
                     }
                     self.maybe_build_lod();
                 }
@@ -1069,6 +1084,7 @@ impl eframe::App for SculptApp {
         }
         self.last_frame = Some(t0);
         self.poll_job();
+        crate::generator_ui::tick_sweep(self, &ctx);
         if self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }

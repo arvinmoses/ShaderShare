@@ -401,8 +401,8 @@ impl Document {
     pub fn set_active_layer(&mut self, id: Option<LayerId>) -> Result<()> {
         if let Some(id) = id {
             let i = self.layer_index(id)?;
-            if self.layers[i].is_folder() {
-                return Err(Error::InvalidData(format!("'{}' is a folder and cannot be sculpted on", self.layers[i].name)));
+            if !self.layers[i].is_sculpt_target() {
+                return Err(Error::InvalidData(format!("'{}' holds no sculpt data, so strokes cannot go into it", self.layers[i].name)));
             }
         }
         self.active = id;
@@ -532,7 +532,7 @@ impl Document {
         }
         let mut ops = vec![undo::StructOp::Remove { index: i }];
         if self.active == Some(id) {
-            let next = self.layers.iter().rev().find(|l| !l.is_folder() && l.id != id).map(|l| l.id);
+            let next = self.layers.iter().rev().find(|l| l.is_sculpt_target() && l.id != id).map(|l| l.id);
             ops.push(undo::StructOp::Active { id: next });
         }
         self.exec_in_open(ops);
@@ -706,8 +706,8 @@ impl Document {
                 if l.locked {
                     return Err(Error::LayerLocked(l.name.clone()));
                 }
-                if l.is_folder() {
-                    return Err(Error::InvalidData(format!("'{}' is a folder and cannot be sculpted on", l.name)));
+                if !l.is_sculpt_target() {
+                    return Err(Error::InvalidData(format!("'{}' holds no sculpt data, so strokes cannot go into it", l.name)));
                 }
                 if !l.visible || (l.scale == 0.0 && l.opacity != 0.0) {
                     return Err(Error::LayerHidden(l.name.clone()));
@@ -1214,7 +1214,7 @@ impl Document {
                 return Err(Error::Format(format!("folder '{}' contains itself", l.name)));
             }
         }
-        doc.active = parts.active.filter(|id| doc.layers.iter().any(|l| l.id == *id && !l.is_folder()));
+        doc.active = parts.active.filter(|id| doc.layers.iter().any(|l| l.id == *id && l.is_sculpt_target()));
         doc.refresh_scales_into(&mut Default::default());
         for i in 0..doc.layers.len() {
             if let Some(stack) = doc.layers[i].mask.clone() {

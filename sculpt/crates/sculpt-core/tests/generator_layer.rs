@@ -141,3 +141,17 @@ fn procedural_layers_refuse_destructive_edits() {
     assert!(doc.merge_down(above).is_err(), "merging into a generator layer is refused");
     assert!(doc.set_generator(sculpt, dents()).is_err(), "a sculpt layer has no generator");
 }
+
+#[test]
+fn a_generator_layer_is_never_the_sculpt_target() {
+    let mut doc = sphere_doc(2);
+    let sculpt = doc.insert_layer("Sculpt", Placement::Top).unwrap();
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    assert_eq!(doc.active_layer(), Some(sculpt), "inserting a generator does not steal the sculpt target");
+    assert!(doc.set_active_layer(Some(id)).is_err(), "strokes cannot be aimed at a generator layer");
+    let copy = doc.duplicate_layer(id).unwrap();
+    assert_eq!(doc.active_layer(), Some(sculpt), "duplicating a generator keeps the target");
+    doc.delete_layer(sculpt).unwrap();
+    assert_ne!(doc.active_layer(), Some(id));
+    assert_ne!(doc.active_layer(), Some(copy), "deleting the target never falls onto a generator");
+}

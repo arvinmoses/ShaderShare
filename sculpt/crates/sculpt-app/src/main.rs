@@ -10,6 +10,7 @@
 
 mod app;
 mod camera;
+mod generator_ui;
 mod gpu_boolean;
 mod gpu_sdf;
 mod icons;
@@ -97,7 +98,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let mut args = std::env::args().skip(1);
-    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, bench_orbit: None, zoom: 1.0 };
+    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, bench_orbit: None, zoom: 1.0 };
     let mut size = [1600.0f32, 1000.0];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -109,6 +110,7 @@ fn main() -> eframe::Result {
             "--test-strokes" => opts.test_frames = args.next().and_then(|v| v.parse().ok()),
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-layers" => opts.demo_layers = true,
+            "--demo-sweep" => opts.demo_sweep = true,
             "--demo-generator" => opts.demo_generator = args.next().and_then(|v| parse_generator_demo(&v)),
             "--size" => {
                 if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
@@ -121,6 +123,10 @@ fn main() -> eframe::Result {
             }
             p => opts.project = Some(PathBuf::from(p)),
         }
+    }
+
+    if opts.demo_sweep && opts.demo_generator.is_none() {
+        opts.demo_generator = Some(sculpt_core::generator::layer::GeneratorSpec { count: 60, size: 0.10, seed: 7, ..Default::default() });
     }
 
     let native = eframe::NativeOptions {
