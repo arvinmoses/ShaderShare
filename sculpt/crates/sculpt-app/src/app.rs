@@ -862,7 +862,7 @@ impl SculptApp {
             self.stats.lod = vp.lod_stats;
             if std::env::var_os("SCULPT_LOD_LOG").is_some() && self.stats.lod.active {
                 let stale = self.doc.as_ref().and_then(|d| d.lod()).map_or(0, |t| t.stale_nodes());
-                eprintln!("lod: {} tris, {} patches, tau {:.2}px, select {:.2} ms, stale {}, refresh hand-off {:.2} ms, encode {:.1} ms", self.stats.lod.triangles, self.stats.lod.nodes, self.stats.lod.tau_px, self.stats.lod.select_ms, stale, self.stats.lod_refresh_ms, t.elapsed().as_secs_f32() * 1e3);
+                eprintln!("lod: {} tris, {} patches, tau {:.2}px, select {:.2} ms, stale {}, refresh hand-off {:.2} ms, encode {:.1} ms, upload {:.2} ms {} KB, edit {:.1} ms, frame {:.1} ms", self.stats.lod.triangles, self.stats.lod.nodes, self.stats.lod.tau_px, self.stats.lod.select_ms, stale, self.stats.lod_refresh_ms, t.elapsed().as_secs_f32() * 1e3, self.stats.upload.ms, self.stats.upload.bytes / 1024, self.gen_timer.summary().map_or(0.0, |s| s.0), self.stats.frame_ms);
             }
             self.stats.render_ms = t.elapsed().as_secs_f32() * 1e3;
             if let Some(tex) = tex {

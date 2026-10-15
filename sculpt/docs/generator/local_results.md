@@ -177,3 +177,23 @@ distance. Rocks and rubble should suit hard normals; low-density meshes seen clo
 Test-setup trap found on the way: the app saves its settings on exit, so a run with a shading override once wrote
 `flat_shading: false` into the real settings file and silently turned later "flat" runs smooth. `SCULPT_SHADING=flat|smooth`
 now overrides for one run and is never saved (the app prints `shading override: ...` so a run can be confirmed).
+
+## Where heavy-phase frame time goes at 6.3M faces (per-frame log, flat shading, scripted sweep)
+
+`SCULPT_LOD_LOG=1` now also prints edit, upload and frame time. In the heavy phases the cost is the edit itself, not the
+level-of-detail draw (the earlier guess was wrong): select 2 ms, encode 2 ms, upload about 5 ms, a UI-thread hand-off to the
+LOD refresh of about 14 ms in some frames, against edits of 13-15 ms (median) and 128-323 ms in the 20,000-cutter stress.
+The LOD never catches up during a continuous drag (about 4000 of 8000 patches stay stale, about 12.5M triangles drawn), which
+costs little on this GPU.
+
+Edit time against cutter count (`generator-edit-bench <levels> <count> <size> --lazy`, medians, ms):
+
+| cutters (size) | 1.57M faces | 6.29M faces |
+|---|---|---|
+| 60 (0.10) | 4-5 | 10-17 |
+| 1000 (0.04) | 8-11 | 27-37 |
+| 5000 (0.025) | 11-17 | 37-56 |
+| 20000 (0.015) | 19-30 | 57-101 |
+
+The edit time grows with the number of vertices the cutters reach, so a cut at full density is the cost to remove: evaluate
+what the view shows first (the progressive scheduler from the spikes, `generator/schedule.rs`) and finish the rest at rest.

@@ -1,7 +1,7 @@
 //! `sculpt-cli generator-edit-bench`: how long each kind of generator parameter edit takes to reach the surface.
 //!
 //! ```text
-//! sculpt-cli generator-edit-bench [levels=8,10] [count=60] [--lazy]
+//! sculpt-cli generator-edit-bench [levels=8,10] [count=60] [size=0.10] [--lazy]
 //! ```
 //! Each edit goes through `Document::set_layer_meta` with coalescing on, exactly as a slider drag does in the app, and
 //! the time is the whole call (placement, indexing and recompositing the leaves the cutters reach). Medians of 9 edits.
@@ -35,7 +35,8 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
     let levels: Vec<u32> = args.first().map_or(vec![8, 10], |s| s.split(',').filter_map(|v| v.parse().ok()).collect());
     let lazy = args.iter().any(|a| a == "--lazy");
     let count: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let base = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count, seed: 7, size: 0.10, lift: 0.6, random_spin: true };
+    let size: f32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.10);
+    let base = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count, seed: 7, size, lift: 0.6, random_spin: true };
     println!("| faces | create ms | count ms | seed ms | size ms | lift ms | primitive ms | operation ms |");
     println!("|---|---|---|---|---|---|---|---|");
     for level in levels {
@@ -50,7 +51,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         let row = [
             alternate(&mut doc, id, &base, &GeneratorSpec { count: count + 30, ..base.clone() }),
             alternate(&mut doc, id, &base, &GeneratorSpec { seed: 8, ..base.clone() }),
-            alternate(&mut doc, id, &base, &GeneratorSpec { size: 0.12, ..base.clone() }),
+            alternate(&mut doc, id, &base, &GeneratorSpec { size: size * 1.2, ..base.clone() }),
             alternate(&mut doc, id, &base, &GeneratorSpec { lift: 0.5, ..base.clone() }),
             alternate(&mut doc, id, &base, &GeneratorSpec { primitive: Primitive::Box, ..base.clone() }),
             alternate(&mut doc, id, &base, &GeneratorSpec { op: BoolOp::Add, ..base.clone() }),
