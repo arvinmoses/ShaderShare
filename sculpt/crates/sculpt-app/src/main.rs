@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sculpt-app [project.sculpt] [--level N] [--quads N] [--theme NAME]
-//!            [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--size WxH]
+//!            [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--demo-generator op:primitive:count:size:lift:seed] [--size WxH]
 //!            [--demo-layers]
 //! sculpt-app --gpu-bench [LEVELS] [COUNTS] [--op subtract|add|intersect|all] [--mixed] [--reps N] [--cpu] [--check] [--png out.png]
 //! sculpt-app --gpu-sdf-bench | --gpu-sdf-check | --gpu-sdf-png <dir>      (headless GPU SDF boolean spike)
@@ -41,6 +41,42 @@ fn gpu_setup() -> WgpuSetup {
     WgpuSetup::CreateNew(setup)
 }
 
+/// `op:primitive:count:size:lift:seed`, for example `subtract:sphere:60:0.12:0.6:7`. Trailing fields are optional.
+fn parse_generator_demo(text: &str) -> Option<sculpt_core::generator::layer::GeneratorSpec> {
+    use sculpt_core::generator::{BoolOp, Primitive, layer::GeneratorSpec};
+    let mut f = text.split(':');
+    let mut spec = GeneratorSpec::default();
+    spec.op = match f.next()? {
+        "add" => BoolOp::Add,
+        "subtract" | "sub" => BoolOp::Subtract,
+        "intersect" => BoolOp::Intersect,
+        other => {
+            eprintln!("--demo-generator: unknown operation '{other}'");
+            return None;
+        }
+    };
+    if let Some(p) = f.next() {
+        spec.primitive = match p {
+            "box" => Primitive::Box,
+            "sphere" => Primitive::Sphere,
+            "cylinder" => Primitive::Cylinder,
+            "cone" => Primitive::Cone,
+            "wedge" => Primitive::Wedge,
+            "chamfer" => Primitive::ChamferCutter,
+            "torus" => Primitive::Torus,
+            other => {
+                eprintln!("--demo-generator: unknown primitive '{other}'");
+                return None;
+            }
+        };
+    }
+    spec.count = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.count);
+    spec.size = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.size);
+    spec.lift = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.lift);
+    spec.seed = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.seed);
+    Some(spec)
+}
+
 fn main() -> eframe::Result {
     // Headless GPU boolean benchmark: no window, own wgpu device.
     if std::env::args().nth(1).as_deref() == Some("--gpu-bench") {
@@ -61,7 +97,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let mut args = std::env::args().skip(1);
-    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, bench_orbit: None, zoom: 1.0 };
+    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, bench_orbit: None, zoom: 1.0 };
     let mut size = [1600.0f32, 1000.0];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -73,13 +109,14 @@ fn main() -> eframe::Result {
             "--test-strokes" => opts.test_frames = args.next().and_then(|v| v.parse().ok()),
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-layers" => opts.demo_layers = true,
+            "--demo-generator" => opts.demo_generator = args.next().and_then(|v| parse_generator_demo(&v)),
             "--size" => {
                 if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
                     size = [w.parse().unwrap_or(size[0]), h.parse().unwrap_or(size[1])];
                 }
             }
             "-h" | "--help" => {
-                println!("sculpt-app [project.sculpt] [--level N] [--theme NAME] [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--size WxH]");
+                println!("sculpt-app [project.sculpt] [--level N] [--theme NAME] [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--demo-generator op:primitive:count:size:lift:seed] [--size WxH]");
                 return Ok(());
             }
             p => opts.project = Some(PathBuf::from(p)),

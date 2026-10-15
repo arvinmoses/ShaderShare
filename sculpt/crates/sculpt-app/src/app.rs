@@ -40,6 +40,8 @@ pub struct Options {
     pub screenshot: Option<PathBuf>,
     /// Create a masked detail layer on startup (for demos and screenshots).
     pub demo_layers: bool,
+    /// Add a generator layer on startup (for demos and screenshots): see `parse_generator_demo`.
+    pub demo_generator: Option<sculpt_core::generator::layer::GeneratorSpec>,
     /// Orbit the camera for this many frames and report timings, waiting for the GPU each frame.
     pub bench_orbit: Option<u32>,
     /// Multiply the initial framing distance (below 1 zooms in), for close-up tests and screenshots.
@@ -162,6 +164,7 @@ pub struct SculptApp {
     /// Editing copy of the active layer's mask stack.
     pub mask_edit: Option<(sculpt_core::LayerId, sculpt_core::mask::MaskStack)>,
     demo_layers: bool,
+    demo_generator: Option<sculpt_core::generator::layer::GeneratorSpec>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -240,6 +243,7 @@ impl SculptApp {
             show_keymap: false,
             mask_edit: None,
             demo_layers: opts.demo_layers,
+            demo_generator: opts.demo_generator,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
         app.view_detail = settings["view_detail"].as_str().and_then(ViewDetail::from_name).unwrap_or(ViewDetail::Balanced);
@@ -303,6 +307,11 @@ impl SculptApp {
                     }
                     if std::mem::take(&mut self.demo_layers) {
                         self.setup_demo_layers();
+                    }
+                    if let Some(spec) = self.demo_generator.take() {
+                        if let Some(doc) = self.doc.as_mut() {
+                            let _ = doc.insert_generator("Generator", sculpt_core::Placement::Top, spec);
+                        }
                     }
                     self.maybe_build_lod();
                 }
