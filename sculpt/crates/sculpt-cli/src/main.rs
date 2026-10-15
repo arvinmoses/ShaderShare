@@ -4,6 +4,7 @@
 //! sculpt-cli demo  [out_dir]           scripted session -> project + OBJs
 //! sculpt-cli bench [level]             brush latency on a dense sphere
 //! sculpt-cli generator-bench [levels] [counts] [--no-voxel] [--mixed]   Generator Boolean spike timings
+//! sculpt-cli generator-edit-bench [levels] [count]   Time of each kind of generator layer edit
 //! sculpt-cli refine-bench <quality|time|cracks|dump> ...   Generator boundary refinement (spike 3)
 //! sculpt-cli adf-bench perf|quality [...]   Spike 6: adaptively sampled distance field boolean
 //! sculpt-cli generator-drag-sim [levels] [counts] [--view ..]           Generator slider-drag scheduler simulation
@@ -14,6 +15,7 @@
 
 mod adf_bench;
 mod generator_bench;
+mod generator_edit_bench;
 mod refine_bench;
 mod generator_drag_sim;
 mod render;
@@ -42,6 +44,7 @@ fn main() {
         Some("lod-bench") => lod_bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000_000), args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0)),
         Some("bench") => bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9)),
         Some("generator-bench") => generator_bench::run(&args[1..]),
+        Some("generator-edit-bench") => generator_edit_bench::run(&args[1..]),
         Some("refine-bench") => refine_bench::run(&args[1..]),
         Some("adf-bench") => adf_bench::run(&args[1..]),
         Some("generator-drag-sim") => generator_drag_sim::run(&args[1..]),

@@ -99,6 +99,7 @@ impl Document {
                 PoseTransform::Scale { pivot, factor } => (Quat::IDENTITY, pivot, 1.0 + (factor - 1.0) * w),
             }
         };
+        self.base_epoch += 1;
         self.base.par_iter_mut().enumerate().for_each(|(v, p)| {
             let w = w_at(v);
             if w <= 0.0 {

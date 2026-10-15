@@ -49,6 +49,7 @@ pub struct SurfaceSample {
 
 /// Importance sampler over the surface: probability of a face is proportional to
 /// `area * mean(mask over its vertices)`.
+#[derive(Debug)]
 pub struct SurfaceSampler {
     /// Inclusive prefix sums of per-face weights.
     cdf: Vec<f64>,

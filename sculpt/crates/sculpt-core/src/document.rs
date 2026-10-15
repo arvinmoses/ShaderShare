@@ -144,6 +144,10 @@ pub struct Document {
     /// Freeze / channels / layer masks changed (overlay upload tracking).
     pub(crate) scalar_dirty: DirtyTracker,
     pub(crate) topology_id: u64,
+    /// Bumped whenever the base positions change, so caches derived from the base know to rebuild.
+    pub(crate) base_epoch: u64,
+    /// Generator stage 0 (see `generator::layer`), valid for one (topology, base epoch).
+    pub(crate) gen_basis: Option<(u64, u64, std::sync::Arc<crate::generator::layer::SurfaceBasis>)>,
     /// Level-of-detail tree for dense meshes, and the topology it was built for.
     pub(crate) lod: Option<(u64, std::sync::Arc<crate::lod::LodTree>)>,
     /// Free-form, round-tripped by the file format (UI state, app metadata).
@@ -181,6 +185,8 @@ impl Document {
             geometry_dirty: DirtyTracker::all(),
             scalar_dirty: DirtyTracker::all(),
             topology_id: new_topology_id(),
+            base_epoch: 0,
+            gen_basis: None,
             lod: None,
             metadata: BTreeMap::new(),
         })
@@ -530,6 +536,7 @@ impl Document {
                 self.base[v] += chunk[k] * self.layers[i].weight(v);
             }
         }
+        self.base_epoch += 1;
         let mut ops = vec![undo::StructOp::Remove { index: i }];
         if self.active == Some(id) {
             let next = self.layers.iter().rev().find(|l| l.is_sculpt_target() && l.id != id).map(|l| l.id);
@@ -744,6 +751,7 @@ impl Document {
 
         match target {
             SculptTarget::Base => {
+                self.base_epoch += 1;
                 let base_slices = split_ranges_mut(&mut self.base, ranges.iter().cloned());
                 disp.leaves.par_iter().zip(pos_slices).zip(base_slices).for_each(|(((_, list), pos), base)| {
                     for &(k, d) in list {
@@ -863,7 +871,9 @@ impl Document {
 
     // ------------------------------------------------------- geometry upkeep
 
-    /// Rebuild composite positions for `leaves` from base + layers.
+    /// Rebuild composite positions for `leaves` from base + layers. Only leaves whose positions actually changed are
+    /// reported onward (normals, GPU upload and level-of-detail staleness), so an edit that reaches many leaves by
+    /// bounding box but moves few vertices stays cheap.
     pub(crate) fn recomposite(&mut self, leaves: &[u32]) {
         if leaves.is_empty() {
             return;
@@ -876,7 +886,12 @@ impl Document {
         let eps = (self.bvh.bounds().extent().length() * 1e-4).max(1e-9);
         let slices = split_ranges_mut(&mut self.positions, ranges.iter().cloned());
         let (base, layers, normals, bvh) = (&self.base, &self.layers, &self.normals, &self.bvh);
-        slices.into_par_iter().zip(leaves.par_iter()).zip(ranges.par_iter()).for_each(|((pos, &l), r)| {
+        let changed: Vec<u32> = slices
+            .into_par_iter()
+            .zip(leaves.par_iter())
+            .zip(ranges.par_iter())
+            .filter_map(|((pos, &l), r)| {
+            let before: Vec<Vec3> = pos.to_vec();
             pos.copy_from_slice(&base[r.clone()]);
             for &i in &order {
                 let layer = &layers[i];
@@ -898,17 +913,35 @@ impl Document {
                     }
                 }
             }
-        });
-        self.geometry_changed(&leaves);
+            (*pos != *before).then_some(l)
+        })
+        .collect();
+        self.geometry_changed(&changed);
     }
 
-    /// Rebuild a generator layer's derived placement from its spec and the base surface.
+    /// The shared stage-0 data for generator layers, built the first time it is needed after the base or topology changed.
+    pub(crate) fn generator_basis(&mut self) -> std::sync::Arc<crate::generator::layer::SurfaceBasis> {
+        if let Some((topology, epoch, basis)) = &self.gen_basis
+            && (*topology, *epoch) == (self.topology_id, self.base_epoch)
+        {
+            return basis.clone();
+        }
+        let basis = std::sync::Arc::new(crate::generator::layer::SurfaceBasis::build(&self.base, &self.faces, &self.topo));
+        self.gen_basis = Some((self.topology_id, self.base_epoch, basis.clone()));
+        basis
+    }
+
+    /// Rebuild a generator layer's derived placement from its spec and the base surface, redoing only the stages the
+    /// change since the last build invalidated.
     pub(crate) fn rebuild_generator_cache(&mut self, i: usize) {
-        let cache = self.layers[i]
-            .generator
-            .as_ref()
-            .map(|s| std::sync::Arc::new(crate::generator::layer::GeneratorCache::build(s, &self.base, &self.faces, &self.topo, &self.bvh)));
-        self.layers[i].gen_cache = cache;
+        let Some(spec) = self.layers[i].generator.clone() else {
+            self.layers[i].gen_cache = None;
+            return;
+        };
+        let basis = self.generator_basis();
+        let previous = self.layers[i].gen_cache.clone();
+        let cache = crate::generator::layer::GeneratorCache::build(&spec, &basis, &self.base, &self.faces, &self.bvh, previous.as_deref());
+        self.layers[i].gen_cache = Some(std::sync::Arc::new(cache));
     }
 
     pub(crate) fn rebuild_generator_caches(&mut self) {
@@ -935,17 +968,6 @@ impl Document {
             }
         }
         let set: Vec<u32> = mark.iter().enumerate().filter(|(_, m)| **m).map(|(i, _)| i as u32).collect();
-        let (positions, faces, topo, bvh) = (&self.positions, &self.faces, &self.topo, &self.bvh);
-        let normals: Vec<Vec<(u32, Vec3)>> = set
-            .par_iter()
-            .map(|&l| {
-                bvh.leaves[l as usize]
-                    .verts
-                    .iter()
-                    .map(|&v| (v, mesh::vertex_normal(positions, faces, topo, v as usize)))
-                    .collect()
-            })
-            .collect();
         let nleaves = self.bvh.leaves.len();
         for &l in &set {
             self.geometry_dirty.mark(l, nleaves);
@@ -953,10 +975,30 @@ impl Document {
         if let Some(tree) = self.lod.as_mut().filter(|(t, _)| *t == self.topology_id).and_then(|(_, tree)| std::sync::Arc::get_mut(tree)) {
             tree.mark_leaves(&set);
         }
-        for list in normals {
+        // Most of the work is each leaf's own vertices: those are contiguous, so they are written in place in parallel.
+        let ranges: Vec<Range<usize>> = set.iter().map(|&l| self.bvh.leaves[l as usize].owned_range()).collect();
+        let (positions, faces, topo, bvh) = (&self.positions, &self.faces, &self.topo, &self.bvh);
+        split_ranges_mut(&mut self.normals, ranges.iter().cloned()).into_par_iter().zip(ranges.par_iter()).for_each(|(out, r)| {
+            for (k, n) in out.iter_mut().enumerate() {
+                *n = mesh::vertex_normal(positions, faces, topo, r.start + k);
+            }
+        });
+        // Vertices a leaf only borrows from a neighbour can belong to a leaf outside the set; those few are patched
+        // afterwards, and their owner's upload range is marked.
+        let borrowed: Vec<Vec<(u32, Vec3)>> = set
+            .par_iter()
+            .map(|&l| {
+                bvh.leaves[l as usize]
+                    .verts
+                    .iter()
+                    .filter(|&&v| !mark[bvh.vert_leaf[v as usize] as usize])
+                    .map(|&v| (v, mesh::vertex_normal(positions, faces, topo, v as usize)))
+                    .collect()
+            })
+            .collect();
+        for list in borrowed {
             for (v, n) in list {
                 self.normals[v as usize] = n;
-                // Normals of borrowed vertices belong to their owner leaf's upload range.
                 self.geometry_dirty.mark(self.bvh.vert_leaf[v as usize], nleaves);
             }
         }
@@ -1068,6 +1110,7 @@ impl Document {
                 (undo::Target::Base, undo::Data::Positions(p)) => {
                     let cur: Box<[Vec3]> = self.base[r.clone()].into();
                     self.base[r].copy_from_slice(&p);
+                    self.base_epoch += 1;
                     leaves.insert(leaf);
                     undo::Data::Positions(cur)
                 }
@@ -1145,6 +1188,7 @@ impl Document {
         let normals = mesh::compute_normals(&positions, &faces, &topo);
         self.faces = faces;
         self.base = base;
+        self.base_epoch += 1;
         self.rest = rest;
         self.positions = positions;
         self.normals = normals;

@@ -21,17 +21,26 @@ evaluated in stack order, and sculpting on layers above or below keeps working.
   evaluate functions. All generator logic stays under `generator/`.
 - `io/project.rs`: format version 4 adds an optional `generator` entry per layer. Older projects load unchanged.
 
+## Direction set by the artist
+
+- **Target:** organic work first: rocks, ruins, rubble piles and similar things you would sculpt. Hard surface comes later.
+- **Priority:** iteration speed beats everything. A live preview is wanted, but never at the cost of how fast edits answer.
+- **Soft blends:** transitions between a cutter and the surface are soft by default for organics, with a blend radius. Sharp
+  edges are a later, separate target (feature-preserving mesher, angle-based sharp preservation).
+
 ## Milestones (each is something you can inspect)
 
 | # | Outcome | How to check |
 |---|---|---|
-| M1 | A generator layer exists in the engine: scatter a primitive over the surface, add / subtract / intersect it, saves and loads, undoable, survives subdivision. | Tests (determinism, save/load, old-format fixture, undo, subdivision, incremental equals full), CLI demo that writes before/after meshes. |
-| M2 | Placement language: density-field mask (white pulls all spawns in, fixed count, importance sampling), edge placement, grid / spacing, minimum spacing. Edge bake. | Tests (>=95% of points in white regions, cube edges), screenshots. |
-| M3 | Attribute mapping table (normal, edge normal, edge length, curvature, noise, random -> align, scale, height, offset). | Tests, "edge damage" preset demo. |
-| M4 | Staged caches and the progressive scheduler wired into `Document` and the app per frame; normals recomputed. | `generator-drag-sim` through `Document`, p95 near 16 ms. |
-| M5 | Generator UI in the layer panel, viewport gizmos, presets, custom OBJ primitives. | Screenshots in all four themes, blind score. |
-| M6 | Refinement after settle, with parent weights. Apply as solid (ADF, optional GPU SDF), staged and cancellable, with diagnostics. | Tests, in-app comparison. |
-| M7 | GPU evaluator behind the same trait, CPU as reference. Render-time preview if wanted. | GPU-vs-CPU equality tests, real-GPU timings. |
+| M1 (done) | Generator layer in the engine: scatter, add / subtract / intersect, save and load, undo, subdivision, panel, edit timer. | Tests, demo clips. |
+| M2 (in progress) | **Iteration speed.** Staged caches (done), changed-leaf-only updates (done), progressive evaluation and a cheaper level-of-detail catch-up for dense meshes (next). | `generator-edit-bench`, the in-app readout, frame time at 6.3M faces during a drag. |
+| M3 | **Placement language for rocks and rubble:** minimum spacing, density mask (white pulls all spawns in, fixed count), size / rotation variance per instance, edge placement, edge bake, clusters. | Tests (spacing, mask weighting >= 95%), screenshots. |
+| M4 | Attribute mapping table (normal, edge normal, edge length, curvature, noise, random -> align, scale, height, offset). | Tests, an "edge damage" and a "rubble" preset. |
+| M5 | Generator UI in the layer panel proper, viewport gizmos, presets, custom OBJ primitives. | Screenshots in all four themes, blind score. |
+| M6 | **Soft-blend live preview** (screen space, approximate), strictly optional so it cannot slow edits. The same blend definition as Apply, shared between shader and Rust with parity tests. | Parity tests, real-GPU timing, side-by-side with Apply. |
+| M7 | Refinement after settle with parent weights, then **Apply as solid** with the blend radius (surface nets first, staged and cancellable, diagnostics). | Tests, in-app comparison. |
+| M8 | GPU evaluator behind the same trait, CPU as reference. | GPU-vs-CPU equality tests, real-GPU timings. |
+| Later | Hard surface: sharp-feature mesher (dual contouring), angle-based sharp preservation, bevels. | |
 
 Each milestone ends with: release build, `cargo clippy --release --workspace` with no new warnings,
 `cargo test --release --workspace`, and the sculpt-latency guard from the hand-off.

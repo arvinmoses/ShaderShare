@@ -161,6 +161,11 @@ impl SculptLayer {
         self.kind == LayerKind::Generator
     }
 
+    /// The derived placement of a generator layer, for inspection.
+    pub fn generator_cache(&self) -> Option<&std::sync::Arc<GeneratorCache>> {
+        self.gen_cache.as_ref()
+    }
+
     /// Only plain layers hold sculpt deltas, so only they can be the stroke target.
     pub fn is_sculpt_target(&self) -> bool {
         self.kind == LayerKind::Layer

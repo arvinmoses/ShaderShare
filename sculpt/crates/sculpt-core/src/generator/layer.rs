@@ -5,12 +5,23 @@
 //! ([`GeneratorCache`]), rebuilt whenever the spec or the topology changes. During compositing it acts as a *function
 //! layer*: it reads the positions accumulated from the layers beneath it and returns displaced positions, which are then
 //! blended by the layer's strength and mask. Placement is taken from the base surface, so it stays put while you sculpt.
+//!
+//! The derived data is staged so an edit redoes only what it invalidates, which is what keeps a slider drag cheap on a
+//! dense mesh:
+//!
+//! | stage | holds | rebuilt when |
+//! |---|---|---|
+//! | [`SurfaceBasis`] | base normals and the per-face sampling table | the base surface or topology changes |
+//! | samples | surface points with their normals | count or seed changes |
+//! | instances and index | cutter transforms and the spatial hash | any parameter changes (cost is per cutter) |
+
+use std::sync::Arc;
 
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-use super::place::SurfaceSampler;
-use super::{BoolOp, EvalParams, InstanceSet, Primitive, affected_leaves, eval_vertex, frame_from_normal};
+use super::place::{SurfaceSample, SurfaceSampler};
+use super::{BoolOp, EvalParams, Instance, InstanceSet, Primitive, affected_leaves, eval_vertex, frame_from_normal};
 use crate::bvh::Bvh;
 use crate::geom::Aabb;
 use crate::mesh::{self, Face, Topology};
@@ -39,9 +50,27 @@ impl Default for GeneratorSpec {
     }
 }
 
+/// Facts about the base surface that every generator edit needs and none changes. Building it walks every face and
+/// vertex, so it is kept by the document and shared by all generator layers until the base or topology changes.
+#[derive(Debug)]
+pub struct SurfaceBasis {
+    normals: Vec<Vec3>,
+    sampler: SurfaceSampler,
+}
+
+impl SurfaceBasis {
+    pub fn build(base: &[Vec3], faces: &[Face], topo: &Topology) -> SurfaceBasis {
+        SurfaceBasis { normals: mesh::compute_normals(base, faces, topo), sampler: SurfaceSampler::new(base, faces, None) }
+    }
+}
+
 /// Placement and spatial hash derived from a spec and the base surface.
 #[derive(Clone, Debug)]
 pub struct GeneratorCache {
+    /// The parameters this cache was built for; the next build diffs against them to see which stages to redo.
+    spec: GeneratorSpec,
+    basis: Arc<SurfaceBasis>,
+    samples: Arc<Vec<SurfaceSample>>,
     pub(crate) set: InstanceSet,
     pub(crate) params: EvalParams,
     /// Leaves whose bounds an instance can reach, ascending.
@@ -49,28 +78,30 @@ pub struct GeneratorCache {
 }
 
 impl GeneratorCache {
-    /// Scatter `spec.count` instances over `base` and index them.
-    pub fn build(spec: &GeneratorSpec, base: &[Vec3], faces: &[Face], topo: &Topology, bvh: &Bvh) -> GeneratorCache {
-        let normals = mesh::compute_normals(base, faces, topo);
-        let samples = SurfaceSampler::new(base, faces, None).sample(base, &normals, faces, None, spec.count as usize, spec.seed);
+    /// Scatter `spec.count` instances over `base` and index them, reusing whatever `previous` still has right.
+    pub fn build(spec: &GeneratorSpec, basis: &Arc<SurfaceBasis>, base: &[Vec3], faces: &[Face], bvh: &Bvh, previous: Option<&GeneratorCache>) -> GeneratorCache {
+        let samples = match previous {
+            Some(p) if Arc::ptr_eq(&p.basis, basis) && p.spec.count == spec.count && p.spec.seed == spec.seed => p.samples.clone(),
+            _ => Arc::new(basis.sampler.sample(base, &basis.normals, faces, None, spec.count as usize, spec.seed)),
+        };
         let instances = samples
             .iter()
             .enumerate()
             .map(|(i, s)| {
                 let spin = if spec.random_spin { unit_random(spec.seed, i as u64) * std::f32::consts::TAU } else { 0.0 };
-                super::Instance::new(
-                    spec.primitive,
-                    s.position + s.normal * (spec.lift * spec.size),
-                    frame_from_normal(s.normal, spin),
-                    Vec3::splat(spec.size),
-                )
+                Instance::new(spec.primitive, s.position + s.normal * (spec.lift * spec.size), frame_from_normal(s.normal, spin), Vec3::splat(spec.size))
             })
             .collect();
         let reach = if spec.op == BoolOp::Subtract { 0.0 } else { 0.25 * spec.size };
         let set = InstanceSet::new(instances, reach);
         let boxes: Vec<Aabb> = (0..set.len()).filter(|&i| set.is_active(i)).map(|i| set.aabb(i)).collect();
         let leaves = affected_leaves(bvh, &boxes);
-        GeneratorCache { set, params: EvalParams { op: spec.op, reach, iterations: 3 }, leaves }
+        GeneratorCache { spec: spec.clone(), basis: basis.clone(), samples, set, params: EvalParams { op: spec.op, reach, iterations: 3 }, leaves }
+    }
+
+    /// True when `self` and `other` share the same scattered points, so an edit between them did not resample.
+    pub fn shares_samples_with(&self, other: &GeneratorCache) -> bool {
+        Arc::ptr_eq(&self.samples, &other.samples)
     }
 
     /// Displace the vertices of one leaf. `pos` is the leaf's slice of accumulated positions, `first` its first vertex

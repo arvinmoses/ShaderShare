@@ -181,3 +181,24 @@ fn a_whole_mesh_edit_never_draws_out_of_date_lod_patches() {
     let stale_drawn = squeezed.ids.iter().filter(|&&n| tree.is_stale(n)).count();
     assert_eq!(stale_drawn, 0, "{stale_drawn} stale patches were drawn to stay inside the triangle budget");
 }
+
+#[test]
+fn normals_match_a_full_recompute_after_generator_edits() {
+    // Edits refresh normals only where something moved (and around it); the result must equal recomputing everything.
+    let mut doc = sphere_doc(4);
+    let id = doc.insert_generator("g", Placement::Top, dents()).unwrap();
+    let check = |doc: &Document, what: &str| {
+        let fresh = sculpt_core::mesh::compute_normals(doc.positions(), doc.faces(), doc.topology());
+        let worst = doc.normals().iter().zip(&fresh).map(|(a, b)| (*a - *b).length()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "{what}: stored normals differ from a full recompute by {worst}");
+    };
+    check(&doc, "after insert");
+    doc.set_generator(id, GeneratorSpec { count: 90, seed: 3, size: 0.12, ..dents() }).unwrap();
+    check(&doc, "after changing count, seed and size");
+    doc.set_generator(id, GeneratorSpec { op: BoolOp::Add, lift: 0.4, ..dents() }).unwrap();
+    check(&doc, "after switching to add");
+    assert!(doc.undo());
+    check(&doc, "after undo");
+    doc.set_layer_visible(id, false).unwrap();
+    check(&doc, "after hiding the layer");
+}

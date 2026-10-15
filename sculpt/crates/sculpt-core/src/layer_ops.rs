@@ -331,7 +331,8 @@ impl Document {
         let mut layer = SculptLayer::new(id, name, self.bvh.leaves.len());
         layer.kind = LayerKind::Generator;
         layer.parent = parent;
-        layer.gen_cache = Some(std::sync::Arc::new(GeneratorCache::build(&spec, &self.base, &self.faces, &self.topo, &self.bvh)));
+        let basis = self.generator_basis();
+        layer.gen_cache = Some(std::sync::Arc::new(GeneratorCache::build(&spec, &basis, &self.base, &self.faces, &self.bvh, None)));
         layer.generator = Some(spec);
         self.exec("Add generator", vec![StructOp::Insert { index, layer: Box::new(layer) }]);
         Ok(id)

@@ -111,3 +111,32 @@ Regression test: `a_whole_mesh_edit_never_draws_out_of_date_lod_patches`. Eviden
 
 After the fix the whole-frame CPU time is about 3 ms and the window runs at about 56 fps at 6.3M faces during the sweep.
 The edit itself still takes about 60-75 ms there (placement rebuilt on every edit), which milestone 4 addresses.
+
+## Edit speed after staging the caches (milestone 2 speed pass)
+
+`sculpt-cli generator-edit-bench 8,10 60`: median of 9 coalesced edits through `set_layer_meta`, alternating two values
+(count 60/90, seed 7/8, size 0.10/0.12, lift 0.6/0.5, sphere/box, subtract/add).
+
+| faces | stage | create | count | seed | size | lift | primitive | operation |
+|---|---|---|---|---|---|---|---|---|
+| 393k | before | 6.9 | 7.2 | 6.6 | 6.6 | 6.8 | 6.7 | 6.6 |
+| 393k | after | 5.6 | 1.9 | 1.8 | 1.7 | 1.7 | 2.0 | 2.1 |
+| 6.29M | before | 71.5 | 92.0 | 79.4 | 73.6 | 65.1 | 85.1 | 74.4 |
+| 6.29M | after | 33.7 | 24.5 | 19.6 | 16.6 | 15.5 | 23.3 | 19.3 |
+
+What changed, in order of effect (the profile of one edit at 6.3M faces was: cache rebuild 0.5 ms, evaluating the
+cutters 5 ms, then 41-45 ms in `geometry_changed`):
+1. Normals and dirty-marking only for leaves whose positions actually changed (`recomposite` compares before and after),
+   instead of every leaf the cutters' bounding boxes reach. This also shrinks the GPU upload and the LOD staleness.
+2. The per-leaf normal update writes each leaf's own vertices in place in parallel; only the few vertices a leaf borrows
+   from outside the touched set are patched serially.
+3. Placement is staged: the base normals and per-face sampling table are kept by the document (rebuilt only when the base or
+   topology changes), the scattered points are reused when count and seed did not change, and only the cutter transforms and
+   index are rebuilt per edit.
+Guards: `normals_match_a_full_recompute_after_generator_edits`, plus the existing equivalence tests. Sculpt latency is no
+worse (input + dabs median 1.09 ms at 98k faces, 1.66 ms at 1.57M).
+
+In the app at 6.3M faces (scripted sweep readout): edit to surface averages 16-22 ms. The whole frame is 41-64 ms (11-19 fps)
+during the heaviest phases (count in the thousands, 20k stress) because stale level-of-detail areas now draw at full detail
+until the refresh catches up, and 2.7-2.9 ms (50-59 fps) in the lighter ones. A preview that does not touch mesh data during a
+drag, or a faster LOD refresh, is the way to remove that. Not yet done.
