@@ -16,6 +16,8 @@ public static class Win {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
 }
 "@
@@ -37,8 +39,21 @@ for ($i = 0; $i -lt 300; $i++) {
     }
 }
 if (($r.Right - $r.Left) -lt 600) { Write-Error "the app window never reached a usable size"; exit 1 }
-[void][Win]::SetForegroundWindow($h)
-Start-Sleep -Milliseconds 800
+# Windows cascades new windows, so pin it near the top left where all of it is on screen (SWP_NOSIZE | SWP_NOZORDER).
+[void][Win]::SetWindowPos($h, [IntPtr]::Zero, 20, 20, 0, 0, 5)
+Start-Sleep -Milliseconds 500
+# Desktop capture records whatever is on screen in the window's rectangle, so refuse to record unless the app is in front.
+$front = $false
+for ($i = 0; $i -lt 20 -and -not $front; $i++) {
+    [void][Win]::SetForegroundWindow($h)
+    Start-Sleep -Milliseconds 300
+    $front = ([Win]::GetForegroundWindow() -eq $h)
+}
+if (-not $front) {
+    $app.Kill()
+    Write-Error "the app window could not be brought to the front, so nothing was recorded (another window would have been captured)"
+    exit 1
+}
 [void][Win]::DwmGetWindowAttribute($h, 9, [ref]$r, [System.Runtime.InteropServices.Marshal]::SizeOf($r))
 $w = [int]([math]::Floor(($r.Right - $r.Left) / 2) * 2)
 $ht = [int]([math]::Floor(($r.Bottom - $r.Top) / 2) * 2)
@@ -48,5 +63,6 @@ Write-Host "recording window at $($r.Left),$($r.Top) size ${w}x${ht}"
 if (-not $app.HasExited) { $app.WaitForExit(15000) | Out-Null }
 if (-not $app.HasExited) { $app.Kill() }
 Write-Host "wrote $outPath"
+
 
 

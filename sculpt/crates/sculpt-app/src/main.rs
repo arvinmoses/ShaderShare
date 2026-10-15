@@ -98,8 +98,9 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let mut args = std::env::args().skip(1);
-    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, bench_orbit: None, zoom: 1.0 };
+    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, sweep_shots: None, bench_orbit: None, zoom: 1.0 };
     let mut size = [1600.0f32, 1000.0];
+    let (mut shots_dir, mut shot_times) = (None::<PathBuf>, Vec::<f32>::new());
     while let Some(a) = args.next() {
         match a.as_str() {
             "--level" => opts.level = args.next().and_then(|v| v.parse().ok()).unwrap_or(7).clamp(1, 11),
@@ -111,6 +112,8 @@ fn main() -> eframe::Result {
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-layers" => opts.demo_layers = true,
             "--demo-sweep" => opts.demo_sweep = true,
+            "--demo-sweep-shots" => shots_dir = args.next().map(PathBuf::from),
+            "--demo-sweep-times" => shot_times = args.next().map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect()).unwrap_or_default(),
             "--demo-generator" => opts.demo_generator = args.next().and_then(|v| parse_generator_demo(&v)),
             "--size" => {
                 if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
@@ -125,6 +128,11 @@ fn main() -> eframe::Result {
         }
     }
 
+    if let Some(dir) = shots_dir.filter(|_| !shot_times.is_empty()) {
+        let _ = std::fs::create_dir_all(&dir);
+        opts.sweep_shots = Some((dir, shot_times));
+        opts.demo_sweep = true;
+    }
     if opts.demo_sweep && opts.demo_generator.is_none() {
         opts.demo_generator = Some(sculpt_core::generator::layer::GeneratorSpec { count: 60, size: 0.10, seed: 7, ..Default::default() });
     }

@@ -365,6 +365,11 @@ impl LodTree {
     }
 
     /// Patches still waiting to be re-simplified.
+    /// True when `id`'s simplified patch no longer matches the vertices it indexes.
+    pub fn is_stale(&self, id: u32) -> bool {
+        self.stale[id as usize]
+    }
+
     pub fn stale_nodes(&self) -> usize {
         self.stale_count
     }
@@ -470,21 +475,21 @@ impl LodTree {
 
     /// Choose what to draw: nodes the frustum can see, descending until a node's error is below `tau_px`.
     /// If the result would exceed `budget_tris`, the threshold is raised until it fits (a frame-time guard).
+    ///
+    /// A stale patch is never drawn: its connectivity was chosen for the old surface, and over the vertices that have
+    /// since moved it tears new detail into shards. So stale areas always refine down to nodes that are current, and
+    /// the budget guard only coarsens the areas that are up to date. After an edit that reaches most of the mesh
+    /// (a generator layer) the cut can therefore exceed the budget until the background refresh catches up.
     pub fn select(&self, bvh: &Bvh, view: &View, tau_px: f32, budget_tris: u64) -> Cut {
         let mut tau = tau_px.max(0.01);
-        let mut honour_stale = true;
         loop {
             let mut cut = Cut { tau_px: tau, ..Default::default() };
-            self.visit(0, bvh, view, tau, honour_stale && self.stale_count > 0, &mut cut);
+            self.visit(0, bvh, view, tau, self.stale_count > 0, &mut cut);
+            // Stale areas stay at full detail however far tau rises, so a budget they alone exceed ends at the ceiling.
             if cut.triangles <= budget_tris || tau > 1e4 {
                 return cut;
             }
-            // Over budget: stop forcing detail through out-of-date patches first, then loosen the tolerance.
-            if honour_stale {
-                honour_stale = false;
-            } else {
-                tau *= 1.4;
-            }
+            tau *= 1.4;
         }
     }
 

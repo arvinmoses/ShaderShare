@@ -44,6 +44,8 @@ pub struct Options {
     pub demo_generator: Option<sculpt_core::generator::layer::GeneratorSpec>,
     /// Sweep the demo generator's parameters on a timeline, then close (for screen recordings).
     pub demo_sweep: bool,
+    /// Save the app's own frame at these sweep times (seconds) into this folder, then close.
+    pub sweep_shots: Option<(PathBuf, Vec<f32>)>,
     /// Orbit the camera for this many frames and report timings, waiting for the GPU each frame.
     pub bench_orbit: Option<u32>,
     /// Multiply the initial framing distance (below 1 zooms in), for close-up tests and screenshots.
@@ -168,6 +170,7 @@ pub struct SculptApp {
     demo_layers: bool,
     demo_generator: Option<sculpt_core::generator::layer::GeneratorSpec>,
     demo_sweep: bool,
+    sweep_shots: Option<(PathBuf, Vec<f32>)>,
     /// How long generator edits took, shown in the generator Properties section.
     pub gen_timer: crate::generator_ui::EditTimer,
     pub sweep: Option<crate::generator_ui::Sweep>,
@@ -251,6 +254,7 @@ impl SculptApp {
             demo_layers: opts.demo_layers,
             demo_generator: opts.demo_generator,
             demo_sweep: opts.demo_sweep,
+            sweep_shots: opts.sweep_shots,
             gen_timer: Default::default(),
             sweep: None,
         };
@@ -323,7 +327,11 @@ impl SculptApp {
                         // Select the row so Properties shows it (it can never become the sculpt target).
                         self.layers.selection.select_only(id);
                         if self.demo_sweep {
-                            self.sweep = Some(crate::generator_ui::Sweep::new(id, spec));
+                            let mut sweep = crate::generator_ui::Sweep::new(id, spec);
+                            if let Some((dir, times)) = self.sweep_shots.take() {
+                                sweep = sweep.with_shots(dir, times);
+                            }
+                            self.sweep = Some(sweep);
                         }
                     }
                     self.maybe_build_lod();
@@ -1084,6 +1092,7 @@ impl eframe::App for SculptApp {
         }
         self.last_frame = Some(t0);
         self.poll_job();
+        crate::generator_ui::collect_screenshot(self, &ctx);
         crate::generator_ui::tick_sweep(self, &ctx);
         if self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));

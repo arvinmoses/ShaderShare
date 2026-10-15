@@ -5,6 +5,7 @@
 //! drags and the timer all behave the same for the panel and for the sweep.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use egui::{RichText, Ui};
@@ -136,11 +137,27 @@ pub struct Sweep {
     id: LayerId,
     base: GeneratorSpec,
     start: Instant,
+    shots: Option<Shots>,
+}
+
+/// Frames the app saves itself at chosen sweep times (`--demo-sweep-shots`), straight from its own framebuffer, so
+/// they do not depend on window focus or what else is on screen.
+struct Shots {
+    dir: PathBuf,
+    times: Vec<f32>,
+    next: usize,
+    pending: Option<PathBuf>,
 }
 
 impl Sweep {
     pub fn new(id: LayerId, base: GeneratorSpec) -> Sweep {
-        Sweep { id, base, start: Instant::now() }
+        Sweep { id, base, start: Instant::now(), shots: None }
+    }
+
+    pub fn with_shots(mut self, dir: PathBuf, mut times: Vec<f32>) -> Sweep {
+        times.sort_by(f32::total_cmp);
+        self.shots = Some(Shots { dir, times, next: 0, pending: None });
+        self
     }
 }
 
@@ -173,10 +190,13 @@ fn spec_at(t: f32, base: &GeneratorSpec) -> GeneratorSpec {
 
 /// Advance the sweep by one frame. Edits go through the same command as the sliders.
 pub(crate) fn tick_sweep(app: &mut SculptApp, ctx: &egui::Context) {
-    let Some(sweep) = app.sweep.as_ref() else { return };
+    let Some(mut sweep) = app.sweep.take() else { return };
     let t = sweep.start.elapsed().as_secs_f32() - SWEEP_LEAD;
-    if t > SWEEP_SECONDS {
-        app.sweep = None;
+    let finished = match &sweep.shots {
+        Some(s) => s.next >= s.times.len() && s.pending.is_none() && t > s.times.last().copied().unwrap_or(0.0) + 0.5,
+        None => t > SWEEP_SECONDS,
+    };
+    if finished || t > SWEEP_SECONDS + 30.0 {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         return;
     }
@@ -185,5 +205,40 @@ pub(crate) fn tick_sweep(app: &mut SculptApp, ctx: &egui::Context) {
     if current.as_ref() != Some(&spec) {
         command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Generator(spec), coalesce: true });
     }
+    if let Some(shots) = sweep.shots.as_mut()
+        && shots.pending.is_none()
+        && shots.next < shots.times.len()
+        && t >= shots.times[shots.next]
+    {
+        shots.pending = Some(shots.dir.join(format!("shot_{:02}_t{:04.1}.png", shots.next, shots.times[shots.next])));
+        shots.next += 1;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+    }
+    app.sweep = Some(sweep);
     ctx.request_repaint();
+}
+
+/// Save the frame the app was asked for by [`tick_sweep`], once the renderer hands it back.
+pub(crate) fn collect_screenshot(app: &mut SculptApp, ctx: &egui::Context) {
+    let Some(shots) = app.sweep.as_mut().and_then(|s| s.shots.as_mut()) else { return };
+    let Some(path) = shots.pending.clone() else { return };
+    let image = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }));
+    if let Some(image) = image {
+        write_png(&path, &image);
+        shots.pending = None;
+    }
+}
+
+fn write_png(path: &std::path::Path, image: &egui::ColorImage) {
+    let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+    let result = std::fs::File::create(path).map_err(|e| e.to_string()).and_then(|file| {
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), image.size[0] as u32, image.size[1] as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().and_then(|mut w| w.write_image_data(&rgba)).map_err(|e| e.to_string())
+    });
+    match result {
+        Ok(()) => println!("saved {}", path.display()),
+        Err(e) => eprintln!("sweep shot: {e}"),
+    }
 }

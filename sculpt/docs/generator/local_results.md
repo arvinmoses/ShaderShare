@@ -93,3 +93,21 @@ Why it is slow at 6.3M: every edit rebuilds the whole placement (`SurfaceSampler
 over all vertices) even when only the size or lift changed, and only then evaluates the touched leaves. Milestone 4
 (staged caches: resample only when count, seed or the mask change; rebuild instances only for primitive, size, lift;
 evaluate progressively) is what brings this back to the interactive budget.
+
+## Torn dents while editing at 6.3M faces: cause and fix
+
+Symptom (first 6.3M-face recording): during parameter sweeps the dents were ragged, with shard-like rims, while the same
+scene was clean at 393k faces and clean once everything settled.
+
+Cause: `LodTree::select` fell back to drawing *stale* simplified patches when refining the stale areas would exceed the
+triangle budget (6M triangles in the app; the 6.3M-face mesh is 12.6M). A patch is a list of indices into the shared vertex
+buffer whose connectivity was chosen for the old surface, so drawn over vertices that have since moved it tears the new
+detail. Sculpt strokes touch few leaves, so the fallback never triggered before. A generator edit touches nearly all of them.
+
+Fix: stale patches are never drawn. Stale areas always refine to current nodes, and the budget guard only coarsens areas
+that are up to date, so after a whole-mesh edit the cut may exceed the budget until the background refresh catches up.
+Regression test: `a_whole_mesh_edit_never_draws_out_of_date_lod_patches`. Evidence: `lod_stale_fix_before_after.png`
+(the app's own frames at five sweep moments, before and after, same scene).
+
+After the fix the whole-frame CPU time is about 3 ms and the window runs at about 56 fps at 6.3M faces during the sweep.
+The edit itself still takes about 60-75 ms there (placement rebuilt on every edit), which milestone 4 addresses.

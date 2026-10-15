@@ -4,7 +4,8 @@ use glam::Vec3;
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::io::project;
-use sculpt_core::primitives::quad_sphere;
+use sculpt_core::lod::{LodParams, View};
+use sculpt_core::primitives::{quad_sphere, quad_sphere_res};
 use sculpt_core::{Document, LayerKind, Placement};
 
 fn sphere_doc(level: u32) -> Document {
@@ -154,4 +155,29 @@ fn a_generator_layer_is_never_the_sculpt_target() {
     doc.delete_layer(sculpt).unwrap();
     assert_ne!(doc.active_layer(), Some(id));
     assert_ne!(doc.active_layer(), Some(copy), "deleting the target never falls onto a generator");
+}
+
+fn view_from(eye: Vec3, fov_deg: f32, px_height: f32) -> View {
+    let proj = glam::camera::rh::proj::directx::perspective(fov_deg.to_radians(), 1.0, 0.01, 100.0);
+    let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+    View::from_view_proj(proj * view, eye, px_height / (2.0 * (fov_deg.to_radians() / 2.0).tan()))
+}
+
+#[test]
+fn a_whole_mesh_edit_never_draws_out_of_date_lod_patches() {
+    // A generator edit reaches nearly every leaf at once. The level-of-detail cut must not fall back to simplified
+    // patches whose connectivity was chosen for the old surface: they tear the new dents into shards.
+    let mut doc = Document::from_mesh(quad_sphere_res(70, 1.0)).unwrap();
+    let id = doc.insert_generator("g", Placement::Top, GeneratorSpec { count: 400, size: 0.08, ..dents() }).unwrap();
+    doc.build_lod(LodParams::default());
+    doc.set_generator(id, GeneratorSpec { count: 500, seed: 9, size: 0.08, ..dents() }).unwrap();
+    let tree = doc.lod().unwrap();
+    assert!(tree.stale_nodes() > 1, "the edit should outdate the patches above the touched leaves");
+
+    let view = view_from(Vec3::new(0.0, 0.0, 3.0), 35.0, 1080.0);
+    let natural = tree.select(doc.bvh(), &view, 1.0, u64::MAX);
+    // A budget well under what the stale areas need at full detail.
+    let squeezed = tree.select(doc.bvh(), &view, 1.0, natural.triangles / 8);
+    let stale_drawn = squeezed.ids.iter().filter(|&&n| tree.is_stale(n)).count();
+    assert_eq!(stale_drawn, 0, "{stale_drawn} stale patches were drawn to stay inside the triangle budget");
 }
