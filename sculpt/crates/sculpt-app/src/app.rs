@@ -308,10 +308,8 @@ impl SculptApp {
                     if std::mem::take(&mut self.demo_layers) {
                         self.setup_demo_layers();
                     }
-                    if let Some(spec) = self.demo_generator.take() {
-                        if let Some(doc) = self.doc.as_mut() {
-                            let _ = doc.insert_generator("Generator", sculpt_core::Placement::Top, spec);
-                        }
+                    if let (Some(spec), Some(doc)) = (self.demo_generator.take(), self.doc.as_mut()) {
+                        let _ = doc.insert_generator("Generator", sculpt_core::Placement::Top, spec);
                     }
                     self.maybe_build_lod();
                 }

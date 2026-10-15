@@ -45,8 +45,7 @@ fn gpu_setup() -> WgpuSetup {
 fn parse_generator_demo(text: &str) -> Option<sculpt_core::generator::layer::GeneratorSpec> {
     use sculpt_core::generator::{BoolOp, Primitive, layer::GeneratorSpec};
     let mut f = text.split(':');
-    let mut spec = GeneratorSpec::default();
-    spec.op = match f.next()? {
+    let op = match f.next()? {
         "add" => BoolOp::Add,
         "subtract" | "sub" => BoolOp::Subtract,
         "intersect" => BoolOp::Intersect,
@@ -55,6 +54,7 @@ fn parse_generator_demo(text: &str) -> Option<sculpt_core::generator::layer::Gen
             return None;
         }
     };
+    let mut spec = GeneratorSpec { op, ..GeneratorSpec::default() };
     if let Some(p) = f.next() {
         spec.primitive = match p {
             "box" => Primitive::Box,
