@@ -67,14 +67,24 @@ fn smax(a: f32, b: f32, k: f32) -> f32 {
     a.max(b) + h * h * k * 0.25
 }
 
-/// Distance to the nearest instance of `set` near `p` (negative inside one); `INFINITY` if none is near.
-fn nearest(set: &InstanceSet, p: Vec3) -> f32 {
-    set.candidates(p).into_iter().filter(|&&i| set.inflated_aabb_contains(i, p)).map(|&i| set.sdf(i, p)).fold(f32::INFINITY, f32::min)
+/// Distance to the nearest instance of `set` near `p` (negative inside one); `INFINITY` if none is within `limit`.
+/// An instance whose box is farther than `limit` cannot change the field at `p`, so it is skipped without evaluating it.
+fn nearest(set: &InstanceSet, p: Vec3, limit: f32) -> f32 {
+    let mut best = f32::INFINITY;
+    for &i in set.candidates(p) {
+        let b = set.instances()[i as usize].aabb();
+        if (p - p.clamp(b.min, b.max)).length() > limit {
+            continue;
+        }
+        best = best.min(set.sdf(i, p));
+    }
+    best
 }
 
 fn apply_terms(mut f: f32, terms: &[Term], p: Vec3) -> f32 {
     for t in terms {
-        let d = nearest(&t.set, p);
+        // Only an instance within |f| + blend of p can move the field there (further away it changes the value, never the sign).
+        let d = nearest(&t.set, p, f.abs() + t.blend);
         if !d.is_finite() {
             continue;
         }

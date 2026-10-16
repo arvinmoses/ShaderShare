@@ -48,6 +48,9 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         blend,
         ..GeneratorSpec::default()
     };
+    let t = Instant::now();
+    let (_, plain) = doc.solidify(&SolidSettings { voxel, grain: None })?;
+    println!("base only: {} quads in {:.0} ms (extract {:.0}), {} of {} samples", plain.quads, t.elapsed().as_secs_f64() * 1e3, plain.extract_ms, plain.evaluated, plain.total);
     doc.insert_generator("Big cuts", Placement::Top, spec(Primitive::Box, 14, 0.6, 0.8, 0.75, 55.0, 0, 0.12))?;
     doc.insert_generator("Medium cuts", Placement::Top, spec(Primitive::Box, 28, 0.2, 0.9, 0.35, 50.0, 1, 0.25))?;
     doc.insert_generator("Chips", Placement::Top, spec(Primitive::Sphere, 30, 0.06, 0.65, 0.15, 0.0, 2, 0.5))?;
