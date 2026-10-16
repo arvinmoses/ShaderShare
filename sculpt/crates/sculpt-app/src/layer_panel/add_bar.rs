@@ -76,6 +76,18 @@ pub fn show(app: &mut SculptApp, ui: &mut Ui) {
         if BarButton::new(Icon::Folder, "Folder", "New folder").key(Command::NewFolder).show(ui, app).clicked() {
             command::execute(app, LayerCommand::NewFolder);
         }
+        let generator = BarButton::new(Icon::Effect, "Generator", "Add a boolean scatter or a noise layer").menu().show(ui, app);
+        egui::Popup::menu(&generator).show(|ui| {
+            use sculpt_core::generator::layer::GeneratorKind;
+            if ui.button("Scatter and boolean").on_hover_text("Scatter a shape over the surface and cut, add or intersect it").clicked() {
+                command::execute(app, LayerCommand::NewGenerator(GeneratorKind::Scatter));
+                ui.close();
+            }
+            if ui.button("Noise").on_hover_text("Roughen the surface").clicked() {
+                command::execute(app, LayerCommand::NewGenerator(GeneratorKind::Noise));
+                ui.close();
+            }
+        });
         let mask = BarButton::new(Icon::Mask, "Mask", if active.is_some() { "Add a mask in one step, or edit this layer's mask" } else { "Select a sculpt layer to add a mask (folders and Base cannot have one)" }).enabled(active.is_some()).menu().show(ui, app);
         if let Some(id) = active {
             super::menus::add_mask_menu_on(app, &mask, id);

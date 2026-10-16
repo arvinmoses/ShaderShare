@@ -39,6 +39,8 @@ impl MetaEdit {
 pub enum LayerCommand {
     NewLayer,
     NewFolder,
+    /// A generator layer: scatter-and-boolean, or noise.
+    NewGenerator(sculpt_core::generator::layer::GeneratorKind),
     /// Duplicate the selection.
     Duplicate,
     MergeDown,
@@ -135,6 +137,23 @@ pub fn execute(app: &mut SculptApp, cmd: LayerCommand) {
                     app.layers.selection.select_only(id);
                 }
                 Err(e) => fail(app, "New layer", e),
+            }
+        }
+        LayerCommand::NewGenerator(kind) => {
+            let at = insert_point(app);
+            let doc = app.doc.as_mut().unwrap();
+            let longest = doc.bounds().extent().max_element();
+            let (name, spec) = match kind {
+                sculpt_core::generator::layer::GeneratorKind::Scatter => ("Scatter", crate::generator_ui::new_generator_spec(kind, longest)),
+                sculpt_core::generator::layer::GeneratorKind::Noise => ("Noise", crate::generator_ui::new_generator_spec(kind, longest)),
+            };
+            match doc.insert_generator(name, at, spec) {
+                Ok(id) => {
+                    reveal(app, id);
+                    app.layers.selection.select_only(id);
+                    app.selection = Selection::Layer;
+                }
+                Err(e) => fail(app, "New generator", e),
             }
         }
         LayerCommand::NewFolder => {

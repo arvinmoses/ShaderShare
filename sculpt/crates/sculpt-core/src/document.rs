@@ -22,7 +22,7 @@ use crate::undo::{self, Group, Record, UndoStack};
 use crate::{Error, Result};
 
 mod solid;
-pub use solid::{Grain, SolidSettings, SolidStats};
+pub use solid::{SolidSettings, SolidStats};
 
 /// Per-leaf sparse vertex displacements produced by a brush kernel.
 /// Indices are local to the leaf's owned range.

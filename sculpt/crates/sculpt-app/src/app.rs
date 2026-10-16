@@ -356,6 +356,9 @@ impl SculptApp {
                             self.sweep = Some(sweep);
                         }
                     }
+                    if std::env::var("SCULPT_DEMO_NOISE").is_ok() {
+                        crate::layer_panel::command::execute(self, crate::layer_panel::command::LayerCommand::NewGenerator(sculpt_core::generator::layer::GeneratorKind::Noise));
+                    }
                     if std::env::var("SCULPT_DEMO_SOLIDIFY").is_ok() {
                         crate::generator_ui::solidify(self);
                     }

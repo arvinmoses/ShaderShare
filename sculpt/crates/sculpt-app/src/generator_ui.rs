@@ -12,7 +12,7 @@ use egui::{RichText, Ui};
 use sculpt_core::{Document, LayerId};
 use sculpt_core::generator::density::Density;
 use sculpt_core::bake::MeshAttribute;
-use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::layer::{GeneratorKind, GeneratorSpec};
 use sculpt_core::generator::mapping::{AttributeRow, AttributeSource, AttributeTarget};
 use sculpt_core::generator::{BoolOp, Primitive};
 
@@ -175,6 +175,10 @@ fn note(r: &egui::Response, changed: &mut bool, coalesce: &mut bool) {
 /// The Properties section for a generator layer.
 pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     let Some(spec) = app.doc.as_ref().and_then(|d| d.layer(id)).and_then(|l| l.generator.clone()) else { return };
+    if spec.kind == GeneratorKind::Noise {
+        noise_props(app, ui, id, spec);
+        return;
+    }
     let fs = app.theme.metrics.font_size;
     let weak = app.theme.weak_text();
     let timing = app.gen_timer.summary();
@@ -357,17 +361,7 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         ui.label(RichText::new(format!("Catch-up work {work_last:5.1} ms/frame   most {work_max:5.1}")).monospace().size(fs * 0.85).color(weak));
         ui.label(RichText::new(format!("Whole frame   {frame_ms:5.1} ms")).monospace().size(fs * 0.85).color(weak));
     });
-    let mut solidify_now = false;
-    section(ui, fs, "solidify", "SOLIDIFY", |ui| {
-        ui.label(RichText::new("Turn the whole stack into one clean, closed mesh. Cuts blend softly and nothing folds. The layers are consumed; Undo brings them back.").size(fs * 0.85).color(weak));
-        prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.divisions, 40..=400).logarithmic(true)).on_hover_text("Samples along the longest side. Higher keeps finer detail and takes longer."));
-        prop(ui, "Grain", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.grain, 0.0..=1.0).max_decimals(2)).on_hover_text("Fine surface noise added before the mesh is made."));
-        if ui.button("Solidify stack").clicked() {
-            solidify_now = true;
-        }
-    });
-    if solidify_now {
-        solidify(app);
+    if solidify_section(app, ui) {
         return;
     }
     if changed && next != spec {
@@ -375,15 +369,63 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     }
 }
 
+/// The Properties section for a noise layer.
+fn noise_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId, spec: GeneratorSpec) {
+    let fs = app.theme.metrics.font_size;
+    let weak = app.theme.weak_text();
+    let longest = app.doc.as_ref().map_or(2.0, |d| d.bounds().extent().max_element());
+    let mut next = spec.clone();
+    let (mut changed, mut coalesce) = (false, false);
+    section(ui, fs, "noise", "NOISE", |ui| {
+        ui.label(RichText::new("Roughens the surface along its normals. Layers above it work on the roughened surface; Solidify keeps it.").size(fs * 0.85).color(weak));
+        note(&prop(ui, "Amount", |ui| ui.add(egui::Slider::new(&mut next.noise.amplitude, 0.0..=0.1 * longest).max_decimals(3))).on_hover_text("Peak-to-peak displacement, in world units."), &mut changed, &mut coalesce);
+        note(&prop(ui, "Scale", |ui| ui.add(egui::Slider::new(&mut next.noise.scale, 0.5..=80.0).logarithmic(true).max_decimals(1))).on_hover_text("Features per world unit: higher is finer."), &mut changed, &mut coalesce);
+        note(&prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut next.noise.octaves, 1..=8))), &mut changed, &mut coalesce);
+        note(&prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut next.noise.seed).speed(0.2))), &mut changed, &mut coalesce);
+    });
+    if solidify_section(app, ui) {
+        return;
+    }
+    if changed && next != spec {
+        command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Generator(next), coalesce });
+    }
+}
+
+/// The Solidify section shared by every generator layer. Returns true if the stack was just solidified, which leaves
+/// the layer being shown gone.
+fn solidify_section(app: &mut SculptApp, ui: &mut Ui) -> bool {
+    let fs = app.theme.metrics.font_size;
+    let weak = app.theme.weak_text();
+    let mut solidify_now = false;
+    section(ui, fs, "solidify", "SOLIDIFY", |ui| {
+        ui.label(RichText::new("Turn the whole stack into one clean, closed mesh. Cuts blend softly and nothing folds. The layers are consumed; Undo brings them back.").size(fs * 0.85).color(weak));
+        prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.divisions, 40..=400).logarithmic(true)).on_hover_text("Samples along the longest side. Higher keeps finer detail and takes longer."));
+        if ui.button("Solidify stack").clicked() {
+            solidify_now = true;
+        }
+    });
+    if solidify_now {
+        solidify(app);
+    }
+    solidify_now
+}
+
+/// A new generator layer of `kind` above the selection, with sizes that suit the model.
+pub(crate) fn new_generator_spec(kind: GeneratorKind, longest: f32) -> GeneratorSpec {
+    match kind {
+        GeneratorKind::Scatter => GeneratorSpec { count: 40, size: 0.08 * longest, seed: 1, ..GeneratorSpec::default() },
+        GeneratorKind::Noise => GeneratorSpec { kind, noise: sculpt_core::generator::layer::NoiseSpec { amplitude: 0.015 * longest, scale: 22.0 / longest, octaves: 4, seed: 1 }, ..GeneratorSpec::default() },
+    }
+}
+
 /// Settings of the Solidify section.
 pub struct SolidUi {
     pub divisions: u32,
-    pub grain: f32,
 }
 
 impl Default for SolidUi {
     fn default() -> Self {
-        SolidUi { divisions: 150, grain: 0.0 }
+        SolidUi { divisions: 150 }
     }
 }
 
@@ -391,8 +433,7 @@ impl Default for SolidUi {
 pub(crate) fn solidify(app: &mut SculptApp) {
     let Some(doc) = app.doc.as_ref() else { return };
     let longest = doc.bounds().extent().max_element();
-    let grain = (app.solid_ui.grain > 0.0).then(|| sculpt_core::document::Grain { amplitude: app.solid_ui.grain * 0.015 * longest, scale: 22.0 / longest, seed: 1 });
-    let settings = sculpt_core::document::SolidSettings { voxel: longest / app.solid_ui.divisions as f32, grain };
+    let settings = sculpt_core::document::SolidSettings { voxel: longest / app.solid_ui.divisions as f32 };
     let started = Instant::now();
     match doc.solidify(&settings).and_then(|(mesh, stats)| Document::from_mesh(mesh).map(|d| (d, stats))) {
         Ok((new, stats)) => {

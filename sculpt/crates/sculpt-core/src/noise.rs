@@ -37,6 +37,7 @@ impl Default for NoiseParams {
     }
 }
 
+#[derive(Debug)]
 pub struct Noise {
     params: NoiseParams,
     perm: [u8; 512],

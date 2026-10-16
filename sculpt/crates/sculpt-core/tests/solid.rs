@@ -1,5 +1,5 @@
 use sculpt_core::document::SolidSettings;
-use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::layer::{GeneratorKind, GeneratorSpec, NoiseSpec};
 use sculpt_core::generator::remesh::non_manifold_edges;
 use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::primitives::quad_sphere;
@@ -10,7 +10,7 @@ fn spec(op: BoolOp, primitive: Primitive, count: u32, size: f32, lift: f32, seed
 }
 
 fn settings() -> SolidSettings {
-    SolidSettings { voxel: 0.05, grain: None }
+    SolidSettings { voxel: 0.05 }
 }
 
 /// Volume of a closed quad mesh by the divergence theorem (each quad as two triangles).
@@ -115,4 +115,61 @@ fn changing_the_surface_invalidates_the_cache() {
     doc.subdivide().unwrap();
     let (_, stats) = doc.solidify(&settings()).unwrap();
     assert!(stats.base_misses > 0, "{stats:?}");
+}
+
+fn noise_spec(amplitude: f32) -> GeneratorSpec {
+    GeneratorSpec { kind: GeneratorKind::Noise, noise: NoiseSpec { amplitude, scale: 4.0, octaves: 3, seed: 2 }, ..GeneratorSpec::default() }
+}
+
+#[test]
+fn a_noise_layer_roughens_the_live_surface_along_the_normals() {
+    let mut doc = Document::from_mesh(quad_sphere(4, 1.0)).unwrap();
+    let before: Vec<f32> = doc.positions().iter().map(|p| p.length()).collect();
+    doc.insert_generator("grain", Placement::Top, noise_spec(0.1)).unwrap();
+    let moved: Vec<f32> = doc.positions().iter().zip(&before).map(|(p, b)| p.length() - b).collect();
+    let peak = moved.iter().fold(0.0f32, |m, d| m.max(d.abs()));
+    assert!(peak > 0.02, "the surface moves, peak {peak}");
+    assert!(peak <= 0.06, "by at most half the peak-to-peak amplitude (and a little for normals), peak {peak}");
+    let mean = moved.iter().sum::<f32>() / moved.len() as f32;
+    assert!(mean.abs() < 0.02, "noise is centred, mean {mean}");
+}
+
+#[test]
+fn a_noise_layer_can_be_turned_off_and_back() {
+    let mut doc = Document::from_mesh(quad_sphere(3, 1.0)).unwrap();
+    let id = doc.insert_generator("grain", Placement::Top, noise_spec(0.1)).unwrap();
+    let rough: Vec<_> = doc.positions().to_vec();
+    let mut meta = doc.layer(id).unwrap().meta();
+    meta.visible = false;
+    doc.set_layer_meta(id, meta, false).unwrap();
+    assert!(doc.positions().iter().all(|p| (p.length() - 1.0).abs() < 1e-3), "hidden noise leaves the sphere alone");
+    let mut meta = doc.layer(id).unwrap().meta();
+    meta.visible = true;
+    doc.set_layer_meta(id, meta, false).unwrap();
+    assert_eq!(doc.positions(), rough.as_slice());
+}
+
+#[test]
+fn solidify_applies_noise_in_stack_order_and_stays_manifold() {
+    let mut doc = Document::from_mesh(quad_sphere(4, 1.0)).unwrap();
+    let (smooth, _) = doc.solidify(&settings()).unwrap();
+    doc.insert_generator("grain", Placement::Top, noise_spec(0.12)).unwrap();
+    let (rough, stats) = doc.solidify(&settings()).unwrap();
+    assert_eq!(stats.layers, 1);
+    assert_eq!(non_manifold_edges(&rough.faces), 0);
+    let spread = |m: &sculpt_core::mesh::PolyMesh| {
+        let r: Vec<f32> = m.positions.iter().map(|p| p.length()).collect();
+        r.iter().cloned().fold(0.0, f32::max) - r.iter().cloned().fold(f32::MAX, f32::min)
+    };
+    assert!(spread(&rough) > spread(&smooth) + 0.04, "noise roughens: {} against {}", spread(&rough), spread(&smooth));
+}
+
+#[test]
+fn noise_after_cuts_roughens_the_cut_faces_too() {
+    let mut doc = Document::from_mesh(quad_sphere(4, 1.0)).unwrap();
+    doc.insert_generator("cuts", Placement::Top, spec(BoolOp::Subtract, Primitive::Box, 6, 0.5, 0.7, 5)).unwrap();
+    doc.insert_generator("grain", Placement::Top, noise_spec(0.08)).unwrap();
+    let (mesh, stats) = doc.solidify(&settings()).unwrap();
+    assert_eq!(stats.layers, 2);
+    assert_eq!(non_manifold_edges(&mesh.faces), 0);
 }

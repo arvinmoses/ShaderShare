@@ -64,5 +64,9 @@ The fix is to treat the stack as a solid for one pass and extract a fresh surfac
 - The ADF was tested on the same rock (13 ms, 19k triangles) but leaves holes at level crossings (214 non-manifold edges),
   has no smooth blend and cannot show grain on its large triangles. Kept as a possible backend for thousands of cutters.
 
-Not done: the Remesh checkpoint layer in the app (new topology, layers above restart), density and painted channels in the
-scatter, layer opacity and masks in the field, a Noise layer (grain is a setting for now), GPU evaluation.
+A noise layer (`GeneratorKind::Noise`) roughens along the normals in the live stack and becomes a field term in stack
+order when solidified; the app has a Generator menu (Scatter, Noise) and a Solidify section. Solidify caches base
+distances between calls (unchanged: 99 ms, one layer edited: 177 ms on the rock).
+
+Not done: a live preview of the solidified result, density and painted channels in the scatter, layer opacity and masks in
+the field, GPU evaluation.

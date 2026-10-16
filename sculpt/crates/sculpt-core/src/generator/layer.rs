@@ -27,10 +27,51 @@ use super::{BoolOp, EvalParams, Instance, InstanceSet, Primitive, affected_leave
 use crate::bvh::Bvh;
 use crate::geom::Aabb;
 use crate::mesh::{self, Face, Topology};
+use crate::noise::{Noise, NoiseKind, NoiseParams};
+
+/// What a generator layer does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratorKind {
+    /// Scatter a primitive over the surface and combine it with the layers below.
+    #[default]
+    Scatter,
+    /// Roughen the surface with noise along its normals.
+    Noise,
+}
+
+/// Parameters of a noise layer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NoiseSpec {
+    /// Peak-to-peak displacement along the surface normal, in world units.
+    pub amplitude: f32,
+    /// Cycles per world unit.
+    pub scale: f32,
+    pub octaves: u32,
+    pub seed: u32,
+}
+
+impl Default for NoiseSpec {
+    fn default() -> Self {
+        NoiseSpec { amplitude: 0.03, scale: 9.0, octaves: 4, seed: 1 }
+    }
+}
+
+impl NoiseSpec {
+    pub fn build(&self) -> Noise {
+        Noise::new(&NoiseParams { kind: NoiseKind::Fbm, scale: self.scale, octaves: self.octaves.max(1), seed: self.seed, ..Default::default() })
+    }
+}
 
 /// User-editable generator parameters. Cheap to copy, so undo can swap them like any other layer property.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GeneratorSpec {
+    /// What the layer does; the scatter parameters below are unused by a noise layer, and `noise` by a scatter layer.
+    #[serde(default)]
+    pub kind: GeneratorKind,
+    #[serde(default)]
+    pub noise: NoiseSpec,
     pub primitive: Primitive,
     pub op: BoolOp,
     /// Number of instances scattered over the surface.
@@ -79,6 +120,8 @@ fn default_blend() -> f32 {
 impl Default for GeneratorSpec {
     fn default() -> Self {
         GeneratorSpec {
+            kind: GeneratorKind::Scatter,
+            noise: NoiseSpec::default(),
             primitive: Primitive::Sphere,
             op: BoolOp::Subtract,
             count: 100,
@@ -139,12 +182,31 @@ pub struct GeneratorCache {
     pub(crate) params: EvalParams,
     /// Leaves whose bounds an instance can reach, ascending.
     pub(crate) leaves: Vec<u32>,
+    /// A noise layer's table, shared between rebuilds while its parameters are unchanged.
+    noise: Option<Arc<Noise>>,
 }
 
 impl GeneratorCache {
     /// Scatter `spec.count` instances over `base` and index them, reusing whatever `previous` still has right.
     pub fn build(spec: &GeneratorSpec, inputs: &BuildInputs<'_>, previous: Option<&GeneratorCache>) -> GeneratorCache {
         let BuildInputs { basis, density, channels, base, faces, bvh } = *inputs;
+        if spec.kind == GeneratorKind::Noise {
+            // A noise layer places nothing; it reaches every leaf.
+            let noise = match previous.and_then(|p| p.noise.as_ref().map(|n| (p, n))) {
+                Some((p, n)) if p.spec.noise.scale == spec.noise.scale && p.spec.noise.octaves == spec.noise.octaves && p.spec.noise.seed == spec.noise.seed => n.clone(),
+                _ => Arc::new(spec.noise.build()),
+            };
+            return GeneratorCache {
+                spec: spec.clone(),
+                basis: basis.clone(),
+                density: None,
+                samples: Arc::new(Vec::new()),
+                set: InstanceSet::new(Vec::new(), 0.0),
+                params: EvalParams { op: BoolOp::Subtract, reach: 0.0, iterations: 1 },
+                leaves: (0..bvh.leaves.len() as u32).collect(),
+                noise: Some(noise),
+            };
+        }
         let same_density = |p: &GeneratorCache| match (&p.density, density) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -198,7 +260,7 @@ impl GeneratorCache {
         let set = InstanceSet::new(instances, reach);
         let boxes: Vec<Aabb> = (0..set.len()).filter(|&i| set.is_active(i)).map(|i| set.aabb(i)).collect();
         let leaves = affected_leaves(bvh, &boxes);
-        GeneratorCache { spec: spec.clone(), basis: basis.clone(), density: density.cloned(), samples, set, params: EvalParams { op: spec.op, reach, iterations: 3 }, leaves }
+        GeneratorCache { spec: spec.clone(), basis: basis.clone(), density: density.cloned(), samples, set, params: EvalParams { op: spec.op, reach, iterations: 3 }, leaves, noise: None }
     }
 
     /// The density the instances were scattered by, if any.
@@ -220,6 +282,17 @@ impl GeneratorCache {
     /// index, and `weight` the layer's per-vertex strength. Positions are blended toward the evaluated result.
     #[inline]
     pub(crate) fn apply_leaf(&self, bounds: &Aabb, pos: &mut [Vec3], normals: &[Vec3], first: usize, weight: impl Fn(usize) -> f32) {
+        if let Some(noise) = &self.noise {
+            let amplitude = self.spec.noise.amplitude;
+            for (k, p) in pos.iter_mut().enumerate() {
+                let v = first + k;
+                let w = weight(v);
+                if w != 0.0 {
+                    *p += normals[v] * ((noise.sample(*p) - 0.5) * amplitude * w);
+                }
+            }
+            return;
+        }
         if !self.set.touches(bounds) {
             return;
         }
