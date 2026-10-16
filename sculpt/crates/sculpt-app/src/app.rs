@@ -176,6 +176,10 @@ pub struct SculptApp {
     /// How long generator edits took, shown in the generator Properties section.
     pub gen_timer: crate::generator_ui::EditTimer,
     pub sweep: Option<crate::generator_ui::Sweep>,
+    /// Settings of the Solidify section: resolution along the longest side, and how much grain to add.
+    pub solid_ui: crate::generator_ui::SolidUi,
+    /// The document before the last Solidify, kept so undo can bring it back.
+    pub solidify_backup: Option<Document>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -266,6 +270,8 @@ impl SculptApp {
             demo_sweep: opts.demo_sweep,
             sweep_shots: opts.sweep_shots,
             gen_timer: Default::default(),
+            solid_ui: Default::default(),
+            solidify_backup: None,
             sweep: None,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
@@ -350,6 +356,9 @@ impl SculptApp {
                             self.sweep = Some(sweep);
                         }
                     }
+                    if std::env::var("SCULPT_DEMO_SOLIDIFY").is_ok() {
+                        crate::generator_ui::solidify(self);
+                    }
                     self.maybe_build_lod();
                 }
                 Ok(Err(e)) => self.status = format!("{} failed: {e}", job.label),
@@ -362,7 +371,7 @@ impl SculptApp {
     }
 
     /// Dense meshes get a level-of-detail tree so drawing costs pixels, not triangles.
-    fn maybe_build_lod(&mut self) {
+    pub(crate) fn maybe_build_lod(&mut self) {
         let Some(doc) = self.doc.as_ref() else { return };
         if doc.lod().is_none() && std::env::var_os("SCULPT_NO_LOD").is_none() && doc.face_count() * 2 >= LOD_MIN_TRIANGLES {
             let mut params = sculpt_core::lod::LodParams::default();
@@ -415,6 +424,10 @@ impl SculptApp {
         }
         if let Some(lc) = crate::layer_panel::command::from_keymap(cmd, self) {
             crate::layer_panel::command::execute(self, lc);
+            return;
+        }
+        if cmd == Command::Undo && self.doc.as_ref().is_some_and(|d| !d.can_undo()) && self.solidify_backup.is_some() {
+            crate::generator_ui::undo_solidify(self);
             return;
         }
         let Some(doc) = self.doc.as_mut() else { return };

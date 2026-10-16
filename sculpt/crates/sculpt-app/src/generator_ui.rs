@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use egui::{RichText, Ui};
-use sculpt_core::LayerId;
+use sculpt_core::{Document, LayerId};
 use sculpt_core::generator::density::Density;
 use sculpt_core::bake::MeshAttribute;
 use sculpt_core::generator::layer::GeneratorSpec;
@@ -212,6 +212,7 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         note(&prop(ui, "Size", |ui| ui.add(egui::Slider::new(&mut next.size, 0.005..=0.5).logarithmic(true).max_decimals(3))), &mut changed, &mut coalesce);
         note(&prop(ui, "Lift", |ui| ui.add(egui::Slider::new(&mut next.lift, -1.0..=1.5).max_decimals(2))), &mut changed, &mut coalesce);
         note(&prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut next.seed).speed(0.2))), &mut changed, &mut coalesce);
+        note(&prop(ui, "Blend", |ui| ui.add(egui::Slider::new(&mut next.blend, 0.0..=1.0).max_decimals(2))).on_hover_text("How softly this layer meets the surface when the stack is solidified, as a fraction of each instance's size. The live preview stays hard-edged."), &mut changed, &mut coalesce);
         note(&prop(ui, "Spacing", |ui| ui.add(egui::Slider::new(&mut next.min_spacing, 0.0..=0.5).max_decimals(3))).on_hover_text("Smallest distance between two instances. 0 places them independently; if the surface is full, fewer are placed."), &mut changed, &mut coalesce);
         note(&prop(ui, "Size variation", |ui| ui.add(egui::Slider::new(&mut next.size_var, 0.0..=1.0).max_decimals(2))), &mut changed, &mut coalesce);
         note(&prop(ui, "Stretch", |ui| ui.add(egui::Slider::new(&mut next.stretch_var, 0.0..=1.0).max_decimals(2))).on_hover_text("Varies each axis separately, so instances come out stretched or squashed."), &mut changed, &mut coalesce);
@@ -356,8 +357,61 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         ui.label(RichText::new(format!("Catch-up work {work_last:5.1} ms/frame   most {work_max:5.1}")).monospace().size(fs * 0.85).color(weak));
         ui.label(RichText::new(format!("Whole frame   {frame_ms:5.1} ms")).monospace().size(fs * 0.85).color(weak));
     });
+    let mut solidify_now = false;
+    section(ui, fs, "solidify", "SOLIDIFY", |ui| {
+        ui.label(RichText::new("Turn the whole stack into one clean, closed mesh. Cuts blend softly and nothing folds. The layers are consumed; Undo brings them back.").size(fs * 0.85).color(weak));
+        prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.divisions, 40..=400).logarithmic(true)).on_hover_text("Samples along the longest side. Higher keeps finer detail and takes longer."));
+        prop(ui, "Grain", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.grain, 0.0..=1.0).max_decimals(2)).on_hover_text("Fine surface noise added before the mesh is made."));
+        if ui.button("Solidify stack").clicked() {
+            solidify_now = true;
+        }
+    });
+    if solidify_now {
+        solidify(app);
+        return;
+    }
     if changed && next != spec {
         command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Generator(next), coalesce });
+    }
+}
+
+/// Settings of the Solidify section.
+pub struct SolidUi {
+    pub divisions: u32,
+    pub grain: f32,
+}
+
+impl Default for SolidUi {
+    fn default() -> Self {
+        SolidUi { divisions: 150, grain: 0.0 }
+    }
+}
+
+/// Replace the document with its solidified stack, keeping the old one for undo.
+pub(crate) fn solidify(app: &mut SculptApp) {
+    let Some(doc) = app.doc.as_ref() else { return };
+    let longest = doc.bounds().extent().max_element();
+    let grain = (app.solid_ui.grain > 0.0).then(|| sculpt_core::document::Grain { amplitude: app.solid_ui.grain * 0.015 * longest, scale: 22.0 / longest, seed: 1 });
+    let settings = sculpt_core::document::SolidSettings { voxel: longest / app.solid_ui.divisions as f32, grain };
+    let started = Instant::now();
+    match doc.solidify(&settings).and_then(|(mesh, stats)| Document::from_mesh(mesh).map(|d| (d, stats))) {
+        Ok((new, stats)) => {
+            app.status = format!("Solidified {} layers into {} quads in {:.0} ms", stats.layers, stats.quads, started.elapsed().as_secs_f64() * 1e3);
+            app.solidify_backup = app.doc.replace(new);
+            app.layers.selection.clear();
+            app.maybe_build_lod();
+        }
+        Err(e) => app.status = format!("Solidify failed: {e}"),
+    }
+}
+
+/// Put back the document from before the last Solidify.
+pub(crate) fn undo_solidify(app: &mut SculptApp) {
+    if let Some(old) = app.solidify_backup.take() {
+        app.doc = Some(old);
+        app.layers.selection.clear();
+        app.status = "Undo solidify".into();
+        app.maybe_build_lod();
     }
 }
 
