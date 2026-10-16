@@ -60,6 +60,13 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
     let (mesh, stats) = doc.solidify(&SolidSettings { voxel })?;
     let ms = t.elapsed().as_secs_f64() * 1e3;
     let bad = non_manifold_edges(&mesh.faces);
+    for ((a, b), n) in sculpt_core::generator::remesh::non_manifold_edge_list(&mesh.faces) {
+        let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+        println!("  bad edge used {n}x between {pa:?} and {pb:?} (length {:.4})", pa.distance(pb));
+        for q in mesh.faces.iter().filter(|q| q.contains(&a) && q.contains(&b)) {
+            println!("    quad {q:?}: {:?}", q.map(|v| mesh.positions[v as usize]));
+        }
+    }
     println!(
         "solidify: {} layers, {} quads in {ms:.0} ms (scatter {:.0}, extract {:.0}); {} of {} samples evaluated; {bad} non-manifold edges",
         stats.layers, stats.quads, stats.scatter_ms, stats.extract_ms, stats.evaluated, stats.total
