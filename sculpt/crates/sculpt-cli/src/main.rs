@@ -20,6 +20,7 @@ mod refine_bench;
 mod generator_drag_sim;
 mod render;
 mod render_mesh;
+mod rock;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -46,6 +47,7 @@ fn main() {
         Some("generator-bench") => generator_bench::run(&args[1..]),
         Some("generator-edit-bench") => generator_edit_bench::run(&args[1..]),
         Some("refine-bench") => refine_bench::run(&args[1..]),
+        Some("rock") => rock::run(&args[1..]),
         Some("adf-bench") => adf_bench::run(&args[1..]),
         Some("generator-drag-sim") => generator_drag_sim::run(&args[1..]),
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
