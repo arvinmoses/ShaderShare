@@ -342,7 +342,7 @@ pub fn check(gpu: &Gpu, level: usize, n: usize, vx: f32, op: Op, smooth_vox: f32
     // --- 5. winding.
     r.tris = dbg.idx.len() / 3;
     let mut ok = 0usize;
-    for t in dbg.idx.chunks_exact(3) {
+    for t in dbg.idx.as_chunks::<3>().0.iter() {
         let (a, b, c) = (gpu_pos[t[0] as usize], gpu_pos[t[1] as usize], gpu_pos[t[2] as usize]);
         let gn = (b - a).cross(c - a);
         let vn = Vec3::new(dbg.verts[t[0] as usize * 8 + 4], dbg.verts[t[0] as usize * 8 + 5], dbg.verts[t[0] as usize * 8 + 6]);

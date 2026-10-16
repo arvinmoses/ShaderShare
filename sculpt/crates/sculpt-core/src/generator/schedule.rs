@@ -265,7 +265,7 @@ impl Scheduler {
             .nodes
             .par_iter()
             .map(|n| {
-                let tris = lod.indices[n.first as usize..(n.first + n.count) as usize].chunks_exact(3);
+                let tris = lod.indices[n.first as usize..(n.first + n.count) as usize].as_chunks::<3>().0.iter();
                 let count = tris.len().max(1) as f32;
                 let area: f64 = tris
                     .map(|t| {

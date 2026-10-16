@@ -295,7 +295,7 @@ pub fn run(args: &[String]) -> Res<()> {
 /// per vertex across all threads.
 fn measure_resample(gpu: &Gpu, sdf: &Sdf, msdf: &MeshSdf, voxel: f32, n: usize) -> f64 {
     let v = gpu.read_f32(&sdf.verts, 0, n * 8);
-    let pts: Vec<Vec3> = v.chunks_exact(8).map(|c| Vec3::new(c[0], c[1], c[2])).collect();
+    let pts: Vec<Vec3> = v.as_chunks::<8>().0.iter().map(|c| Vec3::new(c[0], c[1], c[2])).collect();
     let t = Instant::now();
     let s: f32 = pts.par_iter().map(|&p| msdf.signed_distance(p, 4.0 * voxel)).sum();
     let us = t.elapsed().as_secs_f64() * 1e6 / pts.len() as f64;

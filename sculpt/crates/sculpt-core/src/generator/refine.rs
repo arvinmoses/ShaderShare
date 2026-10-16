@@ -722,7 +722,7 @@ pub fn compose(positions: &[Vec3], normals: &[Vec3], faces: &[Face], patches: &[
         let off = c.positions.len() as u32;
         c.positions.extend_from_slice(&p.positions);
         c.normals.extend_from_slice(&p.normals);
-        c.tris.extend(p.indices.chunks_exact(3).map(|t| [t[0] + off, t[1] + off, t[2] + off]));
+        c.tris.extend(p.indices.as_chunks::<3>().0.iter().map(|t| [t[0] + off, t[1] + off, t[2] + off]));
     }
     c
 }

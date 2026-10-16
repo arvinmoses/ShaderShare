@@ -544,7 +544,7 @@ impl GpuBoolean {
         self.queue.submit([enc.finish()]);
         let raw = read_buffer(&self.device, dst, size);
         let f: &[f32] = bytemuck::cast_slice(&raw);
-        f.chunks_exact(3).take(self.n_verts as usize).map(|c| Vec3::new(c[0], c[1], c[2])).collect()
+        f.as_chunks::<3>().0.iter().take(self.n_verts as usize).map(|c| Vec3::new(c[0], c[1], c[2])).collect()
     }
 
     #[allow(dead_code)] // integration point: a vertex shader adds this to the base positions
