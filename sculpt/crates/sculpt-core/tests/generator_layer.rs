@@ -13,7 +13,7 @@ fn sphere_doc(level: u32) -> Document {
 }
 
 fn dents() -> GeneratorSpec {
-    GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count: 30, seed: 7, size: 0.18, lift: 0.6, random_spin: true }
+    GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count: 30, seed: 7, size: 0.18, lift: 0.6, random_spin: true, ..GeneratorSpec::default() }
 }
 
 fn min_radius(doc: &Document) -> f32 {

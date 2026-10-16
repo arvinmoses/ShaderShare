@@ -34,7 +34,9 @@ evaluated in stack order, and sculpting on layers above or below keeps working.
 |---|---|---|
 | M1 (done) | Generator layer in the engine: scatter, add / subtract / intersect, save and load, undo, subdivision, panel, edit timer. | Tests, demo clips. |
 | M2 (in progress) | **Iteration speed.** Staged caches (done), changed-leaf-only updates (done), progressive evaluation and a cheaper level-of-detail catch-up for dense meshes (next). | `generator-edit-bench`, the in-app readout, frame time at 6.3M faces during a drag. |
-| M3 | **Placement language for rocks and rubble:** minimum spacing, density mask (white pulls all spawns in, fixed count), size / rotation variance per instance, edge placement, edge bake, clusters. | Tests (spacing, mask weighting >= 95%), screenshots. |
+| M3a (done) | **Minimum spacing** (dart throwing, no regional bias, fewer instances when the surface is full) and **per-instance variation**: size, per-axis stretch, tilt, lift jitter, each on its own random stream so editing one never reshuffles another. Old projects load unchanged. | `tests/generator_placement.rs`, `m3a_placement.png`. |
+| M3b | **Density from the layer's mask** (white pulls every spawn in, fixed count; paint where you want rubble), clusters. | Tests (>= 95% of points in white regions), screenshots. |
+| M3c | Edge placement along sharp edges with edge-aligned frames, and the Edge bake. | Tests on a cube, screenshots. |
 | M4 | Attribute mapping table (normal, edge normal, edge length, curvature, noise, random -> align, scale, height, offset). | Tests, an "edge damage" and a "rubble" preset. |
 | M5 | Generator UI in the layer panel proper, viewport gizmos, presets, custom OBJ primitives. | Screenshots in all four themes, blind score. |
 | M6 | **Soft-blend live preview** (screen space, approximate), strictly optional so it cannot slow edits. The same blend definition as Apply, shared between shader and Rust with parity tests. | Parity tests, real-GPU timing, side-by-side with Apply. |

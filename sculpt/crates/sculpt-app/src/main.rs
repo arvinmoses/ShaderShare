@@ -42,7 +42,8 @@ fn gpu_setup() -> WgpuSetup {
     WgpuSetup::CreateNew(setup)
 }
 
-/// `op:primitive:count:size:lift:seed`, for example `subtract:sphere:60:0.12:0.6:7`. Trailing fields are optional.
+/// `op:primitive:count:size:lift:seed[:spacing:size_var:stretch:tilt:lift_var]`, for example `subtract:sphere:60:0.12:0.6:7`.
+/// Trailing fields are optional.
 fn parse_generator_demo(text: &str) -> Option<sculpt_core::generator::layer::GeneratorSpec> {
     use sculpt_core::generator::{BoolOp, Primitive, layer::GeneratorSpec};
     let mut f = text.split(':');
@@ -75,6 +76,11 @@ fn parse_generator_demo(text: &str) -> Option<sculpt_core::generator::layer::Gen
     spec.size = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.size);
     spec.lift = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.lift);
     spec.seed = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.seed);
+    spec.min_spacing = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.min_spacing);
+    spec.size_var = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.size_var);
+    spec.stretch_var = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.stretch_var);
+    spec.tilt = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.tilt);
+    spec.lift_var = f.next().and_then(|v| v.parse().ok()).unwrap_or(spec.lift_var);
     Some(spec)
 }
 

@@ -37,7 +37,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
     let progressive = args.iter().any(|a| a == "--progressive");
     let count: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
     let size: f32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.10);
-    let base = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count, seed: 7, size, lift: 0.6, random_spin: true };
+    let base = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count, seed: 7, size, lift: 0.6, random_spin: true, ..GeneratorSpec::default() };
     println!("| faces | create ms | count ms | seed ms | size ms | lift ms | primitive ms | operation ms |");
     println!("|---|---|---|---|---|---|---|---|");
     for level in levels {

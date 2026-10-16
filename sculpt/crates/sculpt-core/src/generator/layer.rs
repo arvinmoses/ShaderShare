@@ -42,11 +42,40 @@ pub struct GeneratorSpec {
     pub lift: f32,
     /// Spin each instance by a random angle around the surface normal.
     pub random_spin: bool,
+    /// Smallest distance between two instance centres, in world units; `0` places them independently. If the surface
+    /// cannot hold `count` instances this far apart, fewer are placed.
+    #[serde(default)]
+    pub min_spacing: f32,
+    /// Random variation of each instance's size, `0` (all alike) to `1` (anywhere from nothing to double).
+    #[serde(default)]
+    pub size_var: f32,
+    /// Random variation of each axis separately, on top of `size_var`, so instances come out stretched or squashed.
+    #[serde(default)]
+    pub stretch_var: f32,
+    /// Largest random lean away from the surface normal, in degrees.
+    #[serde(default)]
+    pub tilt: f32,
+    /// Random variation of `lift`, in multiples of the instance's size.
+    #[serde(default)]
+    pub lift_var: f32,
 }
 
 impl Default for GeneratorSpec {
     fn default() -> Self {
-        GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Subtract, count: 100, seed: 1, size: 0.05, lift: 0.6, random_spin: true }
+        GeneratorSpec {
+            primitive: Primitive::Sphere,
+            op: BoolOp::Subtract,
+            count: 100,
+            seed: 1,
+            size: 0.05,
+            lift: 0.6,
+            random_spin: true,
+            min_spacing: 0.0,
+            size_var: 0.0,
+            stretch_var: 0.0,
+            tilt: 0.0,
+            lift_var: 0.0,
+        }
     }
 }
 
@@ -86,22 +115,45 @@ impl GeneratorCache {
     /// Scatter `spec.count` instances over `base` and index them, reusing whatever `previous` still has right.
     pub fn build(spec: &GeneratorSpec, basis: &Arc<SurfaceBasis>, base: &[Vec3], faces: &[Face], bvh: &Bvh, previous: Option<&GeneratorCache>) -> GeneratorCache {
         let samples = match previous {
-            Some(p) if Arc::ptr_eq(&p.basis, basis) && p.spec.count == spec.count && p.spec.seed == spec.seed => p.samples.clone(),
-            _ => Arc::new(basis.sampler.sample(base, &basis.normals, faces, None, spec.count as usize, spec.seed)),
+            Some(p)
+                if Arc::ptr_eq(&p.basis, basis) && p.spec.count == spec.count && p.spec.seed == spec.seed && p.spec.min_spacing == spec.min_spacing =>
+            {
+                p.samples.clone()
+            }
+            _ => Arc::new(scatter(&basis.sampler, base, &basis.normals, faces, spec)),
         };
+        let seed = spec.seed;
         let instances = samples
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let spin = if spec.random_spin { unit_random(spec.seed, i as u64) * std::f32::consts::TAU } else { 0.0 };
-                Instance::new(spec.primitive, s.position + s.normal * (spec.lift * spec.size), frame_from_normal(s.normal, spin), Vec3::splat(spec.size))
+                let i = i as u64;
+                let spin = if spec.random_spin { unit_random(seed, i) * std::f32::consts::TAU } else { 0.0 };
+                // Each kind of variation draws from its own stream, so changing one never reshuffles another.
+                let size = spec.size * (1.0 + spec.size_var * signed_random(seed ^ SIZE_STREAM, i)).max(0.05);
+                let axes = Vec3::new(
+                    1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i),
+                    1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 1),
+                    1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 2),
+                )
+                .max(Vec3::splat(0.05));
+                let lift = spec.lift + spec.lift_var * signed_random(seed ^ LIFT_STREAM, i);
+                let up = lean(s.normal, spec.tilt.to_radians() * unit_random(seed ^ TILT_STREAM, i), unit_random(seed ^ TILT_STREAM, i + (1 << 40)) * std::f32::consts::TAU);
+                Instance::new(spec.primitive, s.position + s.normal * (lift * size), frame_from_normal(up, spin), axes * size)
             })
             .collect();
-        let reach = if spec.op == BoolOp::Subtract { 0.0 } else { 0.25 * spec.size };
+        // The largest an instance can grow, which bounds how far it can reach.
+        let biggest = spec.size * (1.0 + spec.size_var) * (1.0 + spec.stretch_var);
+        let reach = if spec.op == BoolOp::Subtract { 0.0 } else { 0.25 * biggest };
         let set = InstanceSet::new(instances, reach);
         let boxes: Vec<Aabb> = (0..set.len()).filter(|&i| set.is_active(i)).map(|i| set.aabb(i)).collect();
         let leaves = affected_leaves(bvh, &boxes);
         GeneratorCache { spec: spec.clone(), basis: basis.clone(), samples, set, params: EvalParams { op: spec.op, reach, iterations: 3 }, leaves }
+    }
+
+    /// The cutters as placed, for inspection.
+    pub fn instances(&self) -> &[Instance] {
+        self.set.instances()
     }
 
     /// True when `self` and `other` share the same scattered points, so an edit between them did not resample.
@@ -126,6 +178,77 @@ impl GeneratorCache {
             *p += (q - *p) * w;
         }
     }
+}
+
+const SIZE_STREAM: u64 = 0x5129_A1C3_0F7D_E001;
+const STRETCH_STREAM: u64 = 0x7C15_93B2_44D1_F002;
+const LIFT_STREAM: u64 = 0x3AF8_61E9_B2C4_D003;
+const TILT_STREAM: u64 = 0x96D2_0E47_58A3_C004;
+const ORDER_STREAM: u64 = 0xE410_7B6D_91F2_A005;
+
+/// Deterministic value in `[-1, 1)`.
+fn signed_random(seed: u64, i: u64) -> f32 {
+    unit_random(seed, i) * 2.0 - 1.0
+}
+
+/// `normal` leaned by `angle` towards the direction `around` radians round it (`angle` 0 returns it unchanged).
+fn lean(normal: Vec3, angle: f32, around: f32) -> Vec3 {
+    if angle <= 1e-6 {
+        return normal;
+    }
+    let (t, b) = {
+        let t = normal.any_orthonormal_vector();
+        (t, normal.cross(t))
+    };
+    let axis = (t * around.cos() + b * around.sin()).normalize_or(t);
+    (normal * angle.cos() + axis * angle.sin()).normalize_or(normal)
+}
+
+/// Scatter `spec.count` points over the surface. With a minimum spacing this is dart throwing: candidates (in a random
+/// order, so no region of the mesh fills first) are accepted when no accepted point is within the spacing, until `count`
+/// are placed or fresh candidates stop finding room.
+fn scatter(sampler: &SurfaceSampler, base: &[Vec3], normals: &[Vec3], faces: &[Face], spec: &GeneratorSpec) -> Vec<SurfaceSample> {
+    let count = spec.count as usize;
+    if spec.min_spacing <= 0.0 || count == 0 {
+        return sampler.sample(base, normals, faces, None, count, spec.seed);
+    }
+    let cell = spec.min_spacing;
+    let key = |p: Vec3| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32, (p.z / cell).floor() as i32);
+    let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<u32>> = std::collections::HashMap::new();
+    let mut accepted: Vec<SurfaceSample> = Vec::with_capacity(count);
+    let min2 = spec.min_spacing * spec.min_spacing;
+    let mut dry_batches = 0;
+    for batch in 0u64..24 {
+        let candidates = sampler.sample(base, normals, faces, None, (count * 3).max(256), spec.seed.wrapping_add(batch.wrapping_mul(0x9E37_79B9)));
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        order.sort_by(|&a, &b| unit_random(spec.seed ^ ORDER_STREAM ^ batch, a as u64).total_cmp(&unit_random(spec.seed ^ ORDER_STREAM ^ batch, b as u64)));
+        let before = accepted.len();
+        for ci in order {
+            if accepted.len() >= count {
+                break;
+            }
+            let c = candidates[ci];
+            let (kx, ky, kz) = key(c.position);
+            let crowded = (-1..=1).any(|dx| {
+                (-1..=1).any(|dy| {
+                    (-1..=1).any(|dz| grid.get(&(kx + dx, ky + dy, kz + dz)).is_some_and(|v| v.iter().any(|&j| accepted[j as usize].position.distance_squared(c.position) < min2)))
+                })
+            });
+            if !crowded {
+                grid.entry((kx, ky, kz)).or_default().push(accepted.len() as u32);
+                accepted.push(c);
+            }
+        }
+        if accepted.len() >= count {
+            break;
+        }
+        // Two batches in a row that found almost nothing: the surface is full.
+        dry_batches = if accepted.len() - before < count / 50 + 1 { dry_batches + 1 } else { 0 };
+        if dry_batches >= 2 {
+            break;
+        }
+    }
+    accepted
 }
 
 /// Deterministic value in `[0, 1)` from a seed and an index (splitmix64).

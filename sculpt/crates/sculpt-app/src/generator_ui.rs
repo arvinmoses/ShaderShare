@@ -156,6 +156,11 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         note(&prop(ui, "Size", |ui| ui.add(egui::Slider::new(&mut next.size, 0.005..=0.5).logarithmic(true).max_decimals(3))), &mut changed, &mut coalesce);
         note(&prop(ui, "Lift", |ui| ui.add(egui::Slider::new(&mut next.lift, -1.0..=1.5).max_decimals(2))), &mut changed, &mut coalesce);
         note(&prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut next.seed).speed(0.2))), &mut changed, &mut coalesce);
+        note(&prop(ui, "Spacing", |ui| ui.add(egui::Slider::new(&mut next.min_spacing, 0.0..=0.5).max_decimals(3))).on_hover_text("Smallest distance between two instances. 0 places them independently; if the surface is full, fewer are placed."), &mut changed, &mut coalesce);
+        note(&prop(ui, "Size variation", |ui| ui.add(egui::Slider::new(&mut next.size_var, 0.0..=1.0).max_decimals(2))), &mut changed, &mut coalesce);
+        note(&prop(ui, "Stretch", |ui| ui.add(egui::Slider::new(&mut next.stretch_var, 0.0..=1.0).max_decimals(2))).on_hover_text("Varies each axis separately, so instances come out stretched or squashed."), &mut changed, &mut coalesce);
+        note(&prop(ui, "Tilt", |ui| ui.add(egui::Slider::new(&mut next.tilt, 0.0..=90.0).suffix(" deg").max_decimals(0))).on_hover_text("Largest random lean away from the surface normal."), &mut changed, &mut coalesce);
+        note(&prop(ui, "Lift jitter", |ui| ui.add(egui::Slider::new(&mut next.lift_var, 0.0..=1.0).max_decimals(2))), &mut changed, &mut coalesce);
         prop(ui, "", |ui| {
             if ui.checkbox(&mut next.random_spin, "Random spin").changed() {
                 changed = true;
