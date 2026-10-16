@@ -42,6 +42,36 @@ fn gpu_setup() -> WgpuSetup {
     WgpuSetup::CreateNew(setup)
 }
 
+/// `even`, `clusters[:scale:coverage:softness:seed]`, `facing[:down|up|x|-x|z|-z[:tightness]]` or `painted[:channel]`.
+fn parse_density(text: &str) -> Option<sculpt_core::generator::density::Density> {
+    use sculpt_core::generator::density::Density;
+    let mut f = text.split(':');
+    let num = |v: Option<&str>, d: f32| v.and_then(|v| v.parse().ok()).unwrap_or(d);
+    match f.next()? {
+        "even" => Some(Density::Even),
+        "clusters" => {
+            let Density::Clusters { scale, coverage, softness, seed } = Density::default_clusters() else { return None };
+            Some(Density::Clusters { scale: num(f.next(), scale), coverage: num(f.next(), coverage), softness: num(f.next(), softness), seed: num(f.next(), seed as f32) as u32 })
+        }
+        "facing" => {
+            let axis = match f.next().unwrap_or("down") {
+                "up" => [0.0, 1.0, 0.0],
+                "x" => [1.0, 0.0, 0.0],
+                "-x" => [-1.0, 0.0, 0.0],
+                "z" => [0.0, 0.0, 1.0],
+                "-z" => [0.0, 0.0, -1.0],
+                _ => [0.0, -1.0, 0.0],
+            };
+            Some(Density::Facing { axis, sharpness: num(f.next(), 1.5) })
+        }
+        "painted" => Some(Density::Painted { channel: f.next().unwrap_or("paint.mask").to_string() }),
+        other => {
+            eprintln!("--demo-density: unknown density '{other}'");
+            None
+        }
+    }
+}
+
 /// `op:primitive:count:size:lift:seed[:spacing:size_var:stretch:tilt:lift_var]`, for example `subtract:sphere:60:0.12:0.6:7`.
 /// Trailing fields are optional.
 fn parse_generator_demo(text: &str) -> Option<sculpt_core::generator::layer::GeneratorSpec> {
@@ -107,6 +137,7 @@ fn main() -> eframe::Result {
     let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, sweep_shots: None, bench_orbit: None, zoom: 1.0 };
     let mut size = [1600.0f32, 1000.0];
     let (mut shots_dir, mut shot_times) = (None::<PathBuf>, Vec::<f32>::new());
+    let mut demo_density = None::<sculpt_core::generator::density::Density>;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--level" => opts.level = args.next().and_then(|v| v.parse().ok()).unwrap_or(7).clamp(1, 11),
@@ -118,6 +149,7 @@ fn main() -> eframe::Result {
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-layers" => opts.demo_layers = true,
             "--demo-sweep" => opts.demo_sweep = true,
+            "--demo-density" => demo_density = args.next().and_then(|v| parse_density(&v)),
             "--demo-sweep-shots" => shots_dir = args.next().map(PathBuf::from),
             "--demo-sweep-times" => shot_times = args.next().map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect()).unwrap_or_default(),
             "--demo-generator" => opts.demo_generator = args.next().and_then(|v| parse_generator_demo(&v)),
@@ -138,6 +170,9 @@ fn main() -> eframe::Result {
         let _ = std::fs::create_dir_all(&dir);
         opts.sweep_shots = Some((dir, shot_times));
         opts.demo_sweep = true;
+    }
+    if let Some(d) = demo_density {
+        opts.demo_generator.get_or_insert_with(sculpt_core::generator::layer::GeneratorSpec::default).density = d;
     }
     if opts.demo_sweep && opts.demo_generator.is_none() {
         opts.demo_generator = Some(sculpt_core::generator::layer::GeneratorSpec { count: 60, size: 0.10, seed: 7, ..Default::default() });

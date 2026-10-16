@@ -20,6 +20,7 @@ use std::sync::Arc;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+use super::density::{Density, DensityField};
 use super::place::{SurfaceSample, SurfaceSampler};
 use super::{BoolOp, EvalParams, Instance, InstanceSet, Primitive, affected_leaves, eval_vertex, frame_from_normal};
 use crate::bvh::Bvh;
@@ -58,6 +59,9 @@ pub struct GeneratorSpec {
     /// Random variation of `lift`, in multiples of the instance's size.
     #[serde(default)]
     pub lift_var: f32,
+    /// Where on the surface the instances gather. The count stays fixed; a density redistributes it.
+    #[serde(default)]
+    pub density: Density,
 }
 
 impl Default for GeneratorSpec {
@@ -75,6 +79,7 @@ impl Default for GeneratorSpec {
             stretch_var: 0.0,
             tilt: 0.0,
             lift_var: 0.0,
+            density: Density::Even,
         }
     }
 }
@@ -104,6 +109,7 @@ pub struct GeneratorCache {
     /// The parameters this cache was built for; the next build diffs against them to see which stages to redo.
     spec: GeneratorSpec,
     basis: Arc<SurfaceBasis>,
+    density: Option<Arc<DensityField>>,
     samples: Arc<Vec<SurfaceSample>>,
     pub(crate) set: InstanceSet,
     pub(crate) params: EvalParams,
@@ -113,14 +119,34 @@ pub struct GeneratorCache {
 
 impl GeneratorCache {
     /// Scatter `spec.count` instances over `base` and index them, reusing whatever `previous` still has right.
-    pub fn build(spec: &GeneratorSpec, basis: &Arc<SurfaceBasis>, base: &[Vec3], faces: &[Face], bvh: &Bvh, previous: Option<&GeneratorCache>) -> GeneratorCache {
+    pub fn build(
+        spec: &GeneratorSpec,
+        basis: &Arc<SurfaceBasis>,
+        density: Option<&Arc<DensityField>>,
+        base: &[Vec3],
+        faces: &[Face],
+        bvh: &Bvh,
+        previous: Option<&GeneratorCache>,
+    ) -> GeneratorCache {
+        let same_density = |p: &GeneratorCache| match (&p.density, density) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
         let samples = match previous {
             Some(p)
-                if Arc::ptr_eq(&p.basis, basis) && p.spec.count == spec.count && p.spec.seed == spec.seed && p.spec.min_spacing == spec.min_spacing =>
+                if Arc::ptr_eq(&p.basis, basis)
+                    && same_density(p)
+                    && p.spec.count == spec.count
+                    && p.spec.seed == spec.seed
+                    && p.spec.min_spacing == spec.min_spacing =>
             {
                 p.samples.clone()
             }
-            _ => Arc::new(scatter(&basis.sampler, base, &basis.normals, faces, spec)),
+            _ => Arc::new(match density {
+                Some(d) => scatter(&d.sampler, Some(&d.values), base, &basis.normals, faces, spec),
+                None => scatter(&basis.sampler, None, base, &basis.normals, faces, spec),
+            }),
         };
         let seed = spec.seed;
         let instances = samples
@@ -148,7 +174,12 @@ impl GeneratorCache {
         let set = InstanceSet::new(instances, reach);
         let boxes: Vec<Aabb> = (0..set.len()).filter(|&i| set.is_active(i)).map(|i| set.aabb(i)).collect();
         let leaves = affected_leaves(bvh, &boxes);
-        GeneratorCache { spec: spec.clone(), basis: basis.clone(), samples, set, params: EvalParams { op: spec.op, reach, iterations: 3 }, leaves }
+        GeneratorCache { spec: spec.clone(), basis: basis.clone(), density: density.cloned(), samples, set, params: EvalParams { op: spec.op, reach, iterations: 3 }, leaves }
+    }
+
+    /// The density the instances were scattered by, if any.
+    pub fn density(&self) -> Option<&Arc<DensityField>> {
+        self.density.as_ref()
     }
 
     /// The cutters as placed, for inspection.
@@ -207,10 +238,10 @@ fn lean(normal: Vec3, angle: f32, around: f32) -> Vec3 {
 /// Scatter `spec.count` points over the surface. With a minimum spacing this is dart throwing: candidates (in a random
 /// order, so no region of the mesh fills first) are accepted when no accepted point is within the spacing, until `count`
 /// are placed or fresh candidates stop finding room.
-fn scatter(sampler: &SurfaceSampler, base: &[Vec3], normals: &[Vec3], faces: &[Face], spec: &GeneratorSpec) -> Vec<SurfaceSample> {
+fn scatter(sampler: &SurfaceSampler, mask: Option<&[f32]>, base: &[Vec3], normals: &[Vec3], faces: &[Face], spec: &GeneratorSpec) -> Vec<SurfaceSample> {
     let count = spec.count as usize;
     if spec.min_spacing <= 0.0 || count == 0 {
-        return sampler.sample(base, normals, faces, None, count, spec.seed);
+        return sampler.sample(base, normals, faces, mask, count, spec.seed);
     }
     let cell = spec.min_spacing;
     let key = |p: Vec3| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32, (p.z / cell).floor() as i32);
@@ -219,7 +250,7 @@ fn scatter(sampler: &SurfaceSampler, base: &[Vec3], normals: &[Vec3], faces: &[F
     let min2 = spec.min_spacing * spec.min_spacing;
     let mut dry_batches = 0;
     for batch in 0u64..24 {
-        let candidates = sampler.sample(base, normals, faces, None, (count * 3).max(256), spec.seed.wrapping_add(batch.wrapping_mul(0x9E37_79B9)));
+        let candidates = sampler.sample(base, normals, faces, mask, (count * 3).max(256), spec.seed.wrapping_add(batch.wrapping_mul(0x9E37_79B9)));
         let mut order: Vec<usize> = (0..candidates.len()).collect();
         order.sort_by(|&a, &b| unit_random(spec.seed ^ ORDER_STREAM ^ batch, a as u64).total_cmp(&unit_random(spec.seed ^ ORDER_STREAM ^ batch, b as u64)));
         let before = accepted.len();

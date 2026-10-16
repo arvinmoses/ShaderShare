@@ -32,6 +32,7 @@
 //!   along each vertex normal.
 
 pub mod adf;
+pub mod density;
 pub mod instances;
 pub mod layer;
 pub mod place;

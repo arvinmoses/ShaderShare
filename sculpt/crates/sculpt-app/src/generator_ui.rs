@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use egui::{RichText, Ui};
 use sculpt_core::LayerId;
+use sculpt_core::generator::density::Density;
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::generator::{BoolOp, Primitive};
 
@@ -161,6 +162,54 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
         note(&prop(ui, "Stretch", |ui| ui.add(egui::Slider::new(&mut next.stretch_var, 0.0..=1.0).max_decimals(2))).on_hover_text("Varies each axis separately, so instances come out stretched or squashed."), &mut changed, &mut coalesce);
         note(&prop(ui, "Tilt", |ui| ui.add(egui::Slider::new(&mut next.tilt, 0.0..=90.0).suffix(" deg").max_decimals(0))).on_hover_text("Largest random lean away from the surface normal."), &mut changed, &mut coalesce);
         note(&prop(ui, "Lift jitter", |ui| ui.add(egui::Slider::new(&mut next.lift_var, 0.0..=1.0).max_decimals(2))), &mut changed, &mut coalesce);
+        ui.add_space(4.0);
+        prop(ui, "Density", |ui| {
+            egui::ComboBox::from_id_salt(("gen_density", id))
+                .selected_text(next.density.label())
+                .show_ui(ui, |ui| {
+                    let options = [("Even", Density::Even), ("Clusters", Density::default_clusters()), ("Facing", Density::default_facing()), ("Painted", Density::default_painted())];
+                    for (name, option) in options {
+                        if ui.selectable_label(next.density.label() == name, name).clicked() && next.density.label() != name {
+                            next.density = option;
+                            changed = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Where the instances gather. The count stays fixed; the density redistributes it.")
+        });
+        match &mut next.density {
+            Density::Even => {}
+            Density::Clusters { scale, coverage, softness, seed } => {
+                note(&prop(ui, "Patch size", |ui| ui.add(egui::Slider::new(scale, 0.5..=12.0).logarithmic(true).max_decimals(1))).on_hover_text("Larger is bigger patches. Smaller is finer, more frequent clumps."), &mut changed, &mut coalesce);
+                note(&prop(ui, "Coverage", |ui| ui.add(egui::Slider::new(coverage, 0.0..=1.0).max_decimals(2))).on_hover_text("How much of the surface is dense."), &mut changed, &mut coalesce);
+                note(&prop(ui, "Softness", |ui| ui.add(egui::Slider::new(softness, 0.02..=1.0).max_decimals(2))), &mut changed, &mut coalesce);
+                note(&prop(ui, "Pattern seed", |ui| ui.add(egui::DragValue::new(seed).speed(0.2))), &mut changed, &mut coalesce);
+            }
+            Density::Facing { axis, sharpness } => {
+                const AXES: [(&str, [f32; 3]); 6] = [("Down (ground)", [0.0, -1.0, 0.0]), ("Up (top)", [0.0, 1.0, 0.0]), ("+X side", [1.0, 0.0, 0.0]), ("-X side", [-1.0, 0.0, 0.0]), ("+Z side", [0.0, 0.0, 1.0]), ("-Z side", [0.0, 0.0, -1.0])];
+                let current = AXES.iter().find(|(_, a)| a == axis).map_or("Custom", |(n, _)| *n);
+                prop(ui, "Faces", |ui| {
+                    egui::ComboBox::from_id_salt(("gen_facing", id)).selected_text(current).show_ui(ui, |ui| {
+                        for (name, a) in AXES {
+                            if ui.selectable_label(current == name, name).clicked() {
+                                *axis = a;
+                                changed = true;
+                            }
+                        }
+                    })
+                });
+                note(&prop(ui, "Tightness", |ui| ui.add(egui::Slider::new(sharpness, 0.3..=6.0).logarithmic(true).max_decimals(1))).on_hover_text("Higher means the surface has to face that way more squarely."), &mut changed, &mut coalesce);
+            }
+            Density::Painted { channel } => {
+                let before = channel.clone();
+                let r = prop(ui, "Channel", |ui| ui.text_edit_singleline(channel));
+                if r.lost_focus() && *channel != before {
+                    changed = true;
+                }
+                ui.label(RichText::new("Paint it with the Mask tool: white pulls instances in, black keeps them out.").small().color(weak));
+            }
+        }
         prop(ui, "", |ui| {
             if ui.checkbox(&mut next.random_spin, "Random spin").changed() {
                 changed = true;

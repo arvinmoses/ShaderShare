@@ -534,6 +534,18 @@ impl Document {
                 leaves.extend(self.layers[i].touched_leaves());
             }
         }
+        for i in 0..self.layers.len() {
+            let Some(stack) = self.layers[i].generator.as_ref().and_then(|g| g.density.to_stack()) else { continue };
+            let mut used = Vec::new();
+            stack.channels(&mut used);
+            if used.iter().any(|c| dirty.contains(c)) {
+                let old = self.layers[i].touched_leaves();
+                self.rebuild_generator_cache_with(i, true);
+                let new = self.layers[i].touched_leaves();
+                self.queue_generator_leaves(old, &mut leaves);
+                self.queue_generator_leaves(new, &mut leaves);
+            }
+        }
         self.recomposite(&leaves.into_iter().collect::<Vec<_>>());
         Ok(())
     }
@@ -968,14 +980,37 @@ impl Document {
     /// Rebuild a generator layer's derived placement from its spec and the base surface, redoing only the stages the
     /// change since the last build invalidated.
     pub(crate) fn rebuild_generator_cache(&mut self, i: usize) {
+        self.rebuild_generator_cache_with(i, false);
+    }
+
+    /// As [`Document::rebuild_generator_cache`]; `force_density` re-evaluates the density even if its definition is
+    /// unchanged (a painted channel it reads has been edited).
+    pub(crate) fn rebuild_generator_cache_with(&mut self, i: usize, force_density: bool) {
         let Some(spec) = self.layers[i].generator.clone() else {
             self.layers[i].gen_cache = None;
             return;
         };
         let basis = self.generator_basis();
         let previous = self.layers[i].gen_cache.clone();
-        let cache = crate::generator::layer::GeneratorCache::build(&spec, &basis, &self.base, &self.faces, &self.bvh, previous.as_deref());
+        let density = self.density_for(&spec, previous.as_ref().and_then(|p| p.density()), force_density);
+        let cache = crate::generator::layer::GeneratorCache::build(&spec, &basis, density.as_ref(), &self.base, &self.faces, &self.bvh, previous.as_deref());
         self.layers[i].gen_cache = Some(std::sync::Arc::new(cache));
+    }
+
+    /// The density field for `spec`, reusing `previous` while its definition is unchanged. `None` for an even scatter, or
+    /// if the density cannot be evaluated (a missing channel, say), which falls back to even.
+    pub(crate) fn density_for(
+        &mut self,
+        spec: &crate::generator::layer::GeneratorSpec,
+        previous: Option<&std::sync::Arc<crate::generator::density::DensityField>>,
+        force: bool,
+    ) -> Option<std::sync::Arc<crate::generator::density::DensityField>> {
+        let stack = spec.density.to_stack()?;
+        if !force && let Some(p) = previous.filter(|p| p.stack == stack) {
+            return Some(p.clone());
+        }
+        let values = self.evaluate_mask(&stack).ok().filter(|v| v.len() == self.vertex_count())?;
+        Some(std::sync::Arc::new(crate::generator::density::DensityField::new(stack, &self.base, &self.faces, values)))
     }
 
     pub(crate) fn rebuild_generator_caches(&mut self) {
