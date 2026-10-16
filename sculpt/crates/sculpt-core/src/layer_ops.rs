@@ -351,7 +351,8 @@ impl Document {
         let basis = self.generator_basis();
         let density = self.density_for(&spec, None, false);
         self.ensure_mapping_channels(&spec);
-        layer.gen_cache = Some(std::sync::Arc::new(GeneratorCache::build(&spec, &basis, density.as_ref(), &self.channels, &self.base, &self.faces, &self.bvh, None)));
+        let inputs = crate::generator::layer::BuildInputs { basis: &basis, density: density.as_ref(), channels: &self.channels, base: &self.base, faces: &self.faces, bvh: &self.bvh };
+        layer.gen_cache = Some(std::sync::Arc::new(GeneratorCache::build(&spec, &inputs, None)));
         layer.generator = Some(spec);
         self.exec("Add generator", vec![StructOp::Insert { index, layer: Box::new(layer) }]);
         Ok(id)

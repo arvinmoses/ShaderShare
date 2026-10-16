@@ -998,7 +998,8 @@ impl Document {
         let previous = self.layers[i].gen_cache.clone();
         let density = self.density_for(&spec, previous.as_ref().and_then(|p| p.density()), force_density);
         self.ensure_mapping_channels(&spec);
-        let cache = crate::generator::layer::GeneratorCache::build(&spec, &basis, density.as_ref(), &self.channels, &self.base, &self.faces, &self.bvh, previous.as_deref());
+        let inputs = crate::generator::layer::BuildInputs { basis: &basis, density: density.as_ref(), channels: &self.channels, base: &self.base, faces: &self.faces, bvh: &self.bvh };
+        let cache = crate::generator::layer::GeneratorCache::build(&spec, &inputs, previous.as_deref());
         self.layers[i].gen_cache = Some(std::sync::Arc::new(cache));
     }
 

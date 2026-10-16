@@ -108,6 +108,16 @@ impl SurfaceBasis {
     }
 }
 
+/// Everything about the surface a build reads, gathered so the build's signature stays small.
+pub struct BuildInputs<'a> {
+    pub basis: &'a Arc<SurfaceBasis>,
+    pub density: Option<&'a Arc<DensityField>>,
+    pub channels: &'a std::collections::BTreeMap<String, Vec<f32>>,
+    pub base: &'a [Vec3],
+    pub faces: &'a [Face],
+    pub bvh: &'a Bvh,
+}
+
 /// Placement and spatial hash derived from a spec and the base surface.
 #[derive(Clone, Debug)]
 pub struct GeneratorCache {
@@ -124,16 +134,8 @@ pub struct GeneratorCache {
 
 impl GeneratorCache {
     /// Scatter `spec.count` instances over `base` and index them, reusing whatever `previous` still has right.
-    pub fn build(
-        spec: &GeneratorSpec,
-        basis: &Arc<SurfaceBasis>,
-        density: Option<&Arc<DensityField>>,
-        channels: &std::collections::BTreeMap<String, Vec<f32>>,
-        base: &[Vec3],
-        faces: &[Face],
-        bvh: &Bvh,
-        previous: Option<&GeneratorCache>,
-    ) -> GeneratorCache {
+    pub fn build(spec: &GeneratorSpec, inputs: &BuildInputs<'_>, previous: Option<&GeneratorCache>) -> GeneratorCache {
+        let BuildInputs { basis, density, channels, base, faces, bvh } = *inputs;
         let same_density = |p: &GeneratorCache| match (&p.density, density) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
