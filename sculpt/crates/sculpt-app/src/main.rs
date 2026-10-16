@@ -42,6 +42,45 @@ fn gpu_setup() -> WgpuSetup {
     WgpuSetup::CreateNew(setup)
 }
 
+/// `source>target:strength[:invert]`, for example `cavity>size:1` or `slope>size:-0.6:invert`. Sources: slope, height, noise,
+/// cavity, curvature, ao, thickness, channel, random, index. Targets: size, height, lift, tilt.
+fn parse_map_row(text: &str) -> Option<sculpt_core::generator::mapping::AttributeRow> {
+    use sculpt_core::bake::MeshAttribute;
+    use sculpt_core::generator::mapping::{AttributeRow, AttributeSource, AttributeTarget};
+    let (path, rest) = text.split_once(':')?;
+    let (source, target) = path.split_once('>')?;
+    let source = match source {
+        "slope" => AttributeSource::Slope { axis: [0.0, 1.0, 0.0] },
+        "height" => AttributeSource::Height { axis: [0.0, 1.0, 0.0], from: -1.0, to: 1.0 },
+        "noise" => AttributeSource::Noise { scale: 3.0, seed: 1 },
+        "cavity" => AttributeSource::Mesh { attribute: MeshAttribute::Cavity },
+        "curvature" => AttributeSource::Mesh { attribute: MeshAttribute::Curvature },
+        "ao" => AttributeSource::Mesh { attribute: MeshAttribute::AmbientOcclusion },
+        "thickness" => AttributeSource::Mesh { attribute: MeshAttribute::Thickness },
+        "channel" => AttributeSource::Channel { name: "paint.mask".into() },
+        "random" => AttributeSource::Random { seed: 1 },
+        "index" => AttributeSource::Index,
+        other => {
+            eprintln!("--demo-map: unknown source '{other}'");
+            return None;
+        }
+    };
+    let target = match target {
+        "size" => AttributeTarget::Size,
+        "height" => AttributeTarget::Stretch,
+        "lift" => AttributeTarget::Lift,
+        "tilt" => AttributeTarget::Tilt,
+        other => {
+            eprintln!("--demo-map: unknown target '{other}'");
+            return None;
+        }
+    };
+    let mut f = rest.split(':');
+    let mut row = AttributeRow::new(source, target, f.next()?.parse().ok()?);
+    row.remap.invert = f.next() == Some("invert");
+    Some(row)
+}
+
 /// `even`, `clusters[:scale:coverage:softness:seed]`, `facing[:down|up|x|-x|z|-z[:tightness]]` or `painted[:channel]`.
 fn parse_density(text: &str) -> Option<sculpt_core::generator::density::Density> {
     use sculpt_core::generator::density::Density;
@@ -138,6 +177,7 @@ fn main() -> eframe::Result {
     let mut size = [1600.0f32, 1000.0];
     let (mut shots_dir, mut shot_times) = (None::<PathBuf>, Vec::<f32>::new());
     let mut demo_density = None::<sculpt_core::generator::density::Density>;
+    let mut demo_rows: Vec<sculpt_core::generator::mapping::AttributeRow> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--level" => opts.level = args.next().and_then(|v| v.parse().ok()).unwrap_or(7).clamp(1, 11),
@@ -149,6 +189,11 @@ fn main() -> eframe::Result {
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-layers" => opts.demo_layers = true,
             "--demo-sweep" => opts.demo_sweep = true,
+            "--demo-map" => {
+                if let Some(row) = args.next().and_then(|v| parse_map_row(&v)) {
+                    demo_rows.push(row);
+                }
+            }
             "--demo-density" => demo_density = args.next().and_then(|v| parse_density(&v)),
             "--demo-sweep-shots" => shots_dir = args.next().map(PathBuf::from),
             "--demo-sweep-times" => shot_times = args.next().map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect()).unwrap_or_default(),
@@ -170,6 +215,9 @@ fn main() -> eframe::Result {
         let _ = std::fs::create_dir_all(&dir);
         opts.sweep_shots = Some((dir, shot_times));
         opts.demo_sweep = true;
+    }
+    if !demo_rows.is_empty() {
+        opts.demo_generator.get_or_insert_with(sculpt_core::generator::layer::GeneratorSpec::default).mapping = demo_rows;
     }
     if let Some(d) = demo_density {
         opts.demo_generator.get_or_insert_with(sculpt_core::generator::layer::GeneratorSpec::default).density = d;

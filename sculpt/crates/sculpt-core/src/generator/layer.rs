@@ -21,6 +21,7 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
 use super::density::{Density, DensityField};
+use super::mapping::{AttributeRow, Mapper};
 use super::place::{SurfaceSample, SurfaceSampler};
 use super::{BoolOp, EvalParams, Instance, InstanceSet, Primitive, affected_leaves, eval_vertex, frame_from_normal};
 use crate::bvh::Bvh;
@@ -62,6 +63,9 @@ pub struct GeneratorSpec {
     /// Where on the surface the instances gather. The count stays fixed; a density redistributes it.
     #[serde(default)]
     pub density: Density,
+    /// Rows that let the surface set each instance's size, height, lift and lean. See [`super::mapping`].
+    #[serde(default)]
+    pub mapping: Vec<AttributeRow>,
 }
 
 impl Default for GeneratorSpec {
@@ -80,6 +84,7 @@ impl Default for GeneratorSpec {
             tilt: 0.0,
             lift_var: 0.0,
             density: Density::Even,
+            mapping: Vec::new(),
         }
     }
 }
@@ -123,6 +128,7 @@ impl GeneratorCache {
         spec: &GeneratorSpec,
         basis: &Arc<SurfaceBasis>,
         density: Option<&Arc<DensityField>>,
+        channels: &std::collections::BTreeMap<String, Vec<f32>>,
         base: &[Vec3],
         faces: &[Face],
         bvh: &Bvh,
@@ -149,27 +155,34 @@ impl GeneratorCache {
             }),
         };
         let seed = spec.seed;
+        let mapper = Mapper::new(&spec.mapping, channels);
+        let count = samples.len();
         let instances = samples
             .iter()
             .enumerate()
             .map(|(i, s)| {
                 let i = i as u64;
+                // What the surface says about this instance (empty rows say nothing).
+                let m = mapper.map(s, i as usize, count, |stream, k| unit_random(seed ^ MAP_STREAM ^ stream as u64, k));
                 let spin = if spec.random_spin { unit_random(seed, i) * std::f32::consts::TAU } else { 0.0 };
                 // Each kind of variation draws from its own stream, so changing one never reshuffles another.
-                let size = spec.size * (1.0 + spec.size_var * signed_random(seed ^ SIZE_STREAM, i)).max(0.05);
-                let axes = Vec3::new(
+                let size = spec.size * (1.0 + spec.size_var * signed_random(seed ^ SIZE_STREAM, i)).max(0.05) * m.size.max(0.05);
+                let mut axes = Vec3::new(
                     1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i),
                     1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 1),
                     1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 2),
                 )
                 .max(Vec3::splat(0.05));
-                let lift = spec.lift + spec.lift_var * signed_random(seed ^ LIFT_STREAM, i);
-                let up = lean(s.normal, spec.tilt.to_radians() * unit_random(seed ^ TILT_STREAM, i), unit_random(seed ^ TILT_STREAM, i + (1 << 40)) * std::f32::consts::TAU);
+                axes.y *= m.stretch.max(0.05);
+                let lift = spec.lift + spec.lift_var * signed_random(seed ^ LIFT_STREAM, i) + m.lift;
+                let max_tilt = (spec.tilt + m.tilt_degrees).clamp(0.0, 89.0).to_radians();
+                let up = lean(s.normal, max_tilt * unit_random(seed ^ TILT_STREAM, i), unit_random(seed ^ TILT_STREAM, i + (1 << 40)) * std::f32::consts::TAU);
                 Instance::new(spec.primitive, s.position + s.normal * (lift * size), frame_from_normal(up, spin), axes * size)
             })
             .collect();
         // The largest an instance can grow, which bounds how far it can reach.
-        let biggest = spec.size * (1.0 + spec.size_var) * (1.0 + spec.stretch_var);
+        let mapped_growth: f32 = spec.mapping.iter().map(|r| r.max_factor()).product();
+        let biggest = spec.size * (1.0 + spec.size_var) * (1.0 + spec.stretch_var) * mapped_growth;
         let reach = if spec.op == BoolOp::Subtract { 0.0 } else { 0.25 * biggest };
         let set = InstanceSet::new(instances, reach);
         let boxes: Vec<Aabb> = (0..set.len()).filter(|&i| set.is_active(i)).map(|i| set.aabb(i)).collect();
@@ -216,6 +229,7 @@ const STRETCH_STREAM: u64 = 0x7C15_93B2_44D1_F002;
 const LIFT_STREAM: u64 = 0x3AF8_61E9_B2C4_D003;
 const TILT_STREAM: u64 = 0x96D2_0E47_58A3_C004;
 const ORDER_STREAM: u64 = 0xE410_7B6D_91F2_A005;
+const MAP_STREAM: u64 = 0x1D8B_44F0_C6A7_E006;
 
 /// Deterministic value in `[-1, 1)`.
 fn signed_random(seed: u64, i: u64) -> f32 {

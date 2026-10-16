@@ -350,7 +350,8 @@ impl Document {
         layer.parent = parent;
         let basis = self.generator_basis();
         let density = self.density_for(&spec, None, false);
-        layer.gen_cache = Some(std::sync::Arc::new(GeneratorCache::build(&spec, &basis, density.as_ref(), &self.base, &self.faces, &self.bvh, None)));
+        self.ensure_mapping_channels(&spec);
+        layer.gen_cache = Some(std::sync::Arc::new(GeneratorCache::build(&spec, &basis, density.as_ref(), &self.channels, &self.base, &self.faces, &self.bvh, None)));
         layer.generator = Some(spec);
         self.exec("Add generator", vec![StructOp::Insert { index, layer: Box::new(layer) }]);
         Ok(id)

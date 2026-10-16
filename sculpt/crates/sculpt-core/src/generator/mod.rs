@@ -35,6 +35,7 @@ pub mod adf;
 pub mod density;
 pub mod instances;
 pub mod layer;
+pub mod mapping;
 pub mod place;
 pub mod refine;
 pub mod schedule;

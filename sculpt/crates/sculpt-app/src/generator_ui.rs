@@ -11,7 +11,9 @@ use std::time::Instant;
 use egui::{RichText, Ui};
 use sculpt_core::LayerId;
 use sculpt_core::generator::density::Density;
+use sculpt_core::bake::MeshAttribute;
 use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::mapping::{AttributeRow, AttributeSource, AttributeTarget};
 use sculpt_core::generator::{BoolOp, Primitive};
 
 use crate::app::SculptApp;
@@ -84,6 +86,58 @@ impl EditTimer {
     }
 }
 
+const AXES: [(&str, [f32; 3]); 6] = [("Down (ground)", [0.0, -1.0, 0.0]), ("Up (top)", [0.0, 1.0, 0.0]), ("+X side", [1.0, 0.0, 0.0]), ("-X side", [-1.0, 0.0, 0.0]), ("+Z side", [0.0, 0.0, 1.0]), ("-Z side", [0.0, 0.0, -1.0])];
+
+/// A drop-down for a direction, from the six axes. Returns true if the choice changed.
+fn axis_combo(ui: &mut Ui, id: egui::Id, axis: &mut [f32; 3]) -> bool {
+    let current = AXES.iter().find(|(_, a)| a == axis).map_or("Custom", |(n, _)| *n);
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id).selected_text(current).show_ui(ui, |ui| {
+        for (name, a) in AXES {
+            if ui.selectable_label(current == name, name).clicked() {
+                *axis = a;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// Rows offered by the "Add row" menu, each a sensible starting point to adjust.
+fn row_presets(vertical_range: (f32, f32)) -> Vec<(&'static str, AttributeRow)> {
+    let mut steep = AttributeRow::new(AttributeSource::Slope { axis: [0.0, 1.0, 0.0] }, AttributeTarget::Size, -0.6);
+    steep.remap.invert = true;
+    let mut low = AttributeRow::new(AttributeSource::Height { axis: [0.0, 1.0, 0.0], from: vertical_range.0, to: vertical_range.1 }, AttributeTarget::Size, 1.0);
+    low.remap.invert = true;
+    let mut convex = AttributeRow::new(AttributeSource::Mesh { attribute: MeshAttribute::Curvature }, AttributeTarget::Lift, 0.4);
+    convex.remap.in_min = 0.45;
+    convex.remap.in_max = 0.75;
+    vec![
+        ("Cavity -> bigger in the hollows", AttributeRow::new(AttributeSource::Mesh { attribute: MeshAttribute::Cavity }, AttributeTarget::Size, 1.0)),
+        ("Steep slopes -> smaller", steep),
+        ("Low down -> bigger", low),
+        ("Noise -> varied size", AttributeRow::new(AttributeSource::Noise { scale: 3.0, seed: 1 }, AttributeTarget::Size, 0.8)),
+        ("Convex edges -> stand proud", convex),
+        ("Random -> lean", AttributeRow::new(AttributeSource::Random { seed: 1 }, AttributeTarget::Tilt, 25.0)),
+        ("Order -> growing size", AttributeRow::new(AttributeSource::Index, AttributeTarget::Size, 1.0)),
+    ]
+}
+
+fn source_options(vertical_range: (f32, f32)) -> Vec<AttributeSource> {
+    vec![
+        AttributeSource::Slope { axis: [0.0, 1.0, 0.0] },
+        AttributeSource::Height { axis: [0.0, 1.0, 0.0], from: vertical_range.0, to: vertical_range.1 },
+        AttributeSource::Noise { scale: 3.0, seed: 1 },
+        AttributeSource::Mesh { attribute: MeshAttribute::Cavity },
+        AttributeSource::Mesh { attribute: MeshAttribute::Curvature },
+        AttributeSource::Mesh { attribute: MeshAttribute::AmbientOcclusion },
+        AttributeSource::Mesh { attribute: MeshAttribute::Thickness },
+        AttributeSource::Channel { name: "paint.mask".into() },
+        AttributeSource::Random { seed: 1 },
+        AttributeSource::Index,
+    ]
+}
+
 fn op_label(op: BoolOp) -> &'static str {
     match op {
         BoolOp::Add => "Add",
@@ -126,6 +180,7 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     let timing = app.gen_timer.summary();
     let (settle, work_last, work_max) = app.gen_timer.catch_up();
     let pending = app.doc.as_ref().map_or(0, |d| d.pending_leaves());
+    let vertical_range = app.doc.as_ref().map_or((-1.0, 1.0), |d| (d.bounds().min.y, d.bounds().max.y));
     let frame_ms = app.stats.frame_ms;
     let mut next = spec.clone();
     let (mut changed, mut coalesce) = (false, false);
@@ -187,18 +242,7 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
                 note(&prop(ui, "Pattern seed", |ui| ui.add(egui::DragValue::new(seed).speed(0.2))), &mut changed, &mut coalesce);
             }
             Density::Facing { axis, sharpness } => {
-                const AXES: [(&str, [f32; 3]); 6] = [("Down (ground)", [0.0, -1.0, 0.0]), ("Up (top)", [0.0, 1.0, 0.0]), ("+X side", [1.0, 0.0, 0.0]), ("-X side", [-1.0, 0.0, 0.0]), ("+Z side", [0.0, 0.0, 1.0]), ("-Z side", [0.0, 0.0, -1.0])];
-                let current = AXES.iter().find(|(_, a)| a == axis).map_or("Custom", |(n, _)| *n);
-                prop(ui, "Faces", |ui| {
-                    egui::ComboBox::from_id_salt(("gen_facing", id)).selected_text(current).show_ui(ui, |ui| {
-                        for (name, a) in AXES {
-                            if ui.selectable_label(current == name, name).clicked() {
-                                *axis = a;
-                                changed = true;
-                            }
-                        }
-                    })
-                });
+                changed |= prop(ui, "Faces", |ui| axis_combo(ui, egui::Id::new(("gen_facing", id)), axis));
                 note(&prop(ui, "Tightness", |ui| ui.add(egui::Slider::new(sharpness, 0.3..=6.0).logarithmic(true).max_decimals(1))).on_hover_text("Higher means the surface has to face that way more squarely."), &mut changed, &mut coalesce);
             }
             Density::Painted { channel } => {
@@ -210,6 +254,88 @@ pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
                 ui.label(RichText::new("Paint it with the Mask tool: white pulls instances in, black keeps them out.").small().color(weak));
             }
         }
+        // Attribute rows: the surface decides how each instance looks.
+        ui.add_space(6.0);
+        ui.label(RichText::new("ATTRIBUTES").size(fs * 0.8).color(weak).extra_letter_spacing(0.6));
+        ui.label(RichText::new("Let the surface set size, height, lift and lean.").small().color(weak));
+        let mut remove = None;
+        for (n, row) in next.mapping.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut row.enabled, "").changed() {
+                        changed = true;
+                    }
+                    egui::ComboBox::from_id_salt(("gen_row_source", id, n)).width(120.0).selected_text(row.source.label()).show_ui(ui, |ui| {
+                        for option in source_options(vertical_range) {
+                            if ui.selectable_label(row.source.label() == option.label(), option.label()).clicked() && row.source.label() != option.label() {
+                                row.source = option;
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.label("->");
+                    egui::ComboBox::from_id_salt(("gen_row_target", id, n)).width(70.0).selected_text(row.target.label()).show_ui(ui, |ui| {
+                        for t in AttributeTarget::ALL {
+                            if ui.selectable_label(row.target == t, t.label()).clicked() && row.target != t {
+                                row.target = t;
+                                changed = true;
+                            }
+                        }
+                    });
+                    if ui.small_button("x").on_hover_text("Remove this row").clicked() {
+                        remove = Some(n);
+                    }
+                });
+                match &mut row.source {
+                    AttributeSource::Slope { axis } => {
+                        changed |= prop(ui, "Facing", |ui| axis_combo(ui, egui::Id::new(("gen_row_axis", id, n)), axis));
+                    }
+                    AttributeSource::Height { axis, from, to } => {
+                        changed |= prop(ui, "Along", |ui| axis_combo(ui, egui::Id::new(("gen_row_axis", id, n)), axis));
+                        note(&prop(ui, "From", |ui| ui.add(egui::DragValue::new(from).speed(0.01).max_decimals(3))), &mut changed, &mut coalesce);
+                        note(&prop(ui, "To", |ui| ui.add(egui::DragValue::new(to).speed(0.01).max_decimals(3))), &mut changed, &mut coalesce);
+                    }
+                    AttributeSource::Noise { scale, seed } => {
+                        note(&prop(ui, "Scale", |ui| ui.add(egui::Slider::new(scale, 0.5..=12.0).logarithmic(true).max_decimals(1))), &mut changed, &mut coalesce);
+                        note(&prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(seed).speed(0.2))), &mut changed, &mut coalesce);
+                    }
+                    AttributeSource::Random { seed } => note(&prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(seed).speed(0.2))), &mut changed, &mut coalesce),
+                    AttributeSource::Channel { name } => {
+                        let before = name.clone();
+                        let r = prop(ui, "Channel", |ui| ui.text_edit_singleline(name));
+                        if r.lost_focus() && *name != before {
+                            changed = true;
+                        }
+                    }
+                    AttributeSource::Mesh { .. } | AttributeSource::Index => {}
+                }
+                let (lo, hi) = match row.target {
+                    AttributeTarget::Tilt => (-90.0, 90.0),
+                    _ => (-3.0, 3.0),
+                };
+                note(&prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut row.strength, lo..=hi).max_decimals(2))).on_hover_text("Size and height are multiplied by 1 + strength x value. Lift adds it, in sizes. Lean adds it, in degrees."), &mut changed, &mut coalesce);
+                note(&prop(ui, "From value", |ui| ui.add(egui::Slider::new(&mut row.remap.in_min, 0.0..=1.0).max_decimals(2))).on_hover_text("Source values at or below this count as 0."), &mut changed, &mut coalesce);
+                note(&prop(ui, "To value", |ui| ui.add(egui::Slider::new(&mut row.remap.in_max, 0.0..=1.0).max_decimals(2))).on_hover_text("Source values at or above this count as 1."), &mut changed, &mut coalesce);
+                prop(ui, "", |ui| {
+                    if ui.checkbox(&mut row.remap.invert, "Invert").changed() {
+                        changed = true;
+                    }
+                });
+            });
+        }
+        if let Some(n) = remove {
+            next.mapping.remove(n);
+            changed = true;
+        }
+        ui.menu_button("+ Add row", |ui| {
+            for (name, preset) in row_presets(vertical_range) {
+                if ui.button(name).clicked() {
+                    next.mapping.push(preset);
+                    changed = true;
+                    ui.close();
+                }
+            }
+        });
         prop(ui, "", |ui| {
             if ui.checkbox(&mut next.random_spin, "Random spin").changed() {
                 changed = true;
