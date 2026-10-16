@@ -9,6 +9,8 @@ use std::time::Instant;
 
 use glam::Vec3;
 use sculpt_core::generator::adf::uniform_surface_nets;
+use sculpt_core::generator::remesh::{RemeshParams, non_manifold_edges, remesh};
+use sculpt_core::{Document, mesh::PolyMesh};
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::generator::{BoolOp, InstanceSet, Primitive};
 use sculpt_core::geom::Aabb;
@@ -77,9 +79,15 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
     }
 
     let full = |p: Vec3| field(&base, &tiers, tiers.len(), p) + (grain.sample(p) - 0.5) * 0.03;
+    // The old extractor, for comparison.
     let t = Instant::now();
-    let mesh = uniform_surface_nets(&full, bounds, voxel);
-    println!("rock: voxel {voxel}, {} tris, {:.0} ms, {} non-manifold edges", mesh.tris.len(), t.elapsed().as_secs_f64() * 1e3, bad_edges(&mesh));
-    render(&to_document(&mesh)?, &views, 520, out)?;
+    let old = uniform_surface_nets(&full, bounds, voxel);
+    println!("old surface nets: {} tris, {:.0} ms, {} non-manifold edges", old.tris.len(), t.elapsed().as_secs_f64() * 1e3, bad_edges(&old));
+    // The remesher: manifold quads, sparse evaluation. The grain adds gradient, hence the Lipschitz bound.
+    let t = Instant::now();
+    let m = remesh(&full, bounds, &RemeshParams { voxel, lipschitz: 1.3 });
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    println!("remesh: {} quads, {ms:.0} ms, {} non-manifold edges, {} of {} samples evaluated", m.quads.len(), non_manifold_edges(&m.quads), m.evaluated, m.total);
+    render(&Document::from_mesh(m.into_poly_mesh())?, &views, 520, out)?;
     Ok(())
 }
