@@ -79,3 +79,40 @@ fn hidden_generator_layers_are_left_out() {
     let (_, stats) = doc.solidify(&settings()).unwrap();
     assert_eq!(stats.layers, 0);
 }
+
+#[test]
+fn a_second_solidify_reuses_the_base_distances_and_gives_the_same_mesh() {
+    let mut doc = Document::from_mesh(quad_sphere(4, 1.0)).unwrap();
+    doc.insert_generator("cuts", Placement::Top, spec(BoolOp::Subtract, Primitive::Box, 8, 0.4, 0.7, 5)).unwrap();
+    let (first, a) = doc.solidify(&settings()).unwrap();
+    let (second, b) = doc.solidify(&settings()).unwrap();
+    assert!(a.base_misses > 0 && a.base_hits < a.base_misses, "a cold call computes: {a:?}");
+    assert_eq!(b.base_misses, 0, "nothing new to compute: {b:?}");
+    assert!(b.base_hits > 0);
+    assert_eq!(first.faces, second.faces);
+    assert_eq!(first.positions, second.positions);
+}
+
+#[test]
+fn editing_a_cutter_keeps_most_of_the_cache() {
+    let mut doc = Document::from_mesh(quad_sphere(4, 1.0)).unwrap();
+    let id = doc.insert_generator("cuts", Placement::Top, spec(BoolOp::Subtract, Primitive::Box, 8, 0.4, 0.7, 5)).unwrap();
+    doc.solidify(&settings()).unwrap();
+    let mut meta = doc.layer(id).unwrap().meta();
+    let mut g = meta.generator.clone().unwrap();
+    g.size = 0.45;
+    meta.generator = Some(g);
+    doc.set_layer_meta(id, meta, false).unwrap();
+    let (_, stats) = doc.solidify(&settings()).unwrap();
+    assert!(stats.base_hits > stats.base_misses * 4, "most distances are reused: {stats:?}");
+}
+
+#[test]
+fn changing_the_surface_invalidates_the_cache() {
+    let mut doc = Document::from_mesh(quad_sphere(3, 1.0)).unwrap();
+    doc.solidify(&settings()).unwrap();
+    // Subdividing moves the surface's vertices, so the old distances must not be reused for it.
+    doc.subdivide().unwrap();
+    let (_, stats) = doc.solidify(&settings()).unwrap();
+    assert!(stats.base_misses > 0, "{stats:?}");
+}

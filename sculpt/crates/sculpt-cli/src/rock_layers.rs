@@ -63,6 +63,21 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         "solidify: {} layers, {} quads in {ms:.0} ms (scatter {:.0}, extract {:.0}); {} of {} samples evaluated; {bad} non-manifold edges",
         stats.layers, stats.quads, stats.scatter_ms, stats.extract_ms, stats.evaluated, stats.total
     );
+    // Repeat, then edit one layer, to see what the base-distance cache buys.
+    let t = Instant::now();
+    let (_, again) = doc.solidify(&SolidSettings { voxel, grain: Some(Grain { amplitude: 0.03, scale: 9.0, seed: seed as u32 + 9 }) })?;
+    println!("again, nothing changed: {:.0} ms ({} base distances reused, {} computed)", t.elapsed().as_secs_f64() * 1e3, again.base_hits, again.base_misses);
+    let big = doc.layers().iter().find(|l| l.name == "Big cuts").map(|l| l.id);
+    if let Some(id) = big {
+        let mut meta = doc.layer(id).expect("layer").meta();
+        let mut g = meta.generator.clone().expect("generator");
+        g.size *= 1.1;
+        meta.generator = Some(g);
+        doc.set_layer_meta(id, meta, false)?;
+        let t = Instant::now();
+        let (_, edited) = doc.solidify(&SolidSettings { voxel, grain: Some(Grain { amplitude: 0.03, scale: 9.0, seed: seed as u32 + 9 }) })?;
+        println!("after growing the big cuts 10%: {:.0} ms ({} base distances reused, {} computed)", t.elapsed().as_secs_f64() * 1e3, edited.base_hits, edited.base_misses);
+    }
     let views = [View { yaw: 0.6, pitch: 0.35, overlay: None }, View { yaw: 2.4, pitch: 0.2, overlay: None }];
     render(&Document::from_mesh(mesh)?, &views, 520, out)?;
     Ok(())

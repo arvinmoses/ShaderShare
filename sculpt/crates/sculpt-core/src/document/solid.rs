@@ -8,6 +8,10 @@
 //! A generator layer scatters on the surface *below* it, so each layer after the first gets a coarse extraction of the
 //! field so far to scatter on. That is what lets small chips land on the faces a big cut made.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use glam::Vec3;
@@ -40,8 +44,79 @@ pub struct SolidSettings {
     pub grain: Option<Grain>,
 }
 
+/// Hashes a key that is already well mixed.
+#[derive(Default)]
+struct Mixed(u64);
+
+impl Hasher for Mixed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 ^= self.0 >> 32;
+    }
+}
+
+const SHARDS: usize = 64;
+/// Entries past which the cache starts over, so a long session cannot grow it without bound.
+const CACHE_LIMIT: usize = 12_000_000;
+
+/// Distances from the sculpted surface, remembered by lattice point between solidify calls. They depend only on that
+/// surface and the lattice spacing, not on the generator layers, so editing a cutter reuses all of them. The lattice is
+/// aligned to multiples of the spacing in world space, so a changed margin around the shape still lands on the same points.
+pub(crate) struct BaseCache {
+    surface: u64,
+    voxel_bits: u32,
+    shards: Vec<Mutex<HashMap<u64, f32, BuildHasherDefault<Mixed>>>>,
+    entries: AtomicUsize,
+}
+
+impl BaseCache {
+    fn new(surface: u64, voxel: f32) -> BaseCache {
+        BaseCache { surface, voxel_bits: voxel.to_bits(), shards: (0..SHARDS).map(|_| Mutex::default()).collect(), entries: AtomicUsize::new(0) }
+    }
+
+    fn key(p: Vec3, voxel: f32) -> u64 {
+        let q = |v: f32| ((v / voxel).round() as i64 & 0x1F_FFFF) as u64;
+        q(p.x) | q(p.y) << 21 | q(p.z) << 42
+    }
+
+    /// The cached value at `p`, or `compute()` stored for next time. Returns whether it was a hit.
+    fn get(&self, p: Vec3, voxel: f32, compute: impl FnOnce() -> f32) -> (f32, bool) {
+        let key = Self::key(p, voxel);
+        let shard = &self.shards[(key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % SHARDS];
+        if let Some(&v) = shard.lock().unwrap().get(&key) {
+            return (v, true);
+        }
+        let v = compute();
+        shard.lock().unwrap().insert(key, v);
+        self.entries.fetch_add(1, Ordering::Relaxed);
+        (v, false)
+    }
+}
+
+/// A cheap fingerprint of the sculpted surface, to know when cached distances are stale.
+fn fingerprint(positions: &[Vec3]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ positions.len() as u64;
+    for p in positions {
+        for v in p.to_array() {
+            h = (h ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SolidStats {
+    /// Distances to the sculpted surface taken from the cache, and computed.
+    pub base_hits: usize,
+    pub base_misses: usize,
     pub layers: usize,
     pub quads: usize,
     pub scatter_ms: f64,
@@ -144,13 +219,33 @@ impl Document {
         stats.layers = specs.len();
         let reach = specs.iter().map(|s| s.size * (1.0 + s.size_var) * (1.0 + s.stretch_var) * 1.8 + s.blend * s.size).fold(0.0, f32::max);
         let pad = reach + 4.0 * settings.voxel;
-        let bounds = Aabb { min: plain.bounds().min - Vec3::splat(pad), max: plain.bounds().max + Vec3::splat(pad) };
+        let snap = |v: Vec3| (v / settings.voxel).floor() * settings.voxel;
+        let bounds = Aabb { min: snap(plain.bounds().min - Vec3::splat(pad)), max: plain.bounds().max + Vec3::splat(pad) };
         // Blocks are skipped when their centre is this far from the surface, so the cutters must be findable that far out.
         let margin = 8.0 * settings.voxel * 0.87 * 1.5;
         let coarse_voxel = (bounds.extent().max_element() / 48.0).max(settings.voxel);
 
         let grain = settings.grain.map(|g| (Noise::new(&NoiseParams { kind: NoiseKind::Fbm, scale: g.scale, octaves: 4, seed: g.seed, ..Default::default() }), g.amplitude));
         let base_field = |p: Vec3| sdf.signed_distance(p, bound);
+        // The final extraction reuses base distances from earlier calls when the surface and spacing are unchanged.
+        let cache = {
+            let surface = fingerprint(plain.positions());
+            let mut slot = self.solid_cache.lock().unwrap();
+            match slot.as_ref() {
+                Some(c) if c.surface == surface && c.voxel_bits == settings.voxel.to_bits() && c.entries.load(Ordering::Relaxed) < CACHE_LIMIT => c.clone(),
+                _ => {
+                    let fresh = Arc::new(BaseCache::new(surface, settings.voxel));
+                    *slot = Some(fresh.clone());
+                    fresh
+                }
+            }
+        };
+        let (hits, misses) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let cached_base = |p: Vec3| {
+            let (v, hit) = cache.get(p, settings.voxel, || base_field(p));
+            if hit { hits.fetch_add(1, Ordering::Relaxed) } else { misses.fetch_add(1, Ordering::Relaxed) };
+            v
+        };
 
         let mut terms: Vec<Term> = Vec::new();
         let t = Instant::now();
@@ -177,7 +272,7 @@ impl Document {
         stats.scatter_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let field = |p: Vec3| {
-            let f = apply_terms(base_field(p), &terms, p);
+            let f = apply_terms(cached_base(p), &terms, p);
             match &grain {
                 Some((noise, amplitude)) => f + (noise.sample(p) - 0.5) * amplitude,
                 None => f,
@@ -188,6 +283,8 @@ impl Document {
         let lipschitz = 1.3 + grain.as_ref().map_or(0.0, |(_, a)| a * 2.0);
         let out = remesh(&field, bounds, &RemeshParams { voxel: settings.voxel, lipschitz });
         stats.extract_ms = t.elapsed().as_secs_f64() * 1e3;
+        stats.base_hits = hits.load(Ordering::Relaxed);
+        stats.base_misses = misses.load(Ordering::Relaxed);
         stats.quads = out.quads.len();
         stats.evaluated = out.evaluated;
         stats.total = out.total;
