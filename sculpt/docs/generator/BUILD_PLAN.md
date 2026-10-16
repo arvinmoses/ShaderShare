@@ -46,3 +46,23 @@ evaluated in stack order, and sculpting on layers above or below keeps working.
 
 Each milestone ends with: release build, `cargo clippy --release --workspace` with no new warnings,
 `cargo test --release --workspace`, and the sculpt-latency guard from the hand-off.
+
+## Remesh and solidify (added after the rock experiments)
+
+Stacked displacement layers fold the surface and never change topology, so a rock built from several generators tore.
+The fix is to treat the stack as a solid for one pass and extract a fresh surface.
+
+- `generator/remesh.rs`: sparse, manifold surface nets over any signed distance field. One vertex per inside region of
+  a cell, so every edge belongs to exactly two quads (tests include a sub-voxel wall, touching balls and a rippled
+  field); blocks far from the surface are skipped. On the rock: 106 ms against 470 ms for plain surface nets, 0
+  non-manifold edges against 40.
+- `Document::solidify` (`document/solid.rs`): base plus plain layers is the starting field; each generator layer combines
+  its instances with a smooth blend (`GeneratorSpec::blend`, a fraction of instance size); each layer scatters on a coarse
+  extraction of the field below it. Returns a mesh; the document is unchanged.
+- `sculpt-cli rock-layers`: the rock as real layers, solidified (about 660 ms at 66k quads, most of it the base mesh
+  distance queries).
+- The ADF was tested on the same rock (13 ms, 19k triangles) but leaves holes at level crossings (214 non-manifold edges),
+  has no smooth blend and cannot show grain on its large triangles. Kept as a possible backend for thousands of cutters.
+
+Not done: the Remesh checkpoint layer in the app (new topology, layers above restart), density and painted channels in the
+scatter, layer opacity and masks in the field, a Noise layer (grain is a setting for now), GPU evaluation.

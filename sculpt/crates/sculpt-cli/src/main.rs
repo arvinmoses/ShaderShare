@@ -22,6 +22,7 @@ mod render;
 mod render_mesh;
 mod rock;
 mod rock_field;
+mod rock_layers;
 mod rock_tiers;
 
 use std::path::{Path, PathBuf};
@@ -51,6 +52,7 @@ fn main() {
         Some("refine-bench") => refine_bench::run(&args[1..]),
         Some("rock") => rock::run(&args[1..]),
         Some("rock-field") => rock_field::run(&args[1..]),
+        Some("rock-layers") => rock_layers::run(&args[1..]),
         Some("rock-tiers") => rock_tiers::run(&args[1..]),
         Some("adf-bench") => adf_bench::run(&args[1..]),
         Some("generator-drag-sim") => generator_drag_sim::run(&args[1..]),

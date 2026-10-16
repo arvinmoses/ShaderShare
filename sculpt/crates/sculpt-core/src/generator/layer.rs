@@ -66,6 +66,14 @@ pub struct GeneratorSpec {
     /// Rows that let the surface set each instance's size, height, lift and lean. See [`super::mapping`].
     #[serde(default)]
     pub mapping: Vec<AttributeRow>,
+    /// How softly this layer meets the surface when the stack is solidified, as a fraction of each instance's size:
+    /// `0` is a hard cut, around `0.25` rounds the join. The live displacement preview ignores it.
+    #[serde(default = "default_blend")]
+    pub blend: f32,
+}
+
+fn default_blend() -> f32 {
+    0.25
 }
 
 impl Default for GeneratorSpec {
@@ -85,6 +93,7 @@ impl Default for GeneratorSpec {
             lift_var: 0.0,
             density: Density::Even,
             mapping: Vec::new(),
+            blend: default_blend(),
         }
     }
 }

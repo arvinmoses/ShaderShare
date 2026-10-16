@@ -10,7 +10,7 @@ use std::time::Instant;
 use glam::Vec3;
 use sculpt_core::generator::adf::uniform_surface_nets;
 use sculpt_core::generator::remesh::{RemeshParams, non_manifold_edges, remesh};
-use sculpt_core::{Document, mesh::PolyMesh};
+use sculpt_core::Document;
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::generator::{BoolOp, InstanceSet, Primitive};
 use sculpt_core::geom::Aabb;

@@ -189,15 +189,15 @@ pub fn remesh<F: Fn(Vec3) -> f32 + Sync>(f: &F, bounds: Aabb, params: &RemeshPar
                 }
                 cell_start[cidx(x, y, z)] = positions.len() as u32;
                 let mut packed = 0u16;
-                for i in 0..8 {
-                    if region[i] != u8::MAX {
-                        packed |= (region[i] as u16) << (2 * i);
+                for (i, &r) in region.iter().enumerate() {
+                    if r != u8::MAX {
+                        packed |= (r as u16) << (2 * i);
                     }
                 }
                 cell_regions[cidx(x, y, z)] = packed;
                 let origin = pos(x, y, z);
-                for r in 0..regions as usize {
-                    positions.push(origin + sum[r] / cnt[r].max(1.0) * vs);
+                for (s, c) in sum.iter().zip(cnt).take(regions as usize) {
+                    positions.push(origin + *s / c.max(1.0) * vs);
                 }
             }
         }
