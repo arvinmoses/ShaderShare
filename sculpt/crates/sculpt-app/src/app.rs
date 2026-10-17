@@ -180,6 +180,8 @@ pub struct SculptApp {
     pub solid_ui: crate::generator_ui::SolidUi,
     /// The document before the last Solidify, kept so undo can bring it back.
     pub solidify_backup: Option<Document>,
+    /// The live preview of the solidified stack (Display menu, and the Solidify section).
+    pub solid_preview: crate::solid_preview::SolidPreview,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -272,6 +274,7 @@ impl SculptApp {
             gen_timer: Default::default(),
             solid_ui: Default::default(),
             solidify_backup: None,
+            solid_preview: Default::default(),
             sweep: None,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
@@ -358,6 +361,9 @@ impl SculptApp {
                     }
                     if std::env::var("SCULPT_DEMO_NOISE").is_ok() {
                         crate::layer_panel::command::execute(self, crate::layer_panel::command::LayerCommand::NewGenerator(sculpt_core::generator::layer::GeneratorKind::Noise));
+                    }
+                    if std::env::var("SCULPT_DEMO_PREVIEW").is_ok() {
+                        self.solid_preview.on = true;
                     }
                     if std::env::var("SCULPT_DEMO_SOLIDIFY").is_ok() {
                         crate::generator_ui::solidify(self);
@@ -759,6 +765,11 @@ impl SculptApp {
 
     // --------------------------------------------------------------- viewport
 
+    /// Time since the last sculpt stroke dab.
+    pub fn last_edit_age(&self) -> Duration {
+        self.last_edit.elapsed()
+    }
+
     fn viewport_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         self.viewport_rect = rect;
@@ -852,6 +863,8 @@ impl SculptApp {
         // Upload + render.
         let ppp = ctx.pixels_per_point();
         let px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
+        crate::solid_preview::tick(self, ui.ctx());
+        let showing_preview = self.solid_preview.shown();
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
             if let Some(doc) = self.doc.as_mut() {
                 // Meshes dense enough that a generator edit would not fit a frame update their surface a little each frame.
@@ -891,13 +904,17 @@ impl SculptApp {
                 if doc.lazy_normals() != self.flat_shading {
                     doc.set_lazy_normals(self.flat_shading);
                 }
-                vp.sync(rs, doc, &self.overlay, custom, std::mem::take(&mut self.pose_weights_changed));
+                let changed = std::mem::take(&mut self.pose_weights_changed);
+                match self.solid_preview.doc.as_mut() {
+                    Some(preview) if self.solid_preview.on => vp.sync(rs, preview, &self.overlay, custom, changed),
+                    _ => vp.sync(rs, doc, &self.overlay, custom, changed),
+                }
                 self.stats.upload = vp.last_upload;
             }
             let t = Instant::now();
             let tau = self.lod_tau_override.or(self.view_detail.tau_px());
             let tau = tau.map(|t| if navigating { t * 2.0 } else { t });
-            let lod = self.doc.as_ref().zip(tau).and_then(|(d, tau)| {
+            let lod = self.doc.as_ref().zip(tau).filter(|_| !showing_preview).and_then(|(d, tau)| {
                 d.lod().map(|tree| crate::viewport::LodInput { tree, bvh: d.bvh(), topology_id: d.topology_id(), tau_px: tau, budget: LOD_BUDGET })
             });
             let tex = vp.render(rs, px, &self.camera, &self.theme, self.overlay_strength, self.cursor, lod);

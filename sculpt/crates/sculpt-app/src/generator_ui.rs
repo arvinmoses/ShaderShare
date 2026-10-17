@@ -400,6 +400,14 @@ fn solidify_section(app: &mut SculptApp, ui: &mut Ui) -> bool {
     section(ui, fs, "solidify", "SOLIDIFY", |ui| {
         ui.label(RichText::new("Turn the whole stack into one clean, closed mesh. Cuts blend softly and nothing folds. The layers are consumed; Undo brings them back.").size(fs * 0.85).color(weak));
         prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.divisions, 40..=400).logarithmic(true)).on_hover_text("Samples along the longest side. Higher keeps finer detail and takes longer."));
+        prop(ui, "", |ui| {
+            if ui.checkbox(&mut app.solid_preview.on, "Live preview").on_hover_text("Show the stack as one clean solid mesh. It follows your edits a moment after you stop; the layers stay editable.").changed() {
+                app.solid_preview.reset();
+            }
+        });
+        if app.solid_preview.on && !app.solid_preview.status.is_empty() {
+            ui.label(RichText::new(format!("Preview: {}", app.solid_preview.status)).size(fs * 0.85).color(weak));
+        }
         if ui.button("Solidify stack").clicked() {
             solidify_now = true;
         }
@@ -439,6 +447,7 @@ pub(crate) fn solidify(app: &mut SculptApp) {
         Ok((new, stats)) => {
             app.status = format!("Solidified {} layers into {} quads in {:.0} ms", stats.layers, stats.quads, started.elapsed().as_secs_f64() * 1e3);
             app.solidify_backup = app.doc.replace(new);
+            app.solid_preview.reset();
             app.layers.selection.clear();
             app.maybe_build_lod();
         }
@@ -450,6 +459,7 @@ pub(crate) fn solidify(app: &mut SculptApp) {
 pub(crate) fn undo_solidify(app: &mut SculptApp) {
     if let Some(old) = app.solidify_backup.take() {
         app.doc = Some(old);
+        app.solid_preview.reset();
         app.layers.selection.clear();
         app.status = "Undo solidify".into();
         app.maybe_build_lod();

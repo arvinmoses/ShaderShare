@@ -178,6 +178,9 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 cmd_button(app, ui, Command::FrameMesh);
                 cmd_button(app, ui, Command::ToggleHud);
                 ui.add(egui::Slider::new(&mut app.overlay_strength, 0.0..=1.0).text("Overlay opacity"));
+                if ui.checkbox(&mut app.solid_preview.on, "Live solid preview").on_hover_text("Show the stack as one clean solid mesh with soft blends. It follows your edits a moment after you stop.").changed() {
+                    app.solid_preview.reset();
+                }
                 ui.separator();
                 ui.label("Shading");
                 for (flat, name, hint) in [(true, "Flat (hard normals)", "One hard normal per triangle. Cheapest: nothing is stored, computed or uploaded for normals."), (false, "Smooth", "Smooth per-vertex normals. Costs time and memory on dense meshes.")] {

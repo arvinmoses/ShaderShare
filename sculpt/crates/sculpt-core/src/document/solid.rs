@@ -198,22 +198,48 @@ impl Document {
         out
     }
 
-    /// Solidify the stack into a clean quad mesh. The document is not changed; the caller decides what to do with the
-    /// result (start a new document from it, which is what a Remesh checkpoint does).
-    pub fn solidify(&self, settings: &SolidSettings) -> Result<(PolyMesh, SolidStats)> {
-        let mut stats = SolidStats::default();
-        let plain = Document::from_mesh(PolyMesh { positions: self.plain_positions(), faces: self.faces.clone() })?;
-        let sdf = MeshSdf::build(plain.bvh(), plain.positions(), plain.faces(), plain.topology());
-        let diagonal = plain.bounds().extent().length().max(1e-3);
-        let bound = diagonal * 2.0;
-
-        // Generator layers that contribute, bottom to top.
-        let specs: Vec<GeneratorSpec> = self
+    /// Everything solidify reads, copied out so it can run on another thread while the document keeps being edited.
+    pub fn solid_input(&self) -> SolidInput {
+        let specs = self
             .composite_order()
             .into_iter()
             .filter(|&i| self.layers[i].gen_cache.is_some() && self.layers[i].scale > 0.0)
             .filter_map(|i| self.layers[i].generator.clone())
             .collect();
+        SolidInput { positions: self.plain_positions(), faces: self.faces.clone(), specs, cache: self.solid_cache.clone() }
+    }
+
+    /// Solidify the stack into a clean quad mesh. The document is not changed; the caller decides what to do with the
+    /// result (start a new document from it, which is what a Remesh checkpoint does).
+    pub fn solidify(&self, settings: &SolidSettings) -> Result<(PolyMesh, SolidStats)> {
+        self.solid_input().run(settings)
+    }
+}
+
+/// A snapshot of a document's stack for [`SolidInput::run`]. It shares the document's distance cache, so a preview run
+/// on a worker thread warms the cache for the next one.
+pub struct SolidInput {
+    positions: Vec<Vec3>,
+    faces: Vec<crate::mesh::Face>,
+    specs: Vec<GeneratorSpec>,
+    cache: Arc<Mutex<Option<Arc<BaseCache>>>>,
+}
+
+impl SolidInput {
+    /// Whether there is any generator layer to solidify.
+    pub fn has_layers(&self) -> bool {
+        !self.specs.is_empty()
+    }
+
+    pub fn run(&self, settings: &SolidSettings) -> Result<(PolyMesh, SolidStats)> {
+        let mut stats = SolidStats::default();
+        let plain = Document::from_mesh(PolyMesh { positions: self.positions.clone(), faces: self.faces.clone() })?;
+        let sdf = MeshSdf::build(plain.bvh(), plain.positions(), plain.faces(), plain.topology());
+        let diagonal = plain.bounds().extent().length().max(1e-3);
+        let bound = diagonal * 2.0;
+
+        // Generator layers that contribute, bottom to top.
+        let specs = &self.specs;
         stats.layers = specs.len();
         let scatter = |s: &&GeneratorSpec| s.kind == GeneratorKind::Scatter;
         let reach = specs.iter().filter(scatter).map(|s| s.size * (1.0 + s.size_var) * (1.0 + s.stretch_var) * 1.8 + s.blend * s.size).fold(0.0, f32::max);
@@ -231,7 +257,7 @@ impl Document {
         // The final extraction reuses base distances from earlier calls when the surface and spacing are unchanged.
         let cache = {
             let surface = fingerprint(plain.positions());
-            let mut slot = self.solid_cache.lock().unwrap();
+            let mut slot = self.cache.lock().unwrap();
             match slot.as_ref() {
                 Some(c) if c.surface == surface && c.voxel_bits == settings.voxel.to_bits() && c.entries.load(Ordering::Relaxed) < CACHE_LIMIT => c.clone(),
                 _ => {
@@ -250,7 +276,7 @@ impl Document {
 
         let mut terms: Vec<Term> = Vec::new();
         let t = Instant::now();
-        for spec in &specs {
+        for spec in specs {
             if spec.kind == GeneratorKind::Noise {
                 terms.push(Term::Noise { noise: spec.noise.build(), amplitude: spec.noise.amplitude });
                 continue;

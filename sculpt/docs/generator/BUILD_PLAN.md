@@ -68,5 +68,10 @@ A noise layer (`GeneratorKind::Noise`) roughens along the normals in the live st
 order when solidified; the app has a Generator menu (Scatter, Noise) and a Solidify section. Solidify caches base
 distances between calls (unchanged: 99 ms, one layer edited: 177 ms on the rock).
 
-Not done: a live preview of the solidified result, density and painted channels in the scatter, layer opacity and masks in
+A live solid preview (Display menu, or the Solidify section) shows the solidified result in place of the live mesh. It is
+built on a worker thread with its own small thread pool from a snapshot (`Document::solid_input`), only after editing
+has paused for 120 ms, so edits never wait for it; the last finished preview stays up until the next replaces it. While
+it is on, sculpt strokes are not visible until the preview catches up.
+
+Not done: density and painted channels in the scatter, layer opacity and masks in
 the field, GPU evaluation.

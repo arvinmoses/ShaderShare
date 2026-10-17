@@ -173,3 +173,21 @@ fn noise_after_cuts_roughens_the_cut_faces_too() {
     assert_eq!(stats.layers, 2);
     assert_eq!(non_manifold_edges(&mesh.faces), 0);
 }
+
+#[test]
+fn a_snapshot_runs_on_another_thread_and_warms_the_documents_cache() {
+    let mut doc = Document::from_mesh(quad_sphere(4, 1.0)).unwrap();
+    doc.insert_generator("cuts", Placement::Top, spec(BoolOp::Subtract, Primitive::Box, 8, 0.4, 0.7, 5)).unwrap();
+    let input = doc.solid_input();
+    assert!(input.has_layers());
+    // The document keeps changing while the snapshot is solidified elsewhere; the snapshot does not see it.
+    let worker = std::thread::spawn(move || input.run(&settings()).unwrap());
+    doc.insert_generator("more", Placement::Top, spec(BoolOp::Subtract, Primitive::Sphere, 20, 0.1, 0.6, 9)).unwrap();
+    let (from_thread, thread_stats) = worker.join().unwrap();
+    assert_eq!(thread_stats.layers, 1);
+    // Solidifying the document afterwards starts from the distances the thread computed.
+    let (_, stats) = doc.solidify(&settings()).unwrap();
+    assert_eq!(stats.layers, 2);
+    assert!(stats.base_hits > stats.base_misses, "the thread's distances are reused: {stats:?}");
+    assert_eq!(non_manifold_edges(&from_thread.faces), 0);
+}

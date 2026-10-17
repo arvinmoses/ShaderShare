@@ -18,6 +18,7 @@ mod layer_panel;
 mod keymap;
 mod panels;
 mod pen;
+mod solid_preview;
 mod test_driver;
 mod theme;
 mod tools;

@@ -22,7 +22,7 @@ use crate::undo::{self, Group, Record, UndoStack};
 use crate::{Error, Result};
 
 mod solid;
-pub use solid::{SolidSettings, SolidStats};
+pub use solid::{SolidInput, SolidSettings, SolidStats};
 
 /// Per-leaf sparse vertex displacements produced by a brush kernel.
 /// Indices are local to the leaf's owned range.
@@ -169,7 +169,7 @@ pub struct Document {
     pub(crate) base_epoch: u64,
     /// Generator stage 0 (see `generator::layer`), valid for one (topology, base epoch).
     /// Base-surface distances remembered by [`Document::solidify`] between calls.
-    pub(crate) solid_cache: std::sync::Mutex<Option<std::sync::Arc<solid::BaseCache>>>,
+    pub(crate) solid_cache: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<solid::BaseCache>>>>,
     pub(crate) gen_basis: Option<(u64, u64, std::sync::Arc<crate::generator::layer::SurfaceBasis>)>,
     /// Level-of-detail tree for dense meshes, and the topology it was built for.
     pub(crate) lod: Option<(u64, std::sync::Arc<crate::lod::LodTree>)>,
@@ -210,7 +210,7 @@ impl Document {
             topology_id: new_topology_id(),
             base_epoch: 0,
             gen_basis: None,
-            solid_cache: std::sync::Mutex::new(None),
+            solid_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
             lazy_normals: false,
             progressive: false,
             pending: BTreeSet::new(),
