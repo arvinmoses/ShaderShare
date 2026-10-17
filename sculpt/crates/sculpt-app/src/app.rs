@@ -184,6 +184,8 @@ pub struct SculptApp {
     pub solid_preview: crate::solid_preview::SolidPreview,
     /// The sculpt waiting aside while the procedural stack below it is edited.
     pub remesh_top: Option<Document>,
+    /// The stack as it was when editing below began, to measure the sculpt against when it is carried as volume.
+    pub remesh_old_stack: Option<sculpt_core::document::SolidInput>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -278,6 +280,7 @@ impl SculptApp {
             solidify_backup: None,
             solid_preview: Default::default(),
             remesh_top: None,
+            remesh_old_stack: None,
             sweep: None,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);

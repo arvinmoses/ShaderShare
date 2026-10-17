@@ -144,6 +144,7 @@ fn check(level: u32, divisions: f32) -> Res<()> {
         println!("after {name}: longest edge {:.4} ({:.1} voxels)", longest(&top), longest(&top) / voxel);
     }
     let mut source = top.take_remesh_source().expect("source");
+    let old_stack = source.solid_input().field(&SolidSettings::new(voxel))?;
     let id = source.layers().iter().find(|l| l.is_generator()).expect("generator").id;
     let mut meta = source.layer(id).expect("layer").meta();
     let mut g = meta.generator.clone().expect("spec");
@@ -151,7 +152,9 @@ fn check(level: u32, divisions: f32) -> Res<()> {
     g.size *= 1.4;
     meta.generator = Some(g);
     source.set_layer_meta(id, meta, false)?;
-    let rebuilt = top.rebuilt_from_source(source)?;
+    let as_volume = std::env::var("SOLID_CARRY").as_deref() == Ok("volume");
+    let rebuilt = if as_volume { top.rebuilt_as_volume(&old_stack, source, &SolidSettings::new(voxel))? } else { top.rebuilt_from_source(source)? };
+    println!("carried as {}", if as_volume { "volume" } else { "layers" });
     println!("after editing the stack below: longest edge {:.4} ({:.1} voxels), non-manifold edges {}", longest(&rebuilt), longest(&rebuilt) / voxel, non_manifold_edges(rebuilt.faces()));
     // Spikes: a vertex carried far off the solid it sits on. Distance of each sculpted vertex from the unsculpted surface.
     let edges: Vec<f32> = rebuilt.faces().iter().flat_map(|f| (0..4).map(move |k| (f[k], f[(k + 1) % 4]))).map(|(a, b)| rebuilt.positions()[a as usize].distance(rebuilt.positions()[b as usize]) / voxel).collect();

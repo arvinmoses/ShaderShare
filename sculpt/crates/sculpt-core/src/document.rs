@@ -23,7 +23,7 @@ use crate::{Error, Result};
 
 mod remesh_layer;
 mod solid;
-pub use solid::{SolidInput, SolidSettings, SolidStats};
+pub use solid::{Extra, SolidInput, SolidSettings, SolidStats, StackField};
 
 /// Per-leaf sparse vertex displacements produced by a brush kernel.
 /// Indices are local to the leaf's owned range.
@@ -174,6 +174,8 @@ pub struct Document {
     pub(crate) remesh_source: Option<Box<Document>>,
     /// The lattice spacing of that remesh.
     pub(crate) remesh_voxel: f32,
+    /// Where sculpting has been baked into the base by carrying it as volume, and how far it reached off the stack.
+    pub(crate) baked_sculpt: Option<(Aabb, f32)>,
     pub(crate) solid_cache: std::sync::Arc<std::sync::Mutex<solid::SolidCaches>>,
     pub(crate) gen_basis: Option<(u64, u64, std::sync::Arc<crate::generator::layer::SurfaceBasis>)>,
     /// Level-of-detail tree for dense meshes, and the topology it was built for.
@@ -217,6 +219,7 @@ impl Document {
             gen_basis: None,
             remesh_source: None,
             remesh_voxel: 0.0,
+            baked_sculpt: None,
             solid_cache: Default::default(),
             lazy_normals: false,
             progressive: false,

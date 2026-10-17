@@ -9,13 +9,19 @@
 //! value is carried onto the new mesh. Each new vertex takes what the old surface held at its closest point,
 //! interpolated across that triangle. Strokes survive moderate changes below them; where a cut removes the sculpted
 //! surface, those strokes go with it, and new surface starts unsculpted.
+//!
+//! [`Document::rebuilt_as_volume`] carries the sculpt as volume instead: the sculpt is the difference between the
+//! distance to the sculpted surface and the old stack's field, and that difference is added to the new stack's field
+//! before one extraction. The result can never fold or tear, wherever the stack moved; the sculpt is baked into the new
+//! base, and the layers start empty again.
 
 use std::collections::BTreeMap;
 
 use glam::Vec3;
 use rayon::prelude::*;
 
-use super::{Document, SolidSettings};
+use super::{Document, Extra, SolidSettings, StackField};
+use crate::geom::Aabb;
 use crate::bvh::Bvh;
 use crate::generator::voxel::MeshSdf;
 use crate::layer_ops::Placement;
@@ -65,9 +71,84 @@ impl Document {
         Ok(out)
     }
 
+    /// Solidify the edited `source` with this document's sculpt carried as volume, measured against `old_stack`, the
+    /// stack as it was when this document's base was made from it.
+    pub fn rebuilt_as_volume(&self, old_stack: &StackField, source: Document, settings: &SolidSettings) -> Result<Document> {
+        let mut out = self.volume_rebuild(old_stack, &source, settings)?;
+        out.set_remesh_source(source, settings.voxel);
+        Ok(out)
+    }
+
+    /// [`Self::rebuilt_as_volume`] without taking `source`, so a failure leaves it with the caller. The result still
+    /// needs [`Self::set_remesh_source`].
+    pub fn volume_rebuild(&self, old_stack: &StackField, source: &Document, settings: &SolidSettings) -> Result<Document> {
+        // The sculpted surface, to measure distances to.
+        let (mut positions, mut faces) = (self.positions.clone(), self.faces.clone());
+        let (bvh, _) = Bvh::build(&mut positions, &mut faces);
+        let topo = Topology::build(positions.len(), &faces);
+        let sculpted = MeshSdf::build_owned(bvh, positions, faces, &topo);
+        // Where the sculpt can be: the strokes in the layers, and whatever earlier rounds baked into the base.
+        let mut region = Aabb::EMPTY;
+        let mut reach = 0.0f32;
+        for (p, b) in self.positions.iter().zip(&self.base) {
+            if p != b {
+                region.grow(*p);
+                region.grow(*b);
+                reach = reach.max(p.distance(*b));
+            }
+        }
+        if let Some((baked, r)) = self.baked_sculpt {
+            region = region.union(&baked);
+            reach = reach.max(r);
+        }
+        let voxel = settings.voxel;
+        let out_mesh = if region.min.x > region.max.x {
+            // Nothing sculpted: just the new stack.
+            source.solidify(settings)?.0
+        } else {
+            // The sculpt only matters near the sculpted surface. It fades out between two and four lattice steps
+            // past the furthest stroke, well inside the region, so the carried field has no jump anywhere (a jump
+            // would let the extraction skip surface and open holes). Away from the surface the stack's field is not a
+            // true distance (an intersect is only bounded there), so the difference means nothing there anyway.
+            let (fade_from, fade_to) = (reach + 2.0 * voxel, reach + 4.0 * voxel);
+            let grow = Vec3::splat(fade_to + voxel);
+            let region = Aabb { min: region.min - grow, max: region.max + grow };
+            let bound = region.extent().length() * 2.0 + 1.0;
+            let carried = |p: Vec3, new_stack: f32| -> f32 {
+                if (p - p.clamp(region.min, region.max)).length_squared() > 0.0 {
+                    return 0.0;
+                }
+                let to_sculpt = sculpted.signed_distance(p, bound);
+                // A stroke also only counts where the new stack's surface is still within its reach: where the surface
+                // it was made on has gone, it fades instead of floating there on its own.
+                let near = (1.0 - smoothstep(fade_from, fade_to, to_sculpt.abs())) * (1.0 - smoothstep(fade_from, fade_to, new_stack.abs()));
+                if near <= 0.0 {
+                    return 0.0;
+                }
+                let d = to_sculpt - old_stack.eval(p);
+                // Unsculpted surface differs from the old stack only by extraction error, under half a lattice step:
+                // count the difference only past that, so untouched surface is exactly the new stack.
+                d * smoothstep(0.5 * voxel, 1.0 * voxel, d.abs()) * near
+            };
+            let extra = Extra { field: &carried, lipschitz: 3.0, bounds: region };
+            source.solid_input().run_with(settings, Some(&extra))?.0
+        };
+        let mut out = self.reprojected(out_mesh, false)?;
+        out.baked_sculpt = if region.min.x > region.max.x { None } else { Some((region, reach)) };
+        out.remesh_voxel = settings.voxel;
+        Ok(out)
+    }
+
     /// A document on `mesh` holding this one's layers, channels and freeze, each new vertex taking the value at its
     /// closest point on this document's base surface.
     pub fn reprojected_onto(&self, mesh: PolyMesh) -> Result<Document> {
+        let mut out = self.reprojected(mesh, true)?;
+        out.baked_sculpt = self.baked_sculpt;
+        Ok(out)
+    }
+
+    /// [`Self::reprojected_onto`], optionally leaving the layers' strokes behind (they were baked into `mesh`).
+    fn reprojected(&self, mesh: PolyMesh, carry_strokes: bool) -> Result<Document> {
         let mut out = Document::from_mesh(mesh)?;
         // Closest points on the old base surface. Its own tree follows the sculpted positions, so build one for the base.
         let (mut positions, mut faces) = (self.base.clone(), self.faces.clone());
@@ -130,7 +211,7 @@ impl Document {
             .iter()
             .map(|layer| {
                 let mut dense = vec![Vec3::ZERO; self.vertex_count()];
-                for l in layer.allocated_leaves() {
+                for l in layer.allocated_leaves().into_iter().filter(|_| carry_strokes) {
                     let r = self.bvh.leaves[l as usize].owned_range();
                     dense[r].copy_from_slice(layer.chunks[l as usize].as_ref().unwrap());
                 }

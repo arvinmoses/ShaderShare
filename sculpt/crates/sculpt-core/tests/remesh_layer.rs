@@ -89,3 +89,72 @@ fn editing_the_stack_below_carries_the_sculpt_onto_the_new_mesh() {
     assert!(height > unsculpted + 0.5 * (sculpted - unsculpted), "the stroke survives: {unsculpted} -> {sculpted}, rebuilt {height}");
 }
 
+
+/// Edit the stack below `top` with `change` and carry the sculpt across as volume.
+fn round_trip_as_volume(top: &mut Document, change: impl FnOnce(&mut Document)) -> Document {
+    let mut source = top.take_remesh_source().unwrap();
+    let settings = SolidSettings::new(VOXEL);
+    let old = source.solid_input().field(&settings).unwrap();
+    change(&mut source);
+    top.rebuilt_as_volume(&old, source, &settings).unwrap()
+}
+
+fn reseed(source: &mut Document, seed: u64) {
+    let id = source.layers().iter().find(|l| l.is_generator()).unwrap().id;
+    let mut meta = source.layer(id).unwrap().meta();
+    let mut g = meta.generator.clone().unwrap();
+    g.seed = seed;
+    meta.generator = Some(g);
+    source.set_layer_meta(id, meta, false).unwrap();
+}
+
+fn stretched_edges(doc: &Document, limit: f32) -> usize {
+    doc.faces().iter().flat_map(|f| (0..4).map(move |k| (f[k], f[(k + 1) % 4]))).filter(|&(a, b)| doc.positions()[a as usize].distance(doc.positions()[b as usize]) > limit).count()
+}
+
+#[test]
+fn volume_carry_keeps_the_sculpt_and_bakes_it_into_the_base() {
+    let mut top = remesh(stack());
+    let unsculpted = top_height(&top);
+    stroke(&mut top);
+    let sculpted = top_height(&top);
+    let out = round_trip_as_volume(&mut top, |_| {});
+    assert_eq!(non_manifold_edges(out.faces()), 0);
+    assert!(out.has_remesh_source());
+    assert!(out.layers().iter().all(|l| l.allocated_leaves().is_empty()), "the strokes are in the base now, the layers start empty");
+    let height = top_height(&out);
+    assert!((height - sculpted).abs() < 2.0 * VOXEL, "the sculpt is kept: {unsculpted} -> {sculpted}, now {height}");
+}
+
+#[test]
+fn volume_carry_over_a_changed_stack_cannot_fold() {
+    let mut top = remesh(stack());
+    let unsculpted = top_height(&top);
+    stroke(&mut top);
+    let sculpted = top_height(&top);
+    let out = round_trip_as_volume(&mut top, |s| reseed(s, 11));
+    assert_eq!(non_manifold_edges(out.faces()), 0);
+    assert_eq!(stretched_edges(&out, 4.0 * VOXEL), 0, "no stretched edges: it is one extraction");
+    let height = top_height(&out);
+    assert!(height > unsculpted + 0.5 * (sculpted - unsculpted), "the stroke survives: {unsculpted} -> {sculpted}, now {height}");
+}
+
+#[test]
+fn volume_carry_accumulates_over_rounds() {
+    let mut top = remesh(stack());
+    let side = |doc: &Document| doc.positions().iter().filter(|p| p.y.abs() < 0.2 && p.z.abs() < 0.2 && p.x > 0.0).map(|p| p.x).fold(f32::MIN, f32::max);
+    let side_before = side(&top);
+    stroke(&mut top);
+    let first = top_height(&top);
+    let mut out = round_trip_as_volume(&mut top, |s| reseed(s, 11));
+    // A second stroke elsewhere, on the side, then another round.
+    let path: Vec<(Vec3, f32)> = (0..=20).map(|i| (Vec3::new(1.0, -0.3 + 0.6 * i as f32 / 20.0, 0.1), 1.0)).collect();
+    out.set_active_layer(Some(out.layers()[0].id)).unwrap();
+    brush::stroke(&mut out, &mut ClayBuildup::default(), &BrushSettings { radius: 0.25, strength: 0.8, ..Default::default() }, &path).unwrap();
+    let side_sculpted = side(&out);
+    assert!(side_sculpted > side_before + 0.01);
+    let again = round_trip_as_volume(&mut out, |s| reseed(s, 12));
+    assert_eq!(non_manifold_edges(again.faces()), 0);
+    assert!(top_height(&again) > first - 3.0 * VOXEL, "the first round's stroke is still there");
+    assert!(side(&again) > side_before + 0.5 * (side_sculpted - side_before), "and the second's");
+}

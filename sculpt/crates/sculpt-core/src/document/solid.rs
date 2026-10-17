@@ -325,7 +325,46 @@ impl SolidInput {
     }
 
     pub fn run(&self, settings: &SolidSettings) -> Result<(PolyMesh, SolidStats)> {
+        self.run_with(settings, None)
+    }
+
+    /// The stack's field, ready to be evaluated anywhere (negative inside), without extracting a mesh.
+    pub fn field(&self, settings: &SolidSettings) -> Result<StackField> {
         let mut stats = SolidStats::default();
+        self.prepare(settings, &mut stats)
+    }
+
+    /// Solidify with `extra` added to the stack's field before extraction.
+    pub fn run_with(&self, settings: &SolidSettings, extra: Option<&Extra<'_>>) -> Result<(PolyMesh, SolidStats)> {
+        let mut stats = SolidStats::default();
+        let stack = self.prepare(settings, &mut stats)?;
+        let bounds = match extra {
+            Some(e) => {
+                let snap = |v: Vec3| (v / settings.voxel).floor() * settings.voxel;
+                let pad = Vec3::splat(4.0 * settings.voxel);
+                Aabb { min: snap(stack.bounds.min.min(e.bounds.min - pad)), max: stack.bounds.max.max(e.bounds.max + pad) }
+            }
+            None => stack.bounds,
+        };
+        let field = |p: Vec3| {
+            let f = stack.eval(p);
+            f + extra.map_or(0.0, |e| (e.field)(p, f))
+        };
+        let t = Instant::now();
+        // Gradient above 1 where blends overlap and grain is added, so skip blocks conservatively.
+        let lipschitz = 1.3 + stack.noise_slope + extra.map_or(0.0, |e| e.lipschitz);
+        let mut out = remesh(&field, bounds, &RemeshParams { voxel: settings.voxel, lipschitz });
+        stats.pieces_dropped = crate::generator::remesh::drop_small_pieces(&mut out, settings.min_piece);
+        stats.extract_ms = t.elapsed().as_secs_f64() * 1e3;
+        stats.base_hits = stack.hits.load(Ordering::Relaxed);
+        stats.base_misses = stack.misses.load(Ordering::Relaxed);
+        stats.quads = out.quads.len();
+        stats.evaluated = out.evaluated;
+        stats.total = out.total;
+        Ok((out.into_poly_mesh(), stats))
+    }
+
+    fn prepare(&self, settings: &SolidSettings, stats: &mut SolidStats) -> Result<StackField> {
         let t_prep = Instant::now();
         let surface = fingerprint(&self.positions);
         // The sculpted surface and its distance structure, built once per surface.
@@ -421,12 +460,6 @@ impl SolidInput {
                 }
             }
         };
-        let (hits, misses) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let cached_base = |p: Vec3| {
-            let (v, hit) = cache.get(p, settings.voxel, || base_field(p));
-            if hit { hits.fetch_add(1, Ordering::Relaxed) } else { misses.fetch_add(1, Ordering::Relaxed) };
-            v
-        };
 
         let mut terms: Vec<Term> = Vec::new();
         let t = Instant::now();
@@ -483,19 +516,41 @@ impl SolidInput {
             terms.push(Term::Instances { set: InstanceSet::new(instances.to_vec(), margin + blend), op: spec.op, blend });
         }
         stats.scatter_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(StackField { plain: plain.clone(), terms, bound, bounds, noise_slope, cache, voxel: settings.voxel, hits: AtomicUsize::new(0), misses: AtomicUsize::new(0) })
+    }
+}
 
-        let field = |p: Vec3| apply_terms(cached_base(p), &terms, p);
-        let t = Instant::now();
-        // Gradient above 1 where blends overlap and grain is added, so skip blocks conservatively.
-        let lipschitz = 1.3 + noise_slope;
-        let mut out = remesh(&field, bounds, &RemeshParams { voxel: settings.voxel, lipschitz });
-        stats.pieces_dropped = crate::generator::remesh::drop_small_pieces(&mut out, settings.min_piece);
-        stats.extract_ms = t.elapsed().as_secs_f64() * 1e3;
-        stats.base_hits = hits.load(Ordering::Relaxed);
-        stats.base_misses = misses.load(Ordering::Relaxed);
-        stats.quads = out.quads.len();
-        stats.evaluated = out.evaluated;
-        stats.total = out.total;
-        Ok((out.into_poly_mesh(), stats))
+/// A field added to the stack's before extraction: what it is (given the point and the stack's value there), how steep
+/// it can get, and where it can be nonzero.
+pub struct Extra<'a> {
+    pub field: &'a (dyn Fn(Vec3, f32) -> f32 + Sync),
+    pub lipschitz: f32,
+    pub bounds: Aabb,
+}
+
+/// A stack's field, prepared: the sculpted surface's distances (cached on the lattice) combined with every layer.
+pub struct StackField {
+    plain: Arc<PlainSurface>,
+    terms: Vec<Term>,
+    bound: f32,
+    bounds: Aabb,
+    noise_slope: f32,
+    cache: Arc<BaseCache>,
+    voxel: f32,
+    hits: AtomicUsize,
+    misses: AtomicUsize,
+}
+
+impl StackField {
+    /// The field at `p`, negative inside. Lattice points reuse cached surface distances.
+    pub fn eval(&self, p: Vec3) -> f32 {
+        let (base, hit) = self.cache.get(p, self.voxel, || self.plain.sdf.signed_distance(p, self.bound));
+        if hit { self.hits.fetch_add(1, Ordering::Relaxed) } else { self.misses.fetch_add(1, Ordering::Relaxed) };
+        apply_terms(base, &self.terms, p)
+    }
+
+    /// Where the field's surface can be, with room for every layer's reach.
+    pub fn bounds(&self) -> Aabb {
+        self.bounds
     }
 }

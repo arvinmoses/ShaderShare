@@ -58,6 +58,7 @@ pub fn edit_stack_below(app: &mut SculptApp) {
     let Some(mut top) = app.doc.take() else { return };
     match top.take_remesh_source() {
         Some(source) => {
+            app.remesh_old_stack = Some(source.solid_input());
             app.remesh_top = Some(top);
             app.doc = Some(source);
             app.status = "Editing the stack below your sculpt. Done remeshes it and brings your strokes back.".into();
@@ -71,7 +72,14 @@ pub fn edit_stack_below(app: &mut SculptApp) {
 pub fn finish_stack_edit(app: &mut SculptApp) {
     let (Some(top), Some(source)) = (app.remesh_top.take(), app.doc.take()) else { return };
     let started = Instant::now();
-    let rebuilt = source.solidify(&app.solid_ui.settings(top.remesh_voxel())).and_then(|(mesh, _)| top.reprojected_onto(mesh));
+    let settings = app.solid_ui.settings(top.remesh_voxel());
+    let old_stack = app.remesh_old_stack.take();
+    let rebuilt = match (&old_stack, app.solid_ui.carry_volume) {
+        // As volume: one clean extraction of the new stack plus the sculpt; the strokes go into the base.
+        (Some(old), true) => old.field(&settings).and_then(|old| top.volume_rebuild(&old, &source, &settings)),
+        // As layers: the new stack, with every stroke carried onto it as an offset.
+        _ => source.solidify(&settings).and_then(|(mesh, _)| top.reprojected_onto(mesh)),
+    };
     match rebuilt {
         Ok(mut new) => {
             new.set_remesh_source(source, top.remesh_voxel());
@@ -83,6 +91,7 @@ pub fn finish_stack_edit(app: &mut SculptApp) {
             app.status = format!("Could not remesh the stack: {e}");
             app.doc = Some(source);
             app.remesh_top = Some(top);
+            app.remesh_old_stack = old_stack;
             return;
         }
     }
@@ -110,6 +119,7 @@ pub fn sections(app: &mut SculptApp, ui: &mut Ui) {
         let mut done = false;
         section(ui, fs, "remesh", "STACK BELOW YOUR SCULPT", |ui| {
             ui.label(RichText::new("You are editing the procedural stack under your sculpt layers. Done remeshes it and carries your strokes onto the new surface.").size(fs * 0.85).color(weak));
+            carry_choice(app, ui);
             done = ui.button("Done: back to sculpting").clicked();
         });
         if done {
@@ -119,10 +129,20 @@ pub fn sections(app: &mut SculptApp, ui: &mut Ui) {
         let mut edit = false;
         section(ui, fs, "remesh", "REMESHED", |ui| {
             ui.label(RichText::new("Sculpting on a clean mesh made from the procedural stack.").size(fs * 0.85).color(weak));
+            carry_choice(app, ui);
             edit = ui.button("Edit stack below").on_hover_text("Change the generators and noise under your sculpt; your strokes follow when you are done.").clicked();
         });
         if edit {
             edit_stack_below(app);
         }
     }
+}
+
+/// How strokes cross a stack edit.
+fn carry_choice(app: &mut SculptApp, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.label("Carry strokes as");
+        ui.radio_value(&mut app.solid_ui.carry_volume, true, "Volume").on_hover_text("One clean mesh that cannot fold or tear. Strokes are baked into the new base; new strokes go on a layer again.");
+        ui.radio_value(&mut app.solid_ui.carry_volume, false, "Layers").on_hover_text("Strokes stay in their layers, moved onto the new surface as offsets. Can leave lips where the stack moved a lot.");
+    });
 }

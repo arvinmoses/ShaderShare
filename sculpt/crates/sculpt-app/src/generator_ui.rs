@@ -439,6 +439,8 @@ pub struct SolidUi {
     pub divisions: u32,
     /// Loose pieces smaller than this fraction of the surface are dropped.
     pub min_piece: f32,
+    /// Carry the sculpt across a stack edit as volume (clean, baked into the base) rather than as layer offsets.
+    pub carry_volume: bool,
 }
 
 impl SolidUi {
@@ -449,7 +451,7 @@ impl SolidUi {
 
 impl Default for SolidUi {
     fn default() -> Self {
-        SolidUi { divisions: 150, min_piece: 0.0025 }
+        SolidUi { divisions: 150, min_piece: 0.0025, carry_volume: true }
     }
 }
 
