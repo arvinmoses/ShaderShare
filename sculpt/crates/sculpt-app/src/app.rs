@@ -182,6 +182,8 @@ pub struct SculptApp {
     pub solidify_backup: Option<Document>,
     /// The live preview of the solidified stack (Display menu, and the Solidify section).
     pub solid_preview: crate::solid_preview::SolidPreview,
+    /// The sculpt waiting aside while the procedural stack below it is edited.
+    pub remesh_top: Option<Document>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -275,6 +277,7 @@ impl SculptApp {
             solid_ui: Default::default(),
             solidify_backup: None,
             solid_preview: Default::default(),
+            remesh_top: None,
             sweep: None,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
@@ -435,6 +438,9 @@ impl SculptApp {
             crate::layer_panel::command::execute(self, lc);
             return;
         }
+        if cmd == Command::Undo && crate::remesh_ui::undo_remesh(self) {
+            return;
+        }
         if cmd == Command::Undo && self.doc.as_ref().is_some_and(|d| !d.can_undo()) && self.solidify_backup.is_some() {
             crate::generator_ui::undo_solidify(self);
             return;
@@ -576,6 +582,16 @@ impl SculptApp {
     }
 
     fn begin_stroke(&mut self, pos: Pos2, modifiers: egui::Modifiers) {
+        // Strokes under generator layers would be displaced by them again: sculpt on a remesh of the stack instead.
+        if self.doc.as_ref().is_some_and(crate::remesh_ui::needs_remesh) {
+            if self.remesh_top.is_some() {
+                self.status = "Sculpting waits while you edit the stack below: click Done in Properties to go back to it.".into();
+                return;
+            }
+            if !crate::remesh_ui::remesh_to_sculpt(self) {
+                return;
+            }
+        }
         // A stroke that would change nothing is refused up front, with the reason in the status bar.
         if let Some(why) = crate::layer_panel::target::resolve(self).and_then(|t| t.refusal) {
             self.status = why;

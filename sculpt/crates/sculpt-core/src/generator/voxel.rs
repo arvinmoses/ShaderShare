@@ -251,7 +251,9 @@ impl<'a> MeshSdf<'a> {
 
     /// Signed distance (negative inside) to the mesh, searching only within
     /// `bound` of `p`; returns `bound` (positive) when nothing is closer.
-    pub fn signed_distance(&self, p: Vec3, bound: f32) -> f32 {
+    /// The closest point on the mesh to `p` within `bound`: the point, the triangle's vertices (quads split
+    /// `[0,1,2]`, `[0,2,3]`) and the point's barycentric weights on it.
+    pub fn closest(&self, p: Vec3, bound: f32) -> Option<(Vec3, [u32; 3], [f32; 3])> {
         let mut best = bound * bound;
         let mut hit: Option<(Vec3, [u32; 3], [f32; 3])> = None;
         let mut stack: smallvec::SmallVec<[(f32, u32); 64]> = smallvec::smallvec![(0.0, 0)];
@@ -276,11 +278,15 @@ impl<'a> MeshSdf<'a> {
                 NodeKind::Leaf { leaf } => self.leaf_closest(leaf as usize, p, &mut best, &mut hit),
             }
         }
-        match hit {
+        hit
+    }
+
+    pub fn signed_distance(&self, p: Vec3, bound: f32) -> f32 {
+        match self.closest(p, bound) {
             None => bound,
             Some((cp, vs, w)) => {
                 let n = self.pseudo[vs[0] as usize] * w[0] + self.pseudo[vs[1] as usize] * w[1] + self.pseudo[vs[2] as usize] * w[2];
-                let d = best.sqrt();
+                let d = cp.distance(p);
                 if (p - cp).dot(n) < 0.0 { -d } else { d }
             }
         }

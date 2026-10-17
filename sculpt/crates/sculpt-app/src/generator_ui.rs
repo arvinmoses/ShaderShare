@@ -408,7 +408,11 @@ fn solidify_section(app: &mut SculptApp, ui: &mut Ui) -> bool {
         if app.solid_preview.on && !app.solid_preview.status.is_empty() {
             ui.label(RichText::new(format!("Preview: {}", app.solid_preview.status)).size(fs * 0.85).color(weak));
         }
-        if ui.button("Solidify stack").clicked() {
+        if ui.button("Remesh to sculpt").on_hover_text("Make a clean mesh to sculpt on and keep this stack underneath to edit later. Your first stroke does this too.").clicked() {
+            crate::remesh_ui::remesh_to_sculpt(app);
+            return;
+        }
+        if ui.button("Solidify stack").on_hover_text("Replace the stack with one clean mesh for good (Undo brings it back).").clicked() {
             solidify_now = true;
         }
     });

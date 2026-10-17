@@ -21,6 +21,7 @@ use crate::subdiv::Subdivider;
 use crate::undo::{self, Group, Record, UndoStack};
 use crate::{Error, Result};
 
+mod remesh_layer;
 mod solid;
 pub use solid::{SolidInput, SolidSettings, SolidStats};
 
@@ -169,6 +170,10 @@ pub struct Document {
     pub(crate) base_epoch: u64,
     /// Generator stage 0 (see `generator::layer`), valid for one (topology, base epoch).
     /// Base-surface distances remembered by [`Document::solidify`] between calls.
+    /// The procedural stack this document was remeshed from, kept to be edited and remeshed again.
+    pub(crate) remesh_source: Option<Box<Document>>,
+    /// The lattice spacing of that remesh.
+    pub(crate) remesh_voxel: f32,
     pub(crate) solid_cache: std::sync::Arc<std::sync::Mutex<solid::SolidCaches>>,
     pub(crate) gen_basis: Option<(u64, u64, std::sync::Arc<crate::generator::layer::SurfaceBasis>)>,
     /// Level-of-detail tree for dense meshes, and the topology it was built for.
@@ -210,6 +215,8 @@ impl Document {
             topology_id: new_topology_id(),
             base_epoch: 0,
             gen_basis: None,
+            remesh_source: None,
+            remesh_voxel: 0.0,
             solid_cache: Default::default(),
             lazy_normals: false,
             progressive: false,

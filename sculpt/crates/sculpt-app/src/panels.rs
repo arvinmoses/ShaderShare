@@ -622,6 +622,7 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
     let target = app.doc.as_ref().and_then(|d| app.layers.selection.primary().or(d.active_layer()).and_then(|id| d.layer(id)).map(|l| (l.id, l.is_folder())));
     let active = app.doc.as_ref().and_then(|d| d.active_layer());
     panel_header(ui, app, "PROPERTIES", |_| {});
+    crate::remesh_ui::sections(app, ui);
     egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 5)).show(ui, |ui| crate::layer_panel::breadcrumb::show(app, ui));
     ui.painter().line_segment([ui.cursor().left_top(), ui.cursor().right_top()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
