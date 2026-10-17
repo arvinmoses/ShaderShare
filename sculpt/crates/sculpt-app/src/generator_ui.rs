@@ -440,10 +440,11 @@ impl Default for SolidUi {
 /// Replace the document with its solidified stack, keeping the old one for undo.
 pub(crate) fn solidify(app: &mut SculptApp) {
     let Some(doc) = app.doc.as_ref() else { return };
-    let longest = doc.bounds().extent().max_element();
-    let settings = sculpt_core::document::SolidSettings { voxel: longest / app.solid_ui.divisions as f32 };
+    let input = doc.solid_input();
+    // The same voxel size the preview uses, so Solidify starts from its cached distances.
+    let settings = sculpt_core::document::SolidSettings { voxel: input.surface_bounds().extent().max_element() / app.solid_ui.divisions as f32 };
     let started = Instant::now();
-    match doc.solidify(&settings).and_then(|(mesh, stats)| Document::from_mesh(mesh).map(|d| (d, stats))) {
+    match input.run(&settings).and_then(|(mesh, stats)| Document::from_mesh(mesh).map(|d| (d, stats))) {
         Ok((new, stats)) => {
             app.status = format!("Solidified {} layers into {} quads in {:.0} ms", stats.layers, stats.quads, started.elapsed().as_secs_f64() * 1e3);
             app.solidify_backup = app.doc.replace(new);

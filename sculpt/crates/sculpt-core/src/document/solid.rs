@@ -9,7 +9,8 @@
 //! field so far to scatter on. That is what lets small chips land on the faces a big cut made.
 
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -20,9 +21,8 @@ use super::Document;
 use crate::generator::layer::{GeneratorKind, GeneratorSpec};
 use crate::generator::remesh::{RemeshParams, remesh};
 use crate::generator::voxel::MeshSdf;
-use crate::generator::{BoolOp, InstanceSet};
+use crate::generator::{BoolOp, Instance, InstanceSet};
 use crate::geom::Aabb;
-use crate::layer_ops::Placement;
 use crate::mesh::PolyMesh;
 use crate::noise::Noise;
 use crate::{Error, Result};
@@ -90,6 +90,29 @@ impl BaseCache {
     }
 }
 
+/// What solidify keeps between calls, shared by the document and every snapshot of it. Each part is keyed by what it
+/// depends on, so a slider drag on one layer reuses everything the drag does not touch.
+#[derive(Default)]
+pub(crate) struct SolidCaches {
+    /// Base distances, one per lattice spacing (the drag preview's and the full-detail one); two at most.
+    bases: Vec<Arc<BaseCache>>,
+    /// The sculpted surface as a document, with its distance structure.
+    plain: Option<Arc<PlainSurface>>,
+    /// Instances each generator layer scattered, keyed by the layer and everything below it.
+    scatters: HashMap<u64, Arc<Vec<Instance>>>,
+}
+
+/// The sculpted surface, ready to measure distances to and to scatter the first layer on.
+pub(crate) struct PlainSurface {
+    surface: u64,
+    sdf: MeshSdf<'static>,
+    bounds: Aabb,
+    doc: Mutex<Document>,
+}
+
+/// Scatter results kept at most; past this the table starts over.
+const SCATTER_LIMIT: usize = 64;
+
 /// A cheap fingerprint of the sculpted surface, to know when cached distances are stale.
 fn fingerprint(positions: &[Vec3]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64 ^ positions.len() as u64;
@@ -108,6 +131,8 @@ pub struct SolidStats {
     pub base_misses: usize,
     pub layers: usize,
     pub quads: usize,
+    /// Building the sculpted surface and its distance structure.
+    pub prep_ms: f64,
     pub scatter_ms: f64,
     pub extract_ms: f64,
     pub evaluated: usize,
@@ -171,6 +196,15 @@ fn apply_terms(mut f: f32, terms: &[Term], p: Vec3) -> f32 {
 }
 
 impl Document {
+    /// The instances `spec` would scatter on this document's base surface, without adding a layer.
+    pub(crate) fn generator_instances(&mut self, spec: &GeneratorSpec) -> Vec<Instance> {
+        let basis = self.generator_basis();
+        let density = self.density_for(spec, None, false);
+        self.ensure_mapping_channels(spec);
+        let inputs = crate::generator::layer::BuildInputs { basis: &basis, density: density.as_ref(), channels: &self.channels, base: &self.base, faces: &self.faces, bvh: &self.bvh };
+        crate::generator::layer::GeneratorCache::build(spec, &inputs, None).instances().to_vec()
+    }
+
     /// The surface of the base plus plain sculpt layers, leaving generator layers out.
     fn plain_positions(&self) -> Vec<Vec3> {
         let order = self.composite_order();
@@ -222,7 +256,7 @@ pub struct SolidInput {
     positions: Vec<Vec3>,
     faces: Vec<crate::mesh::Face>,
     specs: Vec<GeneratorSpec>,
-    cache: Arc<Mutex<Option<Arc<BaseCache>>>>,
+    cache: Arc<Mutex<SolidCaches>>,
 }
 
 impl SolidInput {
@@ -231,38 +265,76 @@ impl SolidInput {
         !self.specs.is_empty()
     }
 
+    /// Bounds of the sculpted surface. Unlike the live mesh's, they do not move while generator layers are edited, so a
+    /// detail setting turned into a voxel size with them gives the same lattice every time, which keeps the caches warm.
+    pub fn surface_bounds(&self) -> Aabb {
+        Aabb::from_points(&self.positions)
+    }
+
     pub fn run(&self, settings: &SolidSettings) -> Result<(PolyMesh, SolidStats)> {
         let mut stats = SolidStats::default();
-        let plain = Document::from_mesh(PolyMesh { positions: self.positions.clone(), faces: self.faces.clone() })?;
-        let sdf = MeshSdf::build(plain.bvh(), plain.positions(), plain.faces(), plain.topology());
-        let diagonal = plain.bounds().extent().length().max(1e-3);
+        let t_prep = Instant::now();
+        let surface = fingerprint(&self.positions);
+        // The sculpted surface and its distance structure, built once per surface.
+        let plain = {
+            let mut caches = self.cache.lock().unwrap();
+            match &caches.plain {
+                Some(p) if p.surface == surface => p.clone(),
+                _ => {
+                    let doc = Document::from_mesh(PolyMesh { positions: self.positions.clone(), faces: self.faces.clone() })?;
+                    let sdf = MeshSdf::build_owned(doc.bvh().clone(), doc.positions().to_vec(), doc.faces().to_vec(), doc.topology());
+                    let p = Arc::new(PlainSurface { surface, sdf, bounds: doc.bounds(), doc: Mutex::new(doc) });
+                    caches.plain = Some(p.clone());
+                    caches.scatters.clear();
+                    p
+                }
+            }
+        };
+        stats.prep_ms = t_prep.elapsed().as_secs_f64() * 1e3;
+        let sdf = &plain.sdf;
+        let diagonal = plain.bounds.extent().length().max(1e-3);
         let bound = diagonal * 2.0;
 
         // Generator layers that contribute, bottom to top.
         let specs = &self.specs;
         stats.layers = specs.len();
-        let scatter = |s: &&GeneratorSpec| s.kind == GeneratorKind::Scatter;
-        let reach = specs.iter().filter(scatter).map(|s| s.size * (1.0 + s.size_var) * (1.0 + s.stretch_var) * 1.8 + s.blend * s.size).fold(0.0, f32::max);
-        // Noise moves the surface by up to its amplitude and steepens the field by about amplitude x scale.
-        let noise_pad: f32 = specs.iter().filter(|s| s.kind == GeneratorKind::Noise).map(|s| s.noise.amplitude).sum();
+        let reach_of = |s: &GeneratorSpec| match s.kind {
+            GeneratorKind::Scatter => s.size * (1.0 + s.size_var) * (1.0 + s.stretch_var) * 1.8 + s.blend * s.size,
+            // Noise moves the surface by up to its amplitude.
+            GeneratorKind::Noise => s.noise.amplitude,
+        };
+        let reach = specs.iter().map(reach_of).fold(0.0, f32::max) + specs.iter().filter(|s| s.kind == GeneratorKind::Noise).map(|s| s.noise.amplitude).sum::<f32>();
+        // Noise steepens the field by about amplitude x scale.
         let noise_slope: f32 = specs.iter().filter(|s| s.kind == GeneratorKind::Noise).map(|s| s.noise.amplitude * s.noise.scale).sum();
-        let pad = reach + noise_pad + 4.0 * settings.voxel;
-        let snap = |v: Vec3| (v / settings.voxel).floor() * settings.voxel;
-        let bounds = Aabb { min: snap(plain.bounds().min - Vec3::splat(pad)), max: plain.bounds().max + Vec3::splat(pad) };
+        let pad = reach + 4.0 * settings.voxel;
+        let snap = |v: Vec3, step: f32| (v / step).floor() * step;
+        let bounds = Aabb { min: snap(plain.bounds.min - Vec3::splat(pad), settings.voxel), max: plain.bounds.max + Vec3::splat(pad) };
         // Blocks are skipped when their centre is this far from the surface, so the cutters must be findable that far out.
         let margin = 8.0 * settings.voxel * 0.87 * 1.5;
-        let coarse_voxel = (bounds.extent().max_element() / 48.0).max(settings.voxel);
+        // The surfaces later layers scatter on depend only on the layers below them (not on the final detail, nor on the
+        // layers above), so they stay cached while a higher layer is dragged.
+        let coarse_voxel = plain.bounds.extent().max_element() / 40.0;
 
         let base_field = |p: Vec3| sdf.signed_distance(p, bound);
         // The final extraction reuses base distances from earlier calls when the surface and spacing are unchanged.
         let cache = {
-            let surface = fingerprint(plain.positions());
-            let mut slot = self.cache.lock().unwrap();
-            match slot.as_ref() {
-                Some(c) if c.surface == surface && c.voxel_bits == settings.voxel.to_bits() && c.entries.load(Ordering::Relaxed) < CACHE_LIMIT => c.clone(),
-                _ => {
+            // One cache per lattice spacing, so a coarse preview while dragging and the full-detail one after do not
+            // evict each other. The two most recently used are kept.
+            let mut caches = self.cache.lock().unwrap();
+            let slots = &mut caches.bases;
+            slots.retain(|c| c.surface == surface && c.entries.load(Ordering::Relaxed) < CACHE_LIMIT);
+            match slots.iter().position(|c| c.voxel_bits == settings.voxel.to_bits()) {
+                Some(i) => {
+                    let c = slots.remove(i);
+                    slots.push(c.clone());
+                    c
+                }
+                None => {
                     let fresh = Arc::new(BaseCache::new(surface, settings.voxel));
-                    *slot = Some(fresh.clone());
+                    slots.push(fresh.clone());
+                    if slots.len() > 2 {
+                        slots.remove(0);
+                    }
                     fresh
                 }
             }
@@ -276,29 +348,57 @@ impl SolidInput {
 
         let mut terms: Vec<Term> = Vec::new();
         let t = Instant::now();
+        // What the layers so far amount to, so a layer's scatter is found again when nothing below it changed.
+        let mut below = DefaultHasher::new();
+        surface.hash(&mut below);
+        let mut lower_reach = 0.0f32;
         for spec in specs {
+            let text = format!("{spec:?}");
             if spec.kind == GeneratorKind::Noise {
                 terms.push(Term::Noise { noise: spec.noise.build(), amplitude: spec.noise.amplitude });
+                text.hash(&mut below);
+                lower_reach += spec.noise.amplitude;
                 continue;
             }
-            // The surface so far is what this layer scatters on: the sculpted surface for the first, a coarse extraction after.
-            let mut surface = if terms.is_empty() {
-                Document::from_mesh(PolyMesh { positions: plain.positions().to_vec(), faces: plain.faces().to_vec() })?
-            } else {
-                let coarse = remesh(&|p: Vec3| apply_terms(base_field(p), &terms, p), bounds, &RemeshParams { voxel: coarse_voxel, lipschitz: 1.5 });
-                if coarse.quads.is_empty() {
-                    return Err(Error::InvalidData("the stack leaves nothing to scatter on".into()));
-                }
-                Document::from_mesh(coarse.into_poly_mesh())?
+            let key = {
+                let mut h = below.clone();
+                text.hash(&mut h);
+                h.finish()
             };
-            let id = surface.insert_generator("solid", Placement::Top, spec.clone())?;
-            let instances = surface.layer(id).and_then(|l| l.generator_cache()).map(|c| c.instances().to_vec()).unwrap_or_default();
+            let known = self.cache.lock().unwrap().scatters.get(&key).cloned();
+            let instances = match known {
+                Some(v) => v,
+                None => {
+                    // The surface so far is what this layer scatters on: the sculpted surface for the first, a coarse
+                    // extraction of the layers below after that.
+                    let found = if terms.is_empty() {
+                        plain.doc.lock().unwrap().generator_instances(spec)
+                    } else {
+                        let p = lower_reach + 4.0 * coarse_voxel;
+                        let lower = Aabb { min: snap(plain.bounds.min - Vec3::splat(p), coarse_voxel), max: plain.bounds.max + Vec3::splat(p) };
+                        let coarse = remesh(&|p: Vec3| apply_terms(base_field(p), &terms, p), lower, &RemeshParams { voxel: coarse_voxel, lipschitz: 1.5 + noise_slope });
+                        if coarse.quads.is_empty() {
+                            return Err(Error::InvalidData("the stack leaves nothing to scatter on".into()));
+                        }
+                        Document::from_mesh(coarse.into_poly_mesh())?.generator_instances(spec)
+                    };
+                    let found = Arc::new(found);
+                    let mut caches = self.cache.lock().unwrap();
+                    if caches.scatters.len() >= SCATTER_LIMIT {
+                        caches.scatters.clear();
+                    }
+                    caches.scatters.insert(key, found.clone());
+                    found
+                }
+            };
+            text.hash(&mut below);
+            lower_reach = lower_reach.max(reach_of(spec));
             if instances.is_empty() {
                 continue;
             }
             let mean_size = instances.iter().map(|i| i.scale.max_element()).sum::<f32>() / instances.len() as f32;
             let blend = spec.blend * mean_size;
-            terms.push(Term::Instances { set: InstanceSet::new(instances, margin + blend), op: spec.op, blend });
+            terms.push(Term::Instances { set: InstanceSet::new(instances.to_vec(), margin + blend), op: spec.op, blend });
         }
         stats.scatter_ms = t.elapsed().as_secs_f64() * 1e3;
 

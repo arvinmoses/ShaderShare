@@ -56,9 +56,9 @@ impl FlatBvh {
 
 /// Closest-point / signed distance acceleration structure over a [`Bvh`]'s leaves.
 pub struct MeshSdf<'a> {
-    bvh: &'a Bvh,
-    positions: &'a [Vec3],
-    faces: &'a [Face],
+    bvh: std::borrow::Cow<'a, Bvh>,
+    positions: std::borrow::Cow<'a, [Vec3]>,
+    faces: std::borrow::Cow<'a, [Face]>,
     trees: Vec<FineTree>,
     pseudo: Vec<Vec3>,
 }
@@ -184,7 +184,16 @@ impl<'a> MeshSdf<'a> {
                 n.normalize_or(Vec3::Y)
             })
             .collect();
-        MeshSdf { bvh, positions, faces, trees, pseudo }
+        MeshSdf { bvh: std::borrow::Cow::Borrowed(bvh), positions: std::borrow::Cow::Borrowed(positions), faces: std::borrow::Cow::Borrowed(faces), trees, pseudo }
+    }
+
+    /// Like [`Self::build`], but the structure keeps its own copy of the mesh, so it can be cached past the mesh's owner.
+    pub fn build_owned(bvh: Bvh, positions: Vec<Vec3>, faces: Vec<Face>, topo: &Topology) -> MeshSdf<'static> {
+        let (trees, pseudo) = {
+            let built = MeshSdf::build(&bvh, &positions, &faces, topo);
+            (built.trees, built.pseudo)
+        };
+        MeshSdf { bvh: std::borrow::Cow::Owned(bvh), positions: std::borrow::Cow::Owned(positions), faces: std::borrow::Cow::Owned(faces), trees, pseudo }
     }
 
     /// Per-vertex angle-weighted pseudo-normals (the sign oracle of [`Self::signed_distance`]).
