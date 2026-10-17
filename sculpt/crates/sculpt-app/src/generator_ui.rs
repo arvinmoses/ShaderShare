@@ -401,7 +401,7 @@ fn solidify_section(app: &mut SculptApp, ui: &mut Ui) -> bool {
         ui.label(RichText::new("Turn the whole stack into one clean, closed mesh. Cuts blend softly and nothing folds. The layers are consumed; Undo brings them back.").size(fs * 0.85).color(weak));
         prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.divisions, 40..=400).logarithmic(true)).on_hover_text("Samples along the longest side. Higher keeps finer detail and takes longer."));
         prop(ui, "", |ui| {
-            if ui.checkbox(&mut app.solid_preview.on, "Live preview").on_hover_text("Show the stack as one clean solid mesh. It follows your edits a moment after you stop; the layers stay editable.").changed() {
+            if ui.checkbox(&mut app.solid_preview.on, "Live preview").on_hover_text("Show the stack as one clean solid mesh, as Solidify would make it. It follows your edits and the layers stay editable. Off shows the fast live approximation.").changed() {
                 app.solid_preview.reset();
             }
         });

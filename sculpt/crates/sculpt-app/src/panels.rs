@@ -178,7 +178,7 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 cmd_button(app, ui, Command::FrameMesh);
                 cmd_button(app, ui, Command::ToggleHud);
                 ui.add(egui::Slider::new(&mut app.overlay_strength, 0.0..=1.0).text("Overlay opacity"));
-                if ui.checkbox(&mut app.solid_preview.on, "Live solid preview").on_hover_text("Show the stack as one clean solid mesh with soft blends. It follows your edits a moment after you stop.").changed() {
+                if ui.checkbox(&mut app.solid_preview.on, "Live solid preview").on_hover_text("Show the stack as one clean solid mesh with soft blends, as Solidify would make it. It follows your edits; the live mesh shows while you sculpt.").changed() {
                     app.solid_preview.reset();
                 }
                 ui.separator();

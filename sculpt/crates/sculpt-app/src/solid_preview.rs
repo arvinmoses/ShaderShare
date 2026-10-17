@@ -1,10 +1,13 @@
 //! Live preview of the solidified stack.
 //!
-//! While it is on, the viewport shows what Solidify would make: one clean closed mesh with soft blends. The live layers
-//! stay what you edit and the preview follows them. Edits themselves never wait for it: the preview is built on a worker
-//! thread from a snapshot of the stack, starting once the editing has paused for a moment, and the last finished result
-//! stays on screen until the next one replaces it. Dragging a slider therefore costs nothing extra; the picture catches
-//! up a fraction of a second after the hand stops.
+//! The viewport shows what Solidify would make whenever the stack has generator layers: one clean closed mesh with soft
+//! blends, instead of the live displacement, which cannot make a shape stand out of the surface (added spheres come out
+//! jammed against it). It is on by default. The live layers stay what you edit and the preview follows them.
+//!
+//! Edits never wait for it. The preview is built on a worker thread with its own small pool from a snapshot of the stack;
+//! a new one starts as soon as the last has finished and something changed, so while a slider is dragged the solid
+//! updates several times a second, and the last finished result stays on screen until the next replaces it. While a
+//! sculpt stroke is under way the live mesh is shown instead, so the brush is never drawn on a stale surface.
 
 use std::hash::{Hash, Hasher};
 use std::thread::JoinHandle;
@@ -15,8 +18,8 @@ use sculpt_core::document::{SolidSettings, SolidStats};
 
 use crate::app::SculptApp;
 
-/// Quiet time after the last edit before a preview starts.
-const SETTLE: Duration = Duration::from_millis(120);
+/// How long after the last brush dab the live mesh stays on screen, so a stroke is seen as it is made.
+const AFTER_STROKE: Duration = Duration::from_millis(300);
 
 /// The preview's own worker threads, a third of the machine, so a preview in flight never competes with a live edit for the
 /// shared pool when the hand starts moving again.
@@ -39,20 +42,22 @@ pub struct SolidPreview {
     last_since: Duration,
     signature: u64,
     dirty: bool,
+    /// A sculpt stroke is under way (or just ended): show the live mesh.
+    hold_live: bool,
     /// One line for the Solidify section.
     pub status: String,
 }
 
 impl Default for SolidPreview {
     fn default() -> Self {
-        SolidPreview { on: false, doc: None, job: None, started: Instant::now(), last_since: Duration::ZERO, signature: 0, dirty: true, status: String::new() }
+        SolidPreview { on: true, doc: None, job: None, started: Instant::now(), last_since: Duration::ZERO, signature: 0, dirty: true, hold_live: false, status: String::new() }
     }
 }
 
 impl SolidPreview {
     /// True while the viewport is showing the preview instead of the live mesh.
     pub fn shown(&self) -> bool {
-        self.on && self.doc.is_some()
+        self.on && self.doc.is_some() && !self.hold_live
     }
 
     /// Forget the current preview (the document it was made from is gone).
@@ -78,9 +83,11 @@ fn signature(doc: &Document) -> u64 {
 /// Called once a frame: collect a finished preview, notice edits, and start the next preview when editing has paused.
 pub fn tick(app: &mut SculptApp, ctx: &egui::Context) {
     let since = app.last_edit_age().min(app.gen_timer.since_edit());
+    let stroking = app.is_stroking() || app.last_edit_age() < AFTER_STROKE;
     let divisions = app.solid_ui.divisions;
     let Some(doc) = app.doc.as_ref() else { return };
     let p = &mut app.solid_preview;
+    p.hold_live = stroking;
     if !p.on {
         if p.doc.is_some() {
             p.reset();
@@ -113,7 +120,8 @@ pub fn tick(app: &mut SculptApp, ctx: &egui::Context) {
         p.status = "no generator layers".into();
         return;
     }
-    if p.dirty && p.job.is_none() && since >= SETTLE {
+    // Strokes change the surface every dab; wait for the stroke to end rather than snapshot the mesh at each one.
+    if p.dirty && p.job.is_none() && !stroking {
         let longest = doc.bounds().extent().max_element();
         let settings = SolidSettings { voxel: longest / divisions as f32 };
         let input = doc.solid_input();
