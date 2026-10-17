@@ -79,16 +79,49 @@ impl Document {
         let topo = Topology::build(positions.len(), &faces);
         let sdf = MeshSdf::build_owned(bvh, positions, faces, &topo);
         let bound = self.bvh.bounds().extent().length() * 4.0 + 1.0;
-        let samples: Vec<([u32; 3], [f32; 3])> = out
+        // How much of the old surface's strokes each new vertex should take. Where the new surface is the old one, all
+        // of them. Where it is new (a cut moved, a face opened up), its closest old point lies some way off or faces
+        // another way, and copying that point's stroke would shove the vertex off its own surface as a spike, so the
+        // stroke fades out instead: over one to two and a half lattice steps of distance, and as the normals turn apart.
+        let step = if self.remesh_voxel > 0.0 { self.remesh_voxel } else { mean_edge(&out) };
+        let pseudo = sdf.pseudo_normals();
+        // (old triangle, weights, how much to keep, how much of the full offset rather than its height)
+        let samples: Vec<([u32; 3], [f32; 3], f32, f32)> = out
             .base
             .par_iter()
-            .map(|&p| match sdf.closest(p, bound) {
-                Some((_, tri, w)) => (tri.map(|v| new_to_old[v as usize]), w),
-                None => ([0; 3], [1.0, 0.0, 0.0]),
+            .zip(out.normals.par_iter())
+            .map(|(&p, &n)| match sdf.closest(p, bound) {
+                Some((cp, tri, w)) => {
+                    let old_n = (pseudo[tri[0] as usize] * w[0] + pseudo[tri[1] as usize] * w[1] + pseudo[tri[2] as usize] * w[2]).normalize_or_zero();
+                    let near = 1.0 - smoothstep(1.0 * step, 2.5 * step, p.distance(cp));
+                    let agree = n.normalize_or_zero().dot(old_n);
+                    let facing = smoothstep(0.2, 0.6, agree);
+                    // Where the surface turned, only the stroke's height carries over, along the new normal: a
+                    // sideways offset built for the old shape would fold the new one.
+                    let whole = smoothstep(0.9, 0.98, agree);
+                    (tri.map(|v| new_to_old[v as usize]), w, near * facing, whole)
+                }
+                None => ([0; 3], [1.0, 0.0, 0.0], 0.0, 0.0),
             })
             .collect();
-        let carry_vec = |vals: &[Vec3]| -> Vec<Vec3> { samples.par_iter().map(|(t, w)| vals[t[0] as usize] * w[0] + vals[t[1] as usize] * w[1] + vals[t[2] as usize] * w[2]).collect() };
-        let carry = |vals: &[f32]| -> Vec<f32> { samples.par_iter().map(|(t, w)| vals[t[0] as usize] * w[0] + vals[t[1] as usize] * w[1] + vals[t[2] as usize] * w[2]).collect() };
+        // The old surface's own normals, to split each stroke into a height and the rest.
+        let old_normals = crate::mesh::compute_normals(&self.base, &self.faces, &self.topo);
+        let new_normals = &out.normals;
+        let carry_vec = |vals: &[Vec3]| -> Vec<Vec3> {
+            let heights: Vec<f32> = vals.par_iter().zip(&old_normals).map(|(d, n)| d.dot(n.normalize_or_zero())).collect();
+            samples
+                .par_iter()
+                .zip(new_normals.par_iter())
+                .map(|((t, w, keep, whole), n)| {
+                    let at = |a: &dyn Fn(usize) -> Vec3| a(t[0] as usize) * w[0] + a(t[1] as usize) * w[1] + a(t[2] as usize) * w[2];
+                    let full = at(&|i| vals[i]);
+                    let height = heights[t[0] as usize] * w[0] + heights[t[1] as usize] * w[1] + heights[t[2] as usize] * w[2];
+                    let along = n.normalize_or_zero() * height;
+                    (along + (full - along) * *whole) * *keep
+                })
+                .collect()
+        };
+        let carry = |vals: &[f32]| -> Vec<f32> { samples.par_iter().map(|(t, w, _, _)| vals[t[0] as usize] * w[0] + vals[t[1] as usize] * w[1] + vals[t[2] as usize] * w[2]).collect() };
 
         out.freeze = carry(&self.freeze).into_iter().map(|f| f.clamp(0.0, 1.0)).collect();
         out.channels = self.channels.iter().map(|(k, v)| (k.clone(), carry(v))).collect::<BTreeMap<_, _>>();
@@ -127,4 +160,22 @@ impl Document {
         out.recomposite_all();
         Ok(out)
     }
+}
+
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Mean edge length, the lattice step of a mesh that did not come from a remesh.
+fn mean_edge(doc: &Document) -> f32 {
+    let (mut sum, mut n) = (0.0f32, 0usize);
+    for f in &doc.faces {
+        let len = crate::mesh::face_len(f);
+        for k in 0..len {
+            sum += doc.base[f[k] as usize].distance(doc.base[f[(k + 1) % len] as usize]);
+            n += 1;
+        }
+    }
+    if n == 0 { 1.0 } else { sum / n as f32 }
 }
