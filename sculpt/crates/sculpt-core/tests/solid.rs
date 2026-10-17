@@ -256,3 +256,23 @@ fn loose_slivers_are_dropped_and_zero_keeps_them() {
     assert!(cleaned.positions.iter().all(|p| p.x < 1.0), "only the speck went");
     assert_eq!(non_manifold_edges(&cleaned.quads), 0);
 }
+
+#[test]
+fn solidified_quads_are_never_slivers() {
+    // Thin quads are what a brush turns inside out first; relaxing after extraction spreads them out.
+    let mut doc = Document::from_mesh(quad_sphere(5, 1.0)).unwrap();
+    doc.insert_generator("cuts", Placement::Top, GeneratorSpec { primitive: Primitive::Box, op: BoolOp::Subtract, count: 14, size: 0.45, lift: 0.7, seed: 5, ..GeneratorSpec::default() }).unwrap();
+    doc.insert_generator("grain", Placement::Top, noise_spec(0.03)).unwrap();
+    let (mesh, _) = doc.solidify(&SolidSettings::new(0.02)).unwrap();
+    let p = &mesh.positions;
+    let thinnest = mesh
+        .faces
+        .iter()
+        .map(|f| {
+            let e: Vec<f32> = (0..4).map(|k| p[f[k] as usize].distance(p[f[(k + 1) % 4] as usize])).collect();
+            e.iter().cloned().fold(f32::MAX, f32::min) / e.iter().cloned().fold(0.0, f32::max)
+        })
+        .fold(1.0f32, f32::min);
+    assert!(thinnest > 0.05, "thinnest quad edge ratio {thinnest}");
+    assert_eq!(non_manifold_edges(&mesh.faces), 0);
+}

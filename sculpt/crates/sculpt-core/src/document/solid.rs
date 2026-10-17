@@ -355,6 +355,7 @@ impl SolidInput {
         let lipschitz = 1.3 + stack.noise_slope + extra.map_or(0.0, |e| e.lipschitz);
         let mut out = remesh(&field, bounds, &RemeshParams { voxel: settings.voxel, lipschitz });
         stats.pieces_dropped = crate::generator::remesh::drop_small_pieces(&mut out, settings.min_piece);
+        crate::generator::remesh::relax(&mut out, 2);
         stats.extract_ms = t.elapsed().as_secs_f64() * 1e3;
         stats.base_hits = stack.hits.load(Ordering::Relaxed);
         stats.base_misses = stack.misses.load(Ordering::Relaxed);

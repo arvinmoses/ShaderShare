@@ -137,11 +137,19 @@ impl Brush for ClayBuildup {
                 return None;
             }
             let risen = (pos - doc.stroke_origin(v)).dot(n);
-            let amount = (-h * falloff.eval(d) * fade).min(cap - risen);
+            // A vertex moves as much as it faces the plane. On a steep wall (the inside of a cut) the lower vertices
+            // would otherwise rise past the ones above them and fold the wall over itself; this way the floor fills
+            // and the wall follows.
+            let amount = (-h * falloff.eval(d) * fade * facing(doc.normals[v], area_n)).min(cap - risen);
             (amount > 0.0).then(|| n * amount)
         });
         doc.apply_displacements(&disp)
     }
+}
+
+/// How squarely a vertex with normal `normal` faces a plane with normal `n`: 1 face on, falling to 0 edge on.
+fn facing(normal: Vec3, n: Vec3) -> f32 {
+    normal.normalize_or_zero().dot(n).clamp(0.0, 1.0)
 }
 
 // --------------------------------------------------------------- Trim Dynamic
@@ -188,7 +196,8 @@ impl Brush for TrimDynamic {
             let h = (pos - plane).dot(n) * sign;
             let mut d = Vec3::ZERO;
             if h > 0.0 {
-                d -= n * (sign * h * falloff.eval(t) * fade);
+                // As in Clay Buildup: shaving a steep wall flat would fold it, so a vertex moves as much as it faces the plane.
+                d -= n * (sign * h * falloff.eval(t) * fade * facing(doc.normals[v], n));
             }
             if sb > 0.0 && t > 1.0 - sb {
                 let u = (t - (1.0 - sb)) / sb;

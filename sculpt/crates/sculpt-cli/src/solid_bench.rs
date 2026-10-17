@@ -116,7 +116,33 @@ fn check(level: u32, divisions: f32) -> Res<()> {
     // which is where a spike shows.
     use sculpt_core::brush::{self, BrushSettings, ClayBuildup, MoveBrush, Smooth, TrimDynamic};
     let longest = |d: &Document| d.faces().iter().flat_map(|f| (0..sculpt_core::mesh::face_len(f)).map(move |k| (f[k], f[(k + 1) % sculpt_core::mesh::face_len(f)]))).map(|(a, b)| d.positions()[a as usize].distance(d.positions()[b as usize])).fold(0.0f32, f32::max);
+    // Quad quality: how thin the thinnest quads are (shortest over longest edge).
+    let thinness = |positions: &[sculpt_core::glam::Vec3], faces: &[[u32; 4]]| -> (usize, usize) {
+        let mut slivers = (0, 0);
+        for f in faces {
+            let e: Vec<f32> = (0..4).map(|k| positions[f[k] as usize].distance(positions[f[(k + 1) % 4] as usize])).collect();
+            let r = e.iter().cloned().fold(f32::MAX, f32::min) / e.iter().cloned().fold(0.0, f32::max).max(1e-12);
+            if r < 0.05 { slivers.0 += 1; }
+            if r < 0.01 { slivers.1 += 1; }
+        }
+        slivers
+    };
+    // Winding: across a consistently oriented surface, the two quads on an edge walk it in opposite directions.
+    let misoriented = |faces: &[[u32; 4]]| {
+        let mut dirs = std::collections::HashMap::new();
+        for f in faces {
+            for k in 0..4 {
+                *dirs.entry((f[k], f[(k + 1) % 4])).or_insert(0u32) += 1;
+            }
+        }
+        dirs.iter().filter(|(k, n)| k.0 < k.1 && (**n > 1 || dirs.get(&(k.1, k.0)).copied().unwrap_or(0) > 1)).count()
+    };
+    println!("edges walked the same way by both quads (wrong winding): {}", misoriented(&mesh.faces));
+    let (s5, s1) = thinness(&mesh.positions, &mesh.faces);
+    println!("quads thinner than 1:20 {s5}, thinner than 1:100 {s1} (of {})", mesh.faces.len());
     let mut top = Document::remeshed(mesh, doc, voxel)?;
+    let rest_normals: Vec<sculpt_core::glam::Vec3> = top.faces().iter().map(|f| sculpt_core::mesh::face_normal(top.positions(), f)).collect();
+    let flipped = |d: &Document| d.faces().iter().zip(&rest_normals).filter(|(f, n)| sculpt_core::mesh::face_normal(d.positions(), f).dot(**n) < 0.0).count();
     println!("remeshed: longest edge {:.4} ({:.1} voxels)", longest(&top), longest(&top) / voxel);
     let s = BrushSettings { radius: 0.35, strength: 1.0, ..Default::default() };
     let path = |a: f32| -> Vec<(sculpt_core::glam::Vec3, f32)> {
@@ -141,7 +167,7 @@ fn check(level: u32, divisions: f32) -> Res<()> {
                 top.end_stroke();
             }
         }
-        println!("after {name}: longest edge {:.4} ({:.1} voxels)", longest(&top), longest(&top) / voxel);
+        println!("after {name}: longest edge {:.4} ({:.1} voxels), quads turned inside out {}", longest(&top), longest(&top) / voxel, flipped(&top));
     }
     let mut source = top.take_remesh_source().expect("source");
     let old_stack = source.solid_input().field(&SolidSettings::new(voxel))?;
@@ -155,6 +181,28 @@ fn check(level: u32, divisions: f32) -> Res<()> {
     let as_volume = std::env::var("SOLID_CARRY").as_deref() == Ok("volume");
     let rebuilt = if as_volume { top.rebuilt_as_volume(&old_stack, source, &SolidSettings::new(voxel))? } else { top.rebuilt_from_source(source)? };
     println!("carried as {}", if as_volume { "volume" } else { "layers" });
+    println!("rebuilt: edges walked the same way by both quads (wrong winding): {}", misoriented(rebuilt.faces()));
+    let (s5, s1) = thinness(rebuilt.base_positions(), rebuilt.faces());
+    println!("rebuilt: quads thinner than 1:20 {s5}, thinner than 1:100 {s1} (of {})", rebuilt.faces().len());
+    let base_n: Vec<sculpt_core::glam::Vec3> = rebuilt.faces().iter().map(|f| sculpt_core::mesh::face_normal(rebuilt.base_positions(), f)).collect();
+    let folded_by_carry = rebuilt.faces().iter().zip(&base_n).filter(|(f, n)| sculpt_core::mesh::face_normal(rebuilt.positions(), f).dot(**n) < 0.0).count();
+    println!("rebuilt: quads the carried strokes turned inside out {folded_by_carry}");
+    let mut rebuilt = rebuilt;
+    let rest_after: Vec<sculpt_core::glam::Vec3> = rebuilt.faces().iter().map(|f| sculpt_core::mesh::face_normal(rebuilt.positions(), f)).collect();
+    if let Some(l) = rebuilt.layers().first().map(|l| l.id) {
+        rebuilt.set_active_layer(Some(l))?;
+    }
+    for (i, name) in ["clay", "smooth", "trim", "clay inverted"].iter().enumerate() {
+        let a = 0.4 + i as f32 * 1.1;
+        match *name {
+            "clay" => drop(brush::stroke(&mut rebuilt, &mut ClayBuildup::default(), &s, &path(a))?),
+            "clay inverted" => drop(brush::stroke(&mut rebuilt, &mut ClayBuildup::default(), &BrushSettings { invert: true, ..s.clone() }, &path(a))?),
+            "trim" => drop(brush::stroke(&mut rebuilt, &mut TrimDynamic::default(), &s, &path(a))?),
+            _ => drop(brush::stroke(&mut rebuilt, &mut Smooth::default(), &s, &path(a))?),
+        }
+        let turned = rebuilt.faces().iter().zip(&rest_after).filter(|(f, n)| sculpt_core::mesh::face_normal(rebuilt.positions(), f).dot(**n) < 0.0).count();
+        println!("after {name} on the rebuilt mesh: quads turned inside out {turned}, longest edge {:.1} voxels", longest(&rebuilt) / voxel);
+    }
     println!("after editing the stack below: longest edge {:.4} ({:.1} voxels), non-manifold edges {}", longest(&rebuilt), longest(&rebuilt) / voxel, non_manifold_edges(rebuilt.faces()));
     // Spikes: a vertex carried far off the solid it sits on. Distance of each sculpted vertex from the unsculpted surface.
     let edges: Vec<f32> = rebuilt.faces().iter().flat_map(|f| (0..4).map(move |k| (f[k], f[(k + 1) % 4]))).map(|(a, b)| rebuilt.positions()[a as usize].distance(rebuilt.positions()[b as usize]) / voxel).collect();

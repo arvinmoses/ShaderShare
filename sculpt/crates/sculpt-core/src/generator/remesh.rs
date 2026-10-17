@@ -71,6 +71,56 @@ pub fn non_manifold_edges(quads: &[[u32; 4]]) -> usize {
     uses.values().filter(|&&n| n != 2).count()
 }
 
+/// Even out the quads: each pass slides every vertex part of the way to the middle of its neighbours, but only within
+/// the surface's tangent plane, so the shape stays put while thin quads and nearly coincident vertices (where the
+/// surface passes close to a lattice point) spread out. Thin quads are what a brush flips inside out first.
+pub fn relax(mesh: &mut Remeshed, passes: u32) {
+    let n = mesh.positions.len();
+    if n == 0 || passes == 0 {
+        return;
+    }
+    // Neighbours along quad edges, and the quads around each vertex for its normal.
+    let mut rings: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut around: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (qi, q) in mesh.quads.iter().enumerate() {
+        for k in 0..4 {
+            let (a, b) = (q[k], q[(k + 1) % 4]);
+            rings[a as usize].push(b);
+            rings[b as usize].push(a);
+            around[a as usize].push(qi as u32);
+        }
+    }
+    for r in &mut rings {
+        r.sort_unstable();
+        r.dedup();
+    }
+    for _ in 0..passes {
+        let p = &mesh.positions;
+        let quads = &mesh.quads;
+        let next: Vec<Vec3> = (0..n)
+            .into_par_iter()
+            .map(|v| {
+                let ring = &rings[v];
+                if ring.is_empty() {
+                    return p[v];
+                }
+                let normal = around[v]
+                    .iter()
+                    .map(|&qi| {
+                        let q = quads[qi as usize];
+                        (p[q[2] as usize] - p[q[0] as usize]).cross(p[q[3] as usize] - p[q[1] as usize])
+                    })
+                    .sum::<Vec3>()
+                    .normalize_or_zero();
+                let mean = ring.iter().map(|&u| p[u as usize]).sum::<Vec3>() / ring.len() as f32;
+                let step = mean - p[v];
+                p[v] + (step - normal * step.dot(normal)) * 0.5
+            })
+            .collect();
+        mesh.positions = next;
+    }
+}
+
 /// Drop connected pieces with fewer than `min_fraction` of all quads, and the vertices only they used. Returns how many
 /// pieces went. The largest piece is always kept.
 pub fn drop_small_pieces(mesh: &mut Remeshed, min_fraction: f32) -> usize {
