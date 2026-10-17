@@ -8,7 +8,6 @@ use std::time::Instant;
 
 use egui::{RichText, Ui};
 use sculpt_core::Document;
-use sculpt_core::document::SolidSettings;
 
 use crate::app::SculptApp;
 use crate::panels::section;
@@ -32,7 +31,7 @@ pub fn remesh_to_sculpt(app: &mut SculptApp) -> bool {
     let input = doc.solid_input();
     // The same voxel size as the preview, so the remesh starts from its cached work.
     let voxel = input.surface_bounds().extent().max_element() / app.solid_ui.divisions as f32;
-    let result = input.run(&SolidSettings { voxel }).map(|(mesh, _)| mesh);
+    let result = input.run(&app.solid_ui.settings(voxel)).map(|(mesh, _)| mesh);
     match result {
         Ok(mesh) => match Document::remeshed(mesh, doc, voxel) {
             Ok(top) => {
@@ -72,7 +71,7 @@ pub fn edit_stack_below(app: &mut SculptApp) {
 pub fn finish_stack_edit(app: &mut SculptApp) {
     let (Some(top), Some(source)) = (app.remesh_top.take(), app.doc.take()) else { return };
     let started = Instant::now();
-    let rebuilt = source.solidify(&SolidSettings { voxel: top.remesh_voxel() }).and_then(|(mesh, _)| top.reprojected_onto(mesh));
+    let rebuilt = source.solidify(&app.solid_ui.settings(top.remesh_voxel())).and_then(|(mesh, _)| top.reprojected_onto(mesh));
     match rebuilt {
         Ok(mut new) => {
             new.set_remesh_source(source, top.remesh_voxel());

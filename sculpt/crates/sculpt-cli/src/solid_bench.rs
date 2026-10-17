@@ -50,7 +50,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         let snapshot = t.elapsed().as_secs_f64() * 1e3;
         let (stats, to_doc, total) = pool.install(|| -> Result<_, String> {
             let t = Instant::now();
-            let (mesh, stats) = input.run(&SolidSettings { voxel }).map_err(|e| e.to_string())?;
+            let (mesh, stats) = input.run(&SolidSettings::new(voxel)).map_err(|e| e.to_string())?;
             let t2 = Instant::now();
             let _preview = Document::from_mesh(mesh).map_err(|e| e.to_string())?;
             Ok((stats, t2.elapsed().as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3))
@@ -67,10 +67,11 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
 fn check(level: u32, divisions: f32) -> Res<()> {
     use sculpt_core::generator::remesh::non_manifold_edges;
     let mut doc = Document::from_mesh(quad_sphere(level, 1.0))?;
-    doc.insert_generator("cuts", Placement::Top, GeneratorSpec { primitive: Primitive::Box, op: BoolOp::Subtract, count: 14, size: 0.45, lift: 0.7, seed: 5, ..GeneratorSpec::default() })?;
+    let op = match std::env::var("SOLID_OP").as_deref() { Ok("intersect") => BoolOp::Intersect, Ok("add") => BoolOp::Add, _ => BoolOp::Subtract };
+    doc.insert_generator("cuts", Placement::Top, GeneratorSpec { primitive: Primitive::Box, op, count: 14, size: 0.45, lift: 0.7, seed: 5, ..GeneratorSpec::default() })?;
     doc.insert_generator("noise", Placement::Top, GeneratorSpec { kind: GeneratorKind::Noise, noise: NoiseSpec { amplitude: 0.03, scale: 10.9, octaves: 4, seed: 1 }, ..GeneratorSpec::default() })?;
     let voxel = doc.solid_input().surface_bounds().extent().max_element() / divisions;
-    let (mesh, _) = doc.solidify(&SolidSettings { voxel })?;
+    let (mesh, _) = doc.solidify(&SolidSettings::new(voxel))?;
     let p = &mesh.positions;
     // Degenerate quads: tiny area or a repeated corner.
     let area = |f: &[u32; 4]| ((p[f[2] as usize] - p[f[0] as usize]).cross(p[f[3] as usize] - p[f[1] as usize])).length() * 0.5;

@@ -58,7 +58,7 @@ impl Document {
 
     /// Solidify the edited `source` again and carry this document's layers onto the result.
     pub fn rebuilt_from_source(&self, source: Document) -> Result<Document> {
-        let (mesh, _) = source.solidify(&SolidSettings { voxel: self.remesh_voxel })?;
+        let (mesh, _) = source.solidify(&SolidSettings::new(self.remesh_voxel))?;
         let mut out = self.reprojected_onto(mesh)?;
         out.remesh_source = Some(Box::new(source));
         out.remesh_voxel = self.remesh_voxel;

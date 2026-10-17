@@ -16,7 +16,7 @@ fn stack() -> Document {
 }
 
 fn remesh(source: Document) -> Document {
-    let (mesh, _) = source.solidify(&SolidSettings { voxel: VOXEL }).unwrap();
+    let (mesh, _) = source.solidify(&SolidSettings::new(VOXEL)).unwrap();
     Document::remeshed(mesh, source, VOXEL).unwrap()
 }
 

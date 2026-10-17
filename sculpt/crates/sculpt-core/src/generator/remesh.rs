@@ -71,6 +71,57 @@ pub fn non_manifold_edges(quads: &[[u32; 4]]) -> usize {
     uses.values().filter(|&&n| n != 2).count()
 }
 
+/// Drop connected pieces with fewer than `min_fraction` of all quads, and the vertices only they used. Returns how many
+/// pieces went. The largest piece is always kept.
+pub fn drop_small_pieces(mesh: &mut Remeshed, min_fraction: f32) -> usize {
+    if min_fraction <= 0.0 || mesh.quads.is_empty() {
+        return 0;
+    }
+    let n = mesh.positions.len();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    fn root(parent: &mut [u32], mut i: u32) -> u32 {
+        while parent[i as usize] != i {
+            parent[i as usize] = parent[parent[i as usize] as usize];
+            i = parent[i as usize];
+        }
+        i
+    }
+    for q in &mesh.quads {
+        let r0 = root(&mut parent, q[0]);
+        for &v in &q[1..] {
+            let r = root(&mut parent, v);
+            if r != r0 {
+                parent[r as usize] = r0;
+            }
+        }
+    }
+    let roots: Vec<u32> = mesh.quads.iter().map(|q| root(&mut parent, q[0])).collect();
+    let mut size: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for &r in &roots {
+        *size.entry(r).or_default() += 1;
+    }
+    let largest = size.values().copied().max().unwrap_or(0);
+    let keep_at = ((mesh.quads.len() as f32 * min_fraction).ceil() as usize).min(largest);
+    let dropped = size.values().filter(|&&s| s < keep_at).count();
+    if dropped == 0 {
+        return 0;
+    }
+    let kept: Vec<[u32; 4]> = mesh.quads.iter().zip(&roots).filter(|(_, r)| size[r] >= keep_at).map(|(q, _)| *q).collect();
+    let mut remap = vec![u32::MAX; n];
+    let mut positions = Vec::with_capacity(n);
+    for q in &kept {
+        for &v in q {
+            if remap[v as usize] == u32::MAX {
+                remap[v as usize] = positions.len() as u32;
+                positions.push(mesh.positions[v as usize]);
+            }
+        }
+    }
+    mesh.quads = kept.into_iter().map(|q| q.map(|v| remap[v as usize])).collect();
+    mesh.positions = positions;
+    dropped
+}
+
 /// The edges not shared by exactly two quads, with how many quads use each, for diagnosing a bad extraction.
 pub fn non_manifold_edge_list(quads: &[[u32; 4]]) -> Vec<((u32, u32), u32)> {
     let mut uses = std::collections::HashMap::new();

@@ -49,7 +49,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         ..GeneratorSpec::default()
     };
     let t = Instant::now();
-    let (_, plain) = doc.solidify(&SolidSettings { voxel })?;
+    let (_, plain) = doc.solidify(&SolidSettings::new(voxel))?;
     println!("base only: {} quads in {:.0} ms (extract {:.0}), {} of {} samples", plain.quads, t.elapsed().as_secs_f64() * 1e3, plain.extract_ms, plain.evaluated, plain.total);
     doc.insert_generator("Big cuts", Placement::Top, spec(Primitive::Box, 14, 0.6, 0.8, 0.75, 55.0, 0, 0.12))?;
     doc.insert_generator("Medium cuts", Placement::Top, spec(Primitive::Box, 28, 0.2, 0.9, 0.35, 50.0, 1, 0.25))?;
@@ -57,7 +57,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
 
     doc.insert_generator("Grain", Placement::Top, GeneratorSpec { kind: GeneratorKind::Noise, noise: NoiseSpec { amplitude: 0.03, scale: 9.0, octaves: 4, seed: seed as u32 + 9 }, ..GeneratorSpec::default() })?;
     let t = Instant::now();
-    let (mesh, stats) = doc.solidify(&SolidSettings { voxel })?;
+    let (mesh, stats) = doc.solidify(&SolidSettings::new(voxel))?;
     let ms = t.elapsed().as_secs_f64() * 1e3;
     let bad = non_manifold_edges(&mesh.faces);
     for ((a, b), n) in sculpt_core::generator::remesh::non_manifold_edge_list(&mesh.faces) {
@@ -73,7 +73,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
     );
     // Repeat, then edit one layer, to see what the base-distance cache buys.
     let t = Instant::now();
-    let (_, again) = doc.solidify(&SolidSettings { voxel })?;
+    let (_, again) = doc.solidify(&SolidSettings::new(voxel))?;
     println!("again, nothing changed: {:.0} ms ({} base distances reused, {} computed)", t.elapsed().as_secs_f64() * 1e3, again.base_hits, again.base_misses);
     let big = doc.layers().iter().find(|l| l.name == "Big cuts").map(|l| l.id);
     if let Some(id) = big {
@@ -83,7 +83,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         meta.generator = Some(g);
         doc.set_layer_meta(id, meta, false)?;
         let t = Instant::now();
-        let (_, edited) = doc.solidify(&SolidSettings { voxel })?;
+        let (_, edited) = doc.solidify(&SolidSettings::new(voxel))?;
         println!("after growing the big cuts 10%: {:.0} ms ({} base distances reused, {} computed)", t.elapsed().as_secs_f64() * 1e3, edited.base_hits, edited.base_misses);
     }
     let views = [View { yaw: 0.6, pitch: 0.35, overlay: None }, View { yaw: 2.4, pitch: 0.2, overlay: None }];

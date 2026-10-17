@@ -400,6 +400,10 @@ fn solidify_section(app: &mut SculptApp, ui: &mut Ui) -> bool {
     section(ui, fs, "solidify", "SOLIDIFY", |ui| {
         ui.label(RichText::new("Turn the whole stack into one clean, closed mesh. Cuts blend softly and nothing folds. The layers are consumed; Undo brings them back.").size(fs * 0.85).color(weak));
         prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut app.solid_ui.divisions, 40..=400).logarithmic(true)).on_hover_text("Samples along the longest side. Higher keeps finer detail and takes longer."));
+        let mut percent = app.solid_ui.min_piece * 100.0;
+        if prop(ui, "Loose bits", |ui| ui.add(egui::Slider::new(&mut percent, 0.0..=2.0).max_decimals(2).suffix("%"))).on_hover_text("Floating pieces smaller than this share of the surface are removed. Crossing cuts can slice off slivers; 0 keeps everything.").changed() {
+            app.solid_ui.min_piece = percent / 100.0;
+        }
         prop(ui, "", |ui| {
             if ui.checkbox(&mut app.solid_preview.on, "Live preview").on_hover_text("Show the stack as one clean solid mesh, as Solidify would make it. It follows your edits and the layers stay editable. Off shows the fast live approximation.").changed() {
                 app.solid_preview.reset();
@@ -433,11 +437,19 @@ pub(crate) fn new_generator_spec(kind: GeneratorKind, longest: f32) -> Generator
 /// Settings of the Solidify section.
 pub struct SolidUi {
     pub divisions: u32,
+    /// Loose pieces smaller than this fraction of the surface are dropped.
+    pub min_piece: f32,
+}
+
+impl SolidUi {
+    pub fn settings(&self, voxel: f32) -> sculpt_core::document::SolidSettings {
+        sculpt_core::document::SolidSettings { min_piece: self.min_piece, ..sculpt_core::document::SolidSettings::new(voxel) }
+    }
 }
 
 impl Default for SolidUi {
     fn default() -> Self {
-        SolidUi { divisions: 150 }
+        SolidUi { divisions: 150, min_piece: 0.0025 }
     }
 }
 
@@ -446,7 +458,7 @@ pub(crate) fn solidify(app: &mut SculptApp) {
     let Some(doc) = app.doc.as_ref() else { return };
     let input = doc.solid_input();
     // The same voxel size the preview uses, so Solidify starts from its cached distances.
-    let settings = sculpt_core::document::SolidSettings { voxel: input.surface_bounds().extent().max_element() / app.solid_ui.divisions as f32 };
+    let settings = app.solid_ui.settings(input.surface_bounds().extent().max_element() / app.solid_ui.divisions as f32);
     let started = Instant::now();
     match input.run(&settings).and_then(|(mesh, stats)| Document::from_mesh(mesh).map(|d| (d, stats))) {
         Ok((new, stats)) => {

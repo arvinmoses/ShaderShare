@@ -102,6 +102,7 @@ pub fn tick(app: &mut SculptApp, ctx: &egui::Context) {
     let since = app.last_edit_age().min(app.gen_timer.since_edit());
     let stroking = app.is_stroking() || app.last_edit_age() < AFTER_STROKE;
     let divisions = app.solid_ui.divisions;
+    let min_piece = app.solid_ui.min_piece;
     let Some(doc) = app.doc.as_ref() else { return };
     let dab_age = app.last_edit_age();
     let p = &mut app.solid_preview;
@@ -175,7 +176,7 @@ pub fn tick(app: &mut SculptApp, ctx: &egui::Context) {
         p.stroked = false;
         let divisions = if coarse { (divisions / 3).max(32) } else { divisions };
         let input = doc.solid_input();
-        let settings = SolidSettings { voxel: input.surface_bounds().extent().max_element() / divisions as f32 };
+        let settings = SolidSettings { min_piece, ..SolidSettings::new(input.surface_bounds().extent().max_element() / divisions as f32) };
         p.dirty = false;
         p.started = Instant::now();
         p.job = Some(std::thread::spawn(move || {

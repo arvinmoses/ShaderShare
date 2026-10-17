@@ -10,7 +10,7 @@ fn spec(op: BoolOp, primitive: Primitive, count: u32, size: f32, lift: f32, seed
 }
 
 fn settings() -> SolidSettings {
-    SolidSettings { voxel: 0.05 }
+    SolidSettings::new(0.05)
 }
 
 /// Volume of a closed quad mesh by the divergence theorem (each quad as two triangles).
@@ -214,4 +214,45 @@ fn after_a_brush_stroke_the_kept_distances_give_exactly_the_cold_result() {
     assert!(cold_stats.base_hits * 50 < cold_stats.base_misses, "a cold run computes nearly everything (block centres are looked up twice): {cold_stats:?}");
     assert_eq!(warm_mesh.faces, cold_mesh.faces);
     assert_eq!(warm_mesh.positions, cold_mesh.positions);
+}
+
+#[test]
+fn intersecting_with_cutters_stays_closed() {
+    // Intersect keeps only what lies inside some cutter, so far from every cutter the field must say outside. Treating
+    // "no cutter nearby" as "no change" left slabs of the base behind and broke the surface open.
+    for seed in [5, 9] {
+        let mut doc = Document::from_mesh(quad_sphere(4, 1.0)).unwrap();
+        doc.insert_generator("keep", Placement::Top, spec(BoolOp::Intersect, Primitive::Box, 10, 0.35, 0.0, seed)).unwrap();
+        let (mesh, _) = doc.solidify(&settings()).unwrap();
+        assert!(!mesh.faces.is_empty());
+        assert_eq!(non_manifold_edges(&mesh.faces), 0, "seed {seed}");
+        assert!(volume(&mesh) < 4.19 * 0.8, "only the parts inside cutters remain, volume {}", volume(&mesh));
+    }
+}
+
+#[test]
+fn the_app_scene_with_intersect_and_noise_stays_closed() {
+    // The scene that tore in the app: 14 lifted boxes intersected with the sphere, a noise layer on top.
+    let mut doc = Document::from_mesh(quad_sphere(5, 1.0)).unwrap();
+    doc.insert_generator("keep", Placement::Top, GeneratorSpec { primitive: Primitive::Box, op: BoolOp::Intersect, count: 14, size: 0.45, lift: 0.7, seed: 5, ..GeneratorSpec::default() }).unwrap();
+    doc.insert_generator("grain", Placement::Top, noise_spec(0.03)).unwrap();
+    let (mesh, _) = doc.solidify(&SolidSettings::new(0.02)).unwrap();
+    assert_eq!(non_manifold_edges(&mesh.faces), 0);
+}
+
+#[test]
+fn loose_slivers_are_dropped_and_zero_keeps_them() {
+    use sculpt_core::generator::remesh::{RemeshParams, drop_small_pieces, remesh};
+    // A ball and a speck well apart.
+    let field = |p: glam::Vec3| (p.length() - 0.8).min((p - glam::Vec3::new(1.15, 0.0, 0.0)).length() - 0.06);
+    let bounds = sculpt_core::geom::Aabb { min: glam::Vec3::splat(-1.3), max: glam::Vec3::splat(1.4) };
+    let whole = remesh(&field, bounds, &RemeshParams::new(0.04));
+    let mut kept = whole.clone();
+    assert_eq!(drop_small_pieces(&mut kept, 0.0), 0);
+    assert_eq!(kept.quads.len(), whole.quads.len());
+    let mut cleaned = whole.clone();
+    assert_eq!(drop_small_pieces(&mut cleaned, 0.01), 1);
+    assert!(cleaned.quads.len() < whole.quads.len());
+    assert!(cleaned.positions.iter().all(|p| p.x < 1.0), "only the speck went");
+    assert_eq!(non_manifold_edges(&cleaned.quads), 0);
 }

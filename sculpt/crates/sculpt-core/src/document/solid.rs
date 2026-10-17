@@ -31,6 +31,15 @@ use crate::{Error, Result};
 pub struct SolidSettings {
     /// Lattice spacing of the final extraction, in world units.
     pub voxel: f32,
+    /// Loose pieces with fewer than this fraction of the surface are dropped (crossing cuts can slice slivers right
+    /// off). `0` keeps everything.
+    pub min_piece: f32,
+}
+
+impl SolidSettings {
+    pub fn new(voxel: f32) -> SolidSettings {
+        SolidSettings { voxel, min_piece: 0.0025 }
+    }
 }
 
 /// Hashes a key that is already well mixed.
@@ -159,6 +168,8 @@ fn fingerprint(positions: &[Vec3]) -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct SolidStats {
     /// Distances to the sculpted surface taken from the cache, and computed.
+    /// Loose pieces too small to keep.
+    pub pieces_dropped: usize,
     pub base_hits: usize,
     pub base_misses: usize,
     pub layers: usize,
@@ -192,18 +203,23 @@ fn smax(a: f32, b: f32, k: f32) -> f32 {
     a.max(b) + h * h * k * 0.25
 }
 
-/// Distance to the nearest instance of `set` near `p` (negative inside one); `INFINITY` if none is within `limit`.
-/// An instance whose box is farther than `limit` cannot change the field at `p`, so it is skipped without evaluating it.
-fn nearest(set: &InstanceSet, p: Vec3, limit: f32) -> f32 {
-    let mut best = f32::INFINITY;
+/// Distance to the nearest instance of `set` near `p` (negative inside one), or `None` if none is within `limit`, with a
+/// lower bound on that distance. An instance whose box is farther than `limit` cannot change a cut or a join at `p`, so
+/// it is not evaluated; an instance the spatial table does not list for `p` is at least the table's margin away.
+fn nearest(set: &InstanceSet, p: Vec3, limit: f32) -> (Option<f32>, f32) {
+    let mut best: Option<f32> = None;
+    let mut lower = set.margin();
     for &i in set.candidates(p) {
         let b = set.instances()[i as usize].aabb();
-        if (p - p.clamp(b.min, b.max)).length() > limit {
+        let gap = (p - p.clamp(b.min, b.max)).length();
+        if gap > limit {
+            lower = lower.min(gap);
             continue;
         }
-        best = best.min(set.sdf(i, p));
+        let d = set.sdf(i, p);
+        best = Some(best.map_or(d, |b: f32| b.min(d)));
     }
-    best
+    (best, lower)
 }
 
 fn apply_terms(mut f: f32, terms: &[Term], p: Vec3) -> f32 {
@@ -211,11 +227,16 @@ fn apply_terms(mut f: f32, terms: &[Term], p: Vec3) -> f32 {
         match t {
             Term::Noise { noise, amplitude } => f += (noise.sample(p) - 0.5) * amplitude,
             Term::Instances { set, op, blend } => {
-                // Only an instance within |f| + blend of p can move the field there (further away it changes the value, never the sign).
-                let d = nearest(set, p, f.abs() + blend);
-                if !d.is_finite() {
-                    continue;
-                }
+                // Only an instance within |f| + blend of p can move a cut or a join there (further away it changes the
+                // value, never the sign).
+                let (near, lower) = nearest(set, p, f.abs() + blend);
+                let d = match (near, op) {
+                    (Some(d), _) => d,
+                    // Intersect keeps only what is inside some instance: with none near, p is outside all of them by
+                    // at least `lower`. Skipping the term instead would keep the base here and tear the field.
+                    (None, BoolOp::Intersect) => lower,
+                    (None, _) => continue,
+                };
                 f = match op {
                     BoolOp::Subtract => smax(f, -d, *blend),
                     BoolOp::Add => -smax(-f, -d, *blend),
@@ -467,7 +488,8 @@ impl SolidInput {
         let t = Instant::now();
         // Gradient above 1 where blends overlap and grain is added, so skip blocks conservatively.
         let lipschitz = 1.3 + noise_slope;
-        let out = remesh(&field, bounds, &RemeshParams { voxel: settings.voxel, lipschitz });
+        let mut out = remesh(&field, bounds, &RemeshParams { voxel: settings.voxel, lipschitz });
+        stats.pieces_dropped = crate::generator::remesh::drop_small_pieces(&mut out, settings.min_piece);
         stats.extract_ms = t.elapsed().as_secs_f64() * 1e3;
         stats.base_hits = hits.load(Ordering::Relaxed);
         stats.base_misses = misses.load(Ordering::Relaxed);
