@@ -191,3 +191,27 @@ fn a_snapshot_runs_on_another_thread_and_warms_the_documents_cache() {
     assert!(stats.base_hits > stats.base_misses, "the thread's distances are reused: {stats:?}");
     assert_eq!(non_manifold_edges(&from_thread.faces), 0);
 }
+
+#[test]
+fn after_a_brush_stroke_the_kept_distances_give_exactly_the_cold_result() {
+    use sculpt_core::brush::{self, BrushSettings, ClayBuildup};
+    let path: Vec<(glam::Vec3, f32)> = (0..=20).map(|i| (glam::Vec3::new(-0.3 + 0.6 * i as f32 / 20.0, 1.0, 0.0), 1.0)).collect();
+    let stack = |doc: &mut Document| {
+        doc.insert_generator("cuts", Placement::Top, spec(BoolOp::Subtract, Primitive::Box, 8, 0.4, 0.7, 5)).unwrap();
+    };
+    // Warm: solidify, stroke, solidify again (the second reuses what the stroke cannot have changed).
+    let mut warm = Document::from_mesh(quad_sphere(5, 1.0)).unwrap();
+    stack(&mut warm);
+    warm.solidify(&settings()).unwrap();
+    brush::stroke(&mut warm, &mut ClayBuildup::default(), &BrushSettings { radius: 0.25, strength: 0.6, ..Default::default() }, &path).unwrap();
+    let (warm_mesh, warm_stats) = warm.solidify(&settings()).unwrap();
+    // Cold: the same stroke, solidified once from nothing.
+    let mut cold = Document::from_mesh(quad_sphere(5, 1.0)).unwrap();
+    stack(&mut cold);
+    brush::stroke(&mut cold, &mut ClayBuildup::default(), &BrushSettings { radius: 0.25, strength: 0.6, ..Default::default() }, &path).unwrap();
+    let (cold_mesh, cold_stats) = cold.solidify(&settings()).unwrap();
+    assert!(warm_stats.base_hits > warm_stats.base_misses, "most distances survive a local stroke: {warm_stats:?}");
+    assert!(cold_stats.base_hits * 50 < cold_stats.base_misses, "a cold run computes nearly everything (block centres are looked up twice): {cold_stats:?}");
+    assert_eq!(warm_mesh.faces, cold_mesh.faces);
+    assert_eq!(warm_mesh.positions, cold_mesh.positions);
+}

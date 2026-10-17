@@ -76,6 +76,36 @@ impl BaseCache {
         q(p.x) | q(p.y) << 21 | q(p.z) << 42
     }
 
+    /// The lattice point a key was made from.
+    fn point(key: u64, voxel: f32) -> Vec3 {
+        // Each coordinate is 21 bits, two's complement.
+        let d = |bits: u64| (((bits & 0x1F_FFFF) as i64) << 43 >> 43) as f32 * voxel;
+        Vec3::new(d(key), d(key >> 21), d(key >> 42))
+    }
+
+    /// A copy for `surface`, which differs from this cache's surface only inside `changed`. A distance stays exact if
+    /// it is shorter than the way to the changed region: the closest point it measured lies outside the region, and
+    /// nothing in the region can have come closer than the region itself. Everything else is dropped.
+    fn carried_over(&self, surface: u64, changed: &Aabb) -> BaseCache {
+        let voxel = f32::from_bits(self.voxel_bits);
+        let out = BaseCache::new(surface, voxel);
+        let mut kept = 0;
+        for (from, to) in self.shards.iter().zip(&out.shards) {
+            let from = from.lock().unwrap();
+            let mut to = to.lock().unwrap();
+            for (&key, &v) in from.iter() {
+                let p = BaseCache::point(key, voxel);
+                let gap = (p - p.clamp(changed.min, changed.max)).length();
+                if v.abs() < gap {
+                    to.insert(key, v);
+                    kept += 1;
+                }
+            }
+        }
+        out.entries.store(kept, Ordering::Relaxed);
+        out
+    }
+
     /// The cached value at `p`, or `compute()` stored for next time. Returns whether it was a hit.
     fn get(&self, p: Vec3, voxel: f32, compute: impl FnOnce() -> f32) -> (f32, bool) {
         let key = Self::key(p, voxel);
@@ -105,6 +135,8 @@ pub(crate) struct SolidCaches {
 /// The sculpted surface, ready to measure distances to and to scatter the first layer on.
 pub(crate) struct PlainSurface {
     surface: u64,
+    /// The surface's vertices in the snapshot's order, to find what the next stroke changed.
+    positions: Vec<Vec3>,
     sdf: MeshSdf<'static>,
     bounds: Aabb,
     doc: Mutex<Document>,
@@ -281,9 +313,38 @@ impl SolidInput {
             match &caches.plain {
                 Some(p) if p.surface == surface => p.clone(),
                 _ => {
+                    // A sculpt stroke moves part of the surface: keep the distances it cannot have changed.
+                    if let Some(old) = caches.plain.clone()
+                        && old.positions.len() == self.positions.len()
+                    {
+                        let mut changed = Aabb::EMPTY;
+                        for (a, b) in old.positions.iter().zip(&self.positions) {
+                            if a != b {
+                                changed.grow(*a);
+                                changed.grow(*b);
+                            }
+                        }
+                        // A moved vertex changes every face around it, and the sign test reads the normals of the
+                        // vertices around those faces: two rings, so two of the longest edges (old or new) further out.
+                        if changed.min.x <= changed.max.x {
+                            let longest = |pos: &[Vec3]| {
+                                self.faces
+                                    .iter()
+                                    .map(|f| {
+                                        let n = crate::mesh::face_len(f);
+                                        (0..n).map(|k| pos[f[k] as usize].distance(pos[f[(k + 1) % n] as usize])).fold(0.0f32, f32::max)
+                                    })
+                                    .fold(0.0f32, f32::max)
+                            };
+                            let grow = 2.0 * longest(&old.positions).max(longest(&self.positions));
+                            changed = Aabb { min: changed.min - Vec3::splat(grow), max: changed.max + Vec3::splat(grow) };
+                        }
+                        let carried: Vec<Arc<BaseCache>> = caches.bases.iter().filter(|c| c.surface == old.surface).map(|c| Arc::new(c.carried_over(surface, &changed))).collect();
+                        caches.bases = carried;
+                    }
                     let doc = Document::from_mesh(PolyMesh { positions: self.positions.clone(), faces: self.faces.clone() })?;
                     let sdf = MeshSdf::build_owned(doc.bvh().clone(), doc.positions().to_vec(), doc.faces().to_vec(), doc.topology());
-                    let p = Arc::new(PlainSurface { surface, sdf, bounds: doc.bounds(), doc: Mutex::new(doc) });
+                    let p = Arc::new(PlainSurface { surface, positions: self.positions.clone(), sdf, bounds: doc.bounds(), doc: Mutex::new(doc) });
                     caches.plain = Some(p.clone());
                     caches.scatters.clear();
                     p

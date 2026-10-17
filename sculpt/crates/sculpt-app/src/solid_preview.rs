@@ -49,6 +49,9 @@ pub struct SolidPreview {
     hold_live: bool,
     /// The preview on screen was built at drag detail and wants a full-detail pass.
     shown_coarse: bool,
+    /// A brush stroke changed the surface since the last preview started: the next one is built at drag detail first.
+    stroked: bool,
+    last_dab_age: Duration,
     /// One line for the Solidify section.
     pub status: String,
     /// `SCULPT_PREVIEW_LOG`: frame intervals and preview build times, printed once a second.
@@ -64,7 +67,7 @@ struct Log {
 
 impl Default for SolidPreview {
     fn default() -> Self {
-        SolidPreview { on: std::env::var("SCULPT_SOLID_PREVIEW").as_deref() != Ok("off"), doc: None, job: None, started: Instant::now(), last_since: Duration::ZERO, signature: 0, dirty: true, hold_live: false, shown_coarse: false, status: String::new(), log: std::env::var_os("SCULPT_PREVIEW_LOG").map(|_| Log { last_frame: Instant::now(), window: Instant::now(), frames: Vec::new(), builds: Vec::new() }) }
+        SolidPreview { on: std::env::var("SCULPT_SOLID_PREVIEW").as_deref() != Ok("off"), doc: None, job: None, started: Instant::now(), last_since: Duration::ZERO, signature: 0, dirty: true, hold_live: false, shown_coarse: false, stroked: false, last_dab_age: Duration::ZERO, status: String::new(), log: std::env::var_os("SCULPT_PREVIEW_LOG").map(|_| Log { last_frame: Instant::now(), window: Instant::now(), frames: Vec::new(), builds: Vec::new() }) }
     }
 }
 
@@ -100,8 +103,13 @@ pub fn tick(app: &mut SculptApp, ctx: &egui::Context) {
     let stroking = app.is_stroking() || app.last_edit_age() < AFTER_STROKE;
     let divisions = app.solid_ui.divisions;
     let Some(doc) = app.doc.as_ref() else { return };
+    let dab_age = app.last_edit_age();
     let p = &mut app.solid_preview;
     p.hold_live = stroking;
+    if dab_age < p.last_dab_age {
+        p.stroked = true;
+    }
+    p.last_dab_age = dab_age;
     if let Some(log) = p.log.as_mut() {
         log.frames.push(log.last_frame.elapsed().as_secs_f32() * 1e3);
         log.last_frame = Instant::now();
@@ -162,7 +170,9 @@ pub fn tick(app: &mut SculptApp, ctx: &egui::Context) {
     // Strokes change the surface every dab; wait for the stroke to end rather than snapshot the mesh at each one.
     let dragging = since < DRAGGING;
     if p.job.is_none() && !stroking && (p.dirty || (p.shown_coarse && !dragging)) {
-        let coarse = dragging;
+        // After a stroke much of the surface's distances are recomputed: show a quick result first.
+        let coarse = dragging || p.stroked;
+        p.stroked = false;
         let divisions = if coarse { (divisions / 3).max(32) } else { divisions };
         let input = doc.solid_input();
         let settings = SolidSettings { voxel: input.surface_bounds().extent().max_element() / divisions as f32 };
@@ -175,9 +185,9 @@ pub fn tick(app: &mut SculptApp, ctx: &egui::Context) {
                 let preview = Document::from_mesh(mesh).map_err(|e| e.to_string())?;
                 Ok((preview, stats, t.elapsed().as_secs_f32() * 1e3, coarse))
             };
-            // While dragging, stay on the preview's own threads so the edit keeps the rest. Once the hand has stopped
-            // nothing competes, so the full-detail pass takes every core.
-            if coarse { pool().install(work) } else { work() }
+            // Always on the preview's own threads: the next brush stroke or slider drag can start at any moment, and
+            // must find the rest of the machine free.
+            pool().install(work)
         }));
         p.status = "updating...".into();
     }
