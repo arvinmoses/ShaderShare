@@ -275,19 +275,15 @@ impl Volume {
         out
     }
 
-    /// Add (`carve` false) or remove a soft blob of radius `r` centred at `c`, blended over `k`, and re-extract.
-    pub fn dab(&mut self, c: Vec3, r: f32, k: f32, carve: bool) -> DabStats {
-        let mut stats = DabStats::default();
-        let t = Instant::now();
+    /// The blocks a blob of radius `r` at `c`, blended over `k`, can change: those its surface passes through
+    /// (sample by sample), and those wholly inside it (they become solid or empty). Only blocks the blob's own surface
+    /// passes through change sample by sample; out of its reach nothing changes: a thin shell of blocks, not a ball.
+    pub fn dab_shell(&self, c: Vec3, r: f32, k: f32) -> (Vec<u32>, Vec<u32>) {
         let reach = r + k + self.band;
         let lo = ((c - Vec3::splat(reach) - self.origin) / (self.voxel * B as f32)).floor().as_ivec3();
         let hi = ((c + Vec3::splat(reach) - self.origin) / (self.voxel * B as f32)).floor().as_ivec3();
-        // Only blocks the blob's own surface passes through can change sample by sample. Blocks wholly inside the blob
-        // just become solid (clay) or empty (carving), and blocks out of its reach are left alone: a thin shell of
-        // blocks instead of a ball of them.
         let shell = self.band + k;
-        let mut touched = Vec::new();
-        let mut swallowed = Vec::new();
+        let (mut touched, mut swallowed) = (Vec::new(), Vec::new());
         for z in lo.z..=hi.z {
             for y in lo.y..=hi.y {
                 for x in lo.x..=hi.x {
@@ -307,6 +303,32 @@ impl Volume {
                 }
             }
         }
+        (touched, swallowed)
+    }
+
+    /// Block coordinates of block `b`, and the block at coordinates `c` (if inside the grid).
+    pub fn coords_of(&self, b: u32) -> IVec3 {
+        self.block_coords(b)
+    }
+    pub fn block_at(&self, c: IVec3) -> Option<u32> {
+        self.block_index(c)
+    }
+    pub fn grid(&self) -> (Vec3, IVec3) {
+        (self.origin, self.dims)
+    }
+    /// `-1` inside, `1` outside, `0` stored, per block.
+    pub fn signs(&self) -> &[i8] {
+        &self.signs
+    }
+    pub fn stored(&self) -> impl Iterator<Item = (u32, &[f32; N])> {
+        self.dense.iter().map(|(b, s)| (*b, &**s))
+    }
+
+    /// Add (`carve` false) or remove a soft blob of radius `r` centred at `c`, blended over `k`, and re-extract.
+    pub fn dab(&mut self, c: Vec3, r: f32, k: f32, carve: bool) -> DabStats {
+        let mut stats = DabStats::default();
+        let t = Instant::now();
+        let (touched, swallowed) = self.dab_shell(c, r, k);
         stats.blocks_touched = touched.len() + swallowed.len();
         let fill: i8 = if carve { 1 } else { -1 };
         // A swallowed block changes only if it was not already all `fill`.

@@ -120,3 +120,51 @@ viewport can show a coarser level.
 
 Still open: GPU compute (spike 3), the banding on steep flanks, refining progressively near the camera first, and
 whether detail should ride (as here) or be buried (as clay does) for each brush type.
+
+# Spike 3: the same on the GPU
+
+Code: `crates/sculpt-app/src/gpu_volume/` (`mod.rs`, `volume.wgsl`), benchmark `sculpt-app --gpu-volume-bench [millions]`.
+AMD Radeon AI PRO R9700, Vulkan, timestamps per pass.
+
+The field stays on the GPU in slots of 512 samples, with a table from every block of the grid to its slot (or inside /
+outside). Each dab the CPU works out which blocks it touches (the same `dab_shell` as the CPU version) and which slots
+to allocate or free, uploads those lists, and the GPU runs five passes: update the slot table, fill new blocks, blend
+the blob in, find each cell's surface point, and write the quads into a GPU buffer. Nothing is uploaded for drawing. It
+re-extracts every block the dab touched rather than only those whose samples changed (the CPU version does the latter).
+
+Correctness: quad counts match the CPU version exactly after the first extraction at every size, and after all the
+strokes (20M: 16,232,148 against 16,232,146, float rounding).
+
+| triangles | brush | dab | GPU ms (median / worst) | total ms incl. planning and wait (median / worst) | of which planning | CPU version ms (median / worst) | upload (most) |
+|---|---|---|---|---|---|---|---|
+| 1M | small | clay / carve | 0.01 / 0.02 | 0.23-0.24 / 0.36-1.39 | 0.02 | 0.23 / 0.60 | 2 KB |
+| 1M | medium | clay / carve | 0.02 / 0.02 | 0.33-0.34 / 0.40 | 0.07 | 0.47-0.57 / 0.97 | 13 KB |
+| 1M | large | clay / carve | 0.06-0.09 / 0.11 | 0.88-0.91 / 1.14 | 0.47 | 1.36-1.81 / 3.85 | 116 KB |
+| 5M | small | clay / carve | 0.02-0.03 / 0.03 | 0.31 / 1.57 | 0.04 | 0.35-0.41 / 0.72 | 6 KB |
+| 5M | medium | clay / carve | 0.04-0.07 / 0.07 | 0.61-0.68 / 1.53 | 0.32 | 0.94-1.45 / 2.11 | 84 KB |
+| 5M | large | clay / carve | 0.35-0.76 / 1.14 | 4.9-7.7 / 8.5 | 4.2-6.2 | 5.5-9.8 / 22 | 1.0 MB |
+| 20M | small | clay / carve | 0.02-0.03 / 0.03 | 0.39-0.41 / 2.6 | 0.11 | 0.63-0.80 / 1.09 | 25 KB |
+| 20M | medium | clay / carve | 0.17-0.30 / 0.51 | 2.9-5.0 / 5.3 | 2.3-4.2 | 3.4-7.1 / 14 | 520 KB |
+| 20M | large | clay / carve | 3.2-4.7 / 7.9 | 45-50 / 85 | 41-44 | 35-55 / 162 | 7.1 MB |
+
+Full extraction of the whole 20M surface: 16.5 ms on the GPU (382 ms on the CPU). The first dispatch of a session
+costs up to 16 ms once (pipeline warm-up), which shows in a few worst cases.
+
+## Verdict
+
+**The GPU does the work 10-20x faster**: a large dab at 20M is 3-5 ms of GPU time against 35-55 ms on the CPU, a medium
+one 0.2-0.3 ms against 3-7. End to end it is now **bound by the CPU planning**, single-threaded and built on hash maps:
+41-44 of the 45-50 ms for a large dab. That is the next thing to move: classify the blocks in a dab's reach on the GPU
+(or on all cores), and allocate slots from a free list there.
+
+## All three spikes together
+
+* Volume sculpting holds up at 20M triangles: small and medium brushes are fast on the CPU already, faster on the GPU.
+* Large brushes belong on a coarse level, which is faster (5 ms CPU at 20M) and the more accurate result; on the GPU
+  that would be well under a millisecond.
+* The engine to build: the field on the GPU in slots, a small pyramid of levels with each brush on the level its size
+  and blend call for, the surface extracted per block straight into GPU buffers and drawn from there, planning on the
+  GPU, and fine detail carried up after coarse strokes.
+
+Not yet tested: drawing the GPU quads directly in the viewport (indirect draws from the quad buffer), the coarse level
+on the GPU, GPU-side planning, Move / grab / smooth brushes, layers, masks, undo and saving in a volume.

@@ -13,6 +13,7 @@ mod camera;
 mod generator_ui;
 mod gpu_boolean;
 mod gpu_sdf;
+mod gpu_volume;
 mod icons;
 mod layer_panel;
 mod keymap;
@@ -161,6 +162,15 @@ fn main() -> eframe::Result {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_boolean::bench::run(&args) {
             eprintln!("gpu-bench: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // Headless GPU volume sculpting spike: see gpu_volume/mod.rs.
+    if std::env::args().nth(1).as_deref() == Some("--gpu-volume-bench") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = gpu_volume::bench(&args) {
+            eprintln!("gpu-volume-bench: {e}");
             std::process::exit(1);
         }
         return Ok(());
