@@ -233,3 +233,61 @@ pub(crate) fn levels(args: &[String]) -> Res<()> {
     }
     Ok(())
 }
+
+/// `sculpt-cli volume-spike video DIR`: frames of a short volume sculpting session, one dab a frame, the camera turning.
+pub(crate) fn video(args: &[String]) -> Res<()> {
+    let dir = Path::new(args.first().map_or("volume_video", |s| s.as_str()));
+    std::fs::create_dir_all(dir)?;
+    let voxel = 0.006f32;
+    let a = Vec3::new(-0.62, 0.0, 0.0);
+    let b = Vec3::new(0.62, 0.0, 0.0);
+    let mut vol = Volume::from_field(&|p: Vec3| ((p - a).length() - 0.5).min((p - b).length() - 0.5), 1.7, voxel);
+    vol.extract_all();
+    // The session: (centre, radius, blend, carve), one dab a frame; `None` holds still for a frame.
+    let mut dabs: Vec<Option<(Vec3, f32, f32, bool)>> = vec![None; 20];
+    // Clay laid across the gap until the balls join.
+    for i in 0..60 {
+        let t = i as f32 / 59.0;
+        dabs.push(Some((Vec3::new(-0.2 + 0.4 * t, 0.05 * (t * 6.0).sin(), 0.0), 0.14, 0.06, false)));
+    }
+    // A horn pulled up out of the right ball, tapering.
+    for i in 0..80 {
+        let t = i as f32 / 79.0;
+        dabs.push(Some((b + Vec3::new(0.25 + 0.45 * t, 0.42 + 0.35 * t, 0.1 * t), 0.11 * (1.0 - 0.6 * t), 0.04, false)));
+    }
+    // A groove carved round the left ball.
+    for i in 0..60 {
+        let t = i as f32 / 59.0 * std::f32::consts::PI;
+        let dir = Vec3::new(-0.9 * t.cos(), 0.9 * t.sin(), 0.6).normalize();
+        dabs.push(Some((a + dir * 0.5, 0.075, 0.02, true)));
+    }
+    // Clay blobs dabbed onto the bridge.
+    for i in 0..30 {
+        let t = i as f32 / 29.0;
+        dabs.push(Some((Vec3::new(-0.15 + 0.3 * t, 0.16, 0.08 * (t * 9.0).cos()), 0.07, 0.03, false)));
+    }
+    dabs.extend(std::iter::repeat_n(None, 30));
+    let mut times = Vec::new();
+    for (frame, dab) in dabs.iter().enumerate() {
+        if let Some((c, r, k, carve)) = *dab {
+            let s = vol.dab(c, r, k, carve);
+            times.push(s.field_ms + s.extract_ms);
+        }
+        // Sway across the front so every stroke stays in view.
+        let yaw = 0.15 + 0.7 * (frame as f32 * 0.022).sin();
+        let views = [sculpt_core_render_view(yaw, 0.35)];
+        crate::render::render(&Document::from_mesh(vol.mesh())?, &views, 720, &dir.join(format!("frame_{frame:04}.png")))?;
+    }
+    let mesh = vol.mesh();
+    println!(
+        "{} frames, {} dabs: median {:.2} ms, worst {:.2} ms; final {} quads, longest edge {:.2} lattice steps, non-manifold edges {}",
+        dabs.len(),
+        times.len(),
+        median(times.clone()),
+        times.iter().cloned().fold(0.0, f64::max),
+        mesh.faces.len(),
+        longest_edge(&mesh) / voxel,
+        sculpt_core::generator::remesh::non_manifold_edges(&mesh.faces)
+    );
+    Ok(())
+}
