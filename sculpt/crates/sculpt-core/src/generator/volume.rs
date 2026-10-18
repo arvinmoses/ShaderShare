@@ -77,7 +77,12 @@ const EDGES: [[usize; 2]; 12] = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3],
 impl Volume {
     /// A volume over `[-half, half]^3` holding `field` (negative inside), at lattice spacing `voxel`.
     pub fn from_field<F: Fn(Vec3) -> f32 + Sync>(field: &F, half: f32, voxel: f32) -> Volume {
-        let band = 2.5 * voxel;
+        Volume::from_field_with_band(field, half, voxel, 2.5 * voxel)
+    }
+
+    /// [`Self::from_field`] keeping true distances out to `band` instead of a few lattice steps. A coarse level needs
+    /// a wide band: refining carries detail back along the distance the surface moved, which must not be clamped.
+    pub fn from_field_with_band<F: Fn(Vec3) -> f32 + Sync>(field: &F, half: f32, voxel: f32, band: f32) -> Volume {
         let blocks = ((2.0 * half / voxel) / B as f32).ceil() as i32 + 2;
         let dims = IVec3::splat(blocks);
         let origin = Vec3::splat(-half - voxel * B as f32);
@@ -380,5 +385,186 @@ impl Volume {
             .map(|q| q.map(|(b, c)| offset[&b] + self.meshes[&b].cell[c as usize]))
             .collect();
         crate::mesh::PolyMesh { positions, faces }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SPIKE 2 (measurement only): a coarse level for large brushes.
+//
+// A large brush changes broad form, so it can work on a coarse copy of the field (4x the lattice step, 64x fewer
+// samples) while the stroke is under way, and the viewport can show that coarse surface: a brush that size is used
+// zoomed out, where the difference does not show. When the stroke ends the fine field is rebuilt once: the new coarse
+// shape plus the old fine detail, carried along with the surface as it moved, so detail rides on the change the way it
+// does in multiresolution sculpting.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RefineStats {
+    pub field_ms: f64,
+    pub extract_ms: f64,
+    pub blocks_checked: usize,
+    pub blocks_rebuilt: usize,
+}
+
+impl Volume {
+    /// A copy of the field without its surface, to remember how it was before a stroke.
+    pub fn field_copy(&self) -> Volume {
+        Volume { voxel: self.voxel, band: self.band, origin: self.origin, dims: self.dims, signs: self.signs.clone(), dense: self.dense.clone(), meshes: HashMap::new() }
+    }
+
+    fn sample(&self, i: IVec3) -> f32 {
+        let Some(b) = self.block_index(i.div_euclid(IVec3::splat(B))) else { return self.band };
+        match self.dense.get(&b) {
+            Some(s) => {
+                let l = i.rem_euclid(IVec3::splat(B));
+                s[(l.z * 64 + l.y * 8 + l.x) as usize]
+            }
+            None => self.signs[b as usize] as f32 * self.band,
+        }
+    }
+
+    /// The field at any point, interpolated between lattice samples.
+    pub fn value_at(&self, p: Vec3) -> f32 {
+        let g = (p - self.origin) / self.voxel;
+        let i = g.floor().as_ivec3();
+        let f = g - i.as_vec3();
+        let s = |dx: i32, dy: i32, dz: i32| self.sample(i + IVec3::new(dx, dy, dz));
+        let x00 = s(0, 0, 0) + (s(1, 0, 0) - s(0, 0, 0)) * f.x;
+        let x10 = s(0, 1, 0) + (s(1, 1, 0) - s(0, 1, 0)) * f.x;
+        let x01 = s(0, 0, 1) + (s(1, 0, 1) - s(0, 0, 1)) * f.x;
+        let x11 = s(0, 1, 1) + (s(1, 1, 1) - s(0, 1, 1)) * f.x;
+        let y0 = x00 + (x10 - x00) * f.y;
+        let y1 = x01 + (x11 - x01) * f.y;
+        y0 + (y1 - y0) * f.z
+    }
+
+    /// The lattice samples around the box `[lo, lo + size]`, gathered once (5 per axis covers a fine block of up to two
+    /// of this field's cells, plus one more for a gradient), so a fine block reads its coarse field without lookups.
+    fn local(&self, lo: Vec3) -> Local {
+        let start = ((lo - self.origin) / self.voxel).floor().as_ivec3();
+        let mut v = [0.0f32; 125];
+        for z in 0..5 {
+            for y in 0..5 {
+                for x in 0..5 {
+                    v[(z * 25 + y * 5 + x) as usize] = self.sample(start + IVec3::new(x, y, z));
+                }
+            }
+        }
+        Local { v, origin: self.origin + start.as_vec3() * self.voxel, voxel: self.voxel }
+    }
+
+    /// Rebuild this (fine) field inside `region` after a stroke changed the coarse field from `old_coarse` to
+    /// `new_coarse`: the new coarse shape plus this field's old detail (its difference from the old coarse shape),
+    /// carried along the surface normal by however far the coarse surface moved.
+    pub fn refine_from(&mut self, old_coarse: &Volume, new_coarse: &Volume, region: (Vec3, Vec3)) -> RefineStats {
+        let mut stats = RefineStats::default();
+        let t = Instant::now();
+        let step = self.voxel * B as f32;
+        let lo = ((region.0 - self.origin) / step).floor().as_ivec3();
+        let hi = ((region.1 - self.origin) / step).floor().as_ivec3();
+        let mut candidates = Vec::new();
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    if let Some(b) = self.block_index(IVec3::new(x, y, z)) {
+                        candidates.push(b);
+                    }
+                }
+            }
+        }
+        stats.blocks_checked = candidates.len();
+        let reach = 0.5 * B as f32 * self.voxel * 3f32.sqrt() + self.band + new_coarse.band;
+        let band = self.band;
+        let this = &*self;
+        // New samples for each block that can hold surface now or did before: computed from the old field, written after.
+        let rebuilt: Vec<(u32, Option<Box<[f32; N]>>, i8)> = candidates
+            .par_iter()
+            .filter_map(|&b| {
+                let lo = this.block_origin(b);
+                let centre = lo + Vec3::splat(0.5 * (B - 1) as f32 * this.voxel);
+                let was_dense = this.dense.contains_key(&b);
+                let near_now = new_coarse.value_at(centre).abs() < reach;
+                let moved = (new_coarse.value_at(centre) - old_coarse.value_at(centre)).abs() > 1e-7;
+                if !moved || (!was_dense && !near_now) {
+                    return None;
+                }
+                let mut s = Box::new([0.0f32; N]);
+                let (mut any_in, mut any_out) = (false, false);
+                let (new_local, old_local) = (new_coarse.local(lo), old_coarse.local(lo));
+                for (i, slot) in s.iter_mut().enumerate() {
+                    let l = IVec3::new((i % 8) as i32, ((i / 8) % 8) as i32, (i / 64) as i32);
+                    let p = lo + l.as_vec3() * this.voxel;
+                    let (cn, grad) = new_local.value_and_gradient(p);
+                    let v = if cn.abs() > 2.0 * band {
+                        // Far from the new surface: the detail (at most a band thick) cannot bring it back.
+                        cn.signum() * band
+                    } else {
+                        let co = old_local.value_and_gradient(p).0;
+                        // Where this point's surface came from before the stroke.
+                        let from = p + grad.normalize_or_zero() * (cn - co);
+                        let fine_old = this.value_at(from);
+                        let detail = if fine_old.abs() < band { fine_old - old_coarse.value_at(from) } else { 0.0 };
+                        (cn + detail).clamp(-band, band)
+                    };
+                    any_in |= v < 0.0;
+                    any_out |= v >= 0.0;
+                    *slot = v;
+                }
+                Some(if any_in && any_out { (b, Some(s), 0) } else { (b, None, if any_in { -1 } else { 1 }) })
+            })
+            .collect();
+        let mut changed = Vec::with_capacity(rebuilt.len());
+        for (b, s, sign) in rebuilt {
+            changed.push(b);
+            match s {
+                Some(s) => {
+                    self.dense.insert(b, s);
+                    self.signs[b as usize] = 0;
+                }
+                None => {
+                    self.dense.remove(&b);
+                    self.signs[b as usize] = sign;
+                }
+            }
+        }
+        stats.field_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let mut dirty: Vec<u32> = changed.iter().flat_map(|&b| self.lower_neighbours(b)).collect();
+        dirty.sort_unstable();
+        dirty.dedup();
+        self.rebuild(&dirty);
+        stats.extract_ms = t.elapsed().as_secs_f64() * 1e3;
+        stats.blocks_rebuilt = dirty.len();
+        stats
+    }
+}
+
+/// A small cube of one field's samples, for reading it many times without lookups.
+struct Local {
+    v: [f32; 125],
+    origin: Vec3,
+    voxel: f32,
+}
+
+impl Local {
+    /// Trilinear value and its gradient at `p`, which must lie inside the cube.
+    fn value_and_gradient(&self, p: Vec3) -> (f32, Vec3) {
+        let g = ((p - self.origin) / self.voxel).clamp(Vec3::ZERO, Vec3::splat(3.999));
+        let i = g.floor().as_ivec3();
+        let f = g - i.as_vec3();
+        let s = |dx: i32, dy: i32, dz: i32| self.v[((i.z + dz) * 25 + (i.y + dy) * 5 + (i.x + dx)) as usize];
+        let (c000, c100, c010, c110) = (s(0, 0, 0), s(1, 0, 0), s(0, 1, 0), s(1, 1, 0));
+        let (c001, c101, c011, c111) = (s(0, 0, 1), s(1, 0, 1), s(0, 1, 1), s(1, 1, 1));
+        let x00 = c000 + (c100 - c000) * f.x;
+        let x10 = c010 + (c110 - c010) * f.x;
+        let x01 = c001 + (c101 - c001) * f.x;
+        let x11 = c011 + (c111 - c011) * f.x;
+        let y0 = x00 + (x10 - x00) * f.y;
+        let y1 = x01 + (x11 - x01) * f.y;
+        let value = y0 + (y1 - y0) * f.z;
+        let dx = ((c100 - c000) * (1.0 - f.y) + (c110 - c010) * f.y) * (1.0 - f.z) + ((c101 - c001) * (1.0 - f.y) + (c111 - c011) * f.y) * f.z;
+        let dy = (x10 - x00) * (1.0 - f.z) + (x11 - x01) * f.z;
+        let dz = y1 - y0;
+        (value, Vec3::new(dx, dy, dz) / self.voxel)
     }
 }
