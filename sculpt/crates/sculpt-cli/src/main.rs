@@ -25,6 +25,7 @@ mod rock_field;
 mod rock_layers;
 mod rock_tiers;
 mod solid_bench;
+mod volume_spike;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -56,6 +57,7 @@ fn main() {
         Some("rock-layers") => rock_layers::run(&args[1..]),
         Some("rock-tiers") => rock_tiers::run(&args[1..]),
         Some("solid-bench") => solid_bench::run(&args[1..]),
+        Some("volume-spike") => volume_spike::run(&args[1..]),
         Some("adf-bench") => adf_bench::run(&args[1..]),
         Some("generator-drag-sim") => generator_drag_sim::run(&args[1..]),
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),

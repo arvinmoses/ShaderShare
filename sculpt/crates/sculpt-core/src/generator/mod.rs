@@ -41,6 +41,7 @@ pub mod refine;
 pub mod remesh;
 pub mod schedule;
 pub mod sdf;
+pub mod volume;
 pub mod voxel;
 
 use glam::Vec3;
