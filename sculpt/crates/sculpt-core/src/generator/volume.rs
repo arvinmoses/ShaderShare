@@ -24,6 +24,11 @@ use rayon::prelude::*;
 const B: i32 = 8;
 const N: usize = 512;
 
+/// A quad's corners, each as (block, cell).
+type Quad = [(u32, u16); 4];
+/// A block as first built: its index, inside (-1) / outside (1) / stored (0), and its samples when stored.
+type Filled = (u32, i8, Option<Box<[f32; N]>>);
+
 /// A sculpt-able solid stored as a sparse, clamped distance field.
 pub struct Volume {
     pub voxel: f32,
@@ -42,7 +47,7 @@ struct BlockMesh {
     verts: Vec<Vec3>,
     cell: Vec<u32>,
     /// Each corner as (block, cell); resolved to indices when the whole mesh is assembled.
-    quads: Vec<[(u32, u16); 4]>,
+    quads: Vec<Quad>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -79,7 +84,7 @@ impl Volume {
         let mut v = Volume { voxel, band, origin, dims, signs: vec![1; (blocks as usize).pow(3)], dense: HashMap::new(), meshes: HashMap::new() };
         let reach = 0.5 * B as f32 * voxel * 3f32.sqrt() + band;
         let total = v.signs.len();
-        let filled: Vec<(u32, i8, Option<Box<[f32; N]>>)> = (0..total as u32)
+        let filled: Vec<Filled> = (0..total as u32)
             .into_par_iter()
             .map(|b| {
                 let lo = v.block_origin(b);
@@ -155,7 +160,7 @@ impl Volume {
                 self.meshes.insert(b, m);
             }
         }
-        let quads: Vec<(u32, Vec<[(u32, u16); 4]>)> = blocks.par_iter().map(|&b| (b, self.block_quads(b))).collect();
+        let quads: Vec<(u32, Vec<Quad>)> = blocks.par_iter().map(|&b| (b, self.block_quads(b))).collect();
         for (b, q) in quads {
             if let Some(m) = self.meshes.get_mut(&b) {
                 m.quads = q;
@@ -224,7 +229,7 @@ impl Volume {
         m
     }
 
-    fn block_quads(&self, b: u32) -> Vec<[(u32, u16); 4]> {
+    fn block_quads(&self, b: u32) -> Vec<Quad> {
         let base = self.block_coords(b) * B;
         let g = self.gather(b);
         let neg = g.iter().filter(|&&v| v < 0.0).count();
