@@ -267,21 +267,39 @@ pub(crate) fn video(args: &[String]) -> Res<()> {
         dabs.push(Some((Vec3::new(-0.15 + 0.3 * t, 0.16, 0.08 * (t * 9.0).cos()), 0.07, 0.03, false)));
     }
     dabs.extend(std::iter::repeat_n(None, 30));
+    // `--realtime`: frames for 60 fps playback at hand speed. A stroke of 60-80 dabs then takes half a second to two
+    // thirds of one (two dabs a frame), and the pauses last as long as in the 30 fps version (two frames per hold).
+    let realtime = args.iter().any(|a| a == "--realtime");
+    let mut frames: Vec<Vec<(Vec3, f32, f32, bool)>> = Vec::new();
+    for d in &dabs {
+        match (d, realtime) {
+            (None, true) => frames.extend([Vec::new(), Vec::new()]),
+            (None, false) => frames.push(Vec::new()),
+            (Some(d), true) if frames.last().is_some_and(|f| f.len() == 1) => frames.last_mut().unwrap().push(*d),
+            (Some(d), _) => frames.push(vec![*d]),
+        }
+    }
     let mut times = Vec::new();
-    for (frame, dab) in dabs.iter().enumerate() {
-        if let Some((c, r, k, carve)) = *dab {
+    let mut frame_ms: Vec<f64> = Vec::new();
+    for (frame, batch) in frames.iter().enumerate() {
+        let mut spent = 0.0;
+        for &(c, r, k, carve) in batch {
             let s = vol.dab(c, r, k, carve);
             times.push(s.field_ms + s.extract_ms);
+            spent += s.field_ms + s.extract_ms;
         }
-        // Sway across the front so every stroke stays in view.
-        let yaw = 0.15 + 0.7 * (frame as f32 * 0.022).sin();
+        frame_ms.push(spent);
+        // Sway across the front so every stroke stays in view, at the same speed in seconds either way.
+        let seconds = frame as f32 / if realtime { 60.0 } else { 30.0 };
+        let yaw = 0.15 + 0.7 * (seconds * 0.66).sin();
         let views = [sculpt_core_render_view(yaw, 0.35)];
         crate::render::render(&Document::from_mesh(vol.mesh())?, &views, 720, &dir.join(format!("frame_{frame:04}.png")))?;
     }
     let mesh = vol.mesh();
+    println!("sculpting work per frame: worst {:.2} ms (a 60 fps frame is 16.7 ms)", frame_ms.iter().cloned().fold(0.0, f64::max));
     println!(
         "{} frames, {} dabs: median {:.2} ms, worst {:.2} ms; final {} quads, longest edge {:.2} lattice steps, non-manifold edges {}",
-        dabs.len(),
+        frames.len(),
         times.len(),
         median(times.clone()),
         times.iter().cloned().fold(0.0, f64::max),
