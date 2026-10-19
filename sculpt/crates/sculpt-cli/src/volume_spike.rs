@@ -309,3 +309,102 @@ pub(crate) fn video(args: &[String]) -> Res<()> {
     );
     Ok(())
 }
+
+/// `sculpt-cli volume-spike brushes DIR`: frames (60 fps, hand speed) of a session with the playground's plane brushes:
+/// clay strips scrubbed into a pad, a crossing strip, small lumps, trim flattening them, and a trim cut.
+pub(crate) fn brushes(args: &[String]) -> Res<()> {
+    let dir = Path::new(args.first().map_or("volume_brushes", |s| s.as_str()));
+    std::fs::create_dir_all(dir)?;
+    let voxel = 0.006f32;
+    let mut vol = Volume::from_field(&|p: Vec3| p.length() - 1.0, 1.8, voxel);
+    vol.extract_all();
+    // A stroke: a path seen from the front (x, y), radius, strength, hardness, trim.
+    struct Stroke {
+        path: Vec<(f32, f32)>,
+        r: f32,
+        strength: f32,
+        hardness: f32,
+        trim: bool,
+    }
+    let line = |a: (f32, f32), b: (f32, f32), n: usize| -> Vec<(f32, f32)> { (0..=n).map(|i| i as f32 / n as f32).map(|t| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)).collect() };
+    let mut strokes = Vec::new();
+    // Clay: one strip, then scrubbed back and forth in a single stroke so it builds into a pad.
+    strokes.push(Stroke { path: line((-0.55, 0.42), (0.45, 0.42), 40), r: 0.2, strength: 0.7, hardness: 0.6, trim: false });
+    let scrub: Vec<(f32, f32)> = (0..=160).map(|i| i as f32 / 160.0).map(|t| (-0.5 + 0.9 * (0.5 - 0.5 * (t * std::f32::consts::TAU * 2.0).cos()), 0.42 + 0.06 * (t * 23.0).sin())).collect();
+    strokes.push(Stroke { path: scrub, r: 0.2, strength: 0.7, hardness: 0.6, trim: false });
+    // A strip crossing it top to bottom: it fills against the pad and follows the ball's form.
+    strokes.push(Stroke { path: line((0.25, 0.75), (0.25, -0.15), 40), r: 0.15, strength: 0.8, hardness: 0.6, trim: false });
+    // Small lumps, lower left.
+    for (i, &(x, y)) in [(-0.55, -0.2), (-0.42, -0.35), (-0.6, -0.42), (-0.35, -0.18), (-0.48, -0.5), (-0.3, -0.42)].iter().enumerate() {
+        strokes.push(Stroke { path: line((x, y), (x + 0.04, y + 0.03 * (i as f32 - 2.5).signum()), 3), r: 0.08, strength: 1.0, hardness: 0.3, trim: false });
+    }
+    // Trim scrubbed over the lumps: they flatten to a facet.
+    let over: Vec<(f32, f32)> = (0..=90).map(|i| i as f32 / 90.0).map(|t| (-0.62 + 0.3 * (0.5 - 0.5 * (t * std::f32::consts::TAU * 1.5).cos()), -0.18 - 0.3 * t)).collect();
+    strokes.push(Stroke { path: over, r: 0.22, strength: 0.6, hardness: 0.7, trim: true });
+    // A trim stroke across the pad's right end: a flat cut.
+    strokes.push(Stroke { path: line((0.1, 0.62), (0.55, 0.25), 30), r: 0.14, strength: 0.7, hardness: 0.8, trim: true });
+
+    // Frames: two dabs a frame while a stroke runs, holds between strokes, a slow turn at the end.
+    let mut times = Vec::new();
+    let mut frame = 0usize;
+    let sway = |frame: usize| 0.25 * (frame as f32 / 60.0 * 0.5).sin();
+    // Swaying across the front, or at `yaw` when given.
+    let render = |vol: &Volume, frame: &mut usize, yaw: Option<f32>| -> Res<()> {
+        let views = [sculpt_core_render_view(yaw.unwrap_or_else(|| sway(*frame)), 0.12)];
+        crate::render::render(&Document::from_mesh(vol.mesh())?, &views, 720, &dir.join(format!("frame_{:04}.png", *frame)))?;
+        *frame += 1;
+        Ok(())
+    };
+    for _ in 0..30 {
+        render(&vol, &mut frame, None)?;
+    }
+    for s in &strokes {
+        vol.begin_stroke();
+        let mut along = Vec3::ZERO;
+        // Dabs every 0.15 of the radius along the path, each on the surface under the cursor.
+        let mut points = Vec::new();
+        for w in s.path.windows(2) {
+            let (a, b) = (Vec3::new(w[0].0, w[0].1, 0.0), Vec3::new(w[1].0, w[1].1, 0.0));
+            let steps = ((b - a).length() / (0.15 * s.r)).ceil().max(1.0) as usize;
+            for k in 0..steps {
+                points.push(a.lerp(b, k as f32 / steps as f32));
+            }
+        }
+        for chunk in points.chunks(2) {
+            for p in chunk {
+                let Some((hit, n)) = vol.raycast(Vec3::new(p.x, p.y, 4.0), Vec3::NEG_Z) else { continue };
+                if along == Vec3::ZERO {
+                    along = n;
+                }
+                let st = s.strength;
+                let h = s.r * if s.trim { 0.01 + 0.05 * st } else { 0.01 + 0.07 * st };
+                let t = std::time::Instant::now();
+                if let Some(nn) = vol.plane_dab(hit, along, s.r, h, s.hardness, s.trim) {
+                    along = (along * 0.5 + nn * 0.5).try_normalize().unwrap_or(nn);
+                }
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            render(&vol, &mut frame, None)?;
+        }
+        vol.end_stroke();
+        for _ in 0..18 {
+            render(&vol, &mut frame, None)?;
+        }
+    }
+    // A slow turn to show the forms from the side.
+    let start = sway(frame);
+    for i in 0..120 {
+        let t = i as f32 / 119.0;
+        render(&vol, &mut frame, Some(start + (0.9 - start) * (0.5 - 0.5 * (t * std::f32::consts::PI).cos())))?;
+    }
+    let mesh = vol.mesh();
+    println!(
+        "{frame} frames, {} dabs: median {:.2} ms, worst {:.2} ms; final {} quads, non-manifold edges {}",
+        times.len(),
+        median(times.clone()),
+        times.iter().cloned().fold(0.0, f64::max),
+        mesh.faces.len(),
+        sculpt_core::generator::remesh::non_manifold_edges(&mesh.faces)
+    );
+    Ok(())
+}
