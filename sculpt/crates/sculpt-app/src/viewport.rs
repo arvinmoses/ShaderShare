@@ -178,14 +178,15 @@ pub struct Viewport {
     volume: Option<VolumeGpu>,
 }
 
-/// The volume playground's surface on the GPU: one slot per block of surface, each with 512 vertex places (one per
-/// cell) and room for a fixed number of quads, drawn in one multi-draw with an indirect entry per slot.
+/// The volume playground's surface on the GPU: one vertex slot per block of surface with 512 places (one per
+/// cell), and the quads in fixed-size chunks, drawn in one multi-draw with an indirect entry per chunk.
 struct VolumeGpu {
     quant: Quant,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     indirect: wgpu::Buffer,
-    capacity: u32,
+    /// Vertex slots and index chunks the buffers hold.
+    capacity: (u32, u32),
     high: u32,
 }
 
@@ -322,48 +323,50 @@ impl Viewport {
         self.targets = Some(Targets { size, msaa, resolve, depth });
     }
 
-    /// Bring the volume playground's surface up to date: rewrite only the slots that changed.
+    /// Bring the volume playground's surface up to date: rewrite only the slots and chunks that changed, or
+    /// everything into fresh buffers when the playground's pools grew.
     pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode) {
-        use crate::volume_mode::{CELLS, QUADS_PER_SLOT};
+        use crate::volume_mode::{CELLS, QUADS_PER_CHUNK};
         let t = Instant::now();
         let mut stats = UploadStats::default();
-        if mode.reset || self.volume.as_ref().is_none_or(|v| v.capacity != mode.capacity) {
+        let up = mode.take_upload();
+        let (slots, chunks) = mode.capacity();
+        if mode.reset || self.volume.as_ref().is_none_or(|v| v.capacity != (slots, chunks)) {
             let make = |label, size: u64, usage| rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            let cap = mode.capacity as u64;
             self.volume = Some(VolumeGpu {
                 quant: Quant::fit(mode.bounds()),
-                vertices: make("volume vertices", cap * CELLS as u64 * 8, wgpu::BufferUsages::VERTEX),
-                indices: make("volume indices", cap * (QUADS_PER_SLOT * 6) as u64 * 4, wgpu::BufferUsages::INDEX),
+                vertices: make("volume vertices", slots as u64 * CELLS as u64 * 8, wgpu::BufferUsages::VERTEX),
+                indices: make("volume indices", chunks as u64 * (QUADS_PER_CHUNK * 6) as u64 * 4, wgpu::BufferUsages::INDEX),
                 // DrawIndexedIndirectArgs: index count, instance count, first index, base vertex, first instance.
-                indirect: make("volume indirect", cap * 20, wgpu::BufferUsages::INDIRECT),
-                capacity: mode.capacity,
+                indirect: make("volume indirect", chunks as u64 * 20, wgpu::BufferUsages::INDIRECT),
+                capacity: (slots, chunks),
                 high: 0,
             });
-            // Fresh buffers start empty: every slot draws nothing until written.
-            let zeros = vec![0u8; (cap * 20) as usize];
+            // Fresh buffers start empty: every chunk draws nothing until written.
+            let zeros = vec![0u8; chunks as usize * 20];
             rs.queue.write_buffer(&self.volume.as_ref().unwrap().indirect, 0, &zeros);
             mode.reset = false;
         }
-        let up = mode.take_upload();
         let v = self.volume.as_mut().unwrap();
-        v.high = mode.high;
+        v.high = mode.draw_count();
+        // Cleared first: a chunk given up can be handed to another block in the same upload.
+        for c in &up.cleared {
+            rs.queue.write_buffer(&v.indirect, *c as u64 * 20, bytemuck::cast_slice(&[0u32; 5]));
+        }
         let mut packed = vec![[0u16; 4]; CELLS];
         for (slot, positions) in &up.verts {
             pack(&v.quant, positions, None, &mut packed);
             rs.queue.write_buffer(&v.vertices, *slot as u64 * CELLS as u64 * 8, bytemuck::cast_slice(&packed));
             stats.bytes += CELLS * 8;
         }
-        let per_slot = (QUADS_PER_SLOT * 6) as u32;
-        for (slot, idx) in &up.indices {
+        let per = (QUADS_PER_CHUNK * 6) as u32;
+        for (c, idx) in &up.chunks {
             if !idx.is_empty() {
-                rs.queue.write_buffer(&v.indices, *slot as u64 * per_slot as u64 * 4, bytemuck::cast_slice(idx));
+                rs.queue.write_buffer(&v.indices, *c as u64 * per as u64 * 4, bytemuck::cast_slice(idx));
             }
-            let args: [u32; 5] = [idx.len() as u32, 1, slot * per_slot, 0, 0];
-            rs.queue.write_buffer(&v.indirect, *slot as u64 * 20, bytemuck::cast_slice(&args));
+            let args: [u32; 5] = [idx.len() as u32, 1, c * per, 0, 0];
+            rs.queue.write_buffer(&v.indirect, *c as u64 * 20, bytemuck::cast_slice(&args));
             stats.bytes += idx.len() * 4 + 20;
-        }
-        for slot in &up.cleared {
-            rs.queue.write_buffer(&v.indirect, *slot as u64 * 20, bytemuck::cast_slice(&[0u32; 5]));
         }
         stats.ranges = up.verts.len();
         stats.ms = t.elapsed().as_secs_f32() * 1e3;

@@ -760,7 +760,7 @@ impl SculptApp {
                     *last = Some(hit);
                 }
                 if dabs > 0 {
-                    self.status = format!("Volume: {dabs} dabs this frame, {:.2} ms ({:.2} ms each), {} blocks of surface{}", mode.last_ms, mode.last_ms / dabs as f64, mode.blocks, if mode.dropped > 0 { format!(", {} quads dropped", mode.dropped) } else { String::new() });
+                    self.status = format!("Volume: {dabs} dabs this frame, {:.2} ms ({:.2} ms each), {} blocks of surface", mode.last_ms, mode.last_ms / dabs as f64, mode.blocks);
                 }
             }
             Stroke::Brush { brush, settings, sampler, normal, dabs: queue, last_hit } => {
