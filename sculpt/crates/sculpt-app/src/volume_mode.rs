@@ -107,28 +107,21 @@ impl VolumeMode {
         self.chunks.high
     }
 
-    /// One dab near surface point `at`: a flat disc on the surface the stroke began on. Clay raises it by up to a third
-    /// of the radius at full strength, carving digs as deep; overlapping dabs in one stroke fill in rather than stack, so
-    /// a stroke lays down (or cuts) one even layer, and the next stroke builds on it.
-    pub fn dab(&mut self, at: Vec3, radius: f32, strength: f32, carve: bool) {
+    /// One dab of Clay Buildup (or, with `carve`, Trim Dynamic) at surface point `at`: a plane brush whose plane
+    /// follows the surface the stroke began on. Clay fills up to a plane a little above the surface under the brush
+    /// (cavities first) and keeps building as you scrub; trim cuts down to a plane a little below it.
+    pub fn dab(&mut self, at: Vec3, radius: f32, strength: f32, hardness: f32, carve: bool) {
         let t = Instant::now();
-        let rough = if self.stroke_n == Vec3::ZERO { self.vol.normal_at(at) } else { self.stroke_n };
-        let on = self.vol.onto_base(at, rough);
-        let here = self.vol.normal_at(on);
-        if here == Vec3::ZERO {
+        let along = if self.stroke_n == Vec3::ZERO { self.vol.normal_at(at) } else { self.stroke_n };
+        if along == Vec3::ZERO {
             return;
         }
-        // The mean normal under the brush, eased from the last dab's: the brush turns gradually along a stroke
-        // instead of tipping with every bump it passes over.
-        // Measured along the brush's own direction so far: the normal at one point on a bump's side would tip it.
-        // A stroke's first dab has no direction yet: measure once along the normal here, then again along that.
-        let along = if self.stroke_n == Vec3::ZERO { self.vol.area_normal(on, here, radius) } else { self.stroke_n };
-        let area = self.vol.area_normal(on, along, radius);
-        let n = if self.stroke_n == Vec3::ZERO { area } else { (self.stroke_n * 0.7 + area * 0.3).try_normalize().unwrap_or(area) };
-        self.stroke_n = n;
-        let height = radius * (0.04 + 0.3 * strength.clamp(0.0, 1.0));
+        let s = strength.clamp(0.0, 1.0);
+        let height = radius * if carve { 0.01 + 0.05 * s } else { 0.01 + 0.07 * s };
         let grid = self.vol.grid();
-        self.vol.dab_disc(on, n, radius, height, height, carve);
+        let Some(n) = self.vol.plane_dab(at, along, radius, height, hardness, carve) else { return };
+        // The original surface's plane is steady already; easing it a little more smooths the turn over sharp forms.
+        self.stroke_n = if self.stroke_n == Vec3::ZERO { n } else { (self.stroke_n * 0.5 + n * 0.5).try_normalize().unwrap_or(n) };
         if self.vol.grid() != grid {
             // The lattice grew and every block was renumbered: start the GPU side over.
             self.slot_of.clear();
@@ -304,7 +297,7 @@ mod tests {
                 let Some((hit, n)) = mode.raycast(dir * 3.0, -dir) else { continue };
                 let _ = n;
                 mode.begin_stroke();
-                mode.dab(hit, radius, 0.8, carve);
+                mode.dab(hit, radius, 0.8, 0.5, carve);
                 mode.end_stroke();
                 if i % 3 == 0 {
                     apply(&mut mode);
@@ -340,7 +333,7 @@ mod tests {
             let at = Vec3::new(0.35 * a.cos() * (i as f32 / 30.0), 0.35 * a.sin() * (i as f32 / 30.0), 1.0).normalize();
             mode.begin_stroke();
             if let Some((hit, _)) = mode.raycast(at * 3.0, -at) {
-                mode.dab(hit, 0.08, 1.0, false);
+                mode.dab(hit, 0.08, 1.0, 0.5, false);
             }
             mode.end_stroke();
         }
@@ -355,7 +348,7 @@ mod tests {
             let at = Vec3::new(x, y, 1.0).normalize();
             let Some((hit, _)) = mode.raycast(at * 3.0, -at) else { continue };
             let raw = mode.vol.normal_at(hit);
-            mode.dab(hit, 0.3, 0.7, false);
+            mode.dab(hit, 0.3, 0.7, 0.5, false);
             if last != Vec3::ZERO {
                 let a = last.angle_between(mode.stroke_n).to_degrees();
                 turn += a;
@@ -368,6 +361,7 @@ mod tests {
         }
         mode.end_stroke();
         let (mean, raw_mean) = (turn / n as f32, raw_turn / n as f32);
+        eprintln!("{:.2} ms per dab of radius 0.3 at 400k triangles", mode.last_ms / mode.last_dabs as f64);
         eprintln!("per dab the brush turned {mean:.2} deg on average ({worst:.2} at most); the normal under it turned {raw_mean:.2}");
         assert!(mean < raw_mean / 3.0 && worst < 6.0);
     }

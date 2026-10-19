@@ -76,7 +76,7 @@ enum Stroke {
     Move { brush: MoveBrush, start: Pos2, world_per_px: f32 },
     Pose { pivot: Vec3, grab: Vec3, start: Pos2, world_per_px: f32, previewed: bool },
     /// A stroke in the volume playground: dabs every `spacing` along the surface since `last`.
-    Volume { carve: bool, size_px: f32, strength: f32, last: Option<Vec3>, carry: f32 },
+    Volume { carve: bool, size_px: f32, strength: f32, hardness: f32, last: Option<Vec3>, carry: f32 },
 }
 
 pub enum Dialog {
@@ -606,7 +606,7 @@ impl SculptApp {
                 }
             };
             let p = self.tools.params(self.tool).clone();
-            self.stroke = Stroke::Volume { carve, size_px: p.size_px, strength: p.strength, last: None, carry: 0.0 };
+            self.stroke = Stroke::Volume { carve, size_px: p.size_px, strength: p.strength, hardness: p.hardness, last: None, carry: 0.0 };
             if let Some(mode) = self.volume_mode.as_mut() {
                 mode.begin_stroke();
             }
@@ -727,7 +727,7 @@ impl SculptApp {
         let size = self.viewport_rect.size();
         let camera = self.camera.clone();
         match &mut self.stroke {
-            Stroke::Volume { carve, size_px, strength, last, carry } => {
+            Stroke::Volume { carve, size_px, strength, hardness, last, carry } => {
                 let Some(mode) = self.volume_mode.as_mut() else { return 0 };
                 mode.last_ms = 0.0;
                 mode.last_dabs = 0;
@@ -744,7 +744,7 @@ impl SculptApp {
                         // Re-entering the surface, or jumping across a gap, starts the spacing over.
                         Some(p) if p.distance(hit) < radius * 4.0 => p,
                         _ => {
-                            mode.dab(hit, radius, *strength * s.pressure, *carve);
+                            mode.dab(hit, radius, *strength * s.pressure, *hardness, *carve);
                             dabs += 1;
                             *last = Some(hit);
                             *carry = 0.0;
@@ -756,7 +756,7 @@ impl SculptApp {
                     let mut along = spacing - *carry;
                     while along <= gap {
                         let q = from.lerp(hit, along / gap);
-                        mode.dab(q, radius, *strength * s.pressure, *carve);
+                        mode.dab(q, radius, *strength * s.pressure, *hardness, *carve);
                         dabs += 1;
                         along += spacing;
                     }

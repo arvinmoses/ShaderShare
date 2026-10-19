@@ -82,6 +82,9 @@ fn smax(a: f32, b: f32, k: f32) -> f32 {
     -smin(-a, -b, k)
 }
 
+/// How much of a clay dab's height each dab adds once the first layer is down.
+pub const BUILD_STEP: f32 = 0.1;
+
 const EDGES: [[usize; 2]; 12] = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
 
 impl Volume {
@@ -386,10 +389,15 @@ impl Volume {
     }
 
     /// Where the line through `p` along `n` meets the surface as it was when the stroke began, within `limit` of `p`.
-    fn along_onto_base(&self, mut p: Vec3, n: Vec3, limit: f32) -> Option<Vec3> {
+    fn along_onto_base(&self, p: Vec3, n: Vec3, limit: f32) -> Option<Vec3> {
+        self.along_onto(p, n, limit, true)
+    }
+
+    /// Where the line through `p` along `n` meets the surface (as it was when the stroke began, or as it is now).
+    fn along_onto(&self, mut p: Vec3, n: Vec3, limit: f32, base: bool) -> Option<Vec3> {
         let start = p;
         for _ in 0..48 {
-            let v = self.base_value_at(p);
+            let v = if base { self.base_value_at(p) } else { self.value_at(p) };
             if v.abs() < 0.01 * self.voxel {
                 break;
             }
@@ -399,6 +407,87 @@ impl Volume {
             }
         }
         Some(p)
+    }
+
+    /// One dab of a plane brush, the way the clay and trim brushes of mesh sculpting work. The brush plane takes its
+    /// tilt from the surface as it was when the stroke began (so it follows the original form and holds steady), and
+    /// its height from the surface as it is now, under the brush.
+    ///
+    /// * Clay (`trim` false) lifts the plane `h` above the surface's average height under the brush and fills
+    ///   everything below it: cavities fill first, bumps above the plane are left alone, and passes over the same place
+    ///   keep building, since each one sees what the stroke has added already.
+    /// * Trim lowers the plane `h` below that average and cuts away everything above it: it flattens.
+    ///
+    /// The plane holds its full height out to `hardness` of the radius and tapers below the surface beyond, so edges
+    /// are square at high hardness and soft at low. `along` is the rough normal near `at`. Returns the plane's normal.
+    pub fn plane_dab(&mut self, at: Vec3, along: Vec3, r: f32, h: f32, hardness: f32, trim: bool) -> Option<Vec3> {
+        let on = self.onto_base(at, along);
+        if self.normal_at(on) == Vec3::ZERO {
+            return None;
+        }
+        let first = self.area_normal(on, along, r);
+        let n = self.area_normal(on, first, r);
+        // Heights under the brush along the plane's normal, from the point brushed: of the surface the stroke began on,
+        // and of what the stroke has added since.
+        let (t1, t2) = n.any_orthonormal_pair();
+        let (mut base_sum, mut added_sum, mut weight) = (0.0, 0.0, 0.0);
+        for (ring, w, count) in [(0.0, 1.0, 1), (0.5, 0.8, 8), (0.9, 0.5, 12)] {
+            for k in 0..count {
+                let a = k as f32 * std::f32::consts::TAU / count as f32;
+                let p = on + (t1 * a.cos() + t2 * a.sin()) * ring * r;
+                if let (Some(b), Some(c)) = (self.along_onto(p, n, r, true), self.along_onto(p, n, r, false)) {
+                    base_sum += (b - on).dot(n) * w;
+                    added_sum += (c - b).dot(n) * w;
+                    weight += w;
+                }
+            }
+        }
+        let (base, added) = if weight > 0.0 { (base_sum / weight, added_sum / weight) } else { (0.0, 0.0) };
+        // Over a cavity the original surface's average lies above the point brushed, so clay fills it; over a convex
+        // form it lies below, and taking it would leave clay barely building, so the point itself sets the level.
+        // Clay then rides on what the stroke has added (it builds up as you scrub); trim does not, so a stroke cuts
+        // down to one plane however long you scrub.
+        let ground = if trim { base.min(0.0) } else { base.max(0.0) };
+        // Clay's first layer comes at once; beyond it each dab adds a small step, so a pass (about a dozen overlapping
+        // dabs at the app's spacing) builds about one more layer rather than a dozen.
+        let level = if trim { ground } else { ground + added };
+        let plane = if trim { ground - h } else { (ground + h).max(level + BUILD_STEP * h) };
+        // Beyond the hard core the plane sinks well below the surface (or rises well above it, for trim), so the rim
+        // touches nothing; how far, and the slope that makes, bound the shape's distance.
+        let hard = hardness.clamp(0.0, 0.9);
+        let dip = 0.5 * r;
+        let slope = 1.5 * (h + dip) / (r * (1.0 - hard));
+        let lip = (1.0 + slope * slope).sqrt();
+        let depth = 0.35 * r;
+        let fade = move |p: Vec3| {
+            let u = (p - on).dot(n);
+            let t = ((p - on) - n * u).length();
+            let x = ((t / r - hard) / (1.0 - hard)).clamp(0.0, 1.0);
+            let w = 1.0 - x * x * (3.0 - 2.0 * x);
+            (u, t, w)
+        };
+        let k = (0.5 * h).max(self.voxel);
+        let reach = 1.5 * r;
+        let cut_lo = plane;
+        if trim {
+            // Everything above the cut, out to the brush's edge and up to `depth` over the average.
+            let shape = move |p: Vec3| {
+                let (u, t, w) = fade(p);
+                let cut = plane * w + (level + dip) * (1.0 - w);
+                ((cut - u) / lip).max(u - (level + depth)).max(t - r)
+            };
+            self.modify_in(on, reach, 0.0, k, true, Some((n, cut_lo, level + depth)), &shape);
+        } else {
+            // Everything below the plane, out to the brush's edge and down to `depth` under the average: deep enough to
+            // fill a cavity, shallow enough not to come out of the far side of a thin part.
+            let shape = move |p: Vec3| {
+                let (u, t, w) = fade(p);
+                let top = plane * w + (level - dip) * (1.0 - w);
+                ((u - top) / lip).max((level - depth) - u).max(t - r)
+            };
+            self.modify_in(on, reach, 0.0, k, false, Some((n, level - depth, plane)), &shape);
+        }
+        Some(n)
     }
 
     /// Start a stroke: until [`Self::end_stroke`], raycasts and normals see the surface as it is now.
@@ -412,11 +501,26 @@ impl Volume {
 
     /// Combine a shape (distance `shape`, within `outer` of `c` and holding the ball of radius `inner`) into the field.
     fn modify(&mut self, c: Vec3, outer: f32, inner: f32, k: f32, carve: bool, shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> DabStats {
+        self.modify_in(c, outer, inner, k, carve, None, shape)
+    }
+
+    /// [`Self::modify`] for a shape that also lies within the slab `lo..hi` along `n` from `c`: only the blocks near it
+    /// are visited.
+    #[allow(clippy::too_many_arguments)]
+    fn modify_in(&mut self, c: Vec3, outer: f32, inner: f32, k: f32, carve: bool, slab: Option<(Vec3, f32, f32)>, shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> DabStats {
         let mut stats = DabStats::default();
         let t = Instant::now();
         let reach = Vec3::splat(outer + k + self.band);
         self.ensure_room(c - reach, c + reach);
-        let (touched, swallowed) = self.shell_of(c, outer, inner, k);
+        let (mut touched, swallowed) = self.shell_of(c, outer, inner, k);
+        if let Some((n, lo, hi)) = slab {
+            let margin = 0.5 * B as f32 * self.voxel * 3f32.sqrt() + self.band + k;
+            let half = 0.5 * (B - 1) as f32 * self.voxel;
+            touched.retain(|&b| {
+                let u = (self.block_origin(b) + Vec3::splat(half) - c).dot(n);
+                u > lo - margin && u < hi + margin
+            });
+        }
         if let Some(saved) = self.saved.as_mut() {
             for &b in touched.iter().chain(&swallowed) {
                 saved.entry(b).or_insert_with(|| (self.signs[b as usize], self.dense.get(&b).cloned()));
