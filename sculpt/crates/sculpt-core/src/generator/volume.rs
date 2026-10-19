@@ -43,7 +43,13 @@ pub struct Volume {
     meshes: HashMap<u32, BlockMesh>,
     /// Blocks whose surface was rebuilt since [`Volume::drain_changed`] last ran, for a viewport to re-upload.
     changed: std::collections::HashSet<u32>,
+    /// While a stroke is under way: each block's samples (or sign) from before the stroke first changed it, so dabs
+    /// are placed on the surface as it was when the stroke began.
+    saved: Option<HashMap<u32, Saved>>,
 }
+
+/// A block as it was: its sign, and its samples when stored.
+type Saved = (i8, Option<Box<[f32; N]>>);
 
 /// The surface inside one block: a vertex per crossed cell, and the quads whose lattice edges start in this block.
 #[derive(Default)]
@@ -90,7 +96,7 @@ impl Volume {
         let blocks = ((2.0 * half / voxel) / B as f32).ceil() as i32 + 2;
         let dims = IVec3::splat(blocks);
         let origin = Vec3::splat(-half - voxel * B as f32);
-        let mut v = Volume { voxel, band, origin, dims, signs: vec![1; (blocks as usize).pow(3)], dense: HashMap::new(), meshes: HashMap::new(), changed: Default::default() };
+        let mut v = Volume { voxel, band, origin, dims, signs: vec![1; (blocks as usize).pow(3)], dense: HashMap::new(), meshes: HashMap::new(), changed: Default::default(), saved: None };
         let reach = 0.5 * B as f32 * voxel * 3f32.sqrt() + band;
         let total = v.signs.len();
         let filled: Vec<Filled> = (0..total as u32)
@@ -284,6 +290,12 @@ impl Volume {
     /// (sample by sample), and those wholly inside it (they become solid or empty). Only blocks the blob's own surface
     /// passes through change sample by sample; out of its reach nothing changes: a thin shell of blocks, not a ball.
     pub fn dab_shell(&self, c: Vec3, r: f32, k: f32) -> (Vec<u32>, Vec<u32>) {
+        self.shell_of(c, r, r, k)
+    }
+
+    /// [`Self::dab_shell`] for a shape that lies within `outer` of `c` and holds the ball of radius `inner` around it.
+    fn shell_of(&self, c: Vec3, outer: f32, inner: f32, k: f32) -> (Vec<u32>, Vec<u32>) {
+        let r = outer;
         let reach = r + k + self.band;
         let lo = ((c - Vec3::splat(reach) - self.origin) / (self.voxel * B as f32)).floor().as_ivec3();
         let hi = ((c + Vec3::splat(reach) - self.origin) / (self.voxel * B as f32)).floor().as_ivec3();
@@ -300,7 +312,7 @@ impl Volume {
                     if near - r > shell {
                         continue;
                     }
-                    if far < r - shell {
+                    if far < inner - shell {
                         swallowed.push(b);
                     } else {
                         touched.push(b);
@@ -331,9 +343,45 @@ impl Volume {
 
     /// Add (`carve` false) or remove a soft blob of radius `r` centred at `c`, blended over `k`, and re-extract.
     pub fn dab(&mut self, c: Vec3, r: f32, k: f32, carve: bool) -> DabStats {
+        self.modify(c, r, r, k, carve, &|p: Vec3| (p - c).length() - r)
+    }
+
+    /// Add or remove a flat disc: an ellipsoid centred at `c`, `r` across and `h` high along `n`, blended over `k`.
+    /// Centred on the surface, clay raises it by at most `h` and carving digs at most `h`, however often dabs overlap.
+    pub fn dab_disc(&mut self, c: Vec3, n: Vec3, r: f32, h: f32, k: f32, carve: bool) -> DabStats {
+        let (r2, h2) = (r * r, h * h);
+        self.modify(c, r, h, k, carve, &|p: Vec3| {
+            // An ellipsoid's distance, closely approximated (exact on its axes).
+            let q = p - c;
+            let qn = q.dot(n);
+            let qt2 = (q.length_squared() - qn * qn).max(0.0);
+            let k0 = (qt2 / r2 + qn * qn / h2).sqrt();
+            let k1 = (qt2 / (r2 * r2) + qn * qn / (h2 * h2)).sqrt();
+            if k1 < 1e-20 { -h } else { k0 * (k0 - 1.0) / k1 }
+        })
+    }
+
+    /// Start a stroke: until [`Self::end_stroke`], raycasts and normals see the surface as it is now.
+    pub fn begin_stroke(&mut self) {
+        self.saved = Some(HashMap::new());
+    }
+
+    pub fn end_stroke(&mut self) {
+        self.saved = None;
+    }
+
+    /// Combine a shape (distance `shape`, within `outer` of `c` and holding the ball of radius `inner`) into the field.
+    fn modify(&mut self, c: Vec3, outer: f32, inner: f32, k: f32, carve: bool, shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> DabStats {
         let mut stats = DabStats::default();
         let t = Instant::now();
-        let (touched, swallowed) = self.dab_shell(c, r, k);
+        let reach = Vec3::splat(outer + k + self.band);
+        self.ensure_room(c - reach, c + reach);
+        let (touched, swallowed) = self.shell_of(c, outer, inner, k);
+        if let Some(saved) = self.saved.as_mut() {
+            for &b in touched.iter().chain(&swallowed) {
+                saved.entry(b).or_insert_with(|| (self.signs[b as usize], self.dense.get(&b).cloned()));
+            }
+        }
         stats.blocks_touched = touched.len() + swallowed.len();
         let fill: i8 = if carve { 1 } else { -1 };
         // A swallowed block changes only if it was not already all `fill`.
@@ -357,14 +405,20 @@ impl Volume {
         let (voxel, band, origin, dims) = (self.voxel, self.band, self.origin, self.dims);
         // Take the touched blocks out, change them in parallel, put them back.
         let mut blocks: Vec<(u32, Box<[f32; N]>, bool)> = touched.iter().filter_map(|b| self.dense.remove(b).map(|s| (*b, s, false))).collect();
+        // During a stroke the shape is blended into the field as it was when the stroke began, then combined with the
+        // field as it is: dabbing the same place again changes nothing, where blending into the current field would
+        // deepen the blend with every dab.
+        let saved = self.saved.as_ref();
         blocks.par_iter_mut().for_each(|(b, s, moved)| {
             let bc = IVec3::new(*b as i32 % dims.x, (*b as i32 / dims.x) % dims.y, *b as i32 / (dims.x * dims.y));
             let lo = origin + (bc * B).as_vec3() * voxel;
+            let before = saved.and_then(|m| m.get(b));
             for (i, v) in s.iter_mut().enumerate() {
                 let l = IVec3::new((i % 8) as i32, ((i / 8) % 8) as i32, (i / 64) as i32);
                 let p = lo + l.as_vec3() * voxel;
-                let blob = (p - c).length() - r;
-                let next = (if carve { smax(*v, -blob, k) } else { smin(*v, blob, k) }).clamp(-band, band);
+                let blob = shape(p);
+                let base = before.map_or(*v, |(sign, samples)| samples.as_ref().map_or(*sign as f32 * band, |o| o[i]));
+                let next = (if carve { smax(base, -blob, k).max(*v) } else { smin(base, blob, k).min(*v) }).clamp(-band, band);
                 if next != *v {
                     *v = next;
                     *moved = true;
@@ -436,7 +490,7 @@ pub struct RefineStats {
 impl Volume {
     /// A copy of the field without its surface, to remember how it was before a stroke.
     pub fn field_copy(&self) -> Volume {
-        Volume { voxel: self.voxel, band: self.band, origin: self.origin, dims: self.dims, signs: self.signs.clone(), dense: self.dense.clone(), meshes: HashMap::new(), changed: Default::default() }
+        Volume { voxel: self.voxel, band: self.band, origin: self.origin, dims: self.dims, signs: self.signs.clone(), dense: self.dense.clone(), meshes: HashMap::new(), changed: Default::default(), saved: None }
     }
 
     fn sample(&self, i: IVec3) -> f32 {
@@ -619,18 +673,93 @@ impl Volume {
         (self.origin, self.origin + (self.dims * B).as_vec3() * self.voxel)
     }
 
-    /// Outward normal of the field at `p`.
+    /// Make the lattice cover the box `[lo, hi]` with a block to spare, growing it (with room to keep growing) when it
+    /// does not. Growing renumbers every block and rebuilds the whole surface: rare, and the price of an unbounded solid.
+    pub fn ensure_room(&mut self, lo: Vec3, hi: Vec3) -> bool {
+        let step = self.voxel * B as f32;
+        let need_lo = ((lo - self.origin) / step).floor().as_ivec3() - IVec3::ONE;
+        let need_hi = ((hi - self.origin) / step).floor().as_ivec3() + IVec3::ONE;
+        if need_lo.cmpge(IVec3::ZERO).all() && need_hi.cmplt(self.dims).all() {
+            return false;
+        }
+        let spare = IVec3::splat((self.dims.max_element() / 4).max(4));
+        let shift = IVec3::select(need_lo.cmplt(IVec3::ZERO), spare - need_lo, IVec3::ZERO);
+        let grow_hi = IVec3::select(need_hi.cmpge(self.dims), need_hi + IVec3::ONE - self.dims + spare, IVec3::ZERO);
+        let dims = self.dims + shift + grow_hi;
+        let remap = |old: &Volume, b: u32| {
+            let c = old.block_coords(b) + shift;
+            ((c.z * dims.y + c.y) * dims.x + c.x) as u32
+        };
+        // Everything past the old lattice is outside, as the old lattice's border was.
+        let mut signs = vec![1i8; (dims.x * dims.y * dims.z) as usize];
+        for (b, &sign) in self.signs.iter().enumerate() {
+            signs[remap(self, b as u32) as usize] = sign;
+        }
+        let dense = std::mem::take(&mut self.dense).into_iter().map(|(b, s)| (remap(self, b), s)).collect();
+        let saved = self.saved.take().map(|m| m.into_iter().map(|(b, s)| (remap(self, b), s)).collect());
+        self.signs = signs;
+        self.dense = dense;
+        self.saved = saved;
+        self.origin -= shift.as_vec3() * step;
+        self.dims = dims;
+        self.meshes.clear();
+        self.changed.clear();
+        self.extract_all();
+        true
+    }
+
+    /// A sample as it was when the stroke began (as it is now, between strokes).
+    fn base_sample(&self, i: IVec3) -> f32 {
+        if let Some(saved) = &self.saved
+            && let Some(b) = self.block_index(i.div_euclid(IVec3::splat(B)))
+            && let Some((sign, samples)) = saved.get(&b)
+        {
+            let l = i.rem_euclid(IVec3::splat(B));
+            return samples.as_ref().map_or(*sign as f32 * self.band, |s| s[(l.z * 64 + l.y * 8 + l.x) as usize]);
+        }
+        self.sample(i)
+    }
+
+    /// The field at `p` as it was when the stroke began, interpolated.
+    pub fn base_value_at(&self, p: Vec3) -> f32 {
+        let g = (p - self.origin) / self.voxel;
+        let i = g.floor().as_ivec3();
+        let f = g - i.as_vec3();
+        let s = |dx: i32, dy: i32, dz: i32| self.base_sample(i + IVec3::new(dx, dy, dz));
+        let x00 = s(0, 0, 0) + (s(1, 0, 0) - s(0, 0, 0)) * f.x;
+        let x10 = s(0, 1, 0) + (s(1, 1, 0) - s(0, 1, 0)) * f.x;
+        let x01 = s(0, 0, 1) + (s(1, 0, 1) - s(0, 0, 1)) * f.x;
+        let x11 = s(0, 1, 1) + (s(1, 1, 1) - s(0, 1, 1)) * f.x;
+        let y0 = x00 + (x10 - x00) * f.y;
+        let y1 = x01 + (x11 - x01) * f.y;
+        y0 + (y1 - y0) * f.z
+    }
+
+    /// Outward normal at `p` of the surface as it was when the stroke began.
     pub fn normal_at(&self, p: Vec3) -> Vec3 {
         self.gradient_at(p)
     }
 
+    /// `p` moved onto the surface as it was when the stroke began, along that surface's normal.
+    pub fn onto_base(&self, mut p: Vec3) -> Vec3 {
+        for _ in 0..3 {
+            let v = self.base_value_at(p);
+            if v.abs() >= self.band * 0.999 {
+                break;
+            }
+            p -= self.gradient_at(p) * v;
+        }
+        p
+    }
+
     fn gradient_at(&self, p: Vec3) -> Vec3 {
         let h = self.voxel;
-        let d = |o: Vec3| self.value_at(p + o) - self.value_at(p - o);
+        let d = |o: Vec3| self.base_value_at(p + o) - self.base_value_at(p - o);
         Vec3::new(d(Vec3::X * h), d(Vec3::Y * h), d(Vec3::Z * h)).normalize_or_zero()
     }
 
-    /// Where a ray from `origin` along `dir` (normalised) first enters the solid, with the surface normal there.
+    /// Where a ray from `origin` along `dir` (normalised) first enters the solid (as it was when the stroke began),
+    /// with the surface normal there.
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(Vec3, Vec3)> {
         let (lo, hi) = self.bounds();
         // Clip the ray to the lattice's box.
@@ -643,14 +772,14 @@ impl Volume {
         // March by the field (a lower bound on the distance), at least a third of a step at a time.
         let mut t = near;
         let mut prev = t;
-        let mut v = self.value_at(origin + dir * t);
+        let mut v = self.base_value_at(origin + dir * t);
         if v < 0.0 {
             return None;
         }
         while t < far {
             prev = t;
             t += v.max(0.3 * self.voxel);
-            v = self.value_at(origin + dir * t);
+            v = self.base_value_at(origin + dir * t);
             if v < 0.0 {
                 break;
             }
@@ -662,7 +791,7 @@ impl Volume {
         let (mut a, mut b) = (prev, t);
         for _ in 0..12 {
             let m = 0.5 * (a + b);
-            if self.value_at(origin + dir * m) < 0.0 {
+            if self.base_value_at(origin + dir * m) < 0.0 {
                 b = m;
             } else {
                 a = m;

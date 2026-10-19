@@ -105,13 +105,27 @@ impl VolumeMode {
         self.chunks.high
     }
 
-    /// One dab at surface point `at` with outward `normal`: clay raises a lump about half the radius high, carving
-    /// digs a groove as deep.
-    pub fn dab(&mut self, at: Vec3, normal: Vec3, radius: f32, strength: f32, carve: bool) {
+    /// One dab near surface point `at`: a flat disc on the surface the stroke began on. Clay raises it by up to a third
+    /// of the radius at full strength, carving digs as deep; overlapping dabs in one stroke fill in rather than stack, so
+    /// a stroke lays down (or cuts) one even layer, and the next stroke builds on it.
+    pub fn dab(&mut self, at: Vec3, radius: f32, strength: f32, carve: bool) {
         let t = Instant::now();
-        let depth = radius * (0.25 + 0.5 * strength.clamp(0.0, 1.0));
-        let centre = if carve { at + normal * (radius - depth) } else { at - normal * (radius - depth) };
-        self.vol.dab(centre, radius, 0.2 * radius, carve);
+        let on = self.vol.onto_base(at);
+        let n = self.vol.normal_at(on);
+        if n == Vec3::ZERO {
+            return;
+        }
+        let height = radius * (0.04 + 0.3 * strength.clamp(0.0, 1.0));
+        let grid = self.vol.grid();
+        self.vol.dab_disc(on, n, radius, height, height, carve);
+        if self.vol.grid() != grid {
+            // The lattice grew and every block was renumbered: start the GPU side over.
+            self.slot_of.clear();
+            self.chunks_of.clear();
+            self.slots.reset();
+            self.chunks.reset();
+            self.reset = true;
+        }
         self.last_ms += t.elapsed().as_secs_f64() * 1e3;
         self.last_dabs += 1;
     }
@@ -267,7 +281,10 @@ mod tests {
                 let a = stroke as f32 * 0.9 + i as f32 * 0.03;
                 let dir = Vec3::new(a.sin(), 0.3 * (stroke as f32).cos(), a.cos()).normalize();
                 let Some((hit, n)) = mode.raycast(dir * 3.0, -dir) else { continue };
-                mode.dab(hit, n, radius, 0.8, carve);
+                let _ = n;
+                mode.vol.begin_stroke();
+                mode.dab(hit, radius, 0.8, carve);
+                mode.vol.end_stroke();
                 if i % 3 == 0 {
                     apply(&mut mode);
                 }

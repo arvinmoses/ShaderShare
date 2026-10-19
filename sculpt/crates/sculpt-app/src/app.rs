@@ -580,6 +580,9 @@ impl SculptApp {
     fn end_stroke(&mut self) {
         self.pending.clear();
         let stroke = std::mem::replace(&mut self.stroke, Stroke::None);
+        if let (Stroke::Volume { .. }, Some(mode)) = (&stroke, self.volume_mode.as_mut()) {
+            mode.vol.end_stroke();
+        }
         if let Some(doc) = self.doc.as_mut() {
             match stroke {
                 Stroke::Move { mut brush, .. } => {
@@ -604,6 +607,9 @@ impl SculptApp {
             };
             let p = self.tools.params(self.tool).clone();
             self.stroke = Stroke::Volume { carve, size_px: p.size_px, strength: p.strength, last: None, carry: 0.0 };
+            if let Some(mode) = self.volume_mode.as_mut() {
+                mode.vol.begin_stroke();
+            }
             self.pending.push_front(Sample { pos, pressure: self.pen.pressure });
             return;
         }
@@ -738,21 +744,19 @@ impl SculptApp {
                         // Re-entering the surface, or jumping across a gap, starts the spacing over.
                         Some(p) if p.distance(hit) < radius * 4.0 => p,
                         _ => {
-                            let n = mode.vol.normal_at(hit);
-                            mode.dab(hit, n, radius, *strength * s.pressure, *carve);
+                            mode.dab(hit, radius, *strength * s.pressure, *carve);
                             dabs += 1;
                             *last = Some(hit);
                             *carry = 0.0;
                             continue;
                         }
                     };
-                    // Dabs every `spacing` along the way from the last one, each on the surface under it.
+                    // Dabs every `spacing` along the way from the last one, each moved onto the surface the stroke began on.
                     let gap = from.distance(hit);
                     let mut along = spacing - *carry;
                     while along <= gap {
                         let q = from.lerp(hit, along / gap);
-                        let n = mode.vol.normal_at(q);
-                        mode.dab(q, n, radius, *strength * s.pressure, *carve);
+                        mode.dab(q, radius, *strength * s.pressure, *carve);
                         dabs += 1;
                         along += spacing;
                     }
