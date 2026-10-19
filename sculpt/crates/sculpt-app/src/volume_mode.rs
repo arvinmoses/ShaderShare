@@ -71,6 +71,8 @@ pub struct VolumeMode {
     /// Timing of the last frame's dabs, for the status line.
     pub last_ms: f64,
     pub last_dabs: usize,
+    /// The brush normal of the stroke's last dab, which the next one leans toward.
+    stroke_n: Vec3,
     /// Set when the viewport must rebuild its buffers from scratch (first frame, or after a pool grew); the upload
     /// that sets it holds everything.
     pub reset: bool,
@@ -85,7 +87,7 @@ impl VolumeMode {
         let surface = vol.drain_changed().into_iter().filter(|&b| vol.surface_of(b).is_some()).count();
         // Room for the surface to roughly double before the first growth.
         let cap = (surface * 2).max(4096) as u32;
-        let mut mode = VolumeMode { vol, slot_of: HashMap::new(), chunks_of: HashMap::new(), slots: Pool::new(cap), chunks: Pool::new(cap), blocks: 0, last_ms: 0.0, last_dabs: 0, reset: true };
+        let mut mode = VolumeMode { vol, slot_of: HashMap::new(), chunks_of: HashMap::new(), slots: Pool::new(cap), chunks: Pool::new(cap), blocks: 0, last_ms: 0.0, last_dabs: 0, stroke_n: Vec3::ZERO, reset: true };
         // Everything is new on the first upload.
         mode.vol.extract_all();
         mode
@@ -110,11 +112,20 @@ impl VolumeMode {
     /// a stroke lays down (or cuts) one even layer, and the next stroke builds on it.
     pub fn dab(&mut self, at: Vec3, radius: f32, strength: f32, carve: bool) {
         let t = Instant::now();
-        let on = self.vol.onto_base(at);
-        let n = self.vol.normal_at(on);
-        if n == Vec3::ZERO {
+        let rough = if self.stroke_n == Vec3::ZERO { self.vol.normal_at(at) } else { self.stroke_n };
+        let on = self.vol.onto_base(at, rough);
+        let here = self.vol.normal_at(on);
+        if here == Vec3::ZERO {
             return;
         }
+        // The mean normal under the brush, eased from the last dab's: the brush turns gradually along a stroke
+        // instead of tipping with every bump it passes over.
+        // Measured along the brush's own direction so far: the normal at one point on a bump's side would tip it.
+        // A stroke's first dab has no direction yet: measure once along the normal here, then again along that.
+        let along = if self.stroke_n == Vec3::ZERO { self.vol.area_normal(on, here, radius) } else { self.stroke_n };
+        let area = self.vol.area_normal(on, along, radius);
+        let n = if self.stroke_n == Vec3::ZERO { area } else { (self.stroke_n * 0.7 + area * 0.3).try_normalize().unwrap_or(area) };
+        self.stroke_n = n;
         let height = radius * (0.04 + 0.3 * strength.clamp(0.0, 1.0));
         let grid = self.vol.grid();
         self.vol.dab_disc(on, n, radius, height, height, carve);
@@ -128,6 +139,16 @@ impl VolumeMode {
         }
         self.last_ms += t.elapsed().as_secs_f64() * 1e3;
         self.last_dabs += 1;
+    }
+
+    pub fn begin_stroke(&mut self) {
+        self.vol.begin_stroke();
+        self.stroke_n = Vec3::ZERO;
+    }
+
+    pub fn end_stroke(&mut self) {
+        self.vol.end_stroke();
+        self.stroke_n = Vec3::ZERO;
     }
 
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(Vec3, Vec3)> {
@@ -282,9 +303,9 @@ mod tests {
                 let dir = Vec3::new(a.sin(), 0.3 * (stroke as f32).cos(), a.cos()).normalize();
                 let Some((hit, n)) = mode.raycast(dir * 3.0, -dir) else { continue };
                 let _ = n;
-                mode.vol.begin_stroke();
+                mode.begin_stroke();
                 mode.dab(hit, radius, 0.8, carve);
-                mode.vol.end_stroke();
+                mode.end_stroke();
                 if i % 3 == 0 {
                     apply(&mut mode);
                 }
@@ -306,5 +327,48 @@ mod tests {
         assert_eq!(drawn / 6, mesh.faces.len());
         assert_eq!(zero, 0);
         assert!((sum - want).length() < 1e-3 * drawn as f64, "{sum} vs {want}");
+    }
+
+    /// Scrubbing a big brush back and forth over bumpy clay: the brush turns a little per dab, far less than the
+    /// surface normal under it does.
+    #[test]
+    fn scrubbing_turns_the_brush_gently() {
+        let mut mode = VolumeMode::ball(4e5);
+        // Bumps: small strokes of clay scattered over the top.
+        for i in 0..30 {
+            let a = i as f32 * 2.4;
+            let at = Vec3::new(0.35 * a.cos() * (i as f32 / 30.0), 0.35 * a.sin() * (i as f32 / 30.0), 1.0).normalize();
+            mode.begin_stroke();
+            if let Some((hit, _)) = mode.raycast(at * 3.0, -at) {
+                mode.dab(hit, 0.08, 1.0, false);
+            }
+            mode.end_stroke();
+        }
+        let _ = mode.take_upload();
+        // One scrub: back and forth across the bumps.
+        let (mut turn, mut raw_turn, mut worst, mut n) = (0.0f32, 0.0f32, 0.0f32, 0);
+        let (mut last, mut last_raw) = (Vec3::ZERO, Vec3::ZERO);
+        mode.begin_stroke();
+        for i in 0..240 {
+            let x = 0.4 * ((i as f32) * 0.08).sin();
+            let y = 0.05 * ((i as f32) * 0.31).sin();
+            let at = Vec3::new(x, y, 1.0).normalize();
+            let Some((hit, _)) = mode.raycast(at * 3.0, -at) else { continue };
+            let raw = mode.vol.normal_at(hit);
+            mode.dab(hit, 0.3, 0.7, false);
+            if last != Vec3::ZERO {
+                let a = last.angle_between(mode.stroke_n).to_degrees();
+                turn += a;
+                worst = worst.max(a);
+                raw_turn += last_raw.angle_between(raw).to_degrees();
+                n += 1;
+            }
+            last = mode.stroke_n;
+            last_raw = raw;
+        }
+        mode.end_stroke();
+        let (mean, raw_mean) = (turn / n as f32, raw_turn / n as f32);
+        eprintln!("per dab the brush turned {mean:.2} deg on average ({worst:.2} at most); the normal under it turned {raw_mean:.2}");
+        assert!(mean < raw_mean / 3.0 && worst < 6.0);
     }
 }

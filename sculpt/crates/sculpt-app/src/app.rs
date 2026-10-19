@@ -581,7 +581,7 @@ impl SculptApp {
         self.pending.clear();
         let stroke = std::mem::replace(&mut self.stroke, Stroke::None);
         if let (Stroke::Volume { .. }, Some(mode)) = (&stroke, self.volume_mode.as_mut()) {
-            mode.vol.end_stroke();
+            mode.end_stroke();
         }
         if let Some(doc) = self.doc.as_mut() {
             match stroke {
@@ -608,7 +608,7 @@ impl SculptApp {
             let p = self.tools.params(self.tool).clone();
             self.stroke = Stroke::Volume { carve, size_px: p.size_px, strength: p.strength, last: None, carry: 0.0 };
             if let Some(mode) = self.volume_mode.as_mut() {
-                mode.vol.begin_stroke();
+                mode.begin_stroke();
             }
             self.pending.push_front(Sample { pos, pressure: self.pen.pressure });
             return;

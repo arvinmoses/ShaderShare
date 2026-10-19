@@ -9,7 +9,7 @@ fn stroke(v: &mut Volume, dabs: usize, r: f32, h: f32, carve: bool) {
     v.begin_stroke();
     for _ in 0..dabs {
         let (hit, _) = v.raycast(Vec3::new(0.0, 0.0, 4.0), Vec3::NEG_Z).unwrap();
-        let on = v.onto_base(hit);
+        let on = v.onto_base(hit, Vec3::Z);
         let n = v.normal_at(on);
         v.dab_disc(on, n, r, h, h, carve);
     }

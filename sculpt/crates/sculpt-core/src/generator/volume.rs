@@ -346,19 +346,59 @@ impl Volume {
         self.modify(c, r, r, k, carve, &|p: Vec3| (p - c).length() - r)
     }
 
-    /// Add or remove a flat disc: an ellipsoid centred at `c`, `r` across and `h` high along `n`, blended over `k`.
-    /// Centred on the surface, clay raises it by at most `h` and carving digs at most `h`, however often dabs overlap.
+    /// Add or remove a low cap on the surface at `c` (outward normal `n`): `r` in radius and `h` high (or deep), its
+    /// rim meeting the surface at a shallow angle so strokes blend into each other, blended over `k`. Clay raises the
+    /// surface by at most `h` and carving digs at most `h`, however often dabs overlap.
     pub fn dab_disc(&mut self, c: Vec3, n: Vec3, r: f32, h: f32, k: f32, carve: bool) -> DabStats {
-        let (r2, h2) = (r * r, h * h);
-        self.modify(c, r, h, k, carve, &|p: Vec3| {
-            // An ellipsoid's distance, closely approximated (exact on its axes).
-            let q = p - c;
-            let qn = q.dot(n);
-            let qt2 = (q.length_squared() - qn * qn).max(0.0);
-            let k0 = (qt2 / r2 + qn * qn / h2).sqrt();
-            let k1 = (qt2 / (r2 * r2) + qn * qn / (h2 * h2)).sqrt();
-            if k1 < 1e-20 { -h } else { k0 * (k0 - 1.0) / k1 }
-        })
+        // A sphere through the rim and the top, cut to the brush's reach so it cannot poke out of thin parts.
+        let big = (r * r + h * h) / (2.0 * h);
+        let centre = if carve { c + n * (big - h) } else { c - n * (big - h) };
+        let reach = 1.05 * r;
+        self.modify(c, reach, h, k, carve, &|p: Vec3| ((p - centre).length() - big).max((p - c).length() - reach))
+    }
+
+    /// The surface's overall normal under a brush of radius `r` at `c` (as it was when the stroke began): the plane
+    /// through rings of surface points around `c`, found along `n`. Heights vary little over small bumps, so the plane
+    /// does not tip with every one the brush passes over, as the normals there would.
+    pub fn area_normal(&self, c: Vec3, n: Vec3, r: f32) -> Vec3 {
+        let (t1, t2) = n.any_orthonormal_pair();
+        let mut sum = Vec3::ZERO;
+        for (ring, weight) in [(0.5, 0.6), (0.8, 1.0), (1.0, 0.8)] {
+            let pts: Option<Vec<Vec3>> = (0..12)
+                .map(|k| {
+                    let a = k as f32 * std::f32::consts::TAU / 12.0;
+                    self.along_onto_base(c + (t1 * a.cos() + t2 * a.sin()) * ring * r, n, r)
+                })
+                .collect();
+            // A ring that leaves the surface (over an edge) says nothing about the plane.
+            let Some(pts) = pts else { continue };
+            // The ring's polygon normal (Newell's method), which a plane fit through its points matches.
+            let mid = pts.iter().sum::<Vec3>() / pts.len() as f32;
+            let mut nn = Vec3::ZERO;
+            for k in 0..pts.len() {
+                nn += (pts[k] - mid).cross(pts[(k + 1) % pts.len()] - mid);
+            }
+            if let Some(u) = nn.try_normalize() {
+                sum += u * weight;
+            }
+        }
+        sum.try_normalize().filter(|u| u.dot(n) > 0.3).unwrap_or(n)
+    }
+
+    /// Where the line through `p` along `n` meets the surface as it was when the stroke began, within `limit` of `p`.
+    fn along_onto_base(&self, mut p: Vec3, n: Vec3, limit: f32) -> Option<Vec3> {
+        let start = p;
+        for _ in 0..48 {
+            let v = self.base_value_at(p);
+            if v.abs() < 0.01 * self.voxel {
+                break;
+            }
+            p -= n * v;
+            if (p - start).length() > limit {
+                return None;
+            }
+        }
+        Some(p)
     }
 
     /// Start a stroke: until [`Self::end_stroke`], raycasts and normals see the surface as it is now.
@@ -741,7 +781,15 @@ impl Volume {
     }
 
     /// `p` moved onto the surface as it was when the stroke began, along that surface's normal.
-    pub fn onto_base(&self, mut p: Vec3) -> Vec3 {
+    /// Far from the surface (where the stored distance is clamped) it first walks along `dir`, the rough normal.
+    pub fn onto_base(&self, mut p: Vec3, dir: Vec3) -> Vec3 {
+        for _ in 0..32 {
+            let v = self.base_value_at(p);
+            if v.abs() < self.band * 0.999 {
+                break;
+            }
+            p -= dir * v;
+        }
         for _ in 0..3 {
             let v = self.base_value_at(p);
             if v.abs() >= self.band * 0.999 {
