@@ -75,6 +75,8 @@ enum Stroke {
     },
     Move { brush: MoveBrush, start: Pos2, world_per_px: f32 },
     Pose { pivot: Vec3, grab: Vec3, start: Pos2, world_per_px: f32, previewed: bool },
+    /// A stroke in the volume playground: dabs every `spacing` along the surface since `last`.
+    Volume { carve: bool, size_px: f32, strength: f32, last: Option<Vec3>, carry: f32 },
 }
 
 pub enum Dialog {
@@ -186,6 +188,8 @@ pub struct SculptApp {
     pub remesh_top: Option<Document>,
     /// The stack as it was when editing below began, to measure the sculpt against when it is carried as volume.
     pub remesh_old_stack: Option<sculpt_core::document::SolidInput>,
+    /// The volume playground, when open: sculpted and drawn instead of the document.
+    pub volume_mode: Option<crate::volume_mode::VolumeMode>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -281,6 +285,7 @@ impl SculptApp {
             solid_preview: Default::default(),
             remesh_top: None,
             remesh_old_stack: None,
+            volume_mode: None,
             sweep: None,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
@@ -364,6 +369,9 @@ impl SculptApp {
                             }
                             self.sweep = Some(sweep);
                         }
+                    }
+                    if let Some(m) = std::env::var("SCULPT_VOLUME").ok().and_then(|v| v.parse::<f32>().ok()) {
+                        self.open_volume(m * 1e6);
                     }
                     if std::env::var("SCULPT_DEMO_NOISE").is_ok() {
                         crate::layer_panel::command::execute(self, crate::layer_panel::command::LayerCommand::NewGenerator(sculpt_core::generator::layer::GeneratorKind::Noise));
@@ -585,6 +593,20 @@ impl SculptApp {
     }
 
     fn begin_stroke(&mut self, pos: Pos2, modifiers: egui::Modifiers) {
+        if self.volume_mode.is_some() {
+            let carve = match self.tool {
+                Tool::ClayBuildup => modifiers.command,
+                Tool::TrimDynamic => !modifiers.command,
+                _ => {
+                    self.status = "The volume playground has Clay Buildup (adds) and Trim Dynamic (carves); Ctrl swaps them.".into();
+                    return;
+                }
+            };
+            let p = self.tools.params(self.tool).clone();
+            self.stroke = Stroke::Volume { carve, size_px: p.size_px, strength: p.strength, last: None, carry: 0.0 };
+            self.pending.push_front(Sample { pos, pressure: self.pen.pressure });
+            return;
+        }
         // Strokes under generator layers would be displaced by them again: sculpt on a remesh of the stack instead.
         if self.doc.as_ref().is_some_and(crate::remesh_ui::needs_remesh) {
             if self.remesh_top.is_some() {
@@ -699,6 +721,48 @@ impl SculptApp {
         let size = self.viewport_rect.size();
         let camera = self.camera.clone();
         match &mut self.stroke {
+            Stroke::Volume { carve, size_px, strength, last, carry } => {
+                let Some(mode) = self.volume_mode.as_mut() else { return 0 };
+                mode.last_ms = 0.0;
+                mode.last_dabs = 0;
+                while let Some(s) = self.pending.pop_front() {
+                    let local = s.pos - self.viewport_rect.min;
+                    let ray = camera.ray(GVec2::new(local.x, local.y), GVec2::new(size.x, size.y));
+                    let Some((hit, _)) = mode.raycast(ray.origin, ray.dir) else {
+                        *last = None;
+                        continue;
+                    };
+                    let radius = *size_px * camera.world_per_pixel(hit, size.y);
+                    let spacing = (0.15 * radius).max(mode.voxel());
+                    let from = match *last {
+                        // Re-entering the surface, or jumping across a gap, starts the spacing over.
+                        Some(p) if p.distance(hit) < radius * 4.0 => p,
+                        _ => {
+                            let n = mode.vol.normal_at(hit);
+                            mode.dab(hit, n, radius, *strength * s.pressure, *carve);
+                            dabs += 1;
+                            *last = Some(hit);
+                            *carry = 0.0;
+                            continue;
+                        }
+                    };
+                    // Dabs every `spacing` along the way from the last one, each on the surface under it.
+                    let gap = from.distance(hit);
+                    let mut along = spacing - *carry;
+                    while along <= gap {
+                        let q = from.lerp(hit, along / gap);
+                        let n = mode.vol.normal_at(q);
+                        mode.dab(q, n, radius, *strength * s.pressure, *carve);
+                        dabs += 1;
+                        along += spacing;
+                    }
+                    *carry = gap - (along - spacing);
+                    *last = Some(hit);
+                }
+                if dabs > 0 {
+                    self.status = format!("Volume: {dabs} dabs this frame, {:.2} ms ({:.2} ms each), {} blocks of surface{}", mode.last_ms, mode.last_ms / dabs as f64, mode.blocks, if mode.dropped > 0 { format!(", {} quads dropped", mode.dropped) } else { String::new() });
+                }
+            }
             Stroke::Brush { brush, settings, sampler, normal, dabs: queue, last_hit } => {
                 let Some(doc) = self.doc.as_mut() else { return 0 };
                 loop {
@@ -784,6 +848,32 @@ impl SculptApp {
 
     // --------------------------------------------------------------- viewport
 
+    /// Open the volume playground on a fresh ball of about `triangles` triangles.
+    pub fn open_volume(&mut self, triangles: f32) {
+        self.end_stroke();
+        let t = Instant::now();
+        let mode = crate::volume_mode::VolumeMode::ball(triangles);
+        self.camera.frame(&sculpt_core::geom::Aabb { min: Vec3::splat(-1.0), max: Vec3::splat(1.0) });
+        self.status = format!("Volume playground: {:.1}M-triangle ball in {:.0} ms. Clay Buildup adds, Trim Dynamic carves, Ctrl swaps. Mesh menu to leave.", triangles / 1e6, t.elapsed().as_secs_f64() * 1e3);
+        self.volume_mode = Some(mode);
+        if self.tool != Tool::ClayBuildup && self.tool != Tool::TrimDynamic {
+            self.select_tool(Tool::ClayBuildup);
+        }
+    }
+
+    /// Back to the document.
+    pub fn close_volume(&mut self) {
+        self.end_stroke();
+        self.volume_mode = None;
+        if let Some(vp) = self.viewport.as_mut() {
+            vp.clear_volume();
+        }
+        if let Some(doc) = self.doc.as_ref() {
+            self.camera.frame(&doc.bounds());
+        }
+        self.status = "Left the volume playground".into();
+    }
+
     /// Time since the last sculpt stroke dab.
     pub fn last_edit_age(&self) -> Duration {
         self.last_edit.elapsed()
@@ -858,7 +948,16 @@ impl SculptApp {
 
         // Brush cursor.
         self.cursor = None;
-        if let (Some(doc), Some(hover)) = (&self.doc, resp.hover_pos().or(last))
+        if let (Some(mode), Some(hover)) = (&self.volume_mode, resp.hover_pos().or(last))
+            && !navigating {
+                let local = hover - rect.min;
+                let ray = self.camera.ray(GVec2::new(local.x, local.y), GVec2::new(rect.width(), rect.height()));
+                if let Some((hit, _)) = mode.raycast(ray.origin, ray.dir) {
+                    let p = self.tools.params(self.tool);
+                    self.cursor = Some((hit, p.size_px * self.camera.world_per_pixel(hit, rect.height()), p.hardness));
+                }
+            }
+        if let (Some(doc), Some(hover), None) = (&self.doc, resp.hover_pos().or(last), &self.volume_mode)
             && !navigating && !busy {
                 let local = hover - rect.min;
                 let ray = self.camera.ray(GVec2::new(local.x, local.y), GVec2::new(rect.width(), rect.height()));
@@ -885,7 +984,10 @@ impl SculptApp {
         crate::solid_preview::tick(self, ui.ctx());
         let showing_preview = self.solid_preview.shown();
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
-            if let Some(doc) = self.doc.as_mut() {
+            if let Some(mode) = self.volume_mode.as_mut() {
+                vp.sync_volume(rs, mode);
+                self.stats.upload = vp.last_upload;
+            } else if let Some(doc) = self.doc.as_mut() {
                 // Meshes dense enough that a generator edit would not fit a frame update their surface a little each frame.
                 let want_progressive = match std::env::var("SCULPT_PROGRESSIVE").as_deref() {
                     Ok("off") => false,
@@ -933,7 +1035,7 @@ impl SculptApp {
             let t = Instant::now();
             let tau = self.lod_tau_override.or(self.view_detail.tau_px());
             let tau = tau.map(|t| if navigating { t * 2.0 } else { t });
-            let lod = self.doc.as_ref().zip(tau).filter(|_| !showing_preview).and_then(|(d, tau)| {
+            let lod = self.doc.as_ref().zip(tau).filter(|_| !showing_preview && self.volume_mode.is_none()).and_then(|(d, tau)| {
                 d.lod().map(|tree| crate::viewport::LodInput { tree, bvh: d.bvh(), topology_id: d.topology_id(), tau_px: tau, budget: LOD_BUDGET })
             });
             let tex = vp.render(rs, px, &self.camera, &self.theme, self.overlay_strength, self.cursor, lod);

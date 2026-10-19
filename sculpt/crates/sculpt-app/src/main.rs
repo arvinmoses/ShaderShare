@@ -25,6 +25,7 @@ mod test_driver;
 mod theme;
 mod tools;
 mod viewport;
+mod volume_mode;
 
 use std::path::PathBuf;
 

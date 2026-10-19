@@ -156,6 +156,23 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 }
             });
             ui.menu_button("Mesh", |ui| {
+                if app.volume_mode.is_some() {
+                    if ui.button("Leave volume playground").clicked() {
+                        app.close_volume();
+                        ui.close();
+                    }
+                } else {
+                    ui.menu_button("Volume playground", |ui| {
+                        ui.label("Sculpt a solid that never stretches (preview: no undo or saving)");
+                        for (label, tris) in [("Ball, 1M triangles", 1e6f32), ("Ball, 3M triangles", 3e6), ("Ball, 5M triangles", 5e6)] {
+                            if ui.button(label).clicked() {
+                                app.open_volume(tris);
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+                ui.separator();
                 cmd_button(app, ui, Command::Subdivide);
                 cmd_button(app, ui, Command::NewLayer);
                 ui.separator();

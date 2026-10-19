@@ -25,9 +25,11 @@ const B: i32 = 8;
 const N: usize = 512;
 
 /// A quad's corners, each as (block, cell).
-type Quad = [(u32, u16); 4];
+pub type Quad = [(u32, u16); 4];
 /// A block as first built: its index, inside (-1) / outside (1) / stored (0), and its samples when stored.
 type Filled = (u32, i8, Option<Box<[f32; N]>>);
+/// A block after refinement: its index, its samples when it holds surface, else whether it is inside (-1) or out (1).
+type Refilled = (u32, Option<Box<[f32; N]>>, i8);
 
 /// A sculpt-able solid stored as a sparse, clamped distance field.
 pub struct Volume {
@@ -39,6 +41,8 @@ pub struct Volume {
     signs: Vec<i8>,
     dense: HashMap<u32, Box<[f32; N]>>,
     meshes: HashMap<u32, BlockMesh>,
+    /// Blocks whose surface was rebuilt since [`Volume::drain_changed`] last ran, for a viewport to re-upload.
+    changed: std::collections::HashSet<u32>,
 }
 
 /// The surface inside one block: a vertex per crossed cell, and the quads whose lattice edges start in this block.
@@ -86,7 +90,7 @@ impl Volume {
         let blocks = ((2.0 * half / voxel) / B as f32).ceil() as i32 + 2;
         let dims = IVec3::splat(blocks);
         let origin = Vec3::splat(-half - voxel * B as f32);
-        let mut v = Volume { voxel, band, origin, dims, signs: vec![1; (blocks as usize).pow(3)], dense: HashMap::new(), meshes: HashMap::new() };
+        let mut v = Volume { voxel, band, origin, dims, signs: vec![1; (blocks as usize).pow(3)], dense: HashMap::new(), meshes: HashMap::new(), changed: Default::default() };
         let reach = 0.5 * B as f32 * voxel * 3f32.sqrt() + band;
         let total = v.signs.len();
         let filled: Vec<Filled> = (0..total as u32)
@@ -157,6 +161,7 @@ impl Volume {
 
     /// Rebuild the surface of `blocks`: vertices first (every block), then quads (which read neighbours' vertices).
     fn rebuild(&mut self, blocks: &[u32]) {
+        self.changed.extend(blocks.iter().copied());
         let built: Vec<(u32, BlockMesh)> = blocks.par_iter().map(|&b| (b, self.block_vertices(b))).collect();
         for (b, m) in built {
             if m.verts.is_empty() {
@@ -431,7 +436,7 @@ pub struct RefineStats {
 impl Volume {
     /// A copy of the field without its surface, to remember how it was before a stroke.
     pub fn field_copy(&self) -> Volume {
-        Volume { voxel: self.voxel, band: self.band, origin: self.origin, dims: self.dims, signs: self.signs.clone(), dense: self.dense.clone(), meshes: HashMap::new() }
+        Volume { voxel: self.voxel, band: self.band, origin: self.origin, dims: self.dims, signs: self.signs.clone(), dense: self.dense.clone(), meshes: HashMap::new(), changed: Default::default() }
     }
 
     fn sample(&self, i: IVec3) -> f32 {
@@ -499,7 +504,7 @@ impl Volume {
         let band = self.band;
         let this = &*self;
         // New samples for each block that can hold surface now or did before: computed from the old field, written after.
-        let rebuilt: Vec<(u32, Option<Box<[f32; N]>>, i8)> = candidates
+        let rebuilt: Vec<Refilled> = candidates
             .par_iter()
             .filter_map(|&b| {
                 let lo = this.block_origin(b);
@@ -588,5 +593,82 @@ impl Local {
         let dy = (x10 - x00) * (1.0 - f.z) + (x11 - x01) * f.z;
         let dz = y1 - y0;
         (value, Vec3::new(dx, dy, dz) / self.voxel)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// For the app's volume playground: what changed, each block's surface, and finding the surface under the cursor.
+// ---------------------------------------------------------------------------------------------
+
+impl Volume {
+    /// Blocks whose surface was rebuilt since the last call.
+    pub fn drain_changed(&mut self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.changed.drain().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Block `b`'s surface: for each of its 512 cells the index of its vertex in `verts` (or `u32::MAX`), the
+    /// vertices, and the quads whose lattice edges start in it. `None` if the block holds no surface.
+    pub fn surface_of(&self, b: u32) -> Option<(&[u32], &[Vec3], &[Quad])> {
+        self.meshes.get(&b).filter(|m| !m.verts.is_empty()).map(|m| (m.cell.as_slice(), m.verts.as_slice(), m.quads.as_slice()))
+    }
+
+    /// The box the lattice covers.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        (self.origin, self.origin + (self.dims * B).as_vec3() * self.voxel)
+    }
+
+    /// Outward normal of the field at `p`.
+    pub fn normal_at(&self, p: Vec3) -> Vec3 {
+        self.gradient_at(p)
+    }
+
+    fn gradient_at(&self, p: Vec3) -> Vec3 {
+        let h = self.voxel;
+        let d = |o: Vec3| self.value_at(p + o) - self.value_at(p - o);
+        Vec3::new(d(Vec3::X * h), d(Vec3::Y * h), d(Vec3::Z * h)).normalize_or_zero()
+    }
+
+    /// Where a ray from `origin` along `dir` (normalised) first enters the solid, with the surface normal there.
+    pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(Vec3, Vec3)> {
+        let (lo, hi) = self.bounds();
+        // Clip the ray to the lattice's box.
+        let inv = dir.recip();
+        let (t0, t1) = ((lo - origin) * inv, (hi - origin) * inv);
+        let (near, far) = (t0.min(t1).max_element().max(0.0), t0.max(t1).min_element());
+        if near > far {
+            return None;
+        }
+        // March by the field (a lower bound on the distance), at least a third of a step at a time.
+        let mut t = near;
+        let mut prev = t;
+        let mut v = self.value_at(origin + dir * t);
+        if v < 0.0 {
+            return None;
+        }
+        while t < far {
+            prev = t;
+            t += v.max(0.3 * self.voxel);
+            v = self.value_at(origin + dir * t);
+            if v < 0.0 {
+                break;
+            }
+        }
+        if v >= 0.0 {
+            return None;
+        }
+        // Narrow down the crossing.
+        let (mut a, mut b) = (prev, t);
+        for _ in 0..12 {
+            let m = 0.5 * (a + b);
+            if self.value_at(origin + dir * m) < 0.0 {
+                b = m;
+            } else {
+                a = m;
+            }
+        }
+        let p = origin + dir * b;
+        Some((p, self.gradient_at(p)))
     }
 }

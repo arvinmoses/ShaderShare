@@ -174,6 +174,19 @@ pub struct Viewport {
     pub lod_stats: LodStats,
     /// Block until the GPU finishes each frame (benchmarking).
     pub wait_gpu: bool,
+    /// The volume playground's surface, drawn instead of the mesh while it is open.
+    volume: Option<VolumeGpu>,
+}
+
+/// The volume playground's surface on the GPU: one slot per block of surface, each with 512 vertex places (one per
+/// cell) and room for a fixed number of quads, drawn in one multi-draw with an indirect entry per slot.
+struct VolumeGpu {
+    quant: Quant,
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    indirect: wgpu::Buffer,
+    capacity: u32,
+    high: u32,
 }
 
 fn linear(c: egui::Color32) -> [f32; 4] {
@@ -270,6 +283,7 @@ impl Viewport {
             bind_group,
             targets: None,
             mesh: None,
+            volume: None,
             texture_id: None,
             overlay_kind: OverlayKind::None,
             last_upload: UploadStats::default(),
@@ -306,6 +320,60 @@ impl Viewport {
             None => self.texture_id = Some(renderer.register_native_texture(&rs.device, &resolve, wgpu::FilterMode::Linear)),
         }
         self.targets = Some(Targets { size, msaa, resolve, depth });
+    }
+
+    /// Bring the volume playground's surface up to date: rewrite only the slots that changed.
+    pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode) {
+        use crate::volume_mode::{CELLS, QUADS_PER_SLOT};
+        let t = Instant::now();
+        let mut stats = UploadStats::default();
+        if mode.reset || self.volume.as_ref().is_none_or(|v| v.capacity != mode.capacity) {
+            let make = |label, size: u64, usage| rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let cap = mode.capacity as u64;
+            self.volume = Some(VolumeGpu {
+                quant: Quant::fit(mode.bounds()),
+                vertices: make("volume vertices", cap * CELLS as u64 * 8, wgpu::BufferUsages::VERTEX),
+                indices: make("volume indices", cap * (QUADS_PER_SLOT * 6) as u64 * 4, wgpu::BufferUsages::INDEX),
+                // DrawIndexedIndirectArgs: index count, instance count, first index, base vertex, first instance.
+                indirect: make("volume indirect", cap * 20, wgpu::BufferUsages::INDIRECT),
+                capacity: mode.capacity,
+                high: 0,
+            });
+            // Fresh buffers start empty: every slot draws nothing until written.
+            let zeros = vec![0u8; (cap * 20) as usize];
+            rs.queue.write_buffer(&self.volume.as_ref().unwrap().indirect, 0, &zeros);
+            mode.reset = false;
+        }
+        let up = mode.take_upload();
+        let v = self.volume.as_mut().unwrap();
+        v.high = mode.high;
+        let mut packed = vec![[0u16; 4]; CELLS];
+        for (slot, positions) in &up.verts {
+            pack(&v.quant, positions, None, &mut packed);
+            rs.queue.write_buffer(&v.vertices, *slot as u64 * CELLS as u64 * 8, bytemuck::cast_slice(&packed));
+            stats.bytes += CELLS * 8;
+        }
+        let per_slot = (QUADS_PER_SLOT * 6) as u32;
+        for (slot, idx) in &up.indices {
+            if !idx.is_empty() {
+                rs.queue.write_buffer(&v.indices, *slot as u64 * per_slot as u64 * 4, bytemuck::cast_slice(idx));
+            }
+            let args: [u32; 5] = [idx.len() as u32, 1, slot * per_slot, 0, 0];
+            rs.queue.write_buffer(&v.indirect, *slot as u64 * 20, bytemuck::cast_slice(&args));
+            stats.bytes += idx.len() * 4 + 20;
+        }
+        for slot in &up.cleared {
+            rs.queue.write_buffer(&v.indirect, *slot as u64 * 20, bytemuck::cast_slice(&[0u32; 5]));
+        }
+        stats.ranges = up.verts.len();
+        stats.ms = t.elapsed().as_secs_f32() * 1e3;
+        self.last_upload = stats;
+    }
+
+    /// Leave the volume playground: draw the document again.
+    pub fn clear_volume(&mut self) {
+        self.volume = None;
+        self.mesh = None;
     }
 
     /// Bring GPU buffers up to date with the document. Cheap when nothing changed.
@@ -472,8 +540,8 @@ impl Viewport {
             cursor: cursor.map_or(Vec4::ZERO, |(c, r, _)| c.extend(r)).to_array(),
             // Alpha carries the falloff hardness (inner cursor ring).
             cursor_color: { let mut cc = linear(vp.cursor.0); cc[3] = cursor.map_or(0.0, |(_, _, h)| h); cc },
-            box_min: self.mesh.as_ref().map_or(Vec4::ZERO, |m| m.quant.min.extend(0.0)).to_array(),
-            box_size: self.mesh.as_ref().map_or(Vec4::ONE, |m| m.quant.size.extend(1.0)).to_array(),
+            box_min: self.volume.as_ref().map(|v| &v.quant).or(self.mesh.as_ref().map(|m| &m.quant)).map_or(Vec4::ZERO, |q| q.min.extend(0.0)).to_array(),
+            box_size: self.volume.as_ref().map(|v| &v.quant).or(self.mesh.as_ref().map(|m| &m.quant)).map_or(Vec4::ONE, |q| q.size.extend(1.0)).to_array(),
         };
         rs.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
@@ -501,7 +569,14 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_pipeline(&self.bg_pipeline);
             pass.draw(0..3, 0..1);
-            if let Some(m) = &self.mesh {
+            if let Some(v) = &self.volume {
+                if v.high > 0 {
+                    pass.set_pipeline(&self.flat_pipeline);
+                    pass.set_vertex_buffer(0, v.vertices.slice(..));
+                    pass.set_index_buffer(v.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.multi_draw_indexed_indirect(&v.indirect, 0, v.high);
+                }
+            } else if let Some(m) = &self.mesh {
                 pass.set_pipeline(if m.normals.is_some() { &self.smooth_pipeline } else { &self.flat_pipeline });
                 pass.set_vertex_buffer(0, m.vertices.slice(..));
                 if let Some(n) = &m.normals {
