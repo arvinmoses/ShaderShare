@@ -12,6 +12,7 @@ mod app;
 mod camera;
 mod generator_ui;
 mod gpu_boolean;
+mod gpu_levels;
 mod gpu_sdf;
 mod gpu_volume;
 mod icons;
@@ -168,6 +169,14 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     // Headless GPU volume sculpting spike: see gpu_volume/mod.rs.
+    if std::env::args().nth(1).as_deref() == Some("--gpu-levels-check") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = gpu_levels::check::run(&args) {
+            eprintln!("gpu-levels-check: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("--gpu-volume-bench") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_volume::bench(&args) {

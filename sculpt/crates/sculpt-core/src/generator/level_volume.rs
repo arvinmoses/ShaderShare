@@ -1468,6 +1468,55 @@ impl LevelVolume {
         None
     }
 
+    /// The stored blocks whose 9x9x9 samples ([`Self::gather9`]) changed when the blocks `changed` changed (samples or
+    /// existence): each of those still stored, the blocks just below it at its level (whose first layer past them is its
+    /// samples), and the finer blocks near it (whose first layer past them may fall where their level has no block and
+    /// so read its level, interpolated).
+    pub fn upload_set(&self, changed: &[Key]) -> Vec<Key> {
+        let mut out: HashSet<Key> = HashSet::new();
+        for &(l8, bc) in changed {
+            let l = l8 as usize;
+            if l >= self.levels() {
+                continue;
+            }
+            for o in 0..8 {
+                let n = bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1);
+                if self.blocks[l].contains_key(&n) {
+                    out.insert((l8, n));
+                }
+            }
+            // Finer blocks whose samples or first layer past them meet this block's box (grown by a sample for
+            // interpolation), found through the nesting.
+            let (rlo, rhi) = (bc * B - IVec3::ONE, bc * B + IVec3::splat(B + 1));
+            let mut frontier: Vec<IVec3> = (0..8).map(|o| bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1)).collect();
+            for m in l + 1..self.levels() {
+                let s = 1i32 << (m - l);
+                let (flo, fhi) = (rlo * s, rhi * s);
+                let mut next = Vec::new();
+                for p in &frontier {
+                    for q in 0..8 {
+                        let c = *p * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
+                        let (clo, chi) = (c * B, c * B + B3);
+                        if chi.cmplt(flo).any() || clo.cmpgt(fhi).any() || !self.blocks[m].contains_key(&c) {
+                            continue;
+                        }
+                        out.insert((m as u8, c));
+                        next.push(c);
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                next.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+                next.dedup();
+                frontier = next;
+            }
+        }
+        let mut v: Vec<Key> = out.into_iter().collect();
+        v.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        v
+    }
+
     /// The blocks to re-extract when the blocks `changed` changed (samples or existence), in a view capped at `cap`:
     /// every stored block whose cells read those samples, whose cells a change in which blocks exist splits or joins,
     /// or whose quads point at their vertices. That is, at every level, the stored blocks meeting a changed block's box
@@ -1641,6 +1690,8 @@ impl LevelVolume {
             }
         }
         let fin = |o: IVec3| finer[((o.z + 1) * 100 + (o.y + 1) * 10 + (o.x + 1)) as usize];
+        // Vertices so far, counting those of cells past the budget: once one cell does not fit, no later one does.
+        let mut total = 0usize;
         for i in 0..N {
             let c = cell_of(i);
             if fin(c) {
@@ -1649,14 +1700,10 @@ impl LevelVolume {
             let d: [f32; 8] = std::array::from_fn(|q| self.corner_value(l, bc, &g, base + c + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32), cap));
             let config = (0..8).fold(0u32, |a, q| a | ((d[q] < 0.0) as u32) << q);
             let transition = l < cap && (0..27).any(|q| q != 13 && fin(c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)));
-            let first = out.verts.len() as u32;
             let corner_pos = |q: usize| Vec3::new(corner(q)[0] as f32, corner(q)[1] as f32, corner(q)[2] as f32);
-            let push = |out: &mut BlockSurface, f: Vec3| {
-                let f = f.clamp(Vec3::ZERO, Vec3::ONE);
-                out.verts.push(self.origin + (base + c).as_vec3() * vx + f * vx);
-                out.normals.push(trilinear_gradient(f, d));
-            };
-            let count = if transition {
+            // Where in the cell each of its vertices lies.
+            let mut at: Vec<Vec3> = Vec::with_capacity(4);
+            if transition {
                 // Crossings on the cell's faces split once: values at the half-step points from the finer level where it
                 // holds them, else interpolated from the corners.
                 let mut sum = Vec3::ZERO;
@@ -1703,20 +1750,13 @@ impl LevelVolume {
                     let gr = trilinear_gradient(m, d);
                     m - gr * trilinear(m, d) / gr.length_squared().max(1e-12)
                 };
-                if first as usize + 1 > VERTS_PER_BLOCK {
-                    continue;
-                }
-                push(&mut out, f);
-                1
+                at.push(f);
             } else {
                 if config == 0 || config == 255 {
                     continue;
                 }
                 let entry = table[config as usize];
                 let pieces = (entry >> 24) as usize;
-                if first as usize + pieces > VERTS_PER_BLOCK {
-                    continue;
-                }
                 let mut sum = [Vec3::ZERO; 4];
                 let mut cnt = [0.0f32; 4];
                 for (e, [a, b]) in EDGES.iter().enumerate() {
@@ -1728,11 +1768,20 @@ impl LevelVolume {
                     cnt[p] += 1.0;
                 }
                 for p in 0..pieces {
-                    push(&mut out, sum[p] / cnt[p].max(1.0));
+                    at.push(sum[p] / cnt[p].max(1.0));
                 }
-                pieces as u32
-            };
-            out.cells[i] = first | count << 10 | config << 13 | (transition as u32) << 21;
+            }
+            let first = total;
+            total += at.len();
+            if first + at.len() > VERTS_PER_BLOCK {
+                continue;
+            }
+            for f in &at {
+                let f = f.clamp(Vec3::ZERO, Vec3::ONE);
+                out.verts.push(self.origin + (base + c).as_vec3() * vx + f * vx);
+                out.normals.push(trilinear_gradient(f, d));
+            }
+            out.cells[i] = first as u32 | (at.len() as u32) << 10 | config << 13 | (transition as u32) << 21;
         }
         out
     }

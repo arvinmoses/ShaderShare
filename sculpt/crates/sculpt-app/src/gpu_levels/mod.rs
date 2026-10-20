@@ -1,0 +1,618 @@
+//! The multi-resolution volume's surface, built and drawn on the GPU.
+//!
+//! The CPU holds the field (`sculpt_core::generator::level_volume`) and edits it; this keeps a copy of every stored
+//! block on the GPU (its 9x9x9 samples at 16 bits) and extracts the surface there, block by block, straight into the
+//! buffers the viewport draws from: nothing about the surface crosses the bus. Each block of any level has a slot; a
+//! hash table on the GPU finds the slot of a (level, block). A stroke uploads the samples of the blocks it changed and
+//! re-extracts the blocks around them ([`LevelVolume::upload_set`], [`LevelVolume::extract_set`]), by the same rules as
+//! the CPU's reference extractor, which `--gpu-levels-check` compares it against exactly.
+//!
+//! Each block's surface is a cluster: its quads in pages of 64 (as triangle indices naming cell and piece, resolved to
+//! a vertex when drawn), its bounds and its normal cone. Every frame a cull pass writes the pages of the clusters in
+//! view and facing the eye as indirect draws, and the viewport draws them in one call.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
+
+use bytemuck::{Pod, Zeroable};
+use eframe::egui_wgpu::wgpu;
+use glam::{IVec3, Mat4, Vec3};
+use rayon::prelude::*;
+use sculpt_core::generator::level_volume::{Key, LevelVolume, VERTS_PER_BLOCK, piece_table, quantize};
+
+pub mod check;
+
+const SHADER: &str = include_str!("levels.wgsl");
+pub const PAGE_QUADS: u32 = 64;
+const PAGE_INDICES: u64 = 384;
+const SLOT_WORDS: u64 = 32;
+const SAMPLE_WORDS: u64 = 365;
+const VSTRIDE: u64 = VERTS_PER_BLOCK as u64;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Params {
+    origin: [f32; 3],
+    voxel0: f32,
+    cap: u32,
+    levels: u32,
+    work_count: u32,
+    hash_mask: u32,
+    release_count: u32,
+    page_capacity: u32,
+    slot_count: u32,
+    cull: u32,
+    eye: [f32; 4],
+    planes: [[f32; 4]; 6],
+}
+
+/// What one sync did.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyncStats {
+    pub uploaded: usize,
+    pub extracted: usize,
+    pub released: usize,
+    /// CPU time: working out what to send, gathering and sending it, recording the passes.
+    pub cpu_ms: f64,
+    pub bytes: usize,
+    /// Everything was rebuilt (first sync, a cap change, or buffers that had to grow).
+    pub full: bool,
+}
+
+struct Buffers {
+    slots: u32,
+    pages: u32,
+    hash_len: u32,
+    params: wgpu::Buffer,
+    cull_params: wgpu::Buffer,
+    samples: wgpu::Buffer,
+    hash: wgpu::Buffer,
+    meta: wgpu::Buffer,
+    work: wgpu::Buffer,
+    work_len: u32,
+    pub verts: wgpu::Buffer,
+    pub cells: wgpu::Buffer,
+    pub pages_buf: wgpu::Buffer,
+    slot_pages: wgpu::Buffer,
+    free_pages: wgpu::Buffer,
+    pub status: wgpu::Buffer,
+    clusters: wgpu::Buffer,
+    table: wgpu::Buffer,
+    pub draws: wgpu::Buffer,
+    group: wgpu::BindGroup,
+    cull_group: wgpu::BindGroup,
+}
+
+/// The GPU side of a [`LevelVolume`].
+pub struct GpuLevels {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    layout: wgpu::BindGroupLayout,
+    release: wgpu::ComputePipeline,
+    vertices: wgpu::ComputePipeline,
+    faces: wgpu::ComputePipeline,
+    cull: wgpu::ComputePipeline,
+    buf: Buffers,
+    /// Slot per stored block, and block per slot.
+    slot_of: HashMap<Key, u32>,
+    key_of: Vec<Option<Key>>,
+    free: Vec<u32>,
+    /// One past the highest slot in use.
+    high: u32,
+    /// The hash table as on the GPU: (block coordinates, level << 24 | slot), -1 empty, -2 removed.
+    hash: Vec<[i32; 4]>,
+    hash_live: usize,
+    hash_dead: usize,
+    hash_dirty: Vec<u32>,
+    pub cap: usize,
+    levels: usize,
+    origin: Vec3,
+    voxel0: f32,
+    /// Status read back from the GPU (free pages, ran out, draws, quads dropped).
+    status_staging: wgpu::Buffer,
+    status_state: Arc<AtomicU8>,
+    pub status: [i32; 4],
+    pub indirect_count: bool,
+    /// Set when the pages ran out: the next sync grows them and rebuilds.
+    grow_pages: bool,
+    cap_changed: bool,
+}
+
+fn hash_of(c: IVec3, l: u32) -> u32 {
+    (c.x as u32).wrapping_mul(73856093) ^ (c.y as u32).wrapping_mul(19349663) ^ (c.z as u32).wrapping_mul(83492791) ^ l.wrapping_mul(2654435761)
+}
+
+/// A block's 9x9x9 samples as the GPU holds them: 16 bits each, two to a word.
+fn packed_samples(vol: &LevelVolume, k: Key) -> Vec<u32> {
+    let (l, bc) = (k.0 as usize, k.1);
+    let band = vol.band(l);
+    let g = vol.gather9(l, bc);
+    let mut out = vec![0u32; SAMPLE_WORDS as usize];
+    for (i, v) in g.iter().enumerate() {
+        let q = quantize(*v, band) as u16 as u32;
+        out[i / 2] |= q << (16 * (i % 2));
+    }
+    out
+}
+
+impl GpuLevels {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, vol: &LevelVolume, cap: usize) -> GpuLevels {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("levels.wgsl"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
+        let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let (ro, rw) = (wgpu::BufferBindingType::Storage { read_only: true }, wgpu::BufferBindingType::Storage { read_only: false });
+        let entries = [
+            entry(0, wgpu::BufferBindingType::Uniform),
+            entry(1, ro),
+            entry(2, ro),
+            entry(3, ro),
+            entry(4, ro),
+            entry(5, rw),
+            entry(6, rw),
+            entry(7, rw),
+            entry(8, rw),
+            entry(9, rw),
+            entry(10, rw),
+            entry(11, rw),
+            entry(12, ro),
+            entry(13, rw),
+        ];
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("levels"), entries: &entries });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("levels"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let pipe = |name: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(name), layout: Some(&pl), module: &module, entry_point: Some(name), compilation_options: Default::default(), cache: None });
+        let indirect_count = device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+        let blocks = vol.keys().len() as u32;
+        let slots = (blocks * 2).max(4096);
+        let buf = Self::buffers(device, &layout, slots, slots * 4, 1024);
+        let status_staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels status staging"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let g = GpuLevels {
+            device: device.clone(),
+            queue: queue.clone(),
+            layout,
+            release: pipe("release"),
+            vertices: pipe("vertices"),
+            faces: pipe("faces"),
+            cull: pipe("cull"),
+            buf,
+            slot_of: HashMap::new(),
+            key_of: Vec::new(),
+            free: Vec::new(),
+            high: 0,
+            hash: Vec::new(),
+            hash_live: 0,
+            hash_dead: 0,
+            hash_dirty: Vec::new(),
+            cap: cap.min(vol.levels() - 1),
+            levels: vol.levels(),
+            origin: vol.origin(),
+            voxel0: vol.voxel0,
+            status_staging,
+            status_state: Arc::new(AtomicU8::new(0)),
+            status: [0; 4],
+            indirect_count,
+            grow_pages: false,
+            cap_changed: false,
+        };
+        g.queue.write_buffer(&g.buf.table, 0, bytemuck::cast_slice(&piece_table()));
+        g
+    }
+
+    fn buffers(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, slots: u32, pages: u32, hash_len: u32) -> Buffers {
+        let make = |label: &str, size: u64, usage: wgpu::BufferUsages| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size.max(16), usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let st = wgpu::BufferUsages::STORAGE;
+        let s = slots as u64;
+        let params = make("levels params", std::mem::size_of::<Params>() as u64, wgpu::BufferUsages::UNIFORM);
+        let cull_params = make("levels cull params", std::mem::size_of::<Params>() as u64, wgpu::BufferUsages::UNIFORM);
+        let samples = make("levels samples", s * SAMPLE_WORDS * 4, st);
+        let hash = make("levels hash", hash_len as u64 * 16, st);
+        let meta = make("levels meta", s * 16, st);
+        let work_len = slots * 2;
+        let work = make("levels work", work_len as u64 * 4, st);
+        let verts = make("levels verts", s * VSTRIDE * 8, st);
+        let cells = make("levels cells", s * 512 * 4, st);
+        let pages_buf = make("levels pages", pages as u64 * PAGE_INDICES * 4, st | wgpu::BufferUsages::INDEX);
+        let slot_pages = make("levels slot pages", s * SLOT_WORDS * 4, st);
+        let free_pages = make("levels free pages", pages as u64 * 4, st);
+        let status = make("levels status", 16, st | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC);
+        let clusters = make("levels clusters", s * 48, st);
+        let table = make("levels table", 256 * 4, st);
+        let draws = make("levels draws", pages as u64 * 20, st | wgpu::BufferUsages::INDIRECT);
+        let group_with = |p: &wgpu::Buffer| {
+            let bufs = [p, &samples, &hash, &meta, &work, &verts, &cells, &pages_buf, &slot_pages, &free_pages, &status, &clusters, &table, &draws];
+            let entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("levels"), layout, entries: &entries })
+        };
+        let group = group_with(&params);
+        let cull_group = group_with(&cull_params);
+        Buffers { slots, pages, hash_len, params, cull_params, samples, hash, meta, work, work_len, verts, cells, pages_buf, slot_pages, free_pages, status, clusters, table, draws, group, cull_group }
+    }
+
+    pub fn page_capacity(&self) -> u32 {
+        self.buf.pages
+    }
+
+    pub fn buffers_for_draw(&self) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
+        (&self.buf.pages_buf, &self.buf.draws, &self.buf.status, &self.buf.verts, &self.buf.cells)
+    }
+
+    pub fn meta_buffer(&self) -> &wgpu::Buffer {
+        &self.buf.meta
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slot_of.len()
+    }
+
+    // ---------------------------------------------------------------- the slot table
+
+    fn hash_insert(&mut self, k: Key, slot: u32) {
+        let mask = self.hash.len() as u32 - 1;
+        let mut h = hash_of(k.1, k.0 as u32) & mask;
+        loop {
+            let e = &mut self.hash[h as usize];
+            if e[3] < 0 {
+                if e[3] == -2 {
+                    self.hash_dead -= 1;
+                }
+                *e = [k.1.x, k.1.y, k.1.z, ((k.0 as i32) << 24) | slot as i32];
+                self.hash_live += 1;
+                self.hash_dirty.push(h);
+                return;
+            }
+            h = (h + 1) & mask;
+        }
+    }
+
+    fn hash_remove(&mut self, k: Key) {
+        let mask = self.hash.len() as u32 - 1;
+        let mut h = hash_of(k.1, k.0 as u32) & mask;
+        loop {
+            let e = &mut self.hash[h as usize];
+            if e[3] == -1 {
+                return;
+            }
+            if e[3] >= 0 && e[0] == k.1.x && e[1] == k.1.y && e[2] == k.1.z && (e[3] >> 24) == k.0 as i32 {
+                e[3] = -2;
+                self.hash_live -= 1;
+                self.hash_dead += 1;
+                self.hash_dirty.push(h);
+                return;
+            }
+            h = (h + 1) & mask;
+        }
+    }
+
+    /// Size the table for the blocks there are (at most half full, counting removed entries) and fill it afresh.
+    /// True if it was rebuilt (and must be sent whole).
+    fn hash_fit(&mut self) -> bool {
+        let want = ((self.slot_of.len() + 64) * 2).next_power_of_two().max(1024);
+        if self.hash.len() >= want && (self.hash_live + self.hash_dead) * 2 <= self.hash.len() {
+            return false;
+        }
+        self.hash = vec![[0, 0, 0, -1]; want.max(self.hash.len())];
+        self.hash_live = 0;
+        self.hash_dead = 0;
+        let all: Vec<(Key, u32)> = self.slot_of.iter().map(|(k, s)| (*k, *s)).collect();
+        for (k, s) in all {
+            self.hash_insert(k, s);
+        }
+        self.hash_dirty.clear();
+        true
+    }
+
+    fn take_slot(&mut self, k: Key) -> Option<u32> {
+        let s = match self.free.pop() {
+            Some(s) => s,
+            None if (self.high as usize) < self.buf.slots as usize => {
+                self.high += 1;
+                self.high - 1
+            }
+            None => return None,
+        };
+        if self.key_of.len() <= s as usize {
+            self.key_of.resize(s as usize + 1, None);
+        }
+        self.key_of[s as usize] = Some(k);
+        self.slot_of.insert(k, s);
+        Some(s)
+    }
+
+    // ---------------------------------------------------------------- syncing
+
+    fn params(&self, work: u32, release: u32) -> Params {
+        Params {
+            origin: self.origin.to_array(),
+            voxel0: self.voxel0,
+            cap: self.cap as u32,
+            levels: self.levels as u32,
+            work_count: work,
+            hash_mask: self.hash.len() as u32 - 1,
+            release_count: release,
+            page_capacity: self.buf.pages,
+            slot_count: self.high,
+            cull: 0,
+            eye: [0.0; 4],
+            planes: [[0.0; 4]; 6],
+        }
+    }
+
+    /// Show levels up to `cap` (rebuilding the whole surface on the next sync if that changes it).
+    pub fn set_cap(&mut self, cap: usize) {
+        let cap = cap.min(self.levels - 1);
+        if cap != self.cap {
+            self.cap = cap;
+            self.cap_changed = true;
+        }
+    }
+
+    /// Everything from scratch: buffers sized for the volume, every block uploaded and extracted.
+    fn rebuild(&mut self, vol: &LevelVolume, stats: &mut SyncStats) {
+        let blocks = vol.keys();
+        let slots = ((blocks.len() as u32) * 2).max(self.buf.slots).max(4096);
+        let mut pages = self.buf.pages.max(slots * 4);
+        if self.grow_pages {
+            pages = pages * 2;
+            self.grow_pages = false;
+        }
+        if slots != self.buf.slots || pages != self.buf.pages {
+            self.buf = Self::buffers(&self.device, &self.layout, slots, pages, 1024);
+            self.queue.write_buffer(&self.buf.table, 0, bytemuck::cast_slice(&piece_table()));
+        }
+        self.slot_of.clear();
+        self.key_of.clear();
+        self.free.clear();
+        self.high = 0;
+        for k in &blocks {
+            self.take_slot(*k);
+        }
+        self.hash.clear();
+        self.hash_fit();
+        self.send_hash_whole();
+        // All pages free, every slot without pages.
+        let free: Vec<u32> = (0..self.buf.pages).rev().collect();
+        self.queue.write_buffer(&self.buf.free_pages, 0, bytemuck::cast_slice(&free));
+        self.queue.write_buffer(&self.buf.status, 0, bytemuck::cast_slice(&[self.buf.pages as i32, 0, 0, 0]));
+        self.queue.write_buffer(&self.buf.slot_pages, 0, &vec![0u8; (self.buf.slots as u64 * SLOT_WORDS * 4) as usize]);
+        self.upload(vol, &blocks, stats);
+        self.send_meta(&blocks);
+        self.extract(&blocks, &[], stats);
+        stats.full = true;
+    }
+
+    fn send_hash_whole(&mut self) {
+        if self.hash.len() as u32 > self.buf.hash_len {
+            // A bigger table needs a bigger buffer, and so a new bind group.
+            let len = self.hash.len() as u32;
+            let pages = self.buf.pages;
+            let slots = self.buf.slots;
+            let old = std::mem::replace(&mut self.buf, Self::buffers(&self.device, &self.layout, slots, pages, len));
+            self.copy_contents(&old);
+        }
+        self.queue.write_buffer(&self.buf.hash, 0, bytemuck::cast_slice(&self.hash));
+        self.hash_dirty.clear();
+    }
+
+    /// Copy what the GPU built into freshly made buffers of the same slot and page counts.
+    fn copy_contents(&self, old: &Buffers) {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        for (a, b) in [(&old.samples, &self.buf.samples), (&old.meta, &self.buf.meta), (&old.verts, &self.buf.verts), (&old.cells, &self.buf.cells), (&old.pages_buf, &self.buf.pages_buf), (&old.slot_pages, &self.buf.slot_pages), (&old.free_pages, &self.buf.free_pages), (&old.status, &self.buf.status), (&old.clusters, &self.buf.clusters), (&old.table, &self.buf.table)] {
+            enc.copy_buffer_to_buffer(a, 0, b, 0, a.size().min(b.size()));
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    fn send_meta(&self, keys: &[Key]) {
+        for k in keys {
+            if let Some(&s) = self.slot_of.get(k) {
+                let m = [k.1.x, k.1.y, k.1.z, k.0 as i32];
+                self.queue.write_buffer(&self.buf.meta, s as u64 * 16, bytemuck::cast_slice(&m));
+            }
+        }
+    }
+
+    fn upload(&self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats) {
+        let packed: Vec<(u32, Vec<u32>)> = keys.par_iter().filter_map(|k| Some((*self.slot_of.get(k)?, packed_samples(vol, *k)))).collect();
+        // Runs of consecutive slots go up in one write.
+        let mut sorted = packed;
+        sorted.sort_unstable_by_key(|p| p.0);
+        let mut i = 0;
+        while i < sorted.len() {
+            let mut j = i + 1;
+            while j < sorted.len() && sorted[j].0 == sorted[j - 1].0 + 1 {
+                j += 1;
+            }
+            let data: Vec<u32> = sorted[i..j].iter().flat_map(|p| p.1.iter().copied()).collect();
+            self.queue.write_buffer(&self.buf.samples, sorted[i].0 as u64 * SAMPLE_WORDS * 4, bytemuck::cast_slice(&data));
+            stats.bytes += data.len() * 4;
+            i = j;
+        }
+        stats.uploaded += sorted.len();
+    }
+
+    /// Record and submit the passes for `extract` (slots re-extracted) and `released` (slots that only give pages back).
+    fn extract(&mut self, extract: &[Key], released: &[u32], stats: &mut SyncStats) {
+        let mut work: Vec<u32> = released.to_vec();
+        let ex: Vec<u32> = extract.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
+        work.extend_from_slice(&ex);
+        if work.is_empty() {
+            return;
+        }
+        if work.len() as u32 > self.buf.work_len {
+            // The work list grows with the slots; a longer list than that is a full rebuild's.
+            let len = (work.len() as u32).next_power_of_two();
+            self.buf.work = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels work"), size: len as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            self.buf.work_len = len;
+            let rebuilt = Self::rebind(&self.device, &self.layout, &self.buf);
+            self.buf.group = rebuilt.0;
+            self.buf.cull_group = rebuilt.1;
+        }
+        self.queue.write_buffer(&self.buf.work, 0, bytemuck::cast_slice(&work));
+        let p = self.params(ex.len() as u32, released.len() as u32);
+        self.queue.write_buffer(&self.buf.params, 0, bytemuck::bytes_of(&p));
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("levels extract") });
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("levels extract"), timestamp_writes: None });
+            cp.set_bind_group(0, &self.buf.group, &[]);
+            let threads = work.len() as u32;
+            let (x, y) = grid(threads.div_ceil(64));
+            cp.set_pipeline(&self.release);
+            cp.dispatch_workgroups(x, y, 1);
+            if !ex.is_empty() {
+                let (x, y) = grid(ex.len() as u32);
+                cp.set_pipeline(&self.vertices);
+                cp.dispatch_workgroups(x, y, 1);
+                cp.set_pipeline(&self.faces);
+                cp.dispatch_workgroups(x, y, 1);
+            }
+        }
+        // Read back the status (free pages, whether they ran out) when the GPU gets to it.
+        if self.status_state.load(Ordering::Acquire) == 0 {
+            enc.copy_buffer_to_buffer(&self.buf.status, 0, &self.status_staging, 0, 16);
+        }
+        self.queue.submit([enc.finish()]);
+        if self.status_state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let state = self.status_state.clone();
+            self.status_staging.slice(..).map_async(wgpu::MapMode::Read, move |r| state.store(if r.is_ok() { 2 } else { 0 }, Ordering::Release));
+        }
+        stats.extracted += ex.len();
+        stats.released += released.len();
+    }
+
+    fn rebind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, b: &Buffers) -> (wgpu::BindGroup, wgpu::BindGroup) {
+        let group_with = |p: &wgpu::Buffer| {
+            let bufs = [p, &b.samples, &b.hash, &b.meta, &b.work, &b.verts, &b.cells, &b.pages_buf, &b.slot_pages, &b.free_pages, &b.status, &b.clusters, &b.table, &b.draws];
+            let entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, x)| wgpu::BindGroupEntry { binding: i as u32, resource: x.as_entire_binding() }).collect();
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("levels"), layout, entries: &entries })
+        };
+        (group_with(&b.params), group_with(&b.cull_params))
+    }
+
+    /// Pick up the status the GPU last reported.
+    fn read_status(&mut self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        if self.status_state.load(Ordering::Acquire) == 2 {
+            {
+                let data = self.status_staging.slice(..).get_mapped_range().expect("mapped");
+                self.status.copy_from_slice(bytemuck::cast_slice(&data[..16]));
+            }
+            self.status_staging.unmap();
+            self.status_state.store(0, Ordering::Release);
+            if self.status[1] != 0 {
+                self.grow_pages = true;
+            }
+        }
+    }
+
+    /// Bring the GPU's copy up to date with `vol`: upload what changed and re-extract around it.
+    pub fn sync(&mut self, vol: &mut LevelVolume) -> SyncStats {
+        let t = Instant::now();
+        let mut stats = SyncStats::default();
+        self.read_status();
+        let dirty = vol.drain_dirty();
+        let first = self.slot_of.is_empty() && self.high == 0;
+        if first || self.grow_pages || self.cap_changed || vol.origin() != self.origin {
+            self.cap_changed = false;
+            self.origin = vol.origin();
+            self.rebuild(vol, &mut stats);
+            stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+            return stats;
+        }
+        if dirty.is_empty() {
+            return stats;
+        }
+        // Blocks that went, and blocks that came.
+        let mut released = Vec::new();
+        let mut gone = Vec::new();
+        for k in &dirty {
+            if vol.block(*k).is_none()
+                && let Some(s) = self.slot_of.remove(k)
+            {
+                self.key_of[s as usize] = None;
+                self.free.push(s);
+                released.push(s);
+                gone.push(*k);
+            }
+        }
+        for k in &gone {
+            self.hash_remove(*k);
+        }
+        let uploads = vol.upload_set(&dirty);
+        let mut out_of_slots = false;
+        for k in &uploads {
+            if !self.slot_of.contains_key(k) {
+                if let Some(s) = self.take_slot(*k) {
+                    self.hash_insert(*k, s);
+                } else {
+                    out_of_slots = true;
+                }
+            }
+        }
+        if out_of_slots {
+            self.rebuild(vol, &mut stats);
+            stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+            return stats;
+        }
+        if self.hash_fit() {
+            self.send_hash_whole();
+        } else {
+            let mut dirty_h = std::mem::take(&mut self.hash_dirty);
+            dirty_h.sort_unstable();
+            dirty_h.dedup();
+            for h in dirty_h {
+                self.queue.write_buffer(&self.buf.hash, h as u64 * 16, bytemuck::cast_slice(&self.hash[h as usize]));
+            }
+        }
+        // Freed slots read as free.
+        for &s in &released {
+            self.queue.write_buffer(&self.buf.meta, s as u64 * 16, bytemuck::cast_slice(&[0i32, 0, 0, -1]));
+        }
+        self.send_meta(&uploads);
+        self.upload(vol, &uploads, &mut stats);
+        let mut changed: Vec<Key> = uploads.clone();
+        changed.extend(gone);
+        let extract = vol.extract_set(&changed, self.cap);
+        self.extract(&extract, &released, &mut stats);
+        stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        stats
+    }
+
+    /// Record the cull pass: the pages of the clusters in view, facing the eye, as indirect draws.
+    pub fn cull(&self, enc: &mut wgpu::CommandEncoder, view_proj: Mat4, eye: Vec3, cull: bool) {
+        let mut p = self.params(0, 0);
+        p.cull = cull as u32;
+        p.eye = eye.extend(1.0).to_array();
+        // Frustum planes from the matrix (rows combined), each pointing inward; depth 0..1.
+        let m = view_proj.transpose();
+        let (r0, r1, r2, r3) = (m.x_axis, m.y_axis, m.z_axis, m.w_axis);
+        let planes = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2];
+        for (k, pl) in planes.iter().enumerate() {
+            let n = pl.truncate().length().max(1e-20);
+            p.planes[k] = (*pl / n).to_array();
+        }
+        self.queue.write_buffer(&self.buf.cull_params, 0, bytemuck::bytes_of(&p));
+        enc.clear_buffer(&self.buf.status, 8, Some(4));
+        if !self.indirect_count {
+            enc.clear_buffer(&self.buf.draws, 0, None);
+        }
+        let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("levels cull"), timestamp_writes: None });
+        cp.set_bind_group(0, &self.buf.cull_group, &[]);
+        cp.set_pipeline(&self.cull);
+        let (x, y) = grid(self.high.div_ceil(64).max(1));
+        cp.dispatch_workgroups(x, y, 1);
+    }
+
+    pub fn origin(&self) -> Vec3 {
+        self.origin
+    }
+
+    pub fn voxel0(&self) -> f32 {
+        self.voxel0
+    }
+}
+
+/// Workgroups as a 2D grid within the 65535 per dimension limit.
+fn grid(n: u32) -> (u32, u32) {
+    let x = n.clamp(1, 65535);
+    (x, n.div_ceil(x).max(1))
+}
