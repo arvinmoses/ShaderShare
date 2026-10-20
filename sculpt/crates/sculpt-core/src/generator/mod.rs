@@ -35,6 +35,7 @@ pub mod adf;
 pub mod density;
 pub mod instances;
 pub mod layer;
+pub mod level_volume;
 pub mod levels;
 pub mod mapping;
 pub mod place;
