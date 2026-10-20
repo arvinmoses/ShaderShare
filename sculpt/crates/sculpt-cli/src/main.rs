@@ -25,6 +25,7 @@ mod rock_field;
 mod rock_layers;
 mod rock_tiers;
 mod solid_bench;
+mod multilevel_spike;
 mod volume_spike;
 
 use std::path::{Path, PathBuf};
@@ -60,6 +61,7 @@ fn main() {
         Some("volume-spike") if args.get(1).is_some_and(|a| a == "levels") => volume_spike::levels(&args[2..]),
         Some("volume-spike") if args.get(1).is_some_and(|a| a == "video") => volume_spike::video(&args[2..]),
         Some("volume-spike") if args.get(1).is_some_and(|a| a == "brushes") => volume_spike::brushes(&args[2..]),
+        Some("volume-spike") if args.get(1).is_some_and(|a| a == "multilevel") => multilevel_spike::run(&args[2..]),
         Some("volume-spike") => volume_spike::run(&args[1..]),
         Some("adf-bench") => adf_bench::run(&args[1..]),
         Some("generator-drag-sim") => generator_drag_sim::run(&args[1..]),

@@ -168,3 +168,100 @@ one 0.2-0.3 ms against 3-7. End to end it is now **bound by the CPU planning**, 
 
 Not yet tested: drawing the GPU quads directly in the viewport (indirect draws from the quad buffer), the coarse level
 on the GPU, GPU-side planning, Move / grab / smooth brushes, layers, masks, undo and saving in a volume.
+
+# Spike 4: several resolutions in one volume (detail at any zoom)
+
+Code: `sculpt-core/src/generator/levels.rs`; run with `sculpt-cli volume-spike multilevel [--rule a|b] [--images DIR]`;
+tests in `sculpt-core/tests/levels.rs`.
+
+## Question
+
+Can the volume hold detail only where it was sculpted, at whatever zoom it was sculpted at, the way an adaptive
+distance field gives a drawing program unlimited stroke detail? And which storage layout should the GPU engine be built
+on, before it is built?
+
+## What the spike does
+
+* **Levels.** Level 0 is the coarse field; each level above halves the lattice step, on the same 8x8x8 blocks, all on
+  one shared lattice (level `l + 1`'s point `2i` is level `l`'s point `i`), so a coarse cell splits exactly into eight
+  finer cells and a finer block covers a 4x4x4 patch of coarser cells. A block exists at a level only where something
+  was sculpted at that level or finer; elsewhere the level's values are the coarser level's, interpolated. Levels nest:
+  a block's parent at the level below always exists.
+* **Brushes.** A dab writes at one level (a zoomed-in brush at a fine one). Blocks a dab creates but does not change are
+  dropped again.
+* **Large edits carry detail.** After a dab at level `l`, every finer level's own detail (its values less the level
+  below, both within its band) moves with the surface: along the normal, as far as the edit moved the surface there.
+* **Surface.** Dual contouring over the tree of cells: one vertex per smallest cell the surface touches, one quad (or a
+  triangle, where two of its four cells are the same coarser cell) per smallest crossing lattice edge. A lattice point
+  that several levels share takes the finest level's value, so cells of different levels agree on every crossing.
+* **Distance views.** A level cap gives the surface a distant view would draw: only levels up to the cap, with the finer
+  levels' detail folded in, filtered (1-2-1 per axis, a level at a time) to the cap's step.
+
+The session: a ball shaped with large dabs on level 0 (step 0.02), ridges on level 1 (0.01), fine grooves on level 2
+(0.005), tiny dots on level 3 (0.0025), each at the brush size a zoomed-in view would give. Then a large level 0 dab
+bulges the patch holding the fine work out by about 0.08.
+
+## Two rules for what coarser levels hold
+
+* **Rule A**: every dab's change also goes to the coarser levels, filtered to their step, so a zoomed-out view sees fine
+  edits directly from storage.
+* **Rule B**: each level holds only what was sculpted at it or coarser. A capped view adds the finer detail back,
+  filtered, when it is drawn.
+
+Rule A fails where it matters: a large edit at a coarse level replaces that level's surface locally, and with it the
+coarse copy of the finer detail, so only what the finer level holds beyond that copy is carried. Measured on a groove
+cut at the finest level, then raised about 0.02 by a broad level 0 dab (`tests/levels.rs`):
+
+| levels | groove depth kept, rule A | rule B |
+|---|---|---|
+| 2 | 36% | 95% |
+| 3 | 58% | 97% |
+
+Rule B also gives a cleaner surface (non-manifold edges 0-4 against up to 125), since coarse levels never hold aliased
+copies of fine work.
+
+## Results (rule B)
+
+| level | step | brush radius | dabs | median ms | worst ms | blocks at this level |
+|---|---|---|---|---|---|---|
+| 0 | 0.02 | 0.35 | 66 | 1.41 | 2.48 | 6974 |
+| 1 | 0.01 | 0.06 | 257 | 0.90 | 2.81 | 278 |
+| 2 | 0.005 | 0.012 | 408 | 0.60 | 2.56 | 50 |
+| 3 | 0.0025 | 0.005 | 10 | 1.25 | 2.34 | 22 |
+
+* **Memory**: 7.5 MB at 16 bits a sample, against about 457 MB for one lattice at the finest step everywhere (60x).
+* **Surface at each cap** (what a view from far to near would draw): 165k quads at cap 0, 182k with all four levels;
+  **no open edges at any cap**, before or after the large edit; 0-4 non-manifold edges (the manifold pieces of
+  `volume.rs` are not in this extractor yet). A full extraction takes about 0.25 s on the CPU.
+* **Detail rides a large edit**: the finer-than-level-1 detail on a line across the patch was 0.0108 high before the
+  bulge and 0.0096 after (88%), with the grooves and the row of dots intact (images below).
+* The large level 0 dab that carries detail took 50 ms on the CPU (229 finer blocks rebuilt), single-threaded per
+  level and unoptimised.
+
+![The fine patch drawn at caps 0, 1, 2, 3](volume/multilevel_patch_by_level.png)
+
+![The patch before and after a large level 0 dab bulges it out](volume/multilevel_detail_rides_bulge.png)
+
+![The whole object at cap 0 and with all levels](volume/multilevel_whole_far_near.png)
+
+## Known gaps
+
+* Steps where carried detail meets the edge of a finer block (visible in the after image): the carry rebuilds the
+  blocks the moved detail lands in, but not a blend at the fine region's edge.
+* The level 0 strokes in the session land on the surface they just changed, so they run away into horns; the app's
+  plane brushes place dabs on the stroke-start surface and would not.
+* The capped views fold detail in every time they are drawn; a real version caches the folded blocks and refreshes
+  only those under an edit.
+* No manifold pieces, checkerboard cleanup, plane brushes or undo in this structure yet.
+
+## Verdict: the layout for the GPU engine
+
+Build the GPU engine on **levels of 8x8x8 blocks keyed by (level, block coordinates), nested, under rule B**:
+
+* Each level holds only its own work. A brush writes at the level its size on screen calls for, and finer levels'
+  detail moves with the surface after an edit at a coarser one.
+* The surface is dual contouring across the levels, finest value at shared points, which joins them without cracks.
+* The view picks a cap per region by distance (and later by the vertex budget) and folds the finer levels in, filtered.
+  That is the zoom-dependent tessellation: the object holds the main shape on coarse levels, and detail appears as you
+  zoom in. Large brushes working on a coarse level are the same mechanism.
+* Undo records and `.svol` files need a level added to each block's key; the rest carries over.
