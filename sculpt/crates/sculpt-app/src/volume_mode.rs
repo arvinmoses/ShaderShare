@@ -117,9 +117,9 @@ impl VolumeMode {
             return;
         }
         let s = strength.clamp(0.0, 1.0);
-        let height = radius * if carve { 0.01 + 0.05 * s } else { 0.01 + 0.07 * s };
+        let height = radius * if carve { 0.015 + 0.06 * s } else { 0.015 + 0.08 * s };
         let grid = self.vol.grid();
-        let Some(n) = self.vol.plane_dab(at, along, radius, height, hardness, carve) else { return };
+        let Some(n) = self.vol.plane_dab(at, along, radius, height, hardness, 0.1 + 0.3 * s, carve) else { return };
         // The original surface's plane is steady already; easing it a little more smooths the turn over sharp forms.
         self.stroke_n = if self.stroke_n == Vec3::ZERO { n } else { (self.stroke_n * 0.5 + n * 0.5).try_normalize().unwrap_or(n) };
         if self.vol.grid() != grid {
@@ -333,7 +333,10 @@ mod tests {
             let at = Vec3::new(0.35 * a.cos() * (i as f32 / 30.0), 0.35 * a.sin() * (i as f32 / 30.0), 1.0).normalize();
             mode.begin_stroke();
             if let Some((hit, _)) = mode.raycast(at * 3.0, -at) {
-                mode.dab(hit, 0.08, 1.0, 0.5, false);
+                // Hard-edged and dabbed over until each bump stands up.
+                for _ in 0..10 {
+                    mode.dab(hit, 0.08, 1.0, 0.9, false);
+                }
             }
             mode.end_stroke();
         }

@@ -83,7 +83,7 @@ fn smax(a: f32, b: f32, k: f32) -> f32 {
 }
 
 /// How much of a clay dab's height each dab adds once the first layer is down.
-pub const BUILD_STEP: f32 = 0.1;
+pub const BUILD_STEP: f32 = 0.05;
 
 const EDGES: [[usize; 2]; 12] = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
 
@@ -418,9 +418,11 @@ impl Volume {
     ///   keep building, since each one sees what the stroke has added already.
     /// * Trim lowers the plane `h` below that average and cuts away everything above it: it flattens.
     ///
-    /// The plane holds its full height out to `hardness` of the radius and tapers below the surface beyond, so edges
-    /// are square at high hardness and soft at low. `along` is the rough normal near `at`. Returns the plane's normal.
-    pub fn plane_dab(&mut self, at: Vec3, along: Vec3, r: f32, h: f32, hardness: f32, trim: bool) -> Option<Vec3> {
+    /// Each dab moves the surface `alpha` of the way to the plane, fully out to `hardness` of the radius and easing to
+    /// nothing at the rim, so edges are square at high hardness and soft at low, and overlapping dabs blend smoothly.
+    /// `along` is the rough normal near `at`. Returns the plane's normal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plane_dab(&mut self, at: Vec3, along: Vec3, r: f32, h: f32, hardness: f32, alpha: f32, trim: bool) -> Option<Vec3> {
         let on = self.onto_base(at, along);
         if self.normal_at(on) == Vec3::ZERO {
             return None;
@@ -452,40 +454,36 @@ impl Volume {
         // dabs at the app's spacing) builds about one more layer rather than a dozen.
         let level = if trim { ground } else { ground + added };
         let plane = if trim { ground - h } else { (ground + h).max(level + BUILD_STEP * h) };
-        // Beyond the hard core the plane sinks well below the surface (or rises well above it, for trim), so the rim
-        // touches nothing; how far, and the slope that makes, bound the shape's distance.
-        let hard = hardness.clamp(0.0, 0.9);
-        let dip = 0.5 * r;
-        let slope = 1.5 * (h + dip) / (r * (1.0 - hard));
-        let lip = (1.0 + slope * slope).sqrt();
+        // Each dab moves the surface `alpha` of the way to the plane at its centre, less toward the edge: full out to
+        // `hardness` of the radius, easing to nothing at the rim, so dabs blend into each other with no edge of their own.
+        let hard = hardness.clamp(0.0, 0.95);
         let depth = 0.35 * r;
-        let fade = move |p: Vec3| {
-            let u = (p - on).dot(n);
-            let t = ((p - on) - n * u).length();
+        let weight = move |p: Vec3| {
+            let q = p - on;
+            let u = q.dot(n);
+            let t = (q - n * u).length();
             let x = ((t / r - hard) / (1.0 - hard)).clamp(0.0, 1.0);
-            let w = 1.0 - x * x * (3.0 - 2.0 * x);
-            (u, t, w)
+            alpha * (1.0 - x * x * (3.0 - 2.0 * x))
         };
         let k = (0.5 * h).max(self.voxel);
-        let reach = 1.5 * r;
-        let cut_lo = plane;
+        let reach = 1.1 * r + depth;
         if trim {
-            // Everything above the cut, out to the brush's edge and up to `depth` over the average.
+            // Everything above the plane, out to the brush's edge and up to `depth` over the average.
             let shape = move |p: Vec3| {
-                let (u, t, w) = fade(p);
-                let cut = plane * w + (level + dip) * (1.0 - w);
-                ((cut - u) / lip).max(u - (level + depth)).max(t - r)
+                let q = p - on;
+                let u = q.dot(n);
+                (plane - u).max(u - (level + depth)).max((q - n * u).length() - r)
             };
-            self.modify_in(on, reach, 0.0, k, true, Some((n, cut_lo, level + depth)), &shape);
+            self.modify_in(on, reach, 0.0, k, true, Some((n, plane, level + depth)), Some(&weight), &shape);
         } else {
             // Everything below the plane, out to the brush's edge and down to `depth` under the average: deep enough to
             // fill a cavity, shallow enough not to come out of the far side of a thin part.
             let shape = move |p: Vec3| {
-                let (u, t, w) = fade(p);
-                let top = plane * w + (level - dip) * (1.0 - w);
-                ((u - top) / lip).max((level - depth) - u).max(t - r)
+                let q = p - on;
+                let u = q.dot(n);
+                (u - plane).max((level - depth) - u).max((q - n * u).length() - r)
             };
-            self.modify_in(on, reach, 0.0, k, false, Some((n, level - depth, plane)), &shape);
+            self.modify_in(on, reach, 0.0, k, false, Some((n, level - depth, plane)), Some(&weight), &shape);
         }
         Some(n)
     }
@@ -501,13 +499,25 @@ impl Volume {
 
     /// Combine a shape (distance `shape`, within `outer` of `c` and holding the ball of radius `inner`) into the field.
     fn modify(&mut self, c: Vec3, outer: f32, inner: f32, k: f32, carve: bool, shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> DabStats {
-        self.modify_in(c, outer, inner, k, carve, None, shape)
+        self.modify_in(c, outer, inner, k, carve, None, None, shape)
     }
 
     /// [`Self::modify`] for a shape that also lies within the slab `lo..hi` along `n` from `c`: only the blocks near it
-    /// are visited.
+    /// are visited. With `weight`, each sample moves only that fraction of the way to the combined field (as a brush
+    /// with falloff moves a mesh part of the way): overlapping dabs then blend into one smooth change instead of each
+    /// leaving its own edge.
     #[allow(clippy::too_many_arguments)]
-    fn modify_in(&mut self, c: Vec3, outer: f32, inner: f32, k: f32, carve: bool, slab: Option<(Vec3, f32, f32)>, shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> DabStats {
+    fn modify_in(
+        &mut self,
+        c: Vec3,
+        outer: f32,
+        inner: f32,
+        k: f32,
+        carve: bool,
+        slab: Option<(Vec3, f32, f32)>,
+        weight: Option<&(dyn Fn(Vec3) -> f32 + Sync)>,
+        shape: &(dyn Fn(Vec3) -> f32 + Sync),
+    ) -> DabStats {
         let mut stats = DabStats::default();
         let t = Instant::now();
         let reach = Vec3::splat(outer + k + self.band);
@@ -560,9 +570,19 @@ impl Volume {
             for (i, v) in s.iter_mut().enumerate() {
                 let l = IVec3::new((i % 8) as i32, ((i / 8) % 8) as i32, (i / 64) as i32);
                 let p = lo + l.as_vec3() * voxel;
-                let blob = shape(p);
-                let base = before.map_or(*v, |(sign, samples)| samples.as_ref().map_or(*sign as f32 * band, |o| o[i]));
-                let next = (if carve { smax(base, -blob, k).max(*v) } else { smin(base, blob, k).min(*v) }).clamp(-band, band);
+                let next = if let Some(weight) = weight {
+                    let w = weight(p);
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let blob = shape(p);
+                    let full = if carve { v.max(-blob) } else { v.min(blob) };
+                    (*v + w * (full - *v)).clamp(-band, band)
+                } else {
+                    let blob = shape(p);
+                    let base = before.map_or(*v, |(sign, samples)| samples.as_ref().map_or(*sign as f32 * band, |o| o[i]));
+                    (if carve { smax(base, -blob, k).max(*v) } else { smin(base, blob, k).min(*v) }).clamp(-band, band)
+                };
                 if next != *v {
                     *v = next;
                     *moved = true;

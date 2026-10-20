@@ -377,9 +377,9 @@ pub(crate) fn brushes(args: &[String]) -> Res<()> {
                     along = n;
                 }
                 let st = s.strength;
-                let h = s.r * if s.trim { 0.01 + 0.05 * st } else { 0.01 + 0.07 * st };
+                let h = s.r * if s.trim { 0.015 + 0.06 * st } else { 0.015 + 0.08 * st };
                 let t = std::time::Instant::now();
-                if let Some(nn) = vol.plane_dab(hit, along, s.r, h, s.hardness, s.trim) {
+                if let Some(nn) = vol.plane_dab(hit, along, s.r, h, s.hardness, 0.1 + 0.3 * st, s.trim) {
                     along = (along * 0.5 + nn * 0.5).try_normalize().unwrap_or(nn);
                 }
                 times.push(t.elapsed().as_secs_f64() * 1e3);
