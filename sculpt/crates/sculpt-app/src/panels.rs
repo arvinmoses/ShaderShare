@@ -157,13 +157,21 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
             });
             ui.menu_button("Mesh", |ui| {
                 if app.volume_mode.is_some() {
+                    if ui.button("Open volume…").clicked() {
+                        app.dialog = Some(Dialog::OpenVolume(app.volume_path.clone().unwrap_or_default()));
+                        ui.close();
+                    }
+                    if ui.button("Save volume…").clicked() {
+                        app.dialog = Some(Dialog::SaveVolume(app.volume_path.clone().unwrap_or("untitled.svol".into())));
+                        ui.close();
+                    }
                     if ui.button("Leave volume playground").clicked() {
                         app.close_volume();
                         ui.close();
                     }
                 } else {
                     ui.menu_button("Volume playground", |ui| {
-                        ui.label("Sculpt a solid that never stretches (preview: no undo or saving)");
+                        ui.label("Sculpt a solid that never stretches (preview: undo and .svol files, no layers yet)");
                         for (label, tris) in [("Ball, 1M triangles", 1e6f32), ("Ball, 3M triangles", 3e6), ("Ball, 5M triangles", 5e6)] {
                             if ui.button(label).clicked() {
                                 app.open_volume(tris);
@@ -1035,6 +1043,8 @@ pub fn dialogs(app: &mut SculptApp, ctx: &egui::Context) {
         Dialog::ImportObj(p) => ("Import OBJ", Some(p)),
         Dialog::ExportObj(p) => ("Export OBJ (composited)", Some(p)),
         Dialog::NewSphere(_) => ("New sphere", None),
+        Dialog::OpenVolume(p) => ("Open volume (.svol)", Some(p)),
+        Dialog::SaveVolume(p) => ("Save volume as (.svol)", Some(p)),
     };
     let mut ok = false;
     let mut cancel = false;

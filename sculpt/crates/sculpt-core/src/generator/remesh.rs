@@ -185,17 +185,17 @@ pub fn non_manifold_edge_list(quads: &[[u32; 4]]) -> Vec<((u32, u32), u32)> {
 }
 
 // Cube corners are numbered by bits: x = bit 0, y = bit 1, z = bit 2.
-const EDGES: [[usize; 2]; 12] = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+pub(crate) const EDGES: [[usize; 2]; 12] = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
 
-fn corner(i: usize) -> [usize; 3] {
+pub(crate) fn corner(i: usize) -> [usize; 3] {
     [i & 1, (i >> 1) & 1, (i >> 2) & 1]
 }
 
 /// The six cell faces as cycles of corners, so consecutive corners share a cube edge.
-const FACES: [[usize; 4]; 6] = [[0, 2, 6, 4], [1, 3, 7, 5], [0, 1, 5, 4], [2, 3, 7, 6], [0, 1, 3, 2], [4, 5, 7, 6]];
+pub(crate) const FACES: [[usize; 4]; 6] = [[0, 2, 6, 4], [1, 3, 7, 5], [0, 1, 5, 4], [2, 3, 7, 6], [0, 1, 3, 2], [4, 5, 7, 6]];
 
 /// Index into [`EDGES`] of the cube edge joining corners `a` and `b`, or 255 if they are not adjacent.
-const EDGE_OF: [[u8; 8]; 8] = {
+pub(crate) const EDGE_OF: [[u8; 8]; 8] = {
     let mut t = [[255u8; 8]; 8];
     let mut i = 0;
     while i < 12 {
@@ -207,7 +207,7 @@ const EDGE_OF: [[u8; 8]; 8] = {
 };
 
 /// Union-find over the 12 cube edges of a cell.
-fn find(parent: &mut [u8; 12], mut i: usize) -> usize {
+pub(crate) fn find(parent: &mut [u8; 12], mut i: usize) -> usize {
     while parent[i] as usize != i {
         parent[i] = parent[parent[i] as usize];
         i = parent[i] as usize;
@@ -215,7 +215,7 @@ fn find(parent: &mut [u8; 12], mut i: usize) -> usize {
     i
 }
 
-fn union(parent: &mut [u8; 12], a: usize, b: usize) {
+pub(crate) fn union(parent: &mut [u8; 12], a: usize, b: usize) {
     let (ra, rb) = (find(parent, a), find(parent, b));
     if ra != rb {
         parent[ra.max(rb)] = ra.min(rb) as u8;

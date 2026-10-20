@@ -178,14 +178,14 @@ pub struct Viewport {
     volume: Option<VolumeGpu>,
 }
 
-/// The volume playground's surface on the GPU: one vertex slot per block of surface with 512 places (one per
-/// cell), and the quads in fixed-size chunks, drawn in one multi-draw with an indirect entry per chunk.
+/// The volume playground's surface on the GPU: each block's vertices and quads in fixed-size chunks, drawn in one
+/// multi-draw with an indirect entry per quad chunk.
 struct VolumeGpu {
     quant: Quant,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     indirect: wgpu::Buffer,
-    /// Vertex slots and index chunks the buffers hold.
+    /// Vertex chunks and quad chunks the buffers hold.
     capacity: (u32, u32),
     high: u32,
 }
@@ -326,7 +326,7 @@ impl Viewport {
     /// Bring the volume playground's surface up to date: rewrite only the slots and chunks that changed, or
     /// everything into fresh buffers when the playground's pools grew.
     pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode) {
-        use crate::volume_mode::{CELLS, QUADS_PER_CHUNK};
+        use crate::volume_mode::{QUADS_PER_CHUNK, VERTS_PER_CHUNK};
         let t = Instant::now();
         let mut stats = UploadStats::default();
         let up = mode.take_upload();
@@ -335,7 +335,7 @@ impl Viewport {
             let make = |label, size: u64, usage| rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             self.volume = Some(VolumeGpu {
                 quant: Quant::fit(mode.bounds()),
-                vertices: make("volume vertices", slots as u64 * CELLS as u64 * 8, wgpu::BufferUsages::VERTEX),
+                vertices: make("volume vertices", slots as u64 * VERTS_PER_CHUNK as u64 * 8, wgpu::BufferUsages::VERTEX),
                 indices: make("volume indices", chunks as u64 * (QUADS_PER_CHUNK * 6) as u64 * 4, wgpu::BufferUsages::INDEX),
                 // DrawIndexedIndirectArgs: index count, instance count, first index, base vertex, first instance.
                 indirect: make("volume indirect", chunks as u64 * 20, wgpu::BufferUsages::INDIRECT),
@@ -353,11 +353,12 @@ impl Viewport {
         for c in &up.cleared {
             rs.queue.write_buffer(&v.indirect, *c as u64 * 20, bytemuck::cast_slice(&[0u32; 5]));
         }
-        let mut packed = vec![[0u16; 4]; CELLS];
-        for (slot, positions) in &up.verts {
-            pack(&v.quant, positions, None, &mut packed);
-            rs.queue.write_buffer(&v.vertices, *slot as u64 * CELLS as u64 * 8, bytemuck::cast_slice(&packed));
-            stats.bytes += CELLS * 8;
+        let mut packed = vec![[0u16; 4]; VERTS_PER_CHUNK];
+        for (c, positions) in &up.verts {
+            let out = &mut packed[..positions.len()];
+            pack(&v.quant, positions, None, out);
+            rs.queue.write_buffer(&v.vertices, *c as u64 * VERTS_PER_CHUNK as u64 * 8, bytemuck::cast_slice(out));
+            stats.bytes += out.len() * 8;
         }
         let per = (QUADS_PER_CHUNK * 6) as u32;
         for (c, idx) in &up.chunks {

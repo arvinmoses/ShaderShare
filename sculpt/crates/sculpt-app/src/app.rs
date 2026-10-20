@@ -85,6 +85,9 @@ pub enum Dialog {
     ImportObj(String),
     ExportObj(String),
     NewSphere(u32),
+    /// The volume playground's file (`.svol`).
+    OpenVolume(String),
+    SaveVolume(String),
 }
 
 struct Job {
@@ -190,6 +193,8 @@ pub struct SculptApp {
     pub remesh_old_stack: Option<sculpt_core::document::SolidInput>,
     /// The volume playground, when open: sculpted and drawn instead of the document.
     pub volume_mode: Option<crate::volume_mode::VolumeMode>,
+    /// Where the volume playground was last saved or opened.
+    pub volume_path: Option<String>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -286,6 +291,7 @@ impl SculptApp {
             remesh_top: None,
             remesh_old_stack: None,
             volume_mode: None,
+            volume_path: None,
             sweep: None,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
@@ -437,6 +443,18 @@ impl SculptApp {
     // ------------------------------------------------------------- commands
 
     pub fn run(&mut self, ctx: &egui::Context, cmd: Command) {
+        // The volume playground has its own undo history and file.
+        if self.volume_mode.is_some() && matches!(cmd, Command::Undo | Command::Redo | Command::Save | Command::Open) {
+            self.end_stroke();
+            let mode = self.volume_mode.as_mut().unwrap();
+            match cmd {
+                Command::Undo => self.status = if mode.undo() { "Undo".into() } else { "Nothing to undo".into() },
+                Command::Redo => self.status = if mode.redo() { "Redo".into() } else { "Nothing to redo".into() },
+                Command::Save => self.dialog = Some(Dialog::SaveVolume(self.volume_path.clone().unwrap_or("untitled.svol".into()))),
+                _ => self.dialog = Some(Dialog::OpenVolume(String::new())),
+            }
+            return;
+        }
         let tool_of = Tool::ALL.iter().find(|t| t.command() == cmd).copied();
         if let Some(t) = tool_of {
             self.select_tool(t);
@@ -544,6 +562,41 @@ impl SculptApp {
                 self.start_job("Opening project", move || project::load(&path).map_err(|e| e.to_string()));
             }
             Dialog::SaveAs(p) => self.save_to(PathBuf::from(p)),
+            Dialog::SaveVolume(p) => {
+                let t = Instant::now();
+                let Some(mode) = self.volume_mode.as_ref() else { return };
+                let r = std::fs::File::create(&p).and_then(|f| {
+                    let mut w = std::io::BufWriter::new(f);
+                    mode.vol.write_to(&mut w)?;
+                    std::io::Write::flush(&mut w)
+                });
+                self.status = match r {
+                    Ok(()) => format!("Saved {p} ({:.2}s)", t.elapsed().as_secs_f32()),
+                    Err(e) => format!("Save failed: {e}"),
+                };
+                self.volume_path = Some(p);
+            }
+            Dialog::OpenVolume(p) => {
+                let t = Instant::now();
+                let r = std::fs::File::open(&p).and_then(|f| sculpt_core::generator::volume::Volume::read_from(&mut std::io::BufReader::new(f)));
+                match r {
+                    Ok(vol) => {
+                        self.end_stroke();
+                        let (lo, hi) = vol.bounds();
+                        self.volume_mode = Some(crate::volume_mode::VolumeMode::new(vol));
+                        if let Some(vp) = self.viewport.as_mut() {
+                            vp.clear_volume();
+                        }
+                        // Frame the solid, not the whole lattice around it.
+                        let c = 0.5 * (lo + hi);
+                        let r = 0.3 * (hi - lo);
+                        self.camera.frame(&sculpt_core::geom::Aabb { min: c - r, max: c + r });
+                        self.status = format!("Opened {p} ({:.2}s)", t.elapsed().as_secs_f32());
+                        self.volume_path = Some(p);
+                    }
+                    Err(e) => self.status = format!("Open failed: {e}"),
+                }
+            }
             Dialog::ImportObj(p) => {
                 self.project_path = None;
                 self.start_job("Importing OBJ", move || {
@@ -581,7 +634,10 @@ impl SculptApp {
         self.pending.clear();
         let stroke = std::mem::replace(&mut self.stroke, Stroke::None);
         if let (Stroke::Volume { .. }, Some(mode)) = (&stroke, self.volume_mode.as_mut()) {
-            mode.end_stroke();
+            let specks = mode.end_stroke();
+            if specks > 0 {
+                self.status = format!("Removed {specks} speck{} the stroke left", if specks == 1 { "" } else { "s" });
+            }
         }
         if let Some(doc) = self.doc.as_mut() {
             match stroke {
