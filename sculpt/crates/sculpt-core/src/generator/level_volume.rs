@@ -1494,7 +1494,8 @@ impl LevelVolume {
         let (vm, fband) = (self.voxel(m), self.band(m));
         let lo = bc * B;
         // The stroke's change and the level `l` field over this block's footprint.
-        let (llo, lhi) = (lo.div_euclid(IVec3::splat(k)) - IVec3::ONE, (lo + B3).div_euclid(IVec3::splat(k)) + IVec3::splat(2));
+        // With a margin of three steps of the stroke's level, which the march below may read.
+        let (llo, lhi) = (lo.div_euclid(IVec3::splat(k)) - IVec3::splat(3), (lo + B3).div_euclid(IVec3::splat(k)) + IVec3::splat(4));
         let ln = lhi - llo + IVec3::ONE;
         let mut dgrid = Grid { lo: llo, n: ln, v: vec![0.0; (ln.x * ln.y * ln.z) as usize] };
         let mut most = 0.0f32;
@@ -1533,6 +1534,8 @@ impl LevelVolume {
         // Samples more than two bands from the new surface come out clamped whatever detail they carry.
         let mut far = vec![false; N];
         let mut from: Vec<Option<Vec3>> = vec![None; N];
+        // The carrying direction at each sample.
+        let mut dir = vec![Vec3::ZERO; N];
         let (mut qlo, mut qhi) = (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN));
         for (i, q) in from.iter_mut().enumerate() {
             let p = lo + cell_of(i);
@@ -1546,9 +1549,11 @@ impl LevelVolume {
                 continue;
             }
             let dn = |o: Vec3| lgrid.trilinear(g + o) - lgrid.trilinear(g - o);
-            let n = Vec3::new(dn(Vec3::X * 0.5), dn(Vec3::Y * 0.5), dn(Vec3::Z * 0.5)).normalize_or_zero();
+            let grad = Vec3::new(dn(Vec3::X * 0.5), dn(Vec3::Y * 0.5), dn(Vec3::Z * 0.5));
+            let n = grad.normalize_or_zero();
             // Along the direction the move was measured in (as `measure_moved` takes it).
             let n = if n == Vec3::ZERO { n } else { self.carry_dir(g, n) };
+            dir[i] = n;
             // The surface moved out by `-d` here: the detail now here was `-d` farther in.
             let at = p.as_vec3() + n * (d / vm);
             qlo = qlo.min(at.floor().as_ivec3());
@@ -1626,7 +1631,49 @@ impl LevelVolume {
                     }
                 }
             }
-            *v = (below.trilinear(p.as_vec3() * 0.5).clamp(-fband, fband) + detail).clamp(-fband, fband);
+            // The level below as a distance. The stroke's level is no distance field while the stroke lasts: a
+            // plane brush leaves a blend of the stroke's start with its plane, and once a big stroke has moved the
+            // surface nearly a band, the start is at its band above the new surface and the blend's slope there is
+            // the dab's weight, a third or less on the brush's falloff. Detail placed against it by value then landed
+            // at its height over the weight: form held at finer levels came out half again as tall near the
+            // brush's line, and a plateau that swallowed the finest grooves farther out. So the level right above
+            // the stroke's reads the distance to the stroke's level's surface, marched along the carrying
+            // direction; the levels above that read their carried level below, which is a distance again by this.
+            let mut under = below.trilinear(p.as_vec3() * 0.5);
+            if m == l + 1 && dir[i] != Vec3::ZERO && under.abs() < fband {
+                // Its signed distance to the stroke's level's surface along the carrying direction, marched on the
+                // footprint's grid: a quarter step at a time to the far side, then halved in. Beyond two bands with
+                // no crossing, the band.
+                let g = p.as_vec3() / kf;
+                let vl = self.voxel(l);
+                let sign = under.signum();
+                let f = |t: f32| lgrid.trilinear(g - dir[i] * (sign * t / vl));
+                let limit = 2.0 * fband;
+                let mut t = 0.0;
+                let mut found = None;
+                while t < limit {
+                    let next = (t + 0.25 * vl).min(limit);
+                    if f(next) * sign <= 0.0 {
+                        let (mut a, mut b) = (t, next);
+                        for _ in 0..8 {
+                            let mid = 0.5 * (a + b);
+                            if f(mid) * sign > 0.0 {
+                                a = mid;
+                            } else {
+                                b = mid;
+                            }
+                        }
+                        found = Some(0.5 * (a + b));
+                        break;
+                    }
+                    t = next;
+                }
+                under = match found {
+                    Some(dist) => sign * dist,
+                    None => sign * fband,
+                };
+            }
+            *v = (under.clamp(-fband, fband) + detail).clamp(-fband, fband);
         }
         differs(&s).then_some(s)
     }
@@ -1877,7 +1924,7 @@ impl LevelVolume {
         self.carry_pending(None);
         self.drop_empty();
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
-        self.redistance(&touched);
+        self.redistance(&touched, false);
         // Moving form down a level moves the coarser level's values toward the finer surface, which puts its
         // surface right but leaves the field around it compressed (its slope fell to half a step from the surface):
         // the finer level's detail against such a field has a slope of its own along the normal, and a later stroke
@@ -1885,7 +1932,7 @@ impl LevelVolume {
         // where it moved.
         let rebased = self.rebase(&touched);
         out.rebased = rebased.len();
-        self.redistance(&rebased);
+        self.redistance(&rebased, true);
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
         out.specks = self.remove_specks(&touched, SPECK_VERTS);
         out
@@ -2023,7 +2070,9 @@ impl LevelVolume {
     /// a level, the next brush's plane) would be misled. Samples next to the surface keep their values, so the surface
     /// does not move; every other sample becomes its distance to the nearest crossing of the surface with the lattice,
     /// within the band.
-    fn redistance(&mut self, touched: &[Key]) {
+    /// With `near_too`, the samples next to the surface become distances as well (see below); otherwise they keep
+    /// their values, which place the surface.
+    fn redistance(&mut self, touched: &[Key], near_too: bool) {
         for l in 0..self.levels() {
             let blocks: Vec<IVec3> = touched.iter().filter(|k| k.0 as usize == l && self.blocks[l].contains_key(&k.1)).map(|k| k.1).collect();
             if blocks.is_empty() {
@@ -2039,20 +2088,8 @@ impl LevelVolume {
                 .filter_map(|&bc| {
                     let lo = bc * B - IVec3::splat(reach.max(1));
                     let g = me.grid(l, lo, bc * B + IVec3::splat(B - 1 + reach.max(1)), false);
-                    // Where the surface crosses the lattice's edges, in lattice units, with the surface's normal there
-                    // (the field's gradient, central differences where the box allows, the edge's own direction at
-                    // its border).
-                    let hi = lo + g.n - IVec3::ONE;
-                    let gradient = |i: IVec3| -> Vec3 {
-                        let d = |axis: usize| {
-                            let (mut a, mut b) = (i, i);
-                            a[axis] = (i[axis] - 1).max(lo[axis]);
-                            b[axis] = (i[axis] + 1).min(hi[axis]);
-                            if a == b { 0.0 } else { (g.at(b) - g.at(a)) / (b[axis] - a[axis]) as f32 }
-                        };
-                        Vec3::new(d(0), d(1), d(2))
-                    };
-                    let mut crossings: Vec<(Vec3, Vec3)> = Vec::new();
+                    // Where the surface crosses the lattice's edges, in lattice units.
+                    let mut crossings: Vec<Vec3> = Vec::new();
                     for z in 0..g.n.z {
                         for y in 0..g.n.y {
                             for x in 0..g.n.x {
@@ -2066,47 +2103,56 @@ impl LevelVolume {
                                     j[axis] += 1;
                                     let b = g.at(j);
                                     if (a < 0.0) != (b < 0.0) {
-                                        let t = a / (a - b);
-                                        let mut n = gradient(i).lerp(gradient(j), t).normalize_or_zero();
-                                        if n == Vec3::ZERO {
-                                            n = Vec3::AXES[axis] * (b - a).signum();
-                                        }
-                                        crossings.push((i.as_vec3().lerp(j.as_vec3(), t), n));
+                                        crossings.push(i.as_vec3().lerp(j.as_vec3(), a / (a - b)));
                                     }
                                 }
                             }
                         }
                     }
+                    let hi = lo + g.n - IVec3::ONE;
                     let old = &me.blocks[l][&bc];
                     let mut s: Block = Box::new(**old);
                     let mut any = false;
                     for (i, v) in s.iter_mut().enumerate() {
                         let p = bc * B + cell_of(i);
                         let a = g.at(p);
-                        // The distance to the surface's tangent plane at the nearest crossing, the samples next to the
-                        // surface included: the plane through a crossing leaves that crossing where it is, so the
-                        // surface stays put (to within its curvature over a step), and every sample is a distance.
-                        // Before, the samples next to the surface kept what the brush left (a plane brush moves
-                        // them part of the way to its plane, a different part at each dab) and the others took the
-                        // distance to the nearest crossing point, up to half the crossings' spacing too far; detail
-                        // carried a fraction of a step along read both as its new surface, a lattice of dips over
-                        // everything a big stroke moved, forty times rougher than the surface had been.
+                        // A sample next to the surface, when asked for: its distance to the plane through the
+                        // crossings on its own lattice edges (the intercepts along each axis that crosses, one over
+                        // the root of the sum of their inverse squares). Where one axis crosses, both ends of the
+                        // edge keep their crossing exactly; elsewhere it moves by what the plane model is off, a
+                        // grain at the sample's scale, which is why it is done only where moving form down a level
+                        // left the field compressed around its surface (carried detail reading that a step or two
+                        // off the old surface came out as a lattice of dips). No gradient is used: the field's
+                        // gradient is no guide to the surface's normal inside fresh clay. Every other sample takes
+                        // its distance to the nearest crossing point, at most half the crossings' spacing too far.
                         let pf = p.as_vec3();
-                        let (mut best, mut at) = (f32::INFINITY, usize::MAX);
-                        for (k, c) in crossings.iter().enumerate() {
-                            let d2 = c.0.distance_squared(pf);
-                            if d2 < best {
-                                (best, at) = (d2, k);
+                        let near = (0..27).any(|q| q != 13 && (g.at(p + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)) < 0.0) != (a < 0.0));
+                        if near && !near_too {
+                            continue;
+                        }
+                        let mut inv2 = 0.0f32;
+                        for axis in 0..3 {
+                            let mut t_near = f32::INFINITY;
+                            for dir in [-1, 1] {
+                                let mut j = p;
+                                j[axis] += dir;
+                                if j[axis] < lo[axis] || j[axis] > hi[axis] {
+                                    continue;
+                                }
+                                let b = g.at(j);
+                                if (a < 0.0) != (b < 0.0) {
+                                    t_near = t_near.min(a / (a - b));
+                                }
+                            }
+                            if t_near.is_finite() {
+                                inv2 += 1.0 / (t_near * t_near).max(1e-12);
                             }
                         }
-                        let d = if at == usize::MAX {
-                            band
+                        let d = if inv2 > 0.0 {
+                            vx / inv2.sqrt()
                         } else {
-                            // Next to the surface the plane's distance; farther out the plane of whichever crossing
-                            // is nearest jumps as that changes, and the crossing point's own distance (never more
-                            // than half the crossings' spacing too far) is the smoother bound.
-                            let (c, n) = crossings[at];
-                            (pf - c).dot(n).abs().max(best.sqrt() - 0.5) * vx
+                            let d2 = crossings.iter().map(|c| c.distance_squared(pf)).fold(f32::INFINITY, f32::min);
+                            if d2.is_finite() { d2.sqrt() * vx } else { band }
                         };
                         let d = d.min(band).min(reach as f32 * vx);
                         let next = if a < 0.0 { -d } else { d };
@@ -2142,7 +2188,6 @@ impl LevelVolume {
             }
             let (fband, cband) = (self.band(m), self.band(m - 1));
             let keep = REBASE_KEEP * fband;
-            let fine: HashSet<IVec3> = blocks.iter().copied().collect();
             let mut under: Vec<IVec3> = blocks.iter().map(|fb| fb.div_euclid(IVec3::splat(2))).collect();
             under.sort_unstable_by_key(|v| (v.z, v.y, v.x));
             under.dedup();
@@ -2185,7 +2230,10 @@ impl LevelVolume {
                     let mut target = [f32::NAN; N];
                     for (i, t) in target.iter_mut().enumerate() {
                         let c = cb * B + cell_of(i);
-                        if !fine.contains(&(c * 2).div_euclid(B3)) {
+                        // Wherever this level has a block, not only under the ones touched: moved coarse samples
+                        // beside unmoved ones, block by block, left a lattice of steps after a big stroke carried
+                        // the fine levels.
+                        if !me.blocks[m].contains_key(&(c * 2).div_euclid(B3)) {
                             continue;
                         }
                         let l = cell_of(i);

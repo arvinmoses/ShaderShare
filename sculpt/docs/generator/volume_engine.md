@@ -195,6 +195,13 @@ same with linear resampling. What was wrong, and what changed:
   values) is set to the distance to its nearest crossing's tangent plane. Roughness under the stroke: 0.00058 to
   0.0001.
 
+* **Fine work on a big brush's falloff was flattened or swallowed**: mid-stroke the stroke's own level is a blend,
+  not a distance (its slope there is the dab's weight, about 0.3-0.7), so levels composed onto it by value landed at
+  detail divided by that slope: form 1.6 times too high, a plateau that swallowed grooves. The level right above the
+  stroke's now reads it as a distance marched along the carrying direction. `rebase` also moved coarse blocks only
+  under touched fine blocks (a lattice a block across); it now moves them wherever the fine level has a block.
+  A test replays the review session's patch dab for dab (`the_review_sessions_patch_rides_its_big_stroke`).
+
 ## Driver workarounds (Vulkan, this AMD driver)
 
 Two things in the compute shaders lost the device or silently gave wrong results on Vulkan while DX12 was fine:
@@ -220,9 +227,14 @@ one array of atomics at fixed places. The exact check runs on both backends.
   transition-cell code out of the vertex pass, is next.
 * **The finest work on a slope fades at one end under a big stroke.** In the demo the lower two grooves and the dots
   come through faint: the finest detail shears sideways by about 0.004 over 0.012 there. Not yet diagnosed.
-* **A faint lattice texture remains under a big stroke where levels 2-5 hold detail**, and the demo's lower grooves
-  and its dots (level 5) still come through faint (`volume/carry_texture_compare.png`: before the stroke, the build
-  before the fix below, and now).
+* **Fine work under a big stroke comes through soft** (`volume/carry_texture_compare.png`: before the stroke, the
+  build before the last fixes, now): the grooves all survive but faint, with a fine grain and faint block seams, and
+  the demo's dots are lost. The cause is the design of carrying: each finer level is carried as a difference of field
+  values against the level below, and those fields are not distances while a stroke lasts, nor read at the same
+  sample phase level to level. Carrying each level instead as its surface's height over the level below's surface,
+  marched, and composing geometrically would remove it (see "Next" below).
+* **Carrying under a big stroke catches up in about 2 s** after the pen lifts (the level above the stroke's is read as
+  a marched distance), frames going on meanwhile.
 * Bumps taller than 2.5 of their level's bands read 3-5% taller after two strokes.
 * **The field is edited on the CPU.** Dabs cost 1-3 ms; the GPU does what grows with the model (extraction, drawing,
   culling). Moving dabs to compute shaders is possible later without changing the layout.
