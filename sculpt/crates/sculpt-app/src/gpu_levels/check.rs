@@ -47,7 +47,9 @@ fn read(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer) -> Vec<u
 }
 
 /// A clay (or trim) stroke at level `l` between two directions, as the app lays dabs.
-fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, mut each: impl FnMut(&mut LevelVolume)) {
+/// A stroke from `a` to `b`, `each` run after every dab and `last` before the stroke ends.
+#[allow(clippy::too_many_arguments)]
+fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, mut each: impl FnMut(&mut LevelVolume), last: impl FnOnce(&mut LevelVolume)) {
     v.begin_stroke();
     let steps = (((b - a).length() / (0.15 * r)).ceil() as usize).max(1);
     let mut along = Vec3::ZERO;
@@ -61,6 +63,7 @@ fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, m
         }
         each(v);
     }
+    last(v);
     v.end_stroke();
 }
 
@@ -140,58 +143,80 @@ pub fn run(args: &[String]) -> Res<()> {
     if args.iter().any(|a| a == "--bench") {
         return bench(&device, &queue);
     }
-    let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
-    // Carrying detail a little at a time, as the app does, so the GPU sees the queued blocks arrive late.
-    vol.carry_budget = Some(0.5);
-    let mut gpu = GpuLevels::new(&device, &queue, &vol, 3);
-    gpu.sync(&mut vol);
-    compare(&device, &queue, &gpu, &vol, "fresh ball")?;
-    let plan: [(usize, Vec3, Vec3, f32, bool); 7] = [
-        (0, Vec3::new(-0.6, 0.2, 1.0), Vec3::new(0.6, 0.3, 1.0), 0.35, false),
-        (1, Vec3::new(-0.4, -0.1, 1.0), Vec3::new(0.3, -0.05, 1.0), 0.06, false),
-        (2, Vec3::new(0.1, 0.0, 1.0), Vec3::new(0.25, 0.05, 1.0), 0.03, true),
-        (3, Vec3::new(0.0, 0.12, 1.0), Vec3::new(0.05, 0.12, 1.0), 0.012, false),
-        (0, Vec3::new(-0.5, -0.4, 1.0), Vec3::new(0.4, -0.3, 1.0), 0.3, true),
-        (2, Vec3::new(-0.2, 0.1, 1.0), Vec3::new(0.0, 0.2, 1.0), 0.02, false),
-        (0, Vec3::new(-0.2, 0.0, 1.0), Vec3::new(0.2, 0.1, 1.0), 0.4, false),
-    ];
-    for (i, (l, a, b, r, trim)) in plan.iter().enumerate() {
-        // Synced after every dab, as the app does each frame.
-        let every = std::env::var("SCULPT_CHECK_EVERY_DAB").is_ok();
-        let mut dab = 0;
-        let mut failed: Option<String> = None;
-        stroke(&mut vol, *l, *a, *b, *r, *trim, |v| {
-            v.carry_pending(Some(0.5));
-            let s = gpu.sync(v);
-            dab += 1;
-            if every && failed.is_none() && let Err(e) = compare(&device, &queue, &gpu, v, &format!("stroke {} dab {dab} (full {}, released {}, uploaded {})", i + 1, s.full, s.released, s.uploaded)) {
-                failed = Some(e.to_string());
-                if std::env::var("SCULPT_CHECK_DIAG").is_ok() {
-                    let c = gpu.cap;
-                    gpu.set_cap(c);
-                    gpu.sync(v);
-                    eprintln!("after a full rebuild: {:?}", compare(&device, &queue, &gpu, v, "rebuilt").err());
+    for jobs in [false, true] {
+        let pass = if jobs { "jobs: " } else { "" };
+        let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+        // Carrying detail a little at a time, so the GPU sees the queued blocks arrive late: first 0.5 ms after each dab,
+        // then (with `jobs`) as the app does, in jobs taken after a dab and brought in after the next.
+        vol.carry_budget = Some(if jobs { 0.0 } else { 0.5 });
+        let mut gpu = GpuLevels::new(&device, &queue, &vol, 3);
+        gpu.sync(&mut vol);
+        compare(&device, &queue, &gpu, &vol, &format!("{pass}fresh ball"))?;
+        let plan: [(usize, Vec3, Vec3, f32, bool); 7] = [
+            (0, Vec3::new(-0.6, 0.2, 1.0), Vec3::new(0.6, 0.3, 1.0), 0.35, false),
+            (1, Vec3::new(-0.4, -0.1, 1.0), Vec3::new(0.3, -0.05, 1.0), 0.06, false),
+            (2, Vec3::new(0.1, 0.0, 1.0), Vec3::new(0.25, 0.05, 1.0), 0.03, true),
+            (3, Vec3::new(0.0, 0.12, 1.0), Vec3::new(0.05, 0.12, 1.0), 0.012, false),
+            (0, Vec3::new(-0.5, -0.4, 1.0), Vec3::new(0.4, -0.3, 1.0), 0.3, true),
+            (2, Vec3::new(-0.2, 0.1, 1.0), Vec3::new(0.0, 0.2, 1.0), 0.02, false),
+            (0, Vec3::new(-0.2, 0.0, 1.0), Vec3::new(0.2, 0.1, 1.0), 0.4, false),
+        ];
+        for (i, (l, a, b, r, trim)) in plan.iter().enumerate() {
+            // Synced after every dab, as the app does each frame.
+            let every = std::env::var("SCULPT_CHECK_EVERY_DAB").is_ok();
+            let mut dab = 0;
+            let mut failed: Option<String> = None;
+            let held: std::cell::RefCell<Option<sculpt_core::generator::level_volume::CarryJob>> = std::cell::RefCell::new(None);
+            let bring_in = |v: &mut LevelVolume| {
+                if let Some(job) = held.borrow_mut().take() {
+                    v.carry_apply(job.run());
                 }
+            };
+            stroke(&mut vol, *l, *a, *b, *r, *trim, |v| {
+                if jobs {
+                    bring_in(v);
+                    *held.borrow_mut() = v.carry_take(64);
+                } else {
+                    v.carry_pending(Some(0.5));
+                }
+                let s = gpu.sync(v);
+                dab += 1;
+                if every && failed.is_none() && let Err(e) = compare(&device, &queue, &gpu, v, &format!("{pass}stroke {} dab {dab} (full {}, released {}, uploaded {})", i + 1, s.full, s.released, s.uploaded)) {
+                    failed = Some(e.to_string());
+                    if std::env::var("SCULPT_CHECK_DIAG").is_ok() {
+                        let samples = read(&device, &queue, &gpu.buf.samples);
+                        let stale: Vec<Key> = v.keys().into_iter().filter(|k| gpu.slot_of.get(k).is_some_and(|&sl| samples[sl as usize * 365..sl as usize * 365 + 365] != packed_samples(v, *k)[..])).collect();
+                        eprintln!("blocks whose GPU samples are stale: {stale:?}");
+                        let c = gpu.cap;
+                        gpu.set_cap(c.saturating_sub(1));
+                        gpu.sync(v);
+                        gpu.set_cap(c);
+                        gpu.sync(v);
+                        eprintln!("after a full rebuild: {:?}", compare(&device, &queue, &gpu, v, "rebuilt").err());
+                    let orphans: Vec<Key> = v.keys().into_iter().filter(|k| k.0 > 0 && !v.exists(k.0 as usize - 1, k.1.div_euclid(glam::IVec3::splat(2)))).collect();
+                    eprintln!("blocks without a parent: {orphans:?}");
+                    }
+                }
+            }, bring_in);
+            if let Some(e) = failed {
+                return Err(e.into());
             }
-        });
-        if let Some(e) = failed {
-            return Err(e.into());
+            gpu.sync(&mut vol);
+            compare(&device, &queue, &gpu, &vol, &format!("{pass}stroke {} (level {l}, {})", i + 1, if *trim { "trim" } else { "clay" }))?;
         }
+        for i in 0..4 {
+            vol.undo();
+            gpu.sync(&mut vol);
+            compare(&device, &queue, &gpu, &vol, &format!("{pass}undo {}", i + 1))?;
+        }
+        vol.redo();
         gpu.sync(&mut vol);
-        compare(&device, &queue, &gpu, &vol, &format!("stroke {} (level {l}, {})", i + 1, if *trim { "trim" } else { "clay" }))?;
-    }
-    for i in 0..4 {
-        vol.undo();
-        gpu.sync(&mut vol);
-        compare(&device, &queue, &gpu, &vol, &format!("undo {}", i + 1))?;
-    }
-    vol.redo();
-    gpu.sync(&mut vol);
-    compare(&device, &queue, &gpu, &vol, "redo")?;
-    for cap in [0, 1, 2, 3] {
-        gpu.set_cap(cap);
-        gpu.sync(&mut vol);
-        compare(&device, &queue, &gpu, &vol, &format!("levels up to {cap}"))?;
+        compare(&device, &queue, &gpu, &vol, &format!("{pass}redo"))?;
+        for cap in [0, 1, 2, 3] {
+            gpu.set_cap(cap);
+            gpu.sync(&mut vol);
+            compare(&device, &queue, &gpu, &vol, &format!("{pass}levels up to {cap}"))?;
+        }
     }
     println!("the GPU surface matches the reference at every step");
     Ok(())
@@ -258,9 +283,35 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     }
     // A big level 0 stroke right over the fine work: every finer level's detail under it rides along. Frame by frame
     // as the app does it: the frame's dabs (two, the app's spacing apart, a brisk stroke) only queue the carrying,
-    // then 6 ms of it, then the sync.
+    // which runs as jobs on a pool of its own (half the cores) while the frames go on; each frame brings in a job that
+    // finished, starts the next, and syncs.
     {
-        let (mut frame_ms, mut dab_ms, mut carry_ms, mut sync_ms, mut queued) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
+        let threads = std::env::var("SCULPT_CARRY_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or((std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).max(2));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
+        let mut job: Option<std::sync::mpsc::Receiver<sculpt_core::generator::level_volume::CarryDone>> = None;
+        let tick = |vol: &mut LevelVolume, job: &mut Option<std::sync::mpsc::Receiver<sculpt_core::generator::level_volume::CarryDone>>, wait: bool| -> (f64, usize) {
+            let t = Instant::now();
+            let mut n = 0;
+            if let Some(rx) = job.as_ref() {
+                let got = if wait { rx.recv().ok() } else { rx.try_recv().ok() };
+                if let Some(done) = got {
+                    n = done.blocks;
+                    vol.carry_apply(done);
+                    *job = None;
+                }
+            }
+            if job.is_none()
+                && let Some(j) = vol.carry_take(384)
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                pool.spawn(move || {
+                    let _ = tx.send(j.run());
+                });
+                *job = Some(rx);
+            }
+            (t.elapsed().as_secs_f64() * 1e3, n)
+        };
+        let (mut frame_ms, mut dab_ms, mut tick_ms, mut sync_ms, mut most) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
         vol.carry_budget = Some(0.0);
         vol.begin_stroke();
         let mut along = Vec3::ZERO;
@@ -277,19 +328,31 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
                 }
             }
             dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
-            let tc = Instant::now();
-            queued = queued.max(vol.carry_pending(Some(6.0)));
-            carry_ms.push(tc.elapsed().as_secs_f64() * 1e3);
+            let (ms, n) = tick(&mut vol, &mut job, false);
+            tick_ms.push(ms);
+            most = most.max(n);
             let s = gpu.sync(&mut vol);
             sync_ms.push(s.cpu_ms);
             frame_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            // The rest of a frame at 60 fps, when the worker carries on.
+            let left = 16.7 - t.elapsed().as_secs_f64() * 1e3;
+            if left > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(left / 1e3));
+            }
         }
+        // Pen up: frames go on (as above, at 60 fps) until the detail is all in, then the stroke ends.
         let t = Instant::now();
-        let mut frames = 0;
-        while vol.carry_busy() {
-            vol.carry_pending(Some(6.0));
+        let (mut frames, mut after_ms) = (0, Vec::new());
+        while job.is_some() || vol.carry_busy() {
+            let tf = Instant::now();
+            tick(&mut vol, &mut job, false);
             gpu.sync(&mut vol);
+            after_ms.push(tf.elapsed().as_secs_f64() * 1e3);
             frames += 1;
+            let left = 16.7 - tf.elapsed().as_secs_f64() * 1e3;
+            if left > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(left / 1e3));
+            }
         }
         let catch_up = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
@@ -297,7 +360,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
         let end_ms = t.elapsed().as_secs_f64() * 1e3;
         gpu.sync(&mut vol);
         vol.carry_budget = Some(6.0);
-        println!("a level 0 stroke (radius 0.3) over the fine work, two dabs a frame: frame {:.1} ms CPU (median: dabs {:.1}, carrying {:.1}, up to {queued} finer blocks a frame, sync {:.1}); the queued detail caught up in {frames} more frames ({catch_up:.0} ms); stroke end {end_ms:.0} ms", median(frame_ms), median(dab_ms), median(carry_ms), median(sync_ms));
+        println!("a level 0 stroke (radius 0.3) over the fine work, two dabs a frame, carried on {threads} threads of its own: frame {:.1} ms on the main thread (median: dabs {:.1}, bringing in and starting jobs {:.1}, sync {:.1}; up to {most} finer blocks a job); after the pen lifts the detail was all in after {frames} frames ({catch_up:.0} ms, {:.1} ms a frame), then the stroke ended in {end_ms:.0} ms", median(frame_ms), median(dab_ms), median(tick_ms), median(sync_ms), median(after_ms));
     }
     println!();
     println!("| level | step | brush radius (steps) | dab ms CPU | sync ms CPU | sync to GPU done ms | blocks uploaded / extracted (most) | stroke end ms | extracted after |");

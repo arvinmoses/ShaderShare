@@ -22,6 +22,7 @@
 //! at the end of a stroke, undo and saving work as in `volume.rs`, per level.
 
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{IVec3, Vec3};
@@ -34,6 +35,164 @@ use crate::mesh::{NO_VERT, PolyMesh};
 /// are) rather than the default, which guards against crafted keys at several times the cost.
 pub type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FastHasher>>;
 pub type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FastHasher>>;
+
+/// Shards a [`Shared`] map splits its keys over, by place: neighbouring blocks share one.
+const SHARDS: usize = 1024;
+
+/// A key a [`Shared`] map can shard by place.
+pub trait Sharded: std::hash::Hash + Eq + Copy {
+    fn shard(&self) -> usize;
+}
+
+impl Sharded for IVec3 {
+    #[inline]
+    fn shard(&self) -> usize {
+        // Blocks 8 apart along each axis to a shard: a stroke writes a few shards, not every one.
+        let c = IVec3::new(self.x >> 3, self.y >> 3, self.z >> 3);
+        ((c.x as u32).wrapping_mul(73856093) ^ (c.y as u32).wrapping_mul(19349663) ^ (c.z as u32).wrapping_mul(83492791)) as usize & (SHARDS - 1)
+    }
+}
+
+impl Sharded for Key {
+    #[inline]
+    fn shard(&self) -> usize {
+        (self.1.shard() + 389 * self.0 as usize) & (SHARDS - 1)
+    }
+}
+
+/// A map that copies in a moment: its shards are shared between copies and a shard is copied only when one copy
+/// writes to it while another still holds it. Carrying detail on a worker reads such a copy of the volume while the
+/// next dabs change the original.
+pub struct Shared<K, V> {
+    shards: Vec<Arc<HashMap<K, V>>>,
+    len: usize,
+}
+
+impl<K, V> Clone for Shared<K, V> {
+    fn clone(&self) -> Self {
+        Shared { shards: self.shards.clone(), len: self.len }
+    }
+}
+
+impl<K: Sharded, V: Clone> Default for Shared<K, V> {
+    fn default() -> Self {
+        let empty = Arc::new(HashMap::default());
+        Shared { shards: vec![empty; SHARDS], len: 0 }
+    }
+}
+
+impl<K: Sharded, V: Clone> Shared<K, V> {
+    #[inline]
+    pub fn get(&self, k: &K) -> Option<&V> {
+        self.shards[k.shard()].get(k)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, k: &K) -> bool {
+        self.shards[k.shard()].contains_key(k)
+    }
+
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        let sh = &mut self.shards[k.shard()];
+        if !sh.contains_key(k) {
+            return None;
+        }
+        Arc::make_mut(sh).get_mut(k)
+    }
+
+    pub fn get_or_insert_with(&mut self, k: K, f: impl FnOnce() -> V) -> &mut V {
+        let sh = Arc::make_mut(&mut self.shards[k.shard()]);
+        if !sh.contains_key(&k) {
+            self.len += 1;
+        }
+        sh.entry(k).or_insert_with(f)
+    }
+
+    pub fn insert(&mut self, k: K, v: impl Into<V>) -> Option<V> {
+        let old = Arc::make_mut(&mut self.shards[k.shard()]).insert(k, v.into());
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        let sh = &mut self.shards[k.shard()];
+        if !sh.contains_key(k) {
+            return None;
+        }
+        self.len -= 1;
+        Arc::make_mut(sh).remove(k)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.shards.iter().flat_map(|s| s.keys())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.shards.iter().flat_map(|s| s.values())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.shards.iter().flat_map(|s| s.iter())
+    }
+}
+
+impl<K: Sharded, V: Clone> std::ops::Index<&K> for Shared<K, V> {
+    type Output = V;
+    fn index(&self, k: &K) -> &V {
+        self.get(k).expect("no such key")
+    }
+}
+
+/// A [`Shared`] set.
+#[derive(Clone)]
+pub struct SharedSet<K>(Shared<K, ()>);
+
+impl<K: Sharded> Default for SharedSet<K> {
+    fn default() -> Self {
+        SharedSet(Shared::default())
+    }
+}
+
+impl<K: Sharded> SharedSet<K> {
+    #[inline]
+    pub fn contains(&self, k: &K) -> bool {
+        self.0.contains_key(k)
+    }
+
+    pub fn insert(&mut self, k: K) -> bool {
+        self.0.insert(k, ()).is_none()
+    }
+
+    pub fn remove(&mut self, k: &K) -> bool {
+        self.0.remove(k).is_some()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &K> {
+        self.0.keys()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 pub struct FastHasher(u64);
@@ -100,7 +259,10 @@ const HISTORY_BYTES: usize = 1 << 30;
 /// Detail at a level up to this fraction of its band stays there; beyond it, form is moved down a level.
 const REBASE_KEEP: f32 = 0.4;
 
+/// A block's samples while they are worked on.
 pub type Block = Box<[f32; N]>;
+/// A block's samples as the volume keeps them: shared by the copies of the volume that hold them.
+pub type Stored = Arc<[f32; N]>;
 /// A block's level and coordinates (in blocks of that level).
 pub type Key = (u8, IVec3);
 /// One bit per sample.
@@ -112,7 +274,7 @@ enum Was {
     Missing,
     /// A level 0 block wholly inside the solid.
     Inside,
-    Stored(Block),
+    Stored(Stored),
 }
 
 fn local(i: IVec3) -> usize {
@@ -146,6 +308,11 @@ fn trilinear_gradient(f: Vec3, c: [f32; 8]) -> Vec3 {
 /// A sample kept at 16 bits, on the same side of zero: the surface must not move by a voxel through rounding.
 /// How far apart (in steps of the stroke's level) the surface's move is measured while detail is carried.
 const MOVE_EVERY: i32 = 4;
+
+/// `v` as the GPU reads it back from [`quantize`].
+fn as_held(v: f32, band: f32) -> f32 {
+    quantize(v, band) as f32 / 32767.0 * band
+}
 
 pub fn quantize(v: f32, band: f32) -> i16 {
     let q = (v / band * 32767.0).round().clamp(-32767.0, 32767.0) as i16;
@@ -283,19 +450,19 @@ pub struct ExtractStats {
 pub struct LevelVolume {
     pub voxel0: f32,
     origin: Vec3,
-    blocks: Vec<HashMap<IVec3, Block>>,
+    blocks: Vec<Shared<IVec3, Stored>>,
     /// Level 0 blocks wholly inside the solid (any other level 0 block not stored is wholly outside).
-    inside0: HashSet<IVec3>,
+    inside0: SharedSet<IVec3>,
     /// While a stroke is under way: each block as it was before the stroke first changed it. Dabs are placed on the
     /// surface as it was when the stroke began, and the stroke is undone from it.
-    stroke: Option<HashMap<Key, Was>>,
-    history: Vec<HashMap<Key, Was>>,
-    redo: Vec<HashMap<Key, Was>>,
+    stroke: Option<Shared<Key, Was>>,
+    history: Vec<Shared<Key, Was>>,
+    redo: Vec<Shared<Key, Was>>,
     /// Blocks whose samples or existence changed since [`Self::drain_dirty`] last ran.
     dirty: HashSet<Key>,
     /// During a stroke: its change so far at level `carry_level` (the level its dabs write), per block, which finer
     /// levels' detail is carried by.
-    carry: HashMap<IVec3, Block>,
+    carry: Shared<IVec3, Stored>,
     carry_level: usize,
     /// Finer blocks (per level) whose detail still has to be carried this stroke.
     pending: Vec<HashSet<IVec3>>,
@@ -310,12 +477,55 @@ pub struct LevelVolume {
     pub carry_budget: Option<f64>,
 }
 
+/// Queued detail to carry on another thread: a copy of the volume (see [`LevelVolume::carry_take`]) and, per level,
+/// the blocks to carry.
+pub struct CarryJob {
+    vol: LevelVolume,
+    plan: Vec<(usize, Vec<IVec3>)>,
+    level: usize,
+}
+
+/// What a [`CarryJob`] carried, for [`LevelVolume::carry_apply`].
+pub struct CarryDone {
+    /// Blocks it changed: their samples, or `None` where it dropped one.
+    changes: Vec<(u8, IVec3, Option<Stored>)>,
+    carried: Vec<(usize, IVec3)>,
+    level: usize,
+    /// Blocks rebuilt, and how long it took.
+    pub blocks: usize,
+    pub ms: f64,
+}
+
+impl CarryJob {
+    /// Blocks it will carry.
+    pub fn len(&self) -> usize {
+        self.plan.iter().map(|p| p.1.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Carry it, coarser levels first: each level reads the one below as this job left it.
+    pub fn run(mut self) -> CarryDone {
+        let t = Instant::now();
+        let mut blocks = 0;
+        for (m, batch) in std::mem::take(&mut self.plan) {
+            blocks += self.vol.carry_batch(self.level, m, &batch);
+        }
+        let v = &self.vol;
+        let changes = v.dirty.iter().map(|&(m, bc)| (m, bc, v.blocks[m as usize].get(&bc).cloned())).collect();
+        let carried = v.carried.iter().enumerate().flat_map(|(m, c)| c.iter().map(move |&bc| (m, bc))).collect();
+        CarryDone { changes, carried, level: self.level, blocks, ms: t.elapsed().as_secs_f64() * 1e3 }
+    }
+}
+
 impl LevelVolume {
     /// `field` (negative inside) over `[-half, half]^3` at level 0's step `voxel0`, with `levels` levels in all.
     pub fn from_field<F: Fn(Vec3) -> f32 + Sync>(field: &F, half: f32, voxel0: f32, levels: usize) -> LevelVolume {
         let levels = levels.clamp(1, MAX_LEVELS);
         let origin = Vec3::ZERO;
-        let mut v = LevelVolume { voxel0, origin, blocks: vec![HashMap::default(); levels], inside0: HashSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: HashMap::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0, origin, blocks: vec![Shared::default(); levels], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
         let band = v.band(0);
         let step = voxel0 * B as f32;
         let lo = ((Vec3::splat(-half) - origin) / step).floor().as_ivec3() - IVec3::ONE;
@@ -378,8 +588,8 @@ impl LevelVolume {
         (counts, bytes)
     }
 
-    pub fn block(&self, k: Key) -> Option<&Block> {
-        self.blocks.get(k.0 as usize)?.get(&k.1)
+    pub fn block(&self, k: Key) -> Option<&[f32; N]> {
+        self.blocks.get(k.0 as usize)?.get(&k.1).map(|b| &**b)
     }
 
     pub fn exists(&self, l: usize, bc: IVec3) -> bool {
@@ -458,6 +668,14 @@ impl LevelVolume {
     fn value_at(&self, l: usize, g: Vec3, base: bool) -> f32 {
         let i = g.floor().as_ivec3();
         let f = g - i.as_vec3();
+        // The cell within one stored block (most cells): look it up once.
+        let li = i.rem_euclid(B3);
+        if li.cmplt(IVec3::splat(B - 1)).all()
+            && let Some(b) = self.stored(l, i.div_euclid(B3), base)
+        {
+            let at = local(i);
+            return trilinear(f, std::array::from_fn(|k| b[at + (k & 1) + 8 * ((k >> 1) & 1) + 64 * ((k >> 2) & 1)]));
+        }
         trilinear(f, std::array::from_fn(|k| self.sample(l, i + IVec3::new((k & 1) as i32, ((k >> 1) & 1) as i32, ((k >> 2) & 1) as i32), base)))
     }
 
@@ -604,7 +822,7 @@ impl LevelVolume {
     /// [`Self::gather9`] into `out`, without allocating where the block and the seven past it are all stored at its
     /// level (most blocks): their samples are copied straight across.
     pub fn gather9_into(&self, l: usize, bc: IVec3, out: &mut [f32; 729]) {
-        let nb: [Option<&Block>; 8] = std::array::from_fn(|q| self.blocks[l].get(&(bc + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32))));
+        let nb: [Option<&Stored>; 8] = std::array::from_fn(|q| self.blocks[l].get(&(bc + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32))));
         if nb.iter().all(|b| b.is_some()) {
             for z in 0..9usize {
                 for y in 0..9usize {
@@ -663,6 +881,10 @@ impl LevelVolume {
 
     /// Store `s` as block `bc` of level `l`, making its parents first if they do not exist.
     fn put(&mut self, l: usize, bc: IVec3, s: Block) {
+        self.put_stored(l, bc, Stored::from(s));
+    }
+
+    fn put_stored(&mut self, l: usize, bc: IVec3, s: Stored) {
         if !self.blocks[l].contains_key(&bc) && l > 0 {
             self.ensure(l - 1, bc.div_euclid(IVec3::splat(2)));
         }
@@ -776,7 +998,7 @@ impl LevelVolume {
                 stats.created += 1;
             }
             self.put(l, bc, s);
-            let total = self.carry.entry(bc).or_insert_with(|| Box::new([0.0; N]));
+            let total = Arc::make_mut(self.carry.get_or_insert_with(bc, || Arc::new([0.0; N])));
             for (t, x) in total.iter_mut().zip(d.iter()) {
                 *t += x;
             }
@@ -849,6 +1071,84 @@ impl LevelVolume {
             set = grown;
         }
         set
+    }
+
+    /// A copy of the volume to carry detail on, made in a moment (its maps share their shards with this one's).
+    fn snapshot(&self) -> LevelVolume {
+        LevelVolume {
+            voxel0: self.voxel0,
+            origin: self.origin,
+            blocks: self.blocks.clone(),
+            inside0: self.inside0.clone(),
+            stroke: self.stroke.clone(),
+            history: Vec::new(),
+            redo: Vec::new(),
+            dirty: HashSet::default(),
+            carry: self.carry.clone(),
+            carry_level: self.carry_level,
+            pending: vec![HashSet::default(); MAX_LEVELS],
+            moved: HashMap::default(),
+            carried: vec![HashSet::default(); MAX_LEVELS],
+            carry_budget: None,
+        }
+    }
+
+    /// Take up to `most` queued blocks off the carrying queue, to carry on another thread ([`CarryJob::run`]) while
+    /// the stroke goes on; [`Self::carry_apply`] then brings the result in. A level's blocks are taken only once the
+    /// coarser ones queued have all been, since carrying reads the level below as carried. A block a later dab
+    /// changes the ground of is queued again, so a result that comes in late is replaced.
+    pub fn carry_take(&mut self, most: usize) -> Option<CarryJob> {
+        self.stroke.as_ref()?;
+        let l = self.carry_level;
+        let mut plan = Vec::new();
+        let mut left = most;
+        for m in l + 1..self.levels() {
+            if self.pending[m].is_empty() {
+                continue;
+            }
+            let mut batch: Vec<IVec3> = self.pending[m].iter().copied().take(left).collect();
+            for c in &batch {
+                self.pending[m].remove(c);
+            }
+            batch.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+            left -= batch.len();
+            plan.push((m, batch));
+            if !self.pending[m].is_empty() || left == 0 {
+                break;
+            }
+        }
+        if plan.is_empty() {
+            return None;
+        }
+        Some(CarryJob { vol: self.snapshot(), plan, level: l })
+    }
+
+    /// Bring in what a [`CarryJob`] carried: its blocks, those it dropped, and the blocks it carried detail into.
+    pub fn carry_apply(&mut self, done: CarryDone) {
+        if self.stroke.is_none() || done.level != self.carry_level {
+            return;
+        }
+        // Blocks made, coarser levels first (a block's parents before it); then blocks dropped, finer levels first (a
+        // block's children before it, which may be dropped too).
+        let mut changes = done.changes;
+        changes.sort_unstable_by_key(|c| (c.2.is_none(), if c.2.is_none() { u8::MAX - c.0 } else { c.0 }, c.1.z, c.1.y, c.1.x));
+        for (m, bc, s) in changes {
+            let m = m as usize;
+            match s {
+                Some(s) => self.put_stored(m, bc, s),
+                None => {
+                    let has_children = m + 1 < self.levels() && (0..8).any(|q| self.blocks[m + 1].contains_key(&(bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))));
+                    if !has_children && self.blocks[m].contains_key(&bc) {
+                        self.keep((m as u8, bc));
+                        self.blocks[m].remove(&bc);
+                        self.dirty.insert((m as u8, bc));
+                    }
+                }
+            }
+        }
+        for (m, bc) in done.carried {
+            self.carried[m].insert(bc);
+        }
     }
 
     /// Whether carrying detail has blocks still queued.
@@ -1232,7 +1532,7 @@ impl LevelVolume {
                 self.keep((l as u8, bc));
                 let i = local(p);
                 if let Some(s) = self.blocks[l].get_mut(&bc) {
-                    s[i] = fill;
+                    Arc::make_mut(s)[i] = fill;
                 }
                 self.dirty.insert((l as u8, bc));
                 flipped.entry(bc).or_insert([0; 8])[i / 64] |= 1 << (i % 64);
@@ -1375,7 +1675,7 @@ impl LevelVolume {
 
     /// Start a stroke: until [`Self::end_stroke`], brushes are placed on the surface as it is now.
     pub fn begin_stroke(&mut self) {
-        self.stroke = Some(HashMap::default());
+        self.stroke = Some(Shared::default());
         self.carry.clear();
         self.moved.clear();
         for p in self.pending.iter_mut().chain(self.carried.iter_mut()) {
@@ -1405,7 +1705,7 @@ impl LevelVolume {
         let saved = self.stroke.take().unwrap_or_default();
         self.history.push(saved);
         self.redo.clear();
-        let size = |m: &HashMap<Key, Was>| m.values().map(|w| 16 + if matches!(w, Was::Stored(_)) { N * 4 } else { 0 }).sum::<usize>();
+        let size = |m: &Shared<Key, Was>| m.values().map(|w| 16 + if matches!(w, Was::Stored(_)) { N * 4 } else { 0 }).sum::<usize>();
         let mut total: usize = self.history.iter().map(size).sum();
         while total > HISTORY_BYTES && self.history.len() > 1 {
             total -= size(&self.history.remove(0));
@@ -1444,9 +1744,10 @@ impl LevelVolume {
         !self.redo.is_empty()
     }
 
-    fn swap_in(&mut self, entry: HashMap<Key, Was>) -> HashMap<Key, Was> {
-        let mut back = HashMap::with_capacity_and_hasher(entry.len(), Default::default());
-        for (k, was) in entry {
+    fn swap_in(&mut self, entry: Shared<Key, Was>) -> Shared<Key, Was> {
+        let mut back = Shared::default();
+        for (&k, was) in entry.iter() {
+            let was = was.clone();
             let (l, bc) = (k.0 as usize, k.1);
             let now = match self.blocks[l].remove(&bc) {
                 Some(b) => Was::Stored(b),
@@ -1515,7 +1816,7 @@ impl LevelVolume {
                         }
                     }
                     let old = &me.blocks[l][&bc];
-                    let mut s = old.clone();
+                    let mut s: Block = Box::new(**old);
                     let mut any = false;
                     for (i, v) in s.iter_mut().enumerate() {
                         let p = bc * B + cell_of(i);
@@ -1765,7 +2066,7 @@ impl LevelVolume {
             self.keep((l as u8, bc));
             let i = local(p);
             if let Some(s) = self.blocks[l].get_mut(&bc) {
-                s[i] = to;
+                Arc::make_mut(s)[i] = to;
             }
             self.dirty.insert((l as u8, bc));
             flipped[l].entry(bc).or_insert([0; 8])[i / 64] |= 1 << (i % 64);
@@ -2018,7 +2319,7 @@ impl LevelVolume {
     fn corner_value(&self, l: usize, bc: IVec3, g: &[f32; 729], i: IVec3, cap: usize) -> f32 {
         let (m, j) = self.canonical(l, i, cap);
         if m > l {
-            return self.blocks[m][&j.div_euclid(B3)][local(j)];
+            return as_held(self.blocks[m][&j.div_euclid(B3)][local(j)], self.band(m));
         }
         let d = i - bc * B;
         g[(d.z * 81 + d.y * 9 + d.x) as usize]
@@ -2026,7 +2327,13 @@ impl LevelVolume {
 
     fn block_vertices(&self, k: Key, cap: usize, table: &[u32; 256]) -> BlockSurface {
         let (l, bc) = (k.0 as usize, k.1);
-        let g = self.gather9(l, bc);
+        // Every value as the GPU's 16-bit samples hold it, so that the surface here is the GPU's to the last bit of
+        // arithmetic: a value interpolated from full-precision samples can land on the other side of zero.
+        let mut g = self.gather9(l, bc);
+        let held_band = self.band(l);
+        for v in g.iter_mut() {
+            *v = as_held(*v, held_band);
+        }
         let (vx, band) = (self.voxel(l), self.band(l));
         let base = bc * B;
         let mut out = BlockSurface { cells: vec![0; N], ..Default::default() };
@@ -2068,10 +2375,9 @@ impl LevelVolume {
                     let (m, j) = self.canonical(l + 1, p, cap);
                     if m > l + 1 || self.blocks[l + 1].contains_key(&p.div_euclid(B3)) {
                         let j = if m > l + 1 { j } else { p };
-                        // Within the band, as the 16-bit samples hold it: mid-stroke, carried detail can lie past it.
+                        // As the 16-bit samples hold it (within the band: mid-stroke, carried detail can lie past it).
                         let m = m.max(l + 1);
-                        let band = self.band(m);
-                        return self.blocks[m][&j.div_euclid(B3)][local(j)].clamp(-band, band);
+                        return as_held(self.blocks[m][&j.div_euclid(B3)][local(j)], self.band(m));
                     }
                     trilinear(h.as_vec3() * 0.5, d)
                 };
@@ -2339,7 +2645,7 @@ impl LevelVolume {
             r.read_exact(&mut b)?;
             Ok(IVec3::new(i32::from_le_bytes(b[0..4].try_into().unwrap()), i32::from_le_bytes(b[4..8].try_into().unwrap()), i32::from_le_bytes(b[8..12].try_into().unwrap())))
         };
-        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![HashMap::default(); n.max(levels.min(MAX_LEVELS))], inside0: HashSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: HashMap::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![Shared::default(); n.max(levels.min(MAX_LEVELS))], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
         for _ in 0..u32_(r)? {
             v.inside0.insert(ivec(r)?);
         }
@@ -2370,7 +2676,7 @@ impl LevelVolume {
     /// A single-resolution volume as level 0 of a new one with `levels` levels.
     pub fn from_volume(old: &super::volume::Volume, levels: usize) -> LevelVolume {
         let (origin, dims) = old.grid();
-        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![HashMap::default(); levels.clamp(1, MAX_LEVELS)], inside0: HashSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: HashMap::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![Shared::default(); levels.clamp(1, MAX_LEVELS)], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
         let band = v.band(0);
         let stored: HashMap<u32, &[f32; N]> = old.stored().collect();
         for (b, &sign) in old.signs().iter().enumerate() {

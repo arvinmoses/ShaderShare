@@ -8,10 +8,12 @@
 //! (`gpu_levels`), built there from the blocks a stroke changed. Strokes can be undone, and the volume saved and opened
 //! (`.svol`); layers and the procedural stack are not here yet.
 
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
 use glam::Vec3;
-use sculpt_core::generator::level_volume::LevelVolume;
+use sculpt_core::generator::level_volume::{CarryDone, LevelVolume};
 
 /// Levels in a new volume: level 0 and five finer, the finest 32 times finer.
 pub const LEVELS: usize = 6;
@@ -19,9 +21,8 @@ pub const LEVELS: usize = 6;
 const PIXELS_PER_STEP: f32 = 1.0;
 /// The most lattice steps across a brush's radius: bigger brushes work a level coarser.
 const MAX_STEPS_PER_RADIUS: f32 = 48.0;
-/// Milliseconds a frame may spend carrying finer detail along under a coarse stroke; the rest follows next frame.
-/// Spent once a frame in [`VolumeMode::tick`], however many dabs the frame has: dabs only queue the work.
-const CARRY_MS: f64 = 6.0;
+/// Finer blocks a carrying job takes at most: one job runs at a time, on its own threads, while the frames go on.
+const CARRY_JOB: usize = 384;
 
 pub struct VolumeMode {
     pub vol: LevelVolume,
@@ -50,6 +51,16 @@ pub struct VolumeMode {
     stroke_n: Vec3,
     /// Whether the stroke under way has chosen its level yet.
     chosen: bool,
+    /// Carrying detail under a coarse stroke runs here, off the frame, a job at a time.
+    pool: Arc<rayon::ThreadPool>,
+    job: Option<Receiver<CarryDone>>,
+    /// The last carrying job: blocks, and its time on its threads.
+    pub carry_blocks: usize,
+    pub carry_ms: f64,
+    /// The pen is up but detail is still being carried: the stroke ends once it is all in.
+    ending: bool,
+    /// Specks the last stroke to end left, removed, until read.
+    ended_specks: Option<usize>,
 }
 
 impl VolumeMode {
@@ -61,7 +72,11 @@ impl VolumeMode {
 
     pub fn new(mut vol: LevelVolume) -> VolumeMode {
         let cap = vol.levels() - 1;
+        // Dabs only queue the carrying; jobs on the pool do it.
         vol.carry_budget = Some(0.0);
+        // A quarter of the cores: the dabs and the sync want the rest, and more would only slow them.
+        let threads = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).max(2);
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("carry {i}")).build().expect("a thread pool"));
         VolumeMode {
             vol,
             generation: 1,
@@ -79,6 +94,12 @@ impl VolumeMode {
             gpu_ms: 0.0,
             stroke_n: Vec3::ZERO,
             chosen: false,
+            pool,
+            job: None,
+            carry_blocks: 0,
+            carry_ms: 0.0,
+            ending: false,
+            ended_specks: None,
         }
     }
 
@@ -122,34 +143,103 @@ impl VolumeMode {
         self.dab_ms = if self.dab_ms == 0.0 { ms } else { self.dab_ms * 0.8 + ms * 0.2 };
     }
 
-    /// Once a frame: carry on carrying detail a coarse stroke queued (see `LevelVolume::carry_pending`).
+    /// Once a frame: bring in a carrying job that finished, and start the next on what is queued (see
+    /// `LevelVolume::carry_take`).
     pub fn tick(&mut self) {
-        if self.vol.carry_busy() {
-            let t = Instant::now();
-            self.vol.carry_pending(Some(CARRY_MS));
-            self.last_ms += t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        if let Some(rx) = &self.job {
+            match rx.try_recv() {
+                Ok(done) => {
+                    self.carry_blocks = done.blocks;
+                    self.carry_ms = done.ms;
+                    self.vol.carry_apply(done);
+                    self.job = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.job = None,
+            }
+        }
+        if self.job.is_none()
+            && let Some(job) = self.vol.carry_take(CARRY_JOB)
+        {
+            let (tx, rx) = channel();
+            self.pool.spawn(move || {
+                let _ = tx.send(job.run());
+            });
+            self.job = Some(rx);
+        }
+        if self.ending && !self.carrying() {
+            self.finish_stroke();
+        }
+        self.last_ms += t.elapsed().as_secs_f64() * 1e3;
+    }
+
+    fn finish_stroke(&mut self) {
+        self.ending = false;
+        self.ended_specks = Some(self.vol.end_stroke().specks);
+    }
+
+    /// Finish a stroke whose detail is still being carried, now: before anything that needs the volume settled (a
+    /// new stroke, undo, saving).
+    pub fn settle(&mut self) {
+        if self.ending {
+            self.finish_job();
+            self.finish_stroke();
         }
     }
 
+    /// Whether frames should keep coming to finish carrying.
+    pub fn busy(&self) -> bool {
+        self.ending || self.carrying()
+    }
+
+    /// The specks the last stroke to end left, removed, once.
+    pub fn take_specks(&mut self) -> Option<usize> {
+        self.ended_specks.take()
+    }
+
+    /// Wait for the carrying job under way, if any, and bring it in.
+    fn finish_job(&mut self) {
+        if let Some(rx) = self.job.take()
+            && let Ok(done) = rx.recv()
+        {
+            self.vol.carry_apply(done);
+        }
+    }
+
+    /// Whether detail is still being carried (queued, or a job under way).
+    pub fn carrying(&self) -> bool {
+        self.job.is_some() || self.vol.carry_busy()
+    }
+
     pub fn begin_stroke(&mut self) {
+        self.settle();
         self.vol.begin_stroke();
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
     }
 
-    /// Returns the specks the stroke left that were removed.
-    pub fn end_stroke(&mut self) -> usize {
+    /// The pen is up: the stroke ends once the detail it queued is all carried, frames going on meanwhile (see
+    /// [`Self::take_specks`]).
+    pub fn end_stroke(&mut self) {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
-        self.vol.end_stroke().specks
+        if self.vol.in_stroke() {
+            self.ending = true;
+        }
+        if !self.carrying() {
+            self.settle();
+        }
     }
 
     pub fn undo(&mut self) -> bool {
+        self.settle();
         self.stroke_n = Vec3::ZERO;
         self.vol.undo()
     }
 
     pub fn redo(&mut self) -> bool {
+        self.settle();
         self.stroke_n = Vec3::ZERO;
         self.vol.redo()
     }

@@ -68,7 +68,9 @@ AMD Radeon AI PRO R9700, Vulkan.
 redoes and shows every level cap, and after each step compares the GPU's surface with the reference block by block:
 every cell word (vertex numbering, pieces, corner signs) and every quad, corner by corner, in order, are identical;
 vertices agree within 0.008 of a lattice step (16-bit samples). With `SCULPT_CHECK_EVERY_DAB=1` it compares after
-every dab of every stroke, with detail carried 0.5 ms at a time so queued blocks arrive late, as in the app. It passed
+every dab of every stroke, with detail carried 0.5 ms at a time so queued blocks arrive late, then all over again
+carrying in jobs that land a dab late, as the app's do. The reference reads every sample as the GPU's 16 bits hold
+it, so both build the surface from the same numbers. It passed
 on DX12 earlier in this work; DX12's shader compiler now fails on the vertex pass (see the gaps).
 
 **Core tests** (`tests/level_volume.rs`): a fresh ball and plane brushes at every level give no open edges, no
@@ -92,12 +94,22 @@ such bumps before and after.
 | 4 | 0.0002 | 37 | 1.0 ms | 0.9 ms | 3.0 ms | 347 | 31 ms |
 | 5 | 0.0001 | 37 | 0.9 ms | 0.9 ms | 4.6 ms | 323 | 25 ms |
 
-A level 0 stroke of radius 0.3 right over the fine work is the slow case. Timed frame by frame as the app runs it
-(two dabs a frame, the app's spacing apart; dabs only queue the carrying, which then gets 6 ms a frame): 30 ms of CPU
-a frame (dabs 10.6, carrying 8.3, sync 11.2), up to 387 finer blocks carried a frame; the queued detail then catches
-up in about 60 frames (0.66 s) and the pen lift takes 0.31 s.
+A level 0 stroke of radius 0.3 right over the fine work, timed frame by frame as the app runs it (two dabs a frame,
+the app's spacing apart): 25 ms a frame on the main thread (dabs 13.9, sync 13.0, bringing in and starting carrying
+jobs 0.1). The carrying runs on a quarter of the cores, off the frame. When the pen lifts, frames go on at 0.2 ms
+each until the detail is all in (0.9 s, about 50 frames), and then the stroke ends in 0.31 s.
+
+The dabs now cost about what the same dabs over bare clay do: a radius of 0.3 is 85 level 0 steps and changes about
+2400 blocks a dab.
 
 That case was 100 ms a frame and 1.8 s of catching up. What it took:
+
+* **Carrying on another thread.** A job takes queued blocks (a level's only once the coarser ones queued are all
+  taken, since carrying reads the level below as carried) with a copy of the volume. The worker carries them on
+  that copy while the next dabs change the original, and the frame after it finishes brings the result in. A block
+  whose ground a later dab changes is queued again, so a result that comes in late is replaced. The copy costs
+  almost nothing: stored blocks are shared, and each level's map is split into 1024 shards by place, each copied
+  only when written while a job still holds it. Keeping a block for undo is now sharing it, not copying it.
 
 * Every point whose move a carried block reads is measured once per batch. Some were missed and measured again by
   every block reading them: three quarters of the carrying time.
@@ -105,7 +117,7 @@ That case was 100 ms a frame and 1.8 s of catching up. What it took:
   after a dab only the measurements and carried blocks within two blocks of what it changed are redone.
 * The finer blocks under a dab are found from the finer levels' side (thousands of blocks) rather than by walking
   down from the 2000-odd coarse blocks a big dab touches.
-* The carrying budget is spent once a frame, not once per dab.
+* Before the worker, the carrying budget was spent once a frame rather than once per dab.
 * The volume's maps hash block coordinates the fast way, not with the default hash, built to resist crafted keys.
 * Syncing: a block whose 16-bit samples come out as the GPU already has them is neither sent nor rebuilt (about
   half under a big stroke). Block coordinates go only to slots given a new block, in runs of consecutive slots,
@@ -132,6 +144,10 @@ half are skipped as facing away.
   buried; then blocks the detail had moved into kept an early dab's values (square platforms). Measuring the move,
   taking the old surface's normal at the source, carrying moved blocks again each dab and a wider level 0 band fixed
   it (the grooves ride along; some small steps remain).
+* Interpolated between full-precision samples, a value can land on the other side of zero from the same value
+  interpolated between the GPU's 16-bit ones (0.0000008 against one 16-bit step of 0.000015): a cell then has one
+  crossing more on one side, and its vertex moves 0.15 steps. Carrying in jobs happened to make such a cell. The
+  reference now reads every sample as the GPU holds it.
 * A cell next to a finer one, deep in fresh clay, with no crossing on its faces fell back to stepping onto the zero
   along the gradient; with every corner at the band the gradient was rounding, and the GPU and the reference put the
   vertex 0.9 steps apart. Both now keep the cell's centre unless the gradient is clear and the zero lies in the cell.
@@ -152,11 +168,12 @@ one array of atomics at fixed places. The exact check runs on both backends.
   the Mesh menu. Choosing the level per region by distance and by how much detail it holds (the error per block is
   stored for it), and a vertex budget, are next.
 * **No occlusion culling yet**, only view and facing.
-* **Big strokes over much fine detail are still not smooth**: about 30 ms a frame on this machine (a radius of 0.3
-  over a patch with detail at levels 2-5), and the carried detail takes about 0.7 s to catch up. Carrying on a
-  worker thread, which needs blocks that can be shared without copying, would take its 6-8 ms out of the frame.
-  Lifting the pen after ordinary strokes costs 25-80 ms (distances again, form moved down, speck search, on the
-  CPU).
+* **The pen lift after a big stroke takes 0.3 s** on the main thread (distances again, form moved down, speck
+  search), after the carried detail is in; 25-80 ms after ordinary strokes. It could run as a job too.
+* **Very big brushes on a fine level 0 cost about 7 ms a dab** (2400 blocks changed); a frame with several such dabs
+  runs at 30-40 fps, detail or not.
+* Carrying in jobs leaves a few empty in-between blocks that carrying all at once drops (up to 10 a level in the
+  tests); they hold nothing and cost little.
 * **DX12 fails to compile the vertex pass** (its FXC compiler aborts with an internal error). The app picks Vulkan on
   this machine; on DX12-only machines the volume mode would not start. Trying the newer DXC compiler, or splitting the
   transition-cell code out of the vertex pass, is next.

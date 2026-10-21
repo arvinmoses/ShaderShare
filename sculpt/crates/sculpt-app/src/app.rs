@@ -569,7 +569,8 @@ impl SculptApp {
             Dialog::SaveAs(p) => self.save_to(PathBuf::from(p)),
             Dialog::SaveVolume(p) => {
                 let t = Instant::now();
-                let Some(mode) = self.volume_mode.as_ref() else { return };
+                let Some(mode) = self.volume_mode.as_mut() else { return };
+                mode.settle();
                 let r = std::fs::File::create(&p).and_then(|f| {
                     let mut w = std::io::BufWriter::new(f);
                     mode.vol.write_to(&mut w)?;
@@ -639,10 +640,7 @@ impl SculptApp {
         self.pending.clear();
         let stroke = std::mem::replace(&mut self.stroke, Stroke::None);
         if let (Stroke::Volume { .. }, Some(mode)) = (&stroke, self.volume_mode.as_mut()) {
-            let specks = mode.end_stroke();
-            if specks > 0 {
-                self.status = format!("Removed {specks} speck{} the stroke left", if specks == 1 { "" } else { "s" });
-            }
+            mode.end_stroke();
         }
         if let Some(doc) = self.doc.as_mut() {
             match stroke {
@@ -1054,6 +1052,14 @@ impl SculptApp {
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
             if let Some(mode) = self.volume_mode.as_mut() {
                 mode.tick();
+                if let Some(specks) = mode.take_specks()
+                    && specks > 0
+                {
+                    self.status = format!("Removed {specks} speck{} the stroke left", if specks == 1 { "" } else { "s" });
+                }
+                if mode.busy() {
+                    ctx.request_repaint();
+                }
                 vp.sync_volume(rs, mode);
                 self.stats.upload = vp.last_upload;
             } else if let Some(doc) = self.doc.as_mut() {

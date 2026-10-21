@@ -265,9 +265,22 @@ fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
     // Bumps 4 thousandths across: at least a couple of steps of the level they are made at.
     // The last: many strokes, raising the area far more than the band of any finer level.
     // And on a finer level 0 (about 1M triangles' step), whose band is far narrower than the rise.
-    for (fine, carve, strokes, voxel0) in [(5usize, false, 2, 0.02), (5, true, 2, 0.02), (4, false, 2, 0.02), (4, true, 2, 0.02), (3, false, 2, 0.02), (4, false, 6, 0.02), (3, false, 2, 0.005)] {
+    // With `jobs`, as the app carries: taken off the queue after each dab and brought in after the next one, so every
+    // job's result lands on a volume a dab has changed since.
+    for (fine, carve, strokes, voxel0, jobs) in [
+        (5usize, false, 2, 0.02, false),
+        (5, true, 2, 0.02, false),
+        (4, false, 2, 0.02, false),
+        (4, true, 2, 0.02, false),
+        (3, false, 2, 0.02, false),
+        (4, false, 6, 0.02, false),
+        (3, false, 2, 0.005, false),
+        (5, false, 2, 0.02, true),
+        (4, false, 6, 0.02, true),
+        (3, false, 2, 0.005, true),
+    ] {
         let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel0, fine + 1);
-        v.carry_budget = Some(2.0);
+        v.carry_budget = Some(if jobs { 0.0 } else { 2.0 });
         // A row of separate bumps (or pits) at a fine level, each its own stroke.
         let xs: Vec<f32> = (0..5).map(|i| -0.024 + 0.012 * i as f32).collect();
         for &x in &xs {
@@ -305,6 +318,7 @@ fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
         for _ in 0..strokes {
             v.begin_stroke();
             let mut along = Vec3::ZERO;
+            let mut held: Option<sculpt_core::generator::level_volume::CarryJob> = None;
             for k in 0..=8 {
                 let dir = Vec3::new(0.0, -0.1 + 0.2 * k as f32 / 8.0, 1.0).normalize();
                 let Some((hit, n)) = v.raycast(dir * 3.0, -dir, 0, true) else { continue };
@@ -312,12 +326,23 @@ fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
                 if let Some((n, _)) = v.plane_dab(0, hit, rough, 0.3, 0.3 * 0.095, 0.5, 0.4, false) {
                     along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
                 }
-                v.carry_pending(Some(2.0));
+                if jobs {
+                    if let Some(job) = held.take() {
+                        let done = job.run();
+                        v.carry_apply(done);
+                    }
+                    held = v.carry_take(64);
+                } else {
+                    v.carry_pending(Some(2.0));
+                }
+            }
+            if let Some(job) = held.take() {
+                v.carry_apply(job.run());
             }
             v.end_stroke();
         }
         let after = relief(&v);
-        eprintln!("level {fine} (level 0 step {voxel0}) {} after {strokes} strokes: relief {before:.5} -> {after:.5} ({:.0}%), the area rose {:.4}; blocks per level {blocks0:?} -> {:?}", if carve { "pits" } else { "bumps" }, 100.0 * after / before, height(&v, 0.0) - top0, v.memory().0);
+        eprintln!("level {fine} (level 0 step {voxel0}{}) {} after {strokes} strokes: relief {before:.5} -> {after:.5} ({:.0}%), the area rose {:.4}; blocks per level {blocks0:?} -> {:?}", if jobs { ", carried in jobs" } else { "" }, if carve { "pits" } else { "bumps" }, 100.0 * after / before, height(&v, 0.0) - top0, v.memory().0);
         results.push((before, height(&v, 0.0) - top0, after));
     }
     for (before, rose, after) in results {
