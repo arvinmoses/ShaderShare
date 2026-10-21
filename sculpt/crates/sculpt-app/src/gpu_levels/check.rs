@@ -355,12 +355,38 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             }
         }
         let catch_up = t.elapsed().as_secs_f64() * 1e3;
+        // Then the stroke's end, as a job on the shared threads, frames going on until it is in.
         let t = Instant::now();
-        vol.end_stroke();
-        let end_ms = t.elapsed().as_secs_f64() * 1e3;
+        let take = Instant::now();
+        let end_job = vol.end_stroke_take().expect("the stroke changed something");
+        let take_ms = take.elapsed().as_secs_f64() * 1e3;
+        let (tx, rx) = std::sync::mpsc::channel();
+        rayon::spawn(move || {
+            let _ = tx.send(end_job.run());
+        });
+        let (mut end_frames, mut end_frame_ms) = (0, Vec::new());
+        let (end, apply_ms) = loop {
+            let tf = Instant::now();
+            if let Ok(done) = rx.try_recv() {
+                let ta = Instant::now();
+                let end = vol.end_stroke_apply(done);
+                break (end, ta.elapsed().as_secs_f64() * 1e3);
+            }
+            gpu.sync(&mut vol);
+            end_frame_ms.push(tf.elapsed().as_secs_f64() * 1e3);
+            end_frames += 1;
+            let left = 16.7 - tf.elapsed().as_secs_f64() * 1e3;
+            if left > 0.0 {
+                std::thread::sleep(std::time::Duration::from_secs_f64(left / 1e3));
+            }
+        };
+        let end_wall = t.elapsed().as_secs_f64() * 1e3;
+        let ts = Instant::now();
         gpu.sync(&mut vol);
+        let end_sync = ts.elapsed().as_secs_f64() * 1e3;
         vol.carry_budget = Some(6.0);
-        println!("a level 0 stroke (radius 0.3) over the fine work, two dabs a frame, carried on {threads} threads of its own: frame {:.1} ms on the main thread (median: dabs {:.1}, bringing in and starting jobs {:.1}, sync {:.1}; up to {most} finer blocks a job); after the pen lifts the detail was all in after {frames} frames ({catch_up:.0} ms, {:.1} ms a frame), then the stroke ended in {end_ms:.0} ms", median(frame_ms), median(dab_ms), median(tick_ms), median(sync_ms), median(after_ms));
+        println!("a level 0 stroke (radius 0.3) over the fine work, two dabs a frame, carried on {threads} threads of its own: frame {:.1} ms on the main thread (median: dabs {:.1}, bringing in and starting jobs {:.1}, sync {:.1}; up to {most} finer blocks a job); after the pen lifts the detail was all in after {frames} frames ({catch_up:.0} ms, {:.1} ms a frame)", median(frame_ms), median(dab_ms), median(tick_ms), median(sync_ms), median(after_ms));
+        println!("  then the stroke's end as a job: {:.0} ms of its own, in {end_frames} frames ({end_wall:.0} ms, {:.1} ms a frame); on the main thread {take_ms:.1} ms to start it, {apply_ms:.1} ms to take it in and {end_sync:.1} ms to sync what it changed", end.ms, median(end_frame_ms));
     }
     println!();
     println!("| level | step | brush radius (steps) | dab ms CPU | sync ms CPU | sync to GPU done ms | blocks uploaded / extracted (most) | stroke end ms | extracted after |");

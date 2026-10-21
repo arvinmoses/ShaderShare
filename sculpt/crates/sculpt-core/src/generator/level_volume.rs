@@ -485,6 +485,26 @@ pub struct CarryJob {
     level: usize,
 }
 
+/// A stroke's end to work out on another thread (see [`LevelVolume::end_stroke_take`]).
+pub struct EndJob {
+    vol: LevelVolume,
+}
+
+/// What an [`EndJob`] did, for [`LevelVolume::end_stroke_apply`].
+pub struct EndDone {
+    vol: LevelVolume,
+    end: StrokeEnd,
+}
+
+impl EndJob {
+    pub fn run(mut self) -> EndDone {
+        let t = Instant::now();
+        let mut end = self.vol.stroke_end_steps();
+        end.ms = t.elapsed().as_secs_f64() * 1e3;
+        EndDone { vol: self.vol, end }
+    }
+}
+
 /// What a [`CarryJob`] carried, for [`LevelVolume::carry_apply`].
 pub struct CarryDone {
     /// Blocks it changed: their samples, or `None` where it dropped one.
@@ -1691,17 +1711,59 @@ impl LevelVolume {
     /// [`Self::undo`].
     pub fn end_stroke(&mut self) -> StrokeEnd {
         let t = Instant::now();
-        let mut out = StrokeEnd::default();
         if self.stroke.as_ref().is_none_or(|s| s.is_empty()) {
             self.stroke = None;
-            return out;
+            return StrokeEnd::default();
         }
+        let mut out = self.stroke_end_steps();
+        self.keep_stroke();
+        out.ms = t.elapsed().as_secs_f64() * 1e3;
+        out
+    }
+
+    /// What ending a stroke changes in the field: the rest of its carrying, distances again, form moved down, specks.
+    fn stroke_end_steps(&mut self) -> StrokeEnd {
+        let mut out = StrokeEnd::default();
         self.carry_pending(None);
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
         self.redistance(&touched);
         out.rebased = self.rebase(&touched);
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
         out.specks = self.remove_specks(&touched, SPECK_VERTS);
+        out
+    }
+
+    /// End a stroke on another thread: [`EndJob::run`] does the field's part on a copy of the volume, and
+    /// [`Self::end_stroke_apply`] takes its result. Nothing may change the volume in between (the caller waits for the
+    /// job before the next stroke, an undo or a save); what it changes is then exactly the copy's. `None` when the
+    /// stroke changed nothing (it has ended).
+    pub fn end_stroke_take(&mut self) -> Option<EndJob> {
+        if self.stroke.as_ref().is_none_or(|s| s.is_empty()) {
+            self.stroke = None;
+            return None;
+        }
+        // Carrying the job's copy cannot do (it starts with nothing queued).
+        self.carry_pending(None);
+        let mut vol = self.snapshot();
+        vol.pending = self.pending.clone();
+        Some(EndJob { vol })
+    }
+
+    /// Take what an [`EndJob`] did, and keep the stroke for [`Self::undo`].
+    pub fn end_stroke_apply(&mut self, done: EndDone) -> StrokeEnd {
+        let EndDone { vol, mut end } = done;
+        let t = Instant::now();
+        self.blocks = vol.blocks;
+        self.inside0 = vol.inside0;
+        self.stroke = vol.stroke;
+        self.dirty.extend(vol.dirty);
+        self.keep_stroke();
+        end.ms += t.elapsed().as_secs_f64() * 1e3;
+        end
+    }
+
+    /// Put the stroke just ended in the history, dropping the oldest strokes past [`HISTORY_BYTES`].
+    fn keep_stroke(&mut self) {
         let saved = self.stroke.take().unwrap_or_default();
         self.history.push(saved);
         self.redo.clear();
@@ -1710,8 +1772,6 @@ impl LevelVolume {
         while total > HISTORY_BYTES && self.history.len() > 1 {
             total -= size(&self.history.remove(0));
         }
-        out.ms = t.elapsed().as_secs_f64() * 1e3;
-        out
     }
 
     pub fn undo(&mut self) -> bool {

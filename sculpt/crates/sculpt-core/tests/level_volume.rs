@@ -351,3 +351,54 @@ fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
         assert!(after > 0.55 * before, "the fine detail was lost");
     }
 }
+
+/// Ending a stroke on another thread (a job on a copy, its result taken back) leaves exactly what ending it at once
+/// does, and undoes the same.
+#[test]
+fn a_stroke_ended_in_a_job_is_the_same_stroke() {
+    let make = || {
+        let mut v = ball(4);
+        // Fine work, broad clay over it, then a ridge at level 2 built tall enough to move form down a level; the last
+        // pass is left open.
+        stroke(&mut v, 3, Vec3::new(0.0, 0.05, 1.0), Vec3::new(0.05, 0.05, 1.0), 0.01, 1.0, false);
+        stroke(&mut v, 0, Vec3::new(-0.3, 0.0, 1.0), Vec3::new(0.3, 0.1, 1.0), 0.3, 1.0, false);
+        for _ in 0..11 {
+            stroke(&mut v, 2, Vec3::new(-0.06, 0.0, 1.0), Vec3::new(0.06, 0.0, 1.0), 0.03, 1.0, false);
+        }
+        let mut open = stroke_open(&mut v, 2, Vec3::new(-0.06, 0.0, 1.0), Vec3::new(0.06, 0.0, 1.0), 0.03);
+        open.carry_pending(None);
+        open
+    };
+    let bytes = |v: &LevelVolume| {
+        let mut b = Vec::new();
+        v.write_to(&mut b).unwrap();
+        b
+    };
+    let (mut now, mut later) = (make(), make());
+    let a = now.end_stroke();
+    let job = later.end_stroke_take().expect("the stroke changed something");
+    let b = later.end_stroke_apply(job.run());
+    eprintln!("ended at once: {} rebased, {} specks; in a job: {} rebased, {} specks", a.rebased, a.specks, b.rebased, b.specks);
+    assert_eq!((a.specks, a.rebased), (b.specks, b.rebased));
+    assert!(a.rebased > 0, "the ridge should have moved form down a level");
+    assert!(bytes(&now) == bytes(&later), "ending in a job left a different volume");
+    assert!(now.undo() && later.undo());
+    assert!(bytes(&now) == bytes(&later), "the strokes ended in a job undo differently");
+}
+
+/// [`stroke`] without its end.
+fn stroke_open(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32) -> LevelVolume {
+    let mut w = std::mem::replace(v, ball(1));
+    w.begin_stroke();
+    let steps = (((b - a).length() / (0.15 * r)).ceil() as usize).max(1);
+    let mut along = Vec3::ZERO;
+    for k in 0..=steps {
+        let dir = a.lerp(b, k as f32 / steps as f32).normalize();
+        let Some((hit, n)) = w.raycast(dir * 3.0, -dir, l, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = w.plane_dab(l, hit, rough, r, r * 0.095, 0.5, 0.4, false) {
+            along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+        }
+    }
+    w
+}

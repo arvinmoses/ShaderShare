@@ -97,7 +97,13 @@ such bumps before and after.
 A level 0 stroke of radius 0.3 right over the fine work, timed frame by frame as the app runs it (two dabs a frame,
 the app's spacing apart): 25 ms a frame on the main thread (dabs 13.9, sync 13.0, bringing in and starting carrying
 jobs 0.1). The carrying runs on a quarter of the cores, off the frame. When the pen lifts, frames go on at 0.2 ms
-each until the detail is all in (0.9 s, about 50 frames), and then the stroke ends in 0.31 s.
+each until the detail is all in (0.9 s, about 50 frames). Then the stroke ends as a job too (distances again, form
+moved down, specks: 0.32 s on the shared threads, about 16 frames), and taking its result costs the main thread
+1.5 ms, plus one frame's sync of about 25 ms for the blocks it changed.
+
+Ending a stroke in a job works on a copy of the volume while nothing else may change it: the next stroke, an undo
+or a save waits for it, and its result is then the copy's maps, taken as they are. A test checks that a stroke ended
+this way is byte for byte the stroke ended at once, and undoes the same.
 
 The dabs now cost about what the same dabs over bare clay do: a radius of 0.3 is 85 level 0 steps and changes about
 2400 blocks a dab.
@@ -168,8 +174,8 @@ one array of atomics at fixed places. The exact check runs on both backends.
   the Mesh menu. Choosing the level per region by distance and by how much detail it holds (the error per block is
   stored for it), and a vertex budget, are next.
 * **No occlusion culling yet**, only view and facing.
-* **The pen lift after a big stroke takes 0.3 s** on the main thread (distances again, form moved down, speck
-  search), after the carried detail is in; 25-80 ms after ordinary strokes. It could run as a job too.
+* **Starting a stroke right after a big one waits** for the last one's end (up to about 0.3 s after a big stroke
+  over detail, if the pen comes down at once).
 * **Very big brushes on a fine level 0 cost about 7 ms a dab** (2400 blocks changed); a frame with several such dabs
   runs at 30-40 fps, detail or not.
 * Carrying in jobs leaves a few empty in-between blocks that carrying all at once drops (up to 10 a level in the

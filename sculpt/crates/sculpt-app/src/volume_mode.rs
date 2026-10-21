@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
 use glam::Vec3;
-use sculpt_core::generator::level_volume::{CarryDone, LevelVolume};
+use sculpt_core::generator::level_volume::{CarryDone, EndDone, LevelVolume};
 
 /// Levels in a new volume: level 0 and five finer, the finest 32 times finer.
 pub const LEVELS: usize = 6;
@@ -59,6 +59,10 @@ pub struct VolumeMode {
     pub carry_ms: f64,
     /// The pen is up but detail is still being carried: the stroke ends once it is all in.
     ending: bool,
+    /// The stroke's end being worked out off the frame (see `LevelVolume::end_stroke_take`).
+    end_job: Option<Receiver<EndDone>>,
+    /// How long the last stroke's end took on its threads.
+    pub end_ms: f64,
     /// Specks the last stroke to end left, removed, until read.
     ended_specks: Option<usize>,
 }
@@ -99,6 +103,8 @@ impl VolumeMode {
             carry_blocks: 0,
             carry_ms: 0.0,
             ending: false,
+            end_job: None,
+            end_ms: 0.0,
             ended_specks: None,
         }
     }
@@ -169,26 +175,62 @@ impl VolumeMode {
             self.job = Some(rx);
         }
         if self.ending && !self.carrying() {
-            self.finish_stroke();
+            match &self.end_job {
+                None => self.start_end(),
+                Some(rx) => match rx.try_recv() {
+                    Ok(done) => self.take_end(done),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        self.end_job = None;
+                        self.ending = false;
+                    }
+                },
+            }
         }
         self.last_ms += t.elapsed().as_secs_f64() * 1e3;
     }
 
-    fn finish_stroke(&mut self) {
-        self.ending = false;
-        self.ended_specks = Some(self.vol.end_stroke().specks);
-    }
-
-    /// Finish a stroke whose detail is still being carried, now: before anything that needs the volume settled (a
-    /// new stroke, undo, saving).
-    pub fn settle(&mut self) {
-        if self.ending {
-            self.finish_job();
-            self.finish_stroke();
+    /// Work out the stroke's end on the shared threads (nothing else wants them once the pen is up).
+    fn start_end(&mut self) {
+        match self.vol.end_stroke_take() {
+            Some(job) => {
+                let (tx, rx) = channel();
+                rayon::spawn(move || {
+                    let _ = tx.send(job.run());
+                });
+                self.end_job = Some(rx);
+            }
+            None => self.ending = false,
         }
     }
 
-    /// Whether frames should keep coming to finish carrying.
+    fn take_end(&mut self, done: EndDone) {
+        let end = self.vol.end_stroke_apply(done);
+        self.end_ms = end.ms;
+        self.ended_specks = Some(end.specks);
+        self.end_job = None;
+        self.ending = false;
+    }
+
+    /// Finish a stroke whose end is still being worked out, now: before anything that needs the volume settled (a
+    /// new stroke, undo, saving).
+    pub fn settle(&mut self) {
+        if !self.ending {
+            return;
+        }
+        self.finish_job();
+        if self.end_job.is_none() {
+            self.start_end();
+        }
+        if let Some(rx) = self.end_job.take() {
+            match rx.recv() {
+                Ok(done) => self.take_end(done),
+                Err(_) => self.ending = false,
+            }
+        }
+    }
+
+    /// Whether frames should keep coming to finish carrying or ending a stroke.
     pub fn busy(&self) -> bool {
         self.ending || self.carrying()
     }
@@ -219,16 +261,13 @@ impl VolumeMode {
         self.chosen = false;
     }
 
-    /// The pen is up: the stroke ends once the detail it queued is all carried, frames going on meanwhile (see
-    /// [`Self::take_specks`]).
+    /// The pen is up: the stroke ends off the frame, once the detail it queued is all carried, frames going on
+    /// meanwhile (see [`Self::take_specks`]).
     pub fn end_stroke(&mut self) {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
         if self.vol.in_stroke() {
             self.ending = true;
-        }
-        if !self.carrying() {
-            self.settle();
         }
     }
 
