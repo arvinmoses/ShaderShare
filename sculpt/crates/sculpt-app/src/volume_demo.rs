@@ -146,7 +146,7 @@ impl VolumeDemo {
         at(50.5, 0.0, Tint(false));
         // A big coarse stroke over the detail.
         at(50.5, 2.5, Camera(Pose::at(patch, 3.0)));
-        at(53.0, 7.0, Caption("A big level 0 stroke right over the fine work: the grooves ride along on the new form (the finest dots fade, and a few block-edge steps show)"));
+        at(53.0, 7.0, Caption("A big level 0 stroke right over the fine work: the grooves ride along whole on the new form (the lowest ones and the dots come through faint)"));
         at(53.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.50, 0.40), (0.60, 0.42), 0.0, 8) });
         at(56.5, 3.0, Camera(Pose::at(patch * 1.05, 0.34)));
         at(60.0, 5.0, Caption("Undo and redo: the whole stroke, at every level it touched"));
