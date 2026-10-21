@@ -268,6 +268,16 @@ pub type Key = (u8, IVec3);
 /// One bit per sample.
 type SignMask = [u64; 8];
 
+/// A plane brush's dab as a push on the surface: its centre on the surface, its plane's normal, its radius and
+/// hardness (the fraction of the radius its falloff starts at).
+#[derive(Clone, Copy)]
+struct Push {
+    on: Vec3,
+    n: Vec3,
+    r: f32,
+    hard: f32,
+}
+
 /// A block as it was before a stroke changed it.
 #[derive(Clone)]
 enum Was {
@@ -463,10 +473,11 @@ pub struct LevelVolume {
     /// During a stroke: its change so far at level `carry_level` (the level its dabs write), per block, which finer
     /// levels' detail is carried by.
     carry: Shared<IVec3, Stored>,
-    /// During a stroke: per block at `carry_level`, the directions its dabs pushed the surface in (their planes'
-    /// normals), weighted by each dab's falloff there. Detail is carried along this ([`Self::push_at`]): along the
-    /// surface's normal instead, it slides sideways wherever the stroke leaves a slope.
-    carry_push: Shared<IVec3, Vec3>,
+    /// During a stroke: its dabs so far at `carry_level`, each the direction it pushed the surface in (its plane's
+    /// normal) with its centre, radius and hardness, so that direction can be blended by the dabs' falloff at any
+    /// point ([`Self::push_at`]). Detail is carried along it: along the surface's normal instead, it slides sideways
+    /// wherever the stroke leaves a slope.
+    carry_push: Vec<Push>,
     /// Blocks at `carry_level` dabs changed since the last [`Self::carry_take`]: a job's result lands after them.
     recent: HashSet<IVec3>,
     carry_level: usize,
@@ -551,7 +562,7 @@ impl LevelVolume {
     pub fn from_field<F: Fn(Vec3) -> f32 + Sync>(field: &F, half: f32, voxel0: f32, levels: usize) -> LevelVolume {
         let levels = levels.clamp(1, MAX_LEVELS);
         let origin = Vec3::ZERO;
-        let mut v = LevelVolume { voxel0, origin, blocks: vec![Shared::default(); levels], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Shared::default(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0, origin, blocks: vec![Shared::default(); levels], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
         let band = v.band(0);
         let step = voxel0 * B as f32;
         let lo = ((Vec3::splat(-half) - origin) / step).floor().as_ivec3() - IVec3::ONE;
@@ -935,10 +946,10 @@ impl LevelVolume {
     /// the slab `lo..hi` along `n` from `c`. Each sample moves `weight` of the way to the field combined with it, so
     /// overlapping dabs blend into one smooth change. Then the finer levels' detail moves with the surface.
     #[allow(clippy::too_many_arguments)]
-    /// `push`: the direction the dab moves the surface in (a plane brush's normal), which finer detail is carried
-    /// along; `None` carries it along the surface's normal.
+    /// `push`: the dab as a direction the surface is moved in (a plane brush's), which finer detail is carried along;
+    /// `None` carries it along the surface's normal.
     #[allow(clippy::too_many_arguments)]
-    fn modify(&mut self, l: usize, c: Vec3, reach: f32, k: f32, carve: bool, slab: (Vec3, f32, f32), push: Option<Vec3>, weight: &(dyn Fn(Vec3) -> f32 + Sync), shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> LevelDab {
+    fn modify(&mut self, l: usize, c: Vec3, reach: f32, k: f32, carve: bool, slab: (Vec3, f32, f32), push: Option<Push>, weight: &(dyn Fn(Vec3) -> f32 + Sync), shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> LevelDab {
         let t = Instant::now();
         let mut stats = LevelDab { level: l, ..Default::default() };
         let (vx, band) = (self.voxel(l), self.band(l));
@@ -1021,6 +1032,9 @@ impl LevelVolume {
             self.carry_push.clear();
             self.carry_level = l;
         }
+        if let Some(push) = push {
+            self.carry_push.push(push);
+        }
         let mut flipped: HashMap<IVec3, SignMask> = HashMap::default();
         let mut changed = Vec::with_capacity(built.len());
         for (bc, s, d, flips) in built {
@@ -1031,14 +1045,6 @@ impl LevelVolume {
             let total = Arc::make_mut(self.carry.get_or_insert_with(bc, || Arc::new([0.0; N])));
             for (t, x) in total.iter_mut().zip(d.iter()) {
                 *t += x;
-            }
-            if let Some(u) = push {
-                // Weighted by the brush's own falloff here, not by how much this dab changed: the first dab over a
-                // place changes it most, so weighting by the change would tilt the push toward where the stroke began.
-                let w = weight(self.origin + (bc * B).as_vec3() * vx + Vec3::splat(half));
-                if w > 0.0 {
-                    *self.carry_push.get_or_insert_with(bc, || Vec3::ZERO) += u * w;
-                }
             }
             self.recent.insert(bc);
             changed.push(bc);
@@ -1360,21 +1366,22 @@ impl LevelVolume {
     }
 
     /// The direction the stroke pushed the surface in at level `carry_level`'s lattice coordinates `g`: its dabs'
-    /// directions blended between block centres, so it turns smoothly (taken per block, detail would jump at block
-    /// faces wherever neighbouring blocks were pushed a little differently). `None` where no dab gave one.
+    /// directions blended by each dab's falloff at the point, so it turns as smoothly as the brush itself. Blended
+    /// between blocks instead, it turned in kinks a block apart, and a groove carried along it wandered sideways by a
+    /// step or two within a block and smeared wide and shallow where the kinks met. Weighted by the falloff, not by
+    /// how much each dab changed: the first dab over a place changes it most, which tilted the push toward where the
+    /// stroke began. `None` where no dab reaches.
     fn push_at(&self, g: Vec3) -> Option<Vec3> {
         if self.carry_push.is_empty() {
             return None;
         }
-        let c = (g - Vec3::splat(0.5 * (B - 1) as f32)) / B as f32;
-        let i = c.floor().as_ivec3();
-        let f = c - i.as_vec3();
+        let p = self.origin + g * self.voxel(self.carry_level);
         let mut sum = Vec3::ZERO;
-        for q in 0..8 {
-            let o = IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
-            let Some(u) = self.carry_push.get(&(i + o)) else { continue };
-            let w = (if o.x == 1 { f.x } else { 1.0 - f.x }) * (if o.y == 1 { f.y } else { 1.0 - f.y }) * (if o.z == 1 { f.z } else { 1.0 - f.z });
-            sum += u.normalize_or_zero() * w;
+        for dab in &self.carry_push {
+            let q = p - dab.on;
+            let t = (q - dab.n * q.dot(dab.n)).length();
+            let x = ((t / dab.r - dab.hard) / (1.0 - dab.hard)).clamp(0.0, 1.0);
+            sum += dab.n * (1.0 - x * x * (3.0 - 2.0 * x));
         }
         sum.try_normalize()
     }
@@ -1522,7 +1529,7 @@ impl LevelVolume {
         let kf = k as f32;
         // Where each sample's detail comes from: `-d` farther in along the carrying direction, where the surface moved
         // out by `-d`.
-        let below = self.grid(m - 1, lo.div_euclid(IVec3::splat(2)) - IVec3::ONE, (lo + B3).div_euclid(IVec3::splat(2)) + IVec3::ONE, false);
+        let below = self.grid(m - 1, lo.div_euclid(IVec3::splat(2)) - IVec3::splat(2), (lo + B3).div_euclid(IVec3::splat(2)) + IVec3::splat(2), false);
         // Samples more than two bands from the new surface come out clamped whatever detail they carry.
         let mut far = vec![false; N];
         let mut from: Vec<Option<Vec3>> = vec![None; N];
@@ -1554,10 +1561,13 @@ impl LevelVolume {
         if qlo.x > qhi.x {
             (qlo, qhi) = (lo, lo + IVec3::ONE);
         }
-        let (blo, bhi) = (qlo, qhi.min(qlo + IVec3::splat(4 * B)));
+        // With the point below and the two above every source, which the cubic interpolation reads: with the box
+        // cut at the sources themselves those read as no detail, and every block's edge samples came out short,
+        // a lattice of block-sized dips over everything a big stroke carried.
+        let (blo, bhi) = (qlo - IVec3::ONE, qhi.min(qlo + IVec3::splat(4 * B)) + IVec3::splat(2));
         let unmoved = self.block_values(m, bc, true);
         let base_m = self.grid(m, blo, bhi, true);
-        let base_below = self.grid(m - 1, blo.div_euclid(IVec3::splat(2)), (bhi + IVec3::ONE).div_euclid(IVec3::splat(2)), true);
+        let base_below = self.grid(m - 1, blo.div_euclid(IVec3::splat(2)) - IVec3::ONE, (bhi + IVec3::ONE).div_euclid(IVec3::splat(2)) + IVec3::ONE, true);
         // The detail over the box: the value less the level below's as this level sees it, clamped to this level's
         // band, the way a level is built from the one below where it has no block of its own. It is put back on the
         // new level below clamped the same way; put on it unclamped, a bump taller than about two of this level's
@@ -1809,14 +1819,14 @@ impl LevelVolume {
                 let u = q.dot(n);
                 (plane - u).max(u - (level + depth)).max((q - n * u).length() - r)
             };
-            self.modify(l, on, reach, k, true, (n, plane, level + depth), Some(n), &weight, &shape)
+            self.modify(l, on, reach, k, true, (n, plane, level + depth), Some(Push { on, n, r, hard }), &weight, &shape)
         } else {
             let shape = move |p: Vec3| {
                 let q = p - on;
                 let u = q.dot(n);
                 (u - plane).max((level - depth) - u).max((q - n * u).length() - r)
             };
-            self.modify(l, on, reach, k, false, (n, level - depth, plane), Some(n), &weight, &shape)
+            self.modify(l, on, reach, k, false, (n, level - depth, plane), Some(Push { on, n, r, hard }), &weight, &shape)
         };
         Some((n, dab))
     }
@@ -1868,7 +1878,14 @@ impl LevelVolume {
         self.drop_empty();
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
         self.redistance(&touched);
-        out.rebased = self.rebase(&touched);
+        // Moving form down a level moves the coarser level's values toward the finer surface, which puts its
+        // surface right but leaves the field around it compressed (its slope fell to half a step from the surface):
+        // the finer level's detail against such a field has a slope of its own along the normal, and a later stroke
+        // carrying it a fraction of a step off the surface read that slope as a lattice of dips. So distances again
+        // where it moved.
+        let rebased = self.rebase(&touched);
+        out.rebased = rebased.len();
+        self.redistance(&rebased);
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
         out.specks = self.remove_specks(&touched, SPECK_VERTS);
         out
@@ -2022,8 +2039,20 @@ impl LevelVolume {
                 .filter_map(|&bc| {
                     let lo = bc * B - IVec3::splat(reach.max(1));
                     let g = me.grid(l, lo, bc * B + IVec3::splat(B - 1 + reach.max(1)), false);
-                    // Where the surface crosses the lattice's edges, in lattice units.
-                    let mut crossings: Vec<Vec3> = Vec::new();
+                    // Where the surface crosses the lattice's edges, in lattice units, with the surface's normal there
+                    // (the field's gradient, central differences where the box allows, the edge's own direction at
+                    // its border).
+                    let hi = lo + g.n - IVec3::ONE;
+                    let gradient = |i: IVec3| -> Vec3 {
+                        let d = |axis: usize| {
+                            let (mut a, mut b) = (i, i);
+                            a[axis] = (i[axis] - 1).max(lo[axis]);
+                            b[axis] = (i[axis] + 1).min(hi[axis]);
+                            if a == b { 0.0 } else { (g.at(b) - g.at(a)) / (b[axis] - a[axis]) as f32 }
+                        };
+                        Vec3::new(d(0), d(1), d(2))
+                    };
+                    let mut crossings: Vec<(Vec3, Vec3)> = Vec::new();
                     for z in 0..g.n.z {
                         for y in 0..g.n.y {
                             for x in 0..g.n.x {
@@ -2037,7 +2066,12 @@ impl LevelVolume {
                                     j[axis] += 1;
                                     let b = g.at(j);
                                     if (a < 0.0) != (b < 0.0) {
-                                        crossings.push(i.as_vec3().lerp(j.as_vec3(), a / (a - b)));
+                                        let t = a / (a - b);
+                                        let mut n = gradient(i).lerp(gradient(j), t).normalize_or_zero();
+                                        if n == Vec3::ZERO {
+                                            n = Vec3::AXES[axis] * (b - a).signum();
+                                        }
+                                        crossings.push((i.as_vec3().lerp(j.as_vec3(), t), n));
                                     }
                                 }
                             }
@@ -2049,14 +2083,32 @@ impl LevelVolume {
                     for (i, v) in s.iter_mut().enumerate() {
                         let p = bc * B + cell_of(i);
                         let a = g.at(p);
-                        // A corner of a cell the surface crosses: its value places the surface and sets the normal there.
-                        let near = (0..27).any(|q| q != 13 && (g.at(p + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)) < 0.0) != (a < 0.0));
-                        if near {
-                            continue;
-                        }
+                        // The distance to the surface's tangent plane at the nearest crossing, the samples next to the
+                        // surface included: the plane through a crossing leaves that crossing where it is, so the
+                        // surface stays put (to within its curvature over a step), and every sample is a distance.
+                        // Before, the samples next to the surface kept what the brush left (a plane brush moves
+                        // them part of the way to its plane, a different part at each dab) and the others took the
+                        // distance to the nearest crossing point, up to half the crossings' spacing too far; detail
+                        // carried a fraction of a step along read both as its new surface, a lattice of dips over
+                        // everything a big stroke moved, forty times rougher than the surface had been.
                         let pf = p.as_vec3();
-                        let d2 = crossings.iter().map(|c| c.distance_squared(pf)).fold(f32::INFINITY, f32::min);
-                        let d = (d2.sqrt() * vx).min(band).min(reach as f32 * vx);
+                        let (mut best, mut at) = (f32::INFINITY, usize::MAX);
+                        for (k, c) in crossings.iter().enumerate() {
+                            let d2 = c.0.distance_squared(pf);
+                            if d2 < best {
+                                (best, at) = (d2, k);
+                            }
+                        }
+                        let d = if at == usize::MAX {
+                            band
+                        } else {
+                            // Next to the surface the plane's distance; farther out the plane of whichever crossing
+                            // is nearest jumps as that changes, and the crossing point's own distance (never more
+                            // than half the crossings' spacing too far) is the smoother bound.
+                            let (c, n) = crossings[at];
+                            (pf - c).dot(n).abs().max(best.sqrt() - 0.5) * vx
+                        };
+                        let d = d.min(band).min(reach as f32 * vx);
                         let next = if a < 0.0 { -d } else { d };
                         if next != *v {
                             *v = next;
@@ -2078,8 +2130,8 @@ impl LevelVolume {
     /// broad form built up at a fine level ends up in the level below too, where a distant view sees it and a later
     /// coarse stroke treats it as form. The finer level's values do not change, so neither does the surface. Returns the
     /// coarser blocks changed.
-    fn rebase(&mut self, touched: &[Key]) -> usize {
-        let mut changed_total = 0;
+    fn rebase(&mut self, touched: &[Key]) -> Vec<Key> {
+        let mut changed_total = Vec::new();
         let mut region: HashSet<IVec3> = HashSet::default();
         for m in (1..self.levels()).rev() {
             let mut blocks: Vec<IVec3> = touched.iter().filter(|k| k.0 as usize == m).map(|k| k.1).chain(region.drain()).filter(|bc| self.blocks[m].contains_key(bc)).collect();
@@ -2168,7 +2220,7 @@ impl LevelVolume {
             for (cb, s) in changes {
                 self.put(m - 1, cb, s);
                 region.insert(cb);
-                changed_total += 1;
+                changed_total.push((m as u8 - 1, cb));
             }
         }
         changed_total
@@ -2873,7 +2925,7 @@ impl LevelVolume {
             r.read_exact(&mut b)?;
             Ok(IVec3::new(i32::from_le_bytes(b[0..4].try_into().unwrap()), i32::from_le_bytes(b[4..8].try_into().unwrap()), i32::from_le_bytes(b[8..12].try_into().unwrap())))
         };
-        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![Shared::default(); n.max(levels.min(MAX_LEVELS))], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Shared::default(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![Shared::default(); n.max(levels.min(MAX_LEVELS))], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
         for _ in 0..u32_(r)? {
             v.inside0.insert(ivec(r)?);
         }
@@ -2904,7 +2956,7 @@ impl LevelVolume {
     /// A single-resolution volume as level 0 of a new one with `levels` levels.
     pub fn from_volume(old: &super::volume::Volume, levels: usize) -> LevelVolume {
         let (origin, dims) = old.grid();
-        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![Shared::default(); levels.clamp(1, MAX_LEVELS)], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Shared::default(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![Shared::default(); levels.clamp(1, MAX_LEVELS)], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
         let band = v.band(0);
         let stored: HashMap<u32, &[f32; N]> = old.stored().collect();
         for (b, &sign) in old.signs().iter().enumerate() {

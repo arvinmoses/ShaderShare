@@ -187,6 +187,14 @@ same with linear resampling. What was wrong, and what changed:
 * **Detail is resampled with a cubic** (Catmull-Rom over 4x4x4) rather than linearly, which lost 3-15% of a feature a
   few steps wide each stroke.
 
+* **A lattice of dips under a big stroke** (roughness 60 times what it was) came from level 0, not level 1: moving
+  form down a level (`rebase`) placed level 0's surface right but left the field around it compressed (a slope of
+  0.5-0.9 instead of 1), and the distances were made again before it, not after. Level 1's detail against level 0
+  then sloped along the push, and a source a step or two off read it off by 0.001-0.002. The blocks `rebase` changes
+  are now made distances afterwards, and every sample (those next to the surface too, which kept the brush's blend
+  values) is set to the distance to its nearest crossing's tangent plane. Roughness under the stroke: 0.00058 to
+  0.0001.
+
 ## Driver workarounds (Vulkan, this AMD driver)
 
 Two things in the compute shaders lost the device or silently gave wrong results on Vulkan while DX12 was fine:
@@ -212,8 +220,9 @@ one array of atomics at fixed places. The exact check runs on both backends.
   transition-cell code out of the vertex pass, is next.
 * **The finest work on a slope fades at one end under a big stroke.** In the demo the lower two grooves and the dots
   come through faint: the finest detail shears sideways by about 0.004 over 0.012 there. Not yet diagnosed.
-* **Level 1 gains a little texture under a big stroke** (its roughness about 1.4 times what it was before the
-  cubic resampling below; the texture itself was already there).
+* **A faint lattice texture remains under a big stroke where levels 2-5 hold detail**, and the demo's lower grooves
+  and its dots (level 5) still come through faint (`volume/carry_texture_compare.png`: before the stroke, the build
+  before the fix below, and now).
 * Bumps taller than 2.5 of their level's bands read 3-5% taller after two strokes.
 * **The field is edited on the CPU.** Dabs cost 1-3 ms; the GPU does what grows with the model (extraction, drawing,
   culling). Moving dabs to compute shaders is possible later without changing the layout.

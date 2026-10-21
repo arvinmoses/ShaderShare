@@ -698,40 +698,60 @@ fn a_whole_patch_of_fine_work_rides_a_big_stroke() {
         let jump = a.windows(2).map(|w| (w[1].1 - w[0].1).abs()).fold(0.0f32, f32::max);
         eprintln!("groove {k}: depth median {:.5} -> {:.5}, least {least:.5}; largest jump of its bottom {jump:.5}", median(b), median(a));
         if std::env::var("GROOVE_DUMP").is_ok() {
+            eprintln!("   depth by station before, in 1e-5: {}", b.iter().map(|x| format!("{:.0}", x.0 * 1e5)).collect::<Vec<_>>().join(" "));
             eprintln!("   depth by station, in 1e-5: {}", a.iter().map(|x| format!("{:.0}", x.0 * 1e5)).collect::<Vec<_>>().join(" "));
-            for i in [2usize, 37] {
+            eprintln!("   bottom by station, in 1e-4: {}", a.iter().map(|x| format!("{:+.1}", x.1 * 1e4)).collect::<Vec<_>>().join(" "));
+            for i in [1usize, 20] {
                 let s = -0.006 + 0.012 * i as f32 / 39.0;
                 let line: Vec<String> = (0..41)
                     .map(|j| {
                         let u = -0.004 + 0.0002 * j as f32;
                         let p = grooves[k] + along * s + across * u;
-                        format!("{:.0}", (h(&v, p, 3) - h(&v, p, 5)) * 1e5)
+                        format!("{:.0}/{:.0}", (h(&v, p, 3) - h(&v, p, 5)) * 1e5, (h(&v, p, 1) - h(&v, p, 0)) * 1e5)
                     })
                     .collect();
-                eprintln!("   across at station {i}, u -0.004..0.004, in 1e-5: {}", line.join(" "));
+                eprintln!("   across at station {i}, u -0.004..0.004, groove depth / level 1 over level 0, in 1e-5: {}", line.join(" "));
             }
         }
     }
     eprintln!("dots: {:.5?} -> {:.5?}", dots0, dots1);
     if std::env::var("GROOVE_DUMP").is_ok() {
         eprintln!("   roughness by cap after: {:?}", (0..=5).map(|c| format!("{:.6}", roughness_at(&v, c))).collect::<Vec<_>>());
+        // And through the dots and grooves: lines along them, between the dots and beside the grooves.
+        let rough_fine = |cap: usize| -> f32 {
+            let (mut sum, mut n) = (0.0f32, 0);
+            for off in [-0.015f32, -0.009, -0.003, 0.003, 0.009, 0.015] {
+                let base = patch + across * off - along * 0.045;
+                let hs: Vec<f32> = (0..37).map(|j| h(&v, base + along * (0.0025 * j as f32), cap)).collect();
+                for w in hs.windows(3) {
+                    let d2 = w[0] - 2.0 * w[1] + w[2];
+                    sum += d2 * d2;
+                    n += 1;
+                }
+            }
+            (sum / n as f32).sqrt()
+        };
+        eprintln!("   roughness by cap through the dots and grooves: {:?}", (0..=5).map(|c| format!("{:.6}", rough_fine(c))).collect::<Vec<_>>());
     }
     eprintln!("roughness (RMS second difference over 0.0025): {rough0:.6} -> {rough1:.6}; the ground rose {rise:.4}; blocks per level {blocks0:?} -> {:?}", v.memory().0);
     let (open, _, dropped, _) = check(&v, 5);
     assert_eq!((open, dropped), (0, 0));
     assert!(rise > 0.02, "the clay did not build there");
     assert!(span(&rolls0) > 0.002, "the rolls did not build");
-    // The bars are where the engine stood before this work (rolls 0.0031 of 0.0034 with the profile off by 0.0014
-    // after a dip in a roll's top; grooves at a median of 0.00013 to 0.00018 of 0.00019, fading at one end; two of
-    // the five dots lost; roughness 0.00036), and the regression this test was written for (rolls 0.0067, grooves
-    // gone, roughness 0.0038).
-    assert!(span(&rolls1) > 0.7 * span(&rolls0), "the rolls lost height: {:.5} of {:.5}", span(&rolls1), span(&rolls0));
-    assert!(roll_diff < 0.5 * span(&rolls0), "the rolls changed shape by {roll_diff:.5} of {:.5}", span(&rolls0));
+    // The bars: the rolls keep their height and shape (before the fields were made distances again after moving
+    // form down a level, the profile was off by 0.0014 of 0.0034, with a dip in a roll's top); every groove keeps
+    // most of its depth along its whole length (they fade to 0.00006 at one end, a known gap); the dots stay; and
+    // the surface between them stays smooth (0.0001 here; a lattice of block-sized dips read 0.00036 before this
+    // work and 0.0005 with cubic interpolation over fields that were not distances).
+    assert!(span(&rolls1) > 0.8 * span(&rolls0), "the rolls lost height: {:.5} of {:.5}", span(&rolls1), span(&rolls0));
+    assert!(roll_diff < 0.35 * span(&rolls0), "the rolls changed shape by {roll_diff:.5} of {:.5}", span(&rolls0));
     for (k, (b, a)) in grooves0.iter().zip(grooves1.iter()).enumerate() {
-        assert!(median(a) > 0.6 * median(b), "groove {k} faded: {:.5} against {:.5}", median(a), median(b));
+        let least = a.iter().map(|x| x.0).fold(f32::INFINITY, f32::min);
+        assert!(median(a) > 0.75 * median(b), "groove {k} faded: {:.5} against {:.5}", median(a), median(b));
+        assert!(least > 0.25 * median(b), "groove {k} broke: {least:.5} against {:.5}", median(b));
     }
     for (k, (b, a)) in dots0.iter().zip(dots1.iter()).enumerate() {
-        assert!(*a > 0.6 * b, "dot {k} faded: {a:.5} against {b:.5}");
+        assert!(*a > 0.75 * b, "dot {k} faded: {a:.5} against {b:.5}");
     }
-    assert!(rough1 < 0.0006, "the surface got rougher: {rough1:.6} (it was {rough0:.6})");
+    assert!(rough1 < 0.00015, "the surface got rougher: {rough1:.6} (it was {rough0:.6})");
 }
