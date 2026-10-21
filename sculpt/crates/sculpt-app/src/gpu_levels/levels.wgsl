@@ -64,7 +64,7 @@ fn voxel(l: u32) -> f32 {
 
 fn band(l: u32) -> f32 {
     if (l == 0u) {
-        return 8.0 * P.voxel0;
+        return 16.0 * P.voxel0;
     }
     return 2.5 * voxel(l);
 }
@@ -476,9 +476,15 @@ fn cell_vertex(l: u32, slot: u32, bc: vec3<i32>, ci: u32, head: u32, k: u32) -> 
         if (n > 0.0) {
             f = sum / n;
         } else {
+            // Onto the zero along the gradient, if there is one to speak of and the zero lies within the cell (as the
+            // reference does: deep in fresh clay the gradient left is rounding).
             let m = vec3<f32>(0.5);
             let gr = trilinear_gradient(m, d);
-            f = m - gr * trilinear(m, d) / max(dot(gr, gr), 1e-12);
+            let g2 = dot(gr, gr);
+            let step = gr * (trilinear(m, d) / max(g2, 1e-20));
+            let vx = voxel(l);
+            let ok = g2 > (0.05 * vx) * (0.05 * vx) && dot(step, step) <= 1.0;
+            f = select(m, m - step, ok);
         }
     } else {
         let entry = table[(head >> 13u) & 255u];

@@ -265,3 +265,5 @@ Build the GPU engine on **levels of 8x8x8 blocks keyed by (level, block coordina
   That is the zoom-dependent tessellation: the object holds the main shape on coarse levels, and detail appears as you
   zoom in. Large brushes working on a coarse level are the same mechanism.
 * Undo records and `.svol` files need a level added to each block's key; the rest carries over.
+
+Built on this layout: the volume engine, `volume_engine.md`.

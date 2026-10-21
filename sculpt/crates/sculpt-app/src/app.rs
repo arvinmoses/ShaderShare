@@ -50,6 +50,8 @@ pub struct Options {
     pub bench_orbit: Option<u32>,
     /// Multiply the initial framing distance (below 1 zooms in), for close-up tests and screenshots.
     pub zoom: f32,
+    /// Run the scripted volume playground session, saving every frame into this folder (`volume_demo.rs`).
+    pub demo_volume: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -135,7 +137,7 @@ pub struct SculptApp {
     lod_batch: usize,
     /// When the last dab landed; refresh waits for the pen to rest so it never competes with a stroke.
     last_edit: Instant,
-    viewport: Option<Viewport>,
+    pub(crate) viewport: Option<Viewport>,
     pub camera: Camera,
     pub themes: ThemeLibrary,
     pub theme: Theme,
@@ -195,6 +197,8 @@ pub struct SculptApp {
     pub volume_mode: Option<crate::volume_mode::VolumeMode>,
     /// Where the volume playground was last saved or opened.
     pub volume_path: Option<String>,
+    /// The scripted session being recorded, if any.
+    volume_demo: Option<crate::volume_demo::VolumeDemo>,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -293,6 +297,7 @@ impl SculptApp {
             volume_mode: None,
             volume_path: None,
             sweep: None,
+            volume_demo: opts.demo_volume.map(crate::volume_demo::VolumeDemo::new),
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
         app.view_detail = settings["view_detail"].as_str().and_then(ViewDetail::from_name).unwrap_or(ViewDetail::Balanced);
@@ -376,7 +381,7 @@ impl SculptApp {
                             self.sweep = Some(sweep);
                         }
                     }
-                    if let Some(m) = std::env::var("SCULPT_VOLUME").ok().and_then(|v| v.parse::<f32>().ok()) {
+                    if let Some(m) = std::env::var("SCULPT_VOLUME").ok().and_then(|v| v.parse::<f32>().ok()).or(self.volume_demo.as_ref().map(|_| 1.0)) {
                         self.open_volume(m * 1e6);
                     }
                     if std::env::var("SCULPT_DEMO_NOISE").is_ok() {
@@ -578,19 +583,19 @@ impl SculptApp {
             }
             Dialog::OpenVolume(p) => {
                 let t = Instant::now();
-                let r = std::fs::File::open(&p).and_then(|f| sculpt_core::generator::volume::Volume::read_from(&mut std::io::BufReader::new(f)));
+                let r = std::fs::File::open(&p).and_then(|f| sculpt_core::generator::level_volume::LevelVolume::read_from(&mut std::io::BufReader::new(f), crate::volume_mode::LEVELS));
                 match r {
                     Ok(vol) => {
                         self.end_stroke();
                         let (lo, hi) = vol.bounds();
-                        self.volume_mode = Some(crate::volume_mode::VolumeMode::new(vol));
+                        let generation = self.volume_mode.as_ref().map_or(0, |m| m.generation) + 1;
+                        let mut mode = crate::volume_mode::VolumeMode::new(vol);
+                        mode.generation = generation;
+                        self.volume_mode = Some(mode);
                         if let Some(vp) = self.viewport.as_mut() {
                             vp.clear_volume();
                         }
-                        // Frame the solid, not the whole lattice around it.
-                        let c = 0.5 * (lo + hi);
-                        let r = 0.3 * (hi - lo);
-                        self.camera.frame(&sculpt_core::geom::Aabb { min: c - r, max: c + r });
+                        self.camera.frame(&sculpt_core::geom::Aabb { min: lo, max: hi });
                         self.status = format!("Opened {p} ({:.2}s)", t.elapsed().as_secs_f32());
                         self.volume_path = Some(p);
                     }
@@ -794,13 +799,14 @@ impl SculptApp {
                         *last = None;
                         continue;
                     };
-                    let radius = *size_px * camera.world_per_pixel(hit, size.y);
+                    let px = camera.world_per_pixel(hit, size.y);
+                    let radius = *size_px * px;
                     let spacing = (0.15 * radius).max(mode.voxel());
                     let from = match *last {
                         // Re-entering the surface, or jumping across a gap, starts the spacing over.
                         Some(p) if p.distance(hit) < radius * 4.0 => p,
                         _ => {
-                            mode.dab(hit, radius, *strength * s.pressure, *hardness, *carve);
+                            mode.dab(hit, radius, px, *strength * s.pressure, *hardness, *carve);
                             dabs += 1;
                             *last = Some(hit);
                             *carry = 0.0;
@@ -812,7 +818,7 @@ impl SculptApp {
                     let mut along = spacing - *carry;
                     while along <= gap {
                         let q = from.lerp(hit, along / gap);
-                        mode.dab(q, radius, *strength * s.pressure, *hardness, *carve);
+                        mode.dab(q, radius, px, *strength * s.pressure, *hardness, *carve);
                         dabs += 1;
                         along += spacing;
                     }
@@ -820,7 +826,7 @@ impl SculptApp {
                     *last = Some(hit);
                 }
                 if dabs > 0 {
-                    self.status = format!("Volume: {dabs} dabs this frame, {:.2} ms ({:.2} ms each), {} blocks of surface", mode.last_ms, mode.last_ms / dabs as f64, mode.blocks);
+                    self.status = format!("Volume: {dabs} dabs this frame at level {} (step {:.5}), {:.2} ms ({:.2} ms each), {} blocks", mode.level, mode.voxel(), mode.last_ms, mode.last_ms / dabs as f64, mode.blocks);
                 }
             }
             Stroke::Brush { brush, settings, sampler, normal, dabs: queue, last_hit } => {
@@ -912,7 +918,8 @@ impl SculptApp {
     pub fn open_volume(&mut self, triangles: f32) {
         self.end_stroke();
         let t = Instant::now();
-        let mode = crate::volume_mode::VolumeMode::ball(triangles);
+        let mut mode = crate::volume_mode::VolumeMode::ball(triangles);
+        mode.generation = self.volume_mode.as_ref().map_or(0, |m| m.generation) + 1;
         self.camera.frame(&sculpt_core::geom::Aabb { min: Vec3::splat(-1.0), max: Vec3::splat(1.0) });
         self.status = format!("Volume playground: {:.1}M-triangle ball in {:.0} ms. Clay Buildup adds, Trim Dynamic carves, Ctrl swaps. Mesh menu to leave.", triangles / 1e6, t.elapsed().as_secs_f64() * 1e3);
         self.volume_mode = Some(mode);
@@ -988,6 +995,7 @@ impl SculptApp {
                 test.drive(rect, &mut self.pending);
             }
         self.apply_test_stroke_edges(mods);
+        self.step_volume_demo(&ctx, rect);
 
         let last = resp.interact_pointer_pos();
         let dabs = self.process_samples(last);
@@ -1045,6 +1053,7 @@ impl SculptApp {
         let showing_preview = self.solid_preview.shown();
         if let (Some(rs), Some(vp)) = (frame.wgpu_render_state(), self.viewport.as_mut()) {
             if let Some(mode) = self.volume_mode.as_mut() {
+                mode.tick();
                 vp.sync_volume(rs, mode);
                 self.stats.upload = vp.last_upload;
             } else if let Some(doc) = self.doc.as_mut() {
@@ -1123,6 +1132,88 @@ impl SculptApp {
         }
     }
 
+    /// One frame of the scripted volume session: apply what it says, and ask for the frame's image.
+    fn step_volume_demo(&mut self, ctx: &egui::Context, rect: Rect) {
+        let Some(demo) = self.volume_demo.as_mut() else { return };
+        if demo.waiting.is_some() || self.volume_mode.is_none() {
+            ctx.request_repaint();
+            return;
+        }
+        if demo.finished() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        let f = demo.step(rect, &self.camera);
+        let shot = demo.current_frame() - 1;
+        if let Some(c) = f.camera {
+            self.camera = c;
+        }
+        if f.end {
+            self.end_stroke();
+        }
+        if f.undo || f.redo {
+            self.end_stroke();
+            if let Some(m) = self.volume_mode.as_mut() {
+                if f.undo {
+                    m.undo();
+                } else {
+                    m.redo();
+                }
+            }
+        }
+        if let Some(m) = self.volume_mode.as_mut() {
+            if let Some(c) = f.cap {
+                m.cap = c.min(m.vol.levels() - 1);
+            }
+            if let Some(t) = f.tint {
+                m.tint = t;
+            }
+        }
+        if let (Some(on), Some(vp)) = (f.cull, self.viewport.as_mut()) {
+            vp.cull = on;
+        }
+        if let Some((tool, size, strength, p)) = f.begin {
+            self.select_tool(tool);
+            let params = self.tools.params_mut(tool);
+            params.size_px = size;
+            params.strength = strength;
+            self.pen.pressure = 1.0;
+            self.begin_stroke(p, egui::Modifiers::NONE);
+        }
+        for p in f.samples {
+            self.pending.push_back(Sample { pos: p, pressure: 1.0 });
+        }
+        if let Some(demo) = self.volume_demo.as_mut() {
+            demo.waiting = Some(shot);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        ctx.request_repaint();
+    }
+
+    /// Save the scripted session's frame once the renderer hands it back.
+    fn collect_volume_demo_frame(&mut self, ctx: &egui::Context) {
+        let Some(demo) = self.volume_demo.as_mut() else { return };
+        let Some(n) = demo.waiting else { return };
+        let image = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }));
+        if let Some(image) = image {
+            let path = demo.frame_path(n);
+            let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+            let r = std::fs::File::create(&path).map_err(|e| e.to_string()).and_then(|file| {
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), image.size[0] as u32, image.size[1] as u32);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                enc.write_header().and_then(|mut w| w.write_image_data(&rgba)).map_err(|e| e.to_string())
+            });
+            if let Err(e) = r {
+                eprintln!("demo frame {n}: {e}");
+            }
+            if n % 150 == 0 {
+                println!("demo: frame {n} ({:.0} s)", n as f32 / crate::volume_demo::FPS);
+            }
+            demo.waiting = None;
+        }
+    }
+
     /// The test driver signals stroke begin/end through `TestDriver::edges`.
     fn apply_test_stroke_edges(&mut self, mods: egui::Modifiers) {
         let Some(test) = &mut self.test else { return };
@@ -1169,6 +1260,41 @@ impl SculptApp {
             painter.rect_filled(pill, 12.0, Color32::from_black_alpha(185));
             painter.rect_stroke(pill, 12.0, egui::Stroke::new(1.5, self.theme.ui.target_mask()), egui::StrokeKind::Inside);
             painter.text(pill.center(), egui::Align2::CENTER_CENTER, galley.text(), font, Color32::WHITE);
+        }
+        if let Some(m) = &self.volume_mode {
+            // The volume engine at a glance: its levels, what the GPU rebuilt, what it drew.
+            let (counts, bytes) = m.vol.memory();
+            let per: Vec<String> = counts.iter().map(|&c| fmt_count(c)).collect();
+            // While recording, the frame rate counts the frame captures: show the frame's own work instead.
+            let pace = if self.volume_demo.is_some() {
+                format!("CPU frame {:.1} ms", self.stats.frame_ms)
+            } else {
+                format!("{:.0} fps", if self.stats.interval_ms > 0.0 { 1000.0 / self.stats.interval_ms } else { 0.0 })
+            };
+            let lines = [
+                format!("Volume  ·  {} levels, showing 0-{}  ·  blocks per level {}  ·  {:.0} MB", counts.len(), m.cap, per.join(" / "), bytes as f64 / 1e6),
+                format!("Last stroke at level {} (step {:.5})  ·  {:.2} ms a dab on the CPU", m.stroke_level, m.vol.voxel(m.stroke_level), m.dab_ms),
+                format!("Surface rebuilt on the GPU: {} blocks in {:.2} ms ({} blocks sent, {:.2} ms CPU)", fmt_count(m.sync.extracted), m.gpu_ms, fmt_count(m.sync.uploaded), m.sync.cpu_ms),
+                format!("Drawing {} of {} pages of quads{}  ·  {pace}", fmt_count(m.pages_drawn as usize), fmt_count(m.pages_used as usize), if self.viewport.as_ref().is_some_and(|v| v.cull) { " (the rest out of view or facing away)" } else { " (culling off)" }),
+            ];
+            let font = egui::FontId::proportional(12.5);
+            let width = lines.iter().map(|l| painter.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x).fold(0.0f32, f32::max);
+            painter.rect_filled(Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::new(width + 14.0, 17.0 * lines.len() as f32 + 8.0)), 6.0, Color32::from_black_alpha(150));
+            let mut y = rect.min.y + 8.0;
+            for l in lines {
+                painter.text(Pos2::new(rect.min.x + 11.0, y), egui::Align2::LEFT_TOP, l, font.clone(), Color32::from_gray(225));
+                y += 17.0;
+            }
+            // The scripted session's caption.
+            if let Some((text, alpha)) = self.volume_demo.as_ref().and_then(|d| d.caption.clone()) {
+                let font = egui::FontId::proportional(19.0);
+                let galley = painter.layout(text, font, Color32::WHITE.gamma_multiply(alpha), rect.width() - 120.0);
+                let size = galley.size() + Vec2::new(36.0, 20.0);
+                let pill = Rect::from_center_size(Pos2::new(rect.center().x, rect.max.y - 30.0 - size.y * 0.5), size);
+                painter.rect_filled(pill, 10.0, Color32::from_black_alpha((190.0 * alpha) as u8));
+                painter.galley(pill.min + Vec2::new(18.0, 10.0), galley, Color32::WHITE);
+            }
+            return;
         }
         if !self.hud {
             // Minimal Mudbox-style readout; H shows the full performance HUD.
@@ -1356,6 +1482,7 @@ impl eframe::App for SculptApp {
         self.last_frame = Some(t0);
         self.poll_job();
         crate::generator_ui::collect_screenshot(self, &ctx);
+        self.collect_volume_demo_frame(&ctx);
         crate::generator_ui::tick_sweep(self, &ctx);
         if self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));

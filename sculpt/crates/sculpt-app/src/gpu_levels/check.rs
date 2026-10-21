@@ -12,7 +12,7 @@ use eframe::egui_wgpu::wgpu;
 use glam::Vec3;
 use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
 
-use super::{GpuLevels, PAGE_INDICES, SLOT_WORDS, VSTRIDE};
+use super::{GpuLevels, PAGE_INDICES, SLOT_WORDS, VSTRIDE, packed_samples};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -92,7 +92,19 @@ fn compare(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, vol: &Le
             let q = verts[(s * VSTRIDE as usize + i) * 2];
             let local = Vec3::new((q & 1023) as f32, ((q >> 10) & 1023) as f32, ((q >> 20) & 1023) as f32) / 1023.0 * 8.0;
             let gp = corner + local * vx;
-            worst = worst.max((gp - *p).length() / vx);
+            let off = (gp - *p).length() / vx;
+            if off > 0.05 && std::env::var("SCULPT_CHECK_DIAG").is_ok() {
+                let samples = read(device, queue, &gpu.buf.samples);
+                let want_s = packed_samples(vol, *k);
+                let got_s = &samples[s * 365..s * 365 + 365];
+                let diffs: Vec<String> = (0..729)
+                    .filter(|&j| (got_s[j / 2] >> (16 * (j % 2))) & 0xffff != (want_s[j / 2] >> (16 * (j % 2))) & 0xffff)
+                    .take(12)
+                    .map(|j| format!("({},{},{}) gpu {} cpu {}", j % 9, (j / 9) % 9, j / 81, ((got_s[j / 2] >> (16 * (j % 2))) & 0xffff) as u16 as i16, ((want_s[j / 2] >> (16 * (j % 2))) & 0xffff) as u16 as i16))
+                    .collect();
+                eprintln!("{when}: block {k:?} vertex {i} off {off:.3}: samples differing {diffs:?}; gpu local {local:?} cpu local {:?}", (*p - corner) / vx);
+            }
+            worst = worst.max(off);
         }
         // Quads, in order.
         let n_pages = slot_pages[s * SLOT_WORDS as usize] as usize;
@@ -129,6 +141,8 @@ pub fn run(args: &[String]) -> Res<()> {
         return bench(&device, &queue);
     }
     let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+    // Carrying detail a little at a time, as the app does, so the GPU sees the queued blocks arrive late.
+    vol.carry_budget = Some(0.5);
     let mut gpu = GpuLevels::new(&device, &queue, &vol, 3);
     gpu.sync(&mut vol);
     compare(&device, &queue, &gpu, &vol, "fresh ball")?;
@@ -143,9 +157,26 @@ pub fn run(args: &[String]) -> Res<()> {
     ];
     for (i, (l, a, b, r, trim)) in plan.iter().enumerate() {
         // Synced after every dab, as the app does each frame.
+        let every = std::env::var("SCULPT_CHECK_EVERY_DAB").is_ok();
+        let mut dab = 0;
+        let mut failed: Option<String> = None;
         stroke(&mut vol, *l, *a, *b, *r, *trim, |v| {
-            gpu.sync(v);
+            v.carry_pending(Some(0.5));
+            let s = gpu.sync(v);
+            dab += 1;
+            if every && failed.is_none() && let Err(e) = compare(&device, &queue, &gpu, v, &format!("stroke {} dab {dab} (full {}, released {}, uploaded {})", i + 1, s.full, s.released, s.uploaded)) {
+                failed = Some(e.to_string());
+                if std::env::var("SCULPT_CHECK_DIAG").is_ok() {
+                    let c = gpu.cap;
+                    gpu.set_cap(c);
+                    gpu.sync(v);
+                    eprintln!("after a full rebuild: {:?}", compare(&device, &queue, &gpu, v, "rebuilt").err());
+                }
+            }
         });
+        if let Some(e) = failed {
+            return Err(e.into());
+        }
         gpu.sync(&mut vol);
         compare(&device, &queue, &gpu, &vol, &format!("stroke {} (level {l}, {})", i + 1, if *trim { "trim" } else { "clay" }))?;
     }
@@ -176,6 +207,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     let voxel0 = 0.0035;
     let t = Instant::now();
     let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, voxel0, 6);
+    vol.carry_budget = Some(6.0);
     println!("ball at level 0 step {voxel0} ({} blocks) in {:.0} ms", vol.keys().len(), t.elapsed().as_secs_f64() * 1e3);
     let mut gpu = GpuLevels::new(device, queue, &vol, 5);
     let t = Instant::now();
@@ -223,6 +255,36 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             end.rebased,
             s.extracted
         ));
+    }
+    // A big level 0 stroke right over the fine work: every finer level's detail under it rides along.
+    {
+        let (mut dab_ms, mut sync_ms, mut carried) = (Vec::new(), Vec::new(), 0);
+        vol.begin_stroke();
+        let mut along = Vec3::ZERO;
+        for k in 0..=12 {
+            let dir = Vec3::new(-0.15 + 0.02 * k as f32, 0.1, 1.0).normalize();
+            let Some((hit, n)) = vol.raycast(dir * 3.0, -dir, 0, true) else { continue };
+            let t = Instant::now();
+            let rough = if along == Vec3::ZERO { n } else { along };
+            if let Some((n, d)) = vol.plane_dab(0, hit, rough, 0.3, 0.3 * 0.09, 0.5, 0.4, false) {
+                along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+                carried = carried.max(d.carried);
+            }
+            dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            let s = gpu.sync(&mut vol);
+            sync_ms.push(s.cpu_ms);
+        }
+        let t = Instant::now();
+        let mut frames = 0;
+        while vol.carry_busy() {
+            vol.carry_pending(Some(6.0));
+            gpu.sync(&mut vol);
+            frames += 1;
+        }
+        let catch_up = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        vol.end_stroke();
+        println!("a level 0 stroke (radius 0.3) over the fine work: dab {:.1} ms CPU (median, within a 6 ms carrying budget; up to {carried} finer blocks a dab), sync {:.1} ms; the queued detail caught up in {frames} more frames ({catch_up:.0} ms); stroke end {:.0} ms", median(dab_ms), median(sync_ms), t.elapsed().as_secs_f64() * 1e3);
     }
     println!();
     println!("| level | step | brush radius (steps) | dab ms CPU | sync ms CPU | sync to GPU done ms | blocks uploaded / extracted (most) | stroke end ms | extracted after |");

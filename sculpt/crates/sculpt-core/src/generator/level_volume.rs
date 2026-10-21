@@ -113,8 +113,8 @@ pub fn piece_table() -> [u32; 256] {
             match on.len() {
                 2 => union(&mut parent, edge(on[0]), edge(on[1])),
                 4 => {
-                    for k in 0..4 {
-                        if inside(face[k]) {
+                    for (k, &c) in face.iter().enumerate() {
+                        if inside(c) {
                             union(&mut parent, edge((k + 3) % 4), edge(k));
                         }
                     }
@@ -125,8 +125,8 @@ pub fn piece_table() -> [u32; 256] {
         let mut piece_of_root = [u8::MAX; 12];
         let mut pieces = 0u32;
         let mut packed = 0u32;
-        for e in 0..12 {
-            if !crossing[e] {
+        for (e, &crosses) in crossing.iter().enumerate() {
+            if !crosses {
                 continue;
             }
             let root = find(&mut parent, e);
@@ -242,6 +242,17 @@ pub struct LevelVolume {
     /// levels' detail is carried by.
     carry: HashMap<IVec3, Block>,
     carry_level: usize,
+    /// Finer blocks (per level) whose detail still has to be carried this stroke.
+    pending: Vec<HashSet<IVec3>>,
+    /// How far the stroke moved the surface ([`Self::moved_at`]) at level `carry_level` points, measured since its last
+    /// dab: measuring takes a march, and many finer blocks read the same points.
+    moved: HashMap<IVec3, f32>,
+    /// Finer blocks (per level) this stroke carried detail into: each dab carries them again, since detail moved far
+    /// enough can sit outside the dab's own reach, and would otherwise keep where an earlier dab put it.
+    carried: Vec<HashSet<IVec3>>,
+    /// How long a dab may spend carrying detail, in milliseconds; the rest waits for [`Self::carry_pending`]. `None`
+    /// (the default) carries it all at once.
+    pub carry_budget: Option<f64>,
 }
 
 impl LevelVolume {
@@ -249,7 +260,7 @@ impl LevelVolume {
     pub fn from_field<F: Fn(Vec3) -> f32 + Sync>(field: &F, half: f32, voxel0: f32, levels: usize) -> LevelVolume {
         let levels = levels.clamp(1, MAX_LEVELS);
         let origin = Vec3::ZERO;
-        let mut v = LevelVolume { voxel0, origin, blocks: vec![HashMap::new(); levels], inside0: HashSet::new(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::new(), carry: HashMap::new(), carry_level: 0 };
+        let mut v = LevelVolume { voxel0, origin, blocks: vec![HashMap::new(); levels], inside0: HashSet::new(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::new(), carry: HashMap::new(), carry_level: 0, pending: vec![HashSet::new(); MAX_LEVELS], moved: HashMap::new(), carried: vec![HashSet::new(); MAX_LEVELS], carry_budget: None };
         let band = v.band(0);
         let step = voxel0 * B as f32;
         let lo = ((Vec3::splat(-half) - origin) / step).floor().as_ivec3() - IVec3::ONE;
@@ -299,10 +310,10 @@ impl LevelVolume {
         self.origin
     }
 
-    /// Distances kept at level `l`: 2.5 lattice steps, but 8 at level 0, so an edit there can carry finer detail as far
+    /// Distances kept at level `l`: 2.5 lattice steps, but 16 at level 0, so an edit there can carry finer detail as far
     /// as it moves the surface.
     pub fn band(&self, l: usize) -> f32 {
-        if l == 0 { 8.0 * self.voxel0 } else { 2.5 * self.voxel(l) }
+        if l == 0 { 16.0 * self.voxel0 } else { 2.5 * self.voxel(l) }
     }
 
     /// Stored blocks per level, and the bytes their samples take at 16 bits.
@@ -425,13 +436,10 @@ impl LevelVolume {
     }
 
     /// Where a ray from `origin` along `dir` (normalised) first enters the solid of levels up to `max` (as it was when
-    /// the stroke began, with `base`), with the normal there. Marched on level 0, whose band reaches farthest, then
-    /// narrowed down on the finer levels.
+    /// the stroke began, with `base`), with the normal there.
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max: usize, base: bool) -> Option<(Vec3, Vec3)> {
         let value = |p: Vec3| self.value_upto(p, max, base);
-        let v0 = self.voxel0;
         let fine = self.voxel(max.min(self.levels() - 1));
-        let coarse = |p: Vec3| self.value_at(0, (p - self.origin) / v0, base);
         let (lo, hi) = self.bounds();
         let (lo, hi) = (lo - Vec3::splat(self.band(0)), hi + Vec3::splat(self.band(0)));
         let inv = dir.recip();
@@ -442,28 +450,21 @@ impl LevelVolume {
         }
         let (mut t, mut prev) = (near, near);
         let mut hit = false;
+        let max = max.min(self.levels() - 1);
         while t < far {
-            let v = coarse(origin + dir * t);
-            // Close to the coarse surface, step on the finest field, which detail may have moved.
-            if v < 2.5 * v0 {
-                let mut s = t;
-                let end = t + 5.0 * v0;
-                while s < end {
-                    if value(origin + dir * s) < 0.0 {
-                        hit = true;
-                        break;
-                    }
-                    prev = s;
-                    s += (0.5 * fine).max(0.15 * value(origin + dir * s).abs());
-                }
-                t = s;
-                if hit {
-                    break;
-                }
-                continue;
+            // March by the field of the finest level at the point, less what the levels finer than it could raise the
+            // surface ahead (at most their bands added up, under 2.5 of this level's steps): a coarser level knows
+            // nothing of the detail in the finer blocks just ahead.
+            let q = origin + dir * t;
+            let lp = self.level_at(q, max, base);
+            let v = self.value_at(lp, (q - self.origin) / self.voxel(lp), base);
+            if v < 0.0 {
+                hit = true;
+                break;
             }
             prev = t;
-            t += v.max(0.3 * v0);
+            let finer = if lp < max { 2.5 * self.voxel(lp) } else { 0.0 };
+            t += (v - finer).max(0.5 * fine);
         }
         if !hit {
             return None;
@@ -702,6 +703,7 @@ impl LevelVolume {
                 stats.created += 1;
             }
             self.put(l, bc, s);
+            self.moved.clear();
             let total = self.carry.entry(bc).or_insert_with(|| Box::new([0.0; N]));
             for (t, x) in total.iter_mut().zip(d.iter()) {
                 *t += x;
@@ -715,6 +717,7 @@ impl LevelVolume {
         self.clear_checkerboards(l, flipped);
         stats.carried = self.carry_detail(l, &changed);
         if own {
+            stats.carried += self.carry_pending(None);
             self.stroke = None;
             self.carry.clear();
         }
@@ -725,76 +728,241 @@ impl LevelVolume {
     /// After a dab at level `l` changed `changed` (blocks of that level), every finer level's own detail (its values
     /// less the level below, both within its band) moves with the surface: along the normal, as far as the stroke has
     /// moved it so far. The detail is always taken from the surface as it was when the stroke began and moved by the
-    /// stroke's whole change, so however many dabs a stroke has, its detail is resampled once. Coarsest first, so each
-    /// level builds on the new level below. Returns the blocks rebuilt.
+    /// stroke's whole change, so however many dabs a stroke has, its detail is resampled once, and the work can be done
+    /// late: the finer blocks under the dab are queued, and as many are rebuilt now as [`Self::carry_budget`] allows
+    /// (all of them when it is `None`); the rest follow in [`Self::carry_pending`], and all by the stroke's end.
     fn carry_detail(&mut self, l: usize, changed: &[IVec3]) -> usize {
         if changed.is_empty() || l + 1 >= self.levels() {
             return 0;
         }
-        let mut carried = 0;
-        // The dab's footprint at level `l`, with a ring of blocks for detail moved across block edges.
+        // The dab's footprint at level `l`, with a ring of blocks for detail moved across block edges, and each finer
+        // level's blocks under it, now or when the stroke began, found through the nesting.
         let mut frontier: Vec<IVec3> = changed.iter().flat_map(|&b| (0..27).map(move |q| b + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1))).collect();
         frontier.sort_unstable_by_key(|v| (v.z, v.y, v.x));
         frontier.dedup();
         for m in l + 1..self.levels() {
-            // This level's blocks under the footprint, found through the nesting.
-            let mut region: Vec<IVec3> = frontier.iter().flat_map(|&p| (0..8).map(move |q| p * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))).filter(|c| self.blocks[m].contains_key(c)).collect();
+            let mut region: Vec<IVec3> = frontier.iter().flat_map(|&p| (0..8).map(move |q| p * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))).filter(|c| self.blocks[m].contains_key(c) || self.exists_at(m, *c, true)).collect();
             region.sort_unstable_by_key(|v| (v.z, v.y, v.x));
             region.dedup();
             if region.is_empty() {
                 break;
             }
-            let k = 1i32 << (m - l);
-            let vm = self.voxel(m);
-            // Where the detail goes: the blocks it is in, and those its box covers once moved with the surface.
-            let dest: Vec<IVec3> = {
-                let me = &*self;
-                let mut dest: Vec<IVec3> = region
-                    .par_iter()
-                    .flat_map_iter(|&bc| {
-                        let mut out = vec![bc];
-                        for c in 0..9 {
-                            let corner = if c == 8 { Vec3::splat(0.5) } else { Vec3::new((c & 1) as f32, ((c >> 1) & 1) as f32, ((c >> 2) & 1) as f32) };
-                            let at = (bc * B).as_vec3() + corner * B as f32;
-                            let g = at / k as f32;
-                            let d = me.carry_delta_at(g);
-                            if d != 0.0 {
-                                let dn = |o: Vec3| me.value_at(l, g + o, false) - me.value_at(l, g - o, false);
-                                let n = Vec3::new(dn(Vec3::X), dn(Vec3::Y), dn(Vec3::Z)).normalize_or_zero();
-                                out.push((at + n * (-d / vm)).floor().as_ivec3().div_euclid(B3));
-                            }
-                        }
-                        out
-                    })
-                    .collect();
-                dest.sort_unstable_by_key(|v| (v.z, v.y, v.x));
-                dest.dedup();
-                dest
-            };
-            for &bc in &dest {
-                if m > 1 {
-                    self.ensure(m - 1, bc.div_euclid(IVec3::splat(2)));
-                }
-            }
-            let me = &*self;
-            let built: Vec<(IVec3, Block)> = dest.par_iter().filter_map(|&bc| me.carry_block(l, m, bc).map(|s| (bc, s))).collect();
-            for (bc, s) in built {
-                self.put(m, bc, s);
-                carried += 1;
-            }
+            self.pending[m].extend(region.iter().copied());
             frontier = region;
+        }
+        for m in l + 1..self.levels() {
+            let again: Vec<IVec3> = self.carried[m].iter().copied().collect();
+            self.pending[m].extend(again);
+        }
+        self.carry_pending(self.carry_budget)
+    }
+
+    /// Whether carrying detail has blocks still queued.
+    pub fn carry_busy(&self) -> bool {
+        self.pending.iter().any(|p| !p.is_empty())
+    }
+
+    /// Rebuild queued finer blocks (see [`Self::carry_detail`]), coarsest level first, for at most `budget_ms` (all of
+    /// them with `None`). Returns the blocks rebuilt.
+    pub fn carry_pending(&mut self, budget_ms: Option<f64>) -> usize {
+        let t = Instant::now();
+        let l = self.carry_level;
+        let mut carried = 0;
+        for m in l + 1..self.levels() {
+            while !self.pending[m].is_empty() {
+                if budget_ms.is_some_and(|b| t.elapsed().as_secs_f64() * 1e3 > b) {
+                    return carried;
+                }
+                // A batch, so a budget is checked often enough.
+                let take = if budget_ms.is_some() { 48 } else { usize::MAX };
+                let mut batch: Vec<IVec3> = self.pending[m].iter().copied().take(take).collect();
+                for c in &batch {
+                    self.pending[m].remove(c);
+                }
+                batch.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+                carried += self.carry_batch(l, m, &batch);
+            }
         }
         carried
     }
 
-    /// The stroke's change so far at level `l`'s lattice coordinates `g` (zero where it changed nothing).
-    fn carry_delta_at(&self, g: Vec3) -> f32 {
-        let i = g.floor().as_ivec3();
-        let f = g - i.as_vec3();
+    /// Carry the detail of level `m`'s blocks `region` (see [`Self::carry_detail`]).
+    fn carry_batch(&mut self, l: usize, m: usize, region: &[IVec3]) -> usize {
+        let mut carried = 0;
+        let k = 1i32 << (m - l);
+        let vm = self.voxel(m);
+        // Detail comes only from blocks that held it when the stroke began: blocks an earlier dab of the stroke made
+        // hold detail moved into them, and moving it on from there would spawn blocks without end.
+        let sources: Vec<IVec3> = region.iter().copied().filter(|c| self.exists_at(m, *c, true)).collect();
+        // Where the detail goes: the blocks themselves, and those the sources' boxes cover once moved.
+        let dest: Vec<IVec3> = {
+            let me = &*self;
+            let mut dest: Vec<IVec3> = region.to_vec();
+            dest.extend(
+                sources
+                    .par_iter()
+                    .flat_map_iter(|&bc| {
+                        let mut out = Vec::new();
+                        // Where this block's detail lands. From the surface the stroke began on (its normal is sound
+                        // where the detail was; the new field may be clamped flat this deep in fresh clay), along that
+                        // normal to the new surface: measured once at the block's centre, and the block's corners
+                        // moved as far, which is all the landing blocks need.
+                        let centre = (bc * B).as_vec3() + Vec3::splat(0.5 * B as f32);
+                        let gl = centre / k as f32;
+                        let i = gl.round().as_ivec3();
+                        let changed = me.carry.get(&i.div_euclid(B3)).is_some_and(|d| d[local(i)] != 0.0);
+                        if !changed {
+                            return out;
+                        }
+                        let dn = |o: Vec3| me.value_at(l, gl + o, true) - me.value_at(l, gl - o, true);
+                        let n_old = Vec3::new(dn(Vec3::X), dn(Vec3::Y), dn(Vec3::Z)).normalize_or_zero();
+                        if n_old == Vec3::ZERO {
+                            return out;
+                        }
+                        let vl = me.voxel(l);
+                        let offset = me.value_at(l, gl, true);
+                        let on_old = gl - n_old * (offset / vl);
+                        let Some(rise) = me.cross_along(l, on_old, n_old, false) else { return out };
+                        for c in 0..9 {
+                            let corner = if c == 8 { Vec3::splat(0.5) } else { Vec3::new((c & 1) as f32, ((c >> 1) & 1) as f32, ((c >> 2) & 1) as f32) };
+                            let at = (bc * B).as_vec3() + corner * B as f32;
+                            out.push((at + n_old * (rise / vm)).floor().as_ivec3().div_euclid(B3));
+                        }
+                        out
+                    })
+                    .collect::<Vec<IVec3>>(),
+            );
+            dest.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+            dest.dedup();
+            dest
+        };
+        // The surface's move at every level `l` point the blocks read, measured once.
+        let mut points: Vec<IVec3> = dest
+            .iter()
+            .flat_map(|&bc| {
+                let lo = bc * B;
+                // The even points around the footprint (see `moved_at`).
+                let (llo, lhi) = ((lo.div_euclid(IVec3::splat(k)) - IVec3::ONE).div_euclid(IVec3::splat(2)), ((lo + B3).div_euclid(IVec3::splat(k)) + IVec3::splat(3)).div_euclid(IVec3::splat(2)));
+                (llo.z..=lhi.z).flat_map(move |z| (llo.y..=lhi.y).flat_map(move |y| (llo.x..=lhi.x).map(move |x| IVec3::new(x, y, z) * 2)))
+            })
+            .filter(|p| !self.moved.contains_key(p) && self.carry.contains_key(&p.div_euclid(B3)))
+            .collect();
+        points.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+        points.dedup();
+        let me = &*self;
+        let measured: Vec<(IVec3, f32)> = points.par_iter().map(|&p| (p, me.measure_moved(p))).collect();
+        self.moved.extend(measured);
+        let me = &*self;
+        let built: Vec<(IVec3, Block)> = dest.par_iter().filter_map(|&bc| me.carry_block(l, m, bc).map(|s| (bc, s))).collect();
+        for (bc, s) in built {
+            self.put(m, bc, s);
+            self.carried[m].insert(bc);
+            carried += 1;
+        }
+        // Blocks the detail has moved out of hold only the level below: drop them (kept for undo), so moving detail
+        // leaves no trail of empty blocks behind. Those with finer blocks inside stay, so the levels stay nested.
+        let tol = 0.02 * vm;
+        for &bc in &dest {
+            if !self.blocks[m].contains_key(&bc) {
+                continue;
+            }
+            let has_children = m + 1 < self.levels() && (0..8).any(|q| self.blocks[m + 1].contains_key(&(bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))));
+            if has_children {
+                continue;
+            }
+            self.keep((m as u8, bc));
+            let Some(s) = self.blocks[m].remove(&bc) else { continue };
+            let fallback = self.block_values(m, bc, false);
+            if s.iter().zip(fallback.iter()).any(|(a, b)| (a - b).abs() > tol) {
+                self.blocks[m].insert(bc, s);
+            } else {
+                self.dirty.insert((m as u8, bc));
+                // Its parent may have held it alone; it is checked when its own detail is next carried.
+            }
+        }
+        carried
+    }
+
+    /// How far along `n` (world units, signed) from level `l`'s lattice point `from` the field (as it is, or as the
+    /// stroke began with `base`) next crosses zero, toward the surface. By stepping until the sign changes, then
+    /// halving: inside fresh clay the field is not a distance yet (it is made one when the stroke ends), so its value
+    /// cannot be trusted as a step.
+    fn cross_along(&self, l: usize, from: Vec3, n: Vec3, base: bool) -> Option<f32> {
+        let (band, vl) = (self.band(l), self.voxel(l));
+        let f = |t: f32| self.value_at(l, from + n * (t / vl), base);
+        let v0 = f(0.0);
+        if v0 == 0.0 {
+            return Some(0.0);
+        }
+        // Toward the surface: inward from outside, outward from inside.
+        let dir = if v0 > 0.0 { -1.0 } else { 1.0 };
+        let mut t = 0.0f32;
+        for _ in 0..256 {
+            let next = t + f(t).abs().clamp(0.5 * vl, band) * dir;
+            if (f(next) > 0.0) != (v0 > 0.0) {
+                let (mut lo, mut hi) = (t, next);
+                for _ in 0..12 {
+                    let m = 0.5 * (lo + hi);
+                    if (f(m) > 0.0) == (v0 > 0.0) {
+                        lo = m;
+                    } else {
+                        hi = m;
+                    }
+                }
+                return Some(0.5 * (lo + hi));
+            }
+            t = next;
+            if t.abs() > 64.0 * band {
+                break;
+            }
+        }
+        None
+    }
+
+    /// How far the stroke moved the surface at level `carry_level`'s lattice point `p`, as a change of the field there
+    /// (negative where it moved out; zero where it changed nothing). Near the new surface the move is measured,
+    /// from there back to the surface the stroke began on: the stroke's change of the samples says the same only while
+    /// both old and new values lie within the band, and a stroke can move the surface farther than that (the samples
+    /// are clamped, so their change stops growing). Farther out no detail is carried, and the change itself will do.
+    fn moved_at(&self, p: IVec3) -> f32 {
+        if !self.carry.contains_key(&p.div_euclid(B3)) {
+            return 0.0;
+        }
+        // Measured on every other lattice point and interpolated: the move varies smoothly, and measuring is a march.
+        let base = p.div_euclid(IVec3::splat(2)) * 2;
+        let f = (p - base).as_vec3() * 0.5;
         trilinear(f, std::array::from_fn(|q| {
-            let p = i + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32);
-            self.carry.get(&p.div_euclid(B3)).map_or(0.0, |d| d[local(p)])
+            let c = base + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32) * 2;
+            self.moved.get(&c).copied().unwrap_or_else(|| self.measure_moved(c))
         }))
+    }
+
+    fn measure_moved(&self, p: IVec3) -> f32 {
+        let Some(d) = self.carry.get(&p.div_euclid(B3)).map(|d| d[local(p)]) else { return 0.0 };
+        if d == 0.0 {
+            return 0.0;
+        }
+        let l = self.carry_level;
+        let (band, vl) = (self.band(l), self.voxel(l));
+        let g = p.as_vec3();
+        let now = self.sample(l, p, false);
+        if now.abs() >= 0.9 * band {
+            // Far from the new surface: no detail is carried here.
+            return d;
+        }
+        let dn = |o: Vec3| self.value_at(l, g + o, false) - self.value_at(l, g - o, false);
+        let n = Vec3::new(dn(Vec3::X), dn(Vec3::Y), dn(Vec3::Z)).normalize_or_zero();
+        if n == Vec3::ZERO {
+            return d;
+        }
+        // Along the normal to the new surface, then on to where the field the stroke began with is zero.
+        let cross = |from: Vec3, base: bool| self.cross_along(l, from, n, base);
+        let Some(to_new) = cross(g, false) else { return d };
+        let on_new = g + n * (to_new / vl);
+        let Some(to_old) = cross(on_new, true) else { return d };
+        let moved = -to_old;
+        // The change of the field at `p` that moving the surface out by `moved` makes.
+        -moved
     }
 
     /// Block `bc` of level `m` (finer than the stroke's level `l`) rebuilt: the new level below plus this level's detail
@@ -812,46 +980,84 @@ impl LevelVolume {
             for y in llo.y..=lhi.y {
                 for x in llo.x..=lhi.x {
                     let p = IVec3::new(x, y, z);
-                    if let Some(d) = self.carry.get(&p.div_euclid(B3)) {
+                    if self.carry.contains_key(&p.div_euclid(B3)) {
+                        let d = self.moved_at(p);
                         let at = dgrid.idx(p);
-                        dgrid.v[at] = d[local(p)];
-                        most = most.max(d[local(p)].abs());
+                        dgrid.v[at] = d;
+                        most = most.max(d.abs());
                     }
                 }
             }
         }
         let current = self.blocks[m].get(&bc);
-        let differs = |s: &Block| current.is_none_or(|c| **c != **s);
+        // A block that is not there yet is only worth making if it holds detail: something other than the level below.
+        let fallback = current.is_none().then(|| self.block_values(m, bc, false));
+        let tol = 0.02 * vm;
+        let differs = |s: &Block| match (current, &fallback) {
+            (Some(c), _) => **c != **s,
+            (None, Some(f)) => s.iter().zip(f.iter()).any(|(a, b)| (a - b).abs() > tol),
+            (None, None) => true,
+        };
         if most == 0.0 {
             // Nothing moved here: the detail is as it was.
             let base = self.block_values(m, bc, true);
             return differs(&base).then_some(base);
         }
         let lgrid = self.grid(l, llo, lhi, false);
-        // Detail as it was, over the box the moved detail comes from.
-        let reach = (most / vm).ceil() as i32 + 2;
-        let (blo, bhi) = (lo - IVec3::splat(reach), lo + IVec3::splat(B + reach));
-        let base_m = self.grid(m, blo, bhi, true);
-        let base_below = self.grid(m - 1, blo.div_euclid(IVec3::splat(2)), (bhi + IVec3::ONE).div_euclid(IVec3::splat(2)), true);
-        let below = self.grid(m - 1, lo.div_euclid(IVec3::splat(2)) - IVec3::ONE, (lo + B3).div_euclid(IVec3::splat(2)) + IVec3::ONE, false);
-        let detail_at = |j: IVec3| -> f32 {
-            let j = j.clamp(blo, bhi);
-            base_m.at(j) - base_below.trilinear(j.as_vec3() * 0.5).clamp(-fband, fband)
-        };
         let kf = k as f32;
-        let mut s = Box::new([0.0f32; N]);
-        for (i, v) in s.iter_mut().enumerate() {
+        // Where each sample's detail comes from: `-d` farther in along the normal, where the surface moved out by `-d`.
+        let below = self.grid(m - 1, lo.div_euclid(IVec3::splat(2)) - IVec3::ONE, (lo + B3).div_euclid(IVec3::splat(2)) + IVec3::ONE, false);
+        // Samples more than two bands from the new surface come out clamped whatever detail they carry.
+        let mut far = vec![false; N];
+        let mut from: Vec<Option<Vec3>> = vec![None; N];
+        let (mut qlo, mut qhi) = (IVec3::splat(i32::MAX), IVec3::splat(i32::MIN));
+        for (i, q) in from.iter_mut().enumerate() {
             let p = lo + cell_of(i);
             let g = p.as_vec3() / kf;
             let d = dgrid.trilinear(g);
             if d == 0.0 {
-                *v = base_m.at(p);
+                continue;
+            }
+            if below.trilinear(p.as_vec3() * 0.5).abs() > 2.0 * fband {
+                far[i] = true;
                 continue;
             }
             let dn = |o: Vec3| lgrid.trilinear(g + o) - lgrid.trilinear(g - o);
             let n = Vec3::new(dn(Vec3::X * 0.5), dn(Vec3::Y * 0.5), dn(Vec3::Z * 0.5)).normalize_or_zero();
             // The surface moved out by `-d` here: the detail now here was `-d` farther in.
-            let q = p.as_vec3() + n * (d / vm);
+            let at = p.as_vec3() + n * (d / vm);
+            qlo = qlo.min(at.floor().as_ivec3());
+            qhi = qhi.max(at.floor().as_ivec3() + IVec3::ONE);
+            *q = Some(at);
+        }
+        // Detail as it was, over the box it comes from: the block moved as a whole, so about a block across however far
+        // the stroke moved it. Kept to a bounded box; the odd sample whose source lies beyond it (where the stroke bent
+        // the surface hard) takes no detail, rather than reading every level point by point.
+        if qlo.x > qhi.x {
+            (qlo, qhi) = (lo, lo + IVec3::ONE);
+        }
+        let (blo, bhi) = (qlo, qhi.min(qlo + IVec3::splat(4 * B)));
+        let unmoved = self.block_values(m, bc, true);
+        let base_m = self.grid(m, blo, bhi, true);
+        let base_below = self.grid(m - 1, blo.div_euclid(IVec3::splat(2)), (bhi + IVec3::ONE).div_euclid(IVec3::splat(2)), true);
+        let detail_at = |j: IVec3| -> f32 {
+            if j.cmpge(blo).all() && j.cmple(bhi).all() {
+                base_m.at(j) - base_below.trilinear(j.as_vec3() * 0.5).clamp(-fband, fband)
+            } else {
+                0.0
+            }
+        };
+        let mut s = Box::new([0.0f32; N]);
+        for (i, v) in s.iter_mut().enumerate() {
+            let p = lo + cell_of(i);
+            if far[i] {
+                *v = below.trilinear(p.as_vec3() * 0.5).clamp(-fband, fband);
+                continue;
+            }
+            let Some(q) = from[i] else {
+                *v = unmoved[i];
+                continue;
+            };
             let j = q.floor().as_ivec3();
             let f = q - j.as_vec3();
             let detail = trilinear(f, std::array::from_fn(|r| detail_at(j + IVec3::new((r & 1) as i32, ((r >> 1) & 1) as i32, ((r >> 2) & 1) as i32))));
@@ -1074,6 +1280,10 @@ impl LevelVolume {
     pub fn begin_stroke(&mut self) {
         self.stroke = Some(HashMap::new());
         self.carry.clear();
+        self.moved.clear();
+        for p in self.pending.iter_mut().chain(self.carried.iter_mut()) {
+            p.clear();
+        }
     }
 
     pub fn in_stroke(&self) -> bool {
@@ -1089,6 +1299,7 @@ impl LevelVolume {
             self.stroke = None;
             return out;
         }
+        self.carry_pending(None);
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
         self.redistance(&touched);
         out.rebased = self.rebase(&touched);
@@ -1108,6 +1319,9 @@ impl LevelVolume {
 
     pub fn undo(&mut self) -> bool {
         self.stroke = None;
+        for p in &mut self.pending {
+            p.clear();
+        }
         let Some(entry) = self.history.pop() else { return false };
         let back = self.swap_in(entry);
         self.redo.push(back);
@@ -1116,6 +1330,9 @@ impl LevelVolume {
 
     pub fn redo(&mut self) -> bool {
         self.stroke = None;
+        for p in &mut self.pending {
+            p.clear();
+        }
         let Some(entry) = self.redo.pop() else { return false };
         let back = self.swap_in(entry);
         self.history.push(back);
@@ -1170,13 +1387,15 @@ impl LevelVolume {
                 continue;
             }
             let (vx, band) = (self.voxel(l), self.band(l));
-            let reach = (band / vx).ceil() as i32 + 1;
+            // Crossings within a few steps: deeper samples get that far as a lower bound, which is all anything here
+            // reads them for (steps toward the surface), and the search stays small for level 0's wide band.
+            let reach = ((band / vx).ceil() as i32 + 1).min(6);
             let me = &*self;
             let fixed: Vec<(IVec3, Block)> = blocks
                 .par_iter()
                 .filter_map(|&bc| {
-                    let lo = bc * B - IVec3::splat(reach);
-                    let g = me.grid(l, lo, bc * B + IVec3::splat(B - 1 + reach), false);
+                    let lo = bc * B - IVec3::splat(reach.max(1));
+                    let g = me.grid(l, lo, bc * B + IVec3::splat(B - 1 + reach.max(1)), false);
                     // Where the surface crosses the lattice's edges, in lattice units.
                     let mut crossings: Vec<Vec3> = Vec::new();
                     for z in 0..g.n.z {
@@ -1204,18 +1423,14 @@ impl LevelVolume {
                     for (i, v) in s.iter_mut().enumerate() {
                         let p = bc * B + cell_of(i);
                         let a = g.at(p);
-                        // Next to the surface: the value places it.
-                        let near = (0..6).any(|q| {
-                            let mut o = IVec3::ZERO;
-                            o[q / 2] = if q % 2 == 0 { 1 } else { -1 };
-                            (g.at(p + o) < 0.0) != (a < 0.0)
-                        });
+                        // A corner of a cell the surface crosses: its value places the surface and sets the normal there.
+                        let near = (0..27).any(|q| q != 13 && (g.at(p + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)) < 0.0) != (a < 0.0));
                         if near {
                             continue;
                         }
                         let pf = p.as_vec3();
                         let d2 = crossings.iter().map(|c| c.distance_squared(pf)).fold(f32::INFINITY, f32::min);
-                        let d = (d2.sqrt() * vx).min(band);
+                        let d = (d2.sqrt() * vx).min(band).min(reach as f32 * vx);
                         let next = if a < 0.0 { -d } else { d };
                         if next != *v {
                             *v = next;
@@ -1254,28 +1469,50 @@ impl LevelVolume {
             under.sort_unstable_by_key(|v| (v.z, v.y, v.x));
             under.dedup();
             let me = &*self;
-            let wts = [1.0f32, 4.0, 6.0, 4.0, 1.0];
+            // Smoothing about a coarse step wide (binomial, 17 taps at the fine step): a feature counts as form only
+            // where it is broad enough for the coarse level to hold; narrow detail, however tall, stays fine.
+            let mut wts = [1.0f32; 17];
+            for (k, w) in wts.iter_mut().enumerate() {
+                let mut c = 1.0f64;
+                for j in 0..k {
+                    c = c * (16 - j) as f64 / (j + 1) as f64;
+                }
+                *w = (c / 65536.0) as f32;
+            }
             let changes: Vec<(IVec3, Block)> = under
                 .par_iter()
                 .filter_map(|&cb| {
-                    // This level's field around the coarse block, smoothed at each coarse point under a touched block.
-                    let lo = cb * B * 2 - IVec3::splat(2);
-                    let g = me.grid(m, lo, lo + IVec3::splat(2 * B + 2), false);
+                    // This level's field around the coarse block, smoothed at the coarse points, one axis at a time.
+                    const R: i32 = 8;
+                    const NF: usize = (2 * B + 2 * R - 1) as usize;
+                    let lo = cb * B * 2 - IVec3::splat(R);
+                    let g = me.grid(m, lo, lo + IVec3::splat(NF as i32 - 1), false);
+                    let at = |x: usize, y: usize, z: usize| g.v[(z * NF + y) * NF + x];
+                    let mut ax = vec![0.0f32; 8 * NF * NF];
+                    for z in 0..NF {
+                        for y in 0..NF {
+                            for x in 0..8 {
+                                ax[(z * NF + y) * 8 + x] = (0..17).map(|k| wts[k] * at(2 * x + k, y, z)).sum();
+                            }
+                        }
+                    }
+                    let mut ay = vec![0.0f32; 8 * 8 * NF];
+                    for z in 0..NF {
+                        for y in 0..8 {
+                            for x in 0..8 {
+                                ay[(z * 8 + y) * 8 + x] = (0..17).map(|k| wts[k] * ax[(z * NF + 2 * y + k) * 8 + x]).sum();
+                            }
+                        }
+                    }
                     let mut target = [f32::NAN; N];
                     for (i, t) in target.iter_mut().enumerate() {
                         let c = cb * B + cell_of(i);
                         if !fine.contains(&(c * 2).div_euclid(B3)) {
                             continue;
                         }
-                        let mut sum = 0.0;
-                        for z in -2..=2i32 {
-                            for y in -2..=2i32 {
-                                for x in -2..=2i32 {
-                                    sum += wts[(x + 2) as usize] * wts[(y + 2) as usize] * wts[(z + 2) as usize] * g.at(c * 2 + IVec3::new(x, y, z));
-                                }
-                            }
-                        }
-                        *t = sum / 4096.0;
+                        let l = cell_of(i);
+                        let (x, y, z) = (l.x as usize, l.y as usize, l.z as usize);
+                        *t = (0..17).map(|k| wts[k] * ay[((2 * z + k) * 8 + y) * 8 + x]).sum();
                     }
                     let mut s = me.block_values(m - 1, cb, false);
                     let mut any = false;
@@ -1338,10 +1575,15 @@ impl LevelVolume {
             i
         }
         let mut open = vec![false; total as usize];
+        // Vertices no quad uses (a cell next to finer ones always has one) are not surface, let alone a speck.
+        let mut used = vec![false; total as usize];
         for s in surf.values() {
             for q in &s.quads {
                 let ids: Vec<Option<u32>> = q.iter().map(|(k, c, p)| Some(first.get(k)? + surf[k].vertex(*c, *p)? as u32)).collect();
                 let known: Vec<u32> = ids.iter().flatten().copied().collect();
+                for &v in &known {
+                    used[v as usize] = true;
+                }
                 for w in known.windows(2) {
                     let (a, c) = (root(&mut parent, w[0]), root(&mut parent, w[1]));
                     if a != c {
@@ -1368,7 +1610,9 @@ impl LevelVolume {
         let mut size: HashMap<u32, usize> = HashMap::new();
         for i in 0..total {
             let r = root(&mut parent, i);
-            *size.entry(r).or_default() += 1;
+            if used[i as usize] {
+                *size.entry(r).or_default() += 1;
+            }
         }
         let specks: HashSet<u32> = size.iter().filter(|&(&r, &n)| n <= max_verts && !open[r as usize]).map(|(&r, _)| r).collect();
         if specks.is_empty() {
@@ -1500,7 +1744,11 @@ impl LevelVolume {
                         if chi.cmplt(flo).any() || clo.cmpgt(fhi).any() || !self.blocks[m].contains_key(&c) {
                             continue;
                         }
-                        out.insert((m as u8, c));
+                        // Only a block with a missing neighbour above it reads its first layer past it from coarser
+                        // levels; one inside a finer region reads its neighbours, which this change leaves alone.
+                        if (1..8).any(|o| !self.blocks[m].contains_key(&(c + IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1)))) {
+                            out.insert((m as u8, c));
+                        }
                         next.push(c);
                     }
                 }
@@ -1571,7 +1819,11 @@ impl LevelVolume {
                             continue;
                         }
                         if self.blocks[m].contains_key(&c) {
-                            out.insert((m as u8, c));
+                            // Only a block at the edge of its region (a neighbour missing) reads coarser samples or
+                            // points its quads at coarser cells; one inside it is untouched by a coarser change.
+                            if (0..27).any(|q| q != 13 && !self.blocks[m].contains_key(&(c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)))) {
+                                out.insert((m as u8, c));
+                            }
                             next.push(c);
                         }
                     }
@@ -1674,7 +1926,7 @@ impl LevelVolume {
     fn block_vertices(&self, k: Key, cap: usize, table: &[u32; 256]) -> BlockSurface {
         let (l, bc) = (k.0 as usize, k.1);
         let g = self.gather9(l, bc);
-        let vx = self.voxel(l);
+        let (vx, band) = (self.voxel(l), self.band(l));
         let base = bc * B;
         let mut out = BlockSurface { cells: vec![0; N], ..Default::default() };
         // Which level `l` cells around the block are split by finer ones: a 10x10x10 neighbourhood.
@@ -1697,7 +1949,8 @@ impl LevelVolume {
             if fin(c) {
                 continue;
             }
-            let d: [f32; 8] = std::array::from_fn(|q| self.corner_value(l, bc, &g, base + c + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32), cap));
+            // Within the band, as the GPU's 16-bit samples hold them: mid-stroke, fresh clay can lie past it.
+            let d: [f32; 8] = std::array::from_fn(|q| self.corner_value(l, bc, &g, base + c + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32), cap).clamp(-band, band));
             let config = (0..8).fold(0u32, |a, q| a | ((d[q] < 0.0) as u32) << q);
             let transition = l < cap && (0..27).any(|q| q != 13 && fin(c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)));
             let corner_pos = |q: usize| Vec3::new(corner(q)[0] as f32, corner(q)[1] as f32, corner(q)[2] as f32);
@@ -1714,7 +1967,10 @@ impl LevelVolume {
                     let (m, j) = self.canonical(l + 1, p, cap);
                     if m > l + 1 || self.blocks[l + 1].contains_key(&p.div_euclid(B3)) {
                         let j = if m > l + 1 { j } else { p };
-                        return self.blocks[m.max(l + 1)][&j.div_euclid(B3)][local(j)];
+                        // Within the band, as the 16-bit samples hold it: mid-stroke, carried detail can lie past it.
+                        let m = m.max(l + 1);
+                        let band = self.band(m);
+                        return self.blocks[m][&j.div_euclid(B3)][local(j)].clamp(-band, band);
                     }
                     trilinear(h.as_vec3() * 0.5, d)
                 };
@@ -1745,10 +2001,13 @@ impl LevelVolume {
                 let f = if n > 0.0 {
                     sum / n
                 } else {
-                    // Near the centre, moved onto the field's zero along its gradient.
+                    // Near the centre, moved onto the field's zero along its gradient: if there is one to speak of and
+                    // the zero lies within the cell. Deep in fresh clay the corners all sit at the band, and the
+                    // gradient left is rounding, which would fling the vertex anywhere.
                     let m = Vec3::splat(0.5);
                     let gr = trilinear_gradient(m, d);
-                    m - gr * trilinear(m, d) / gr.length_squared().max(1e-12)
+                    let step = gr * trilinear(m, d) / gr.length_squared().max(1e-20);
+                    if gr.length_squared() > (0.05 * vx) * (0.05 * vx) && step.length_squared() <= 1.0 { m - step } else { m }
                 };
                 at.push(f);
             } else {
@@ -1979,7 +2238,7 @@ impl LevelVolume {
             r.read_exact(&mut b)?;
             Ok(IVec3::new(i32::from_le_bytes(b[0..4].try_into().unwrap()), i32::from_le_bytes(b[4..8].try_into().unwrap()), i32::from_le_bytes(b[8..12].try_into().unwrap())))
         };
-        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![HashMap::new(); n.max(levels.min(MAX_LEVELS))], inside0: HashSet::new(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::new(), carry: HashMap::new(), carry_level: 0 };
+        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![HashMap::new(); n.max(levels.min(MAX_LEVELS))], inside0: HashSet::new(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::new(), carry: HashMap::new(), carry_level: 0, pending: vec![HashSet::new(); MAX_LEVELS], moved: HashMap::new(), carried: vec![HashSet::new(); MAX_LEVELS], carry_budget: None };
         for _ in 0..u32_(r)? {
             v.inside0.insert(ivec(r)?);
         }
@@ -2010,7 +2269,7 @@ impl LevelVolume {
     /// A single-resolution volume as level 0 of a new one with `levels` levels.
     pub fn from_volume(old: &super::volume::Volume, levels: usize) -> LevelVolume {
         let (origin, dims) = old.grid();
-        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![HashMap::new(); levels.clamp(1, MAX_LEVELS)], inside0: HashSet::new(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::new(), carry: HashMap::new(), carry_level: 0 };
+        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![HashMap::new(); levels.clamp(1, MAX_LEVELS)], inside0: HashSet::new(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::new(), carry: HashMap::new(), carry_level: 0, pending: vec![HashSet::new(); MAX_LEVELS], moved: HashMap::new(), carried: vec![HashSet::new(); MAX_LEVELS], carry_budget: None };
         let band = v.band(0);
         let stored: HashMap<u32, &[f32; N]> = old.stored().collect();
         for (b, &sign) in old.signs().iter().enumerate() {

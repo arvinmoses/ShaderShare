@@ -26,6 +26,7 @@ mod test_driver;
 mod theme;
 mod tools;
 mod viewport;
+mod volume_demo;
 mod volume_mode;
 
 use std::path::PathBuf;
@@ -42,6 +43,9 @@ fn gpu_setup() -> WgpuSetup {
         let have = adapter.limits();
         desc.required_limits.max_buffer_size = have.max_buffer_size.min(4 << 30);
         desc.required_limits.max_storage_buffer_binding_size = have.max_storage_buffer_binding_size.min(2 << 30);
+        // The volume's GPU surface binds 13 storage buffers in one pass and draws with an indirect count.
+        desc.required_limits.max_storage_buffers_per_shader_stage = have.max_storage_buffers_per_shader_stage.min(16);
+        desc.required_features |= adapter.features() & (eframe::egui_wgpu::wgpu::Features::MULTI_DRAW_INDIRECT_COUNT | eframe::egui_wgpu::wgpu::Features::TIMESTAMP_QUERY);
         desc
     });
     WgpuSetup::CreateNew(setup)
@@ -195,7 +199,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let mut args = std::env::args().skip(1);
-    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, sweep_shots: None, bench_orbit: None, zoom: 1.0 };
+    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, sweep_shots: None, bench_orbit: None, zoom: 1.0, demo_volume: None };
     let mut size = [1600.0f32, 1000.0];
     let (mut shots_dir, mut shot_times) = (None::<PathBuf>, Vec::<f32>::new());
     let mut demo_density = None::<sculpt_core::generator::density::Density>;
@@ -210,6 +214,7 @@ fn main() -> eframe::Result {
             "--test-strokes" => opts.test_frames = args.next().and_then(|v| v.parse().ok()),
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-layers" => opts.demo_layers = true,
+            "--demo-volume" => opts.demo_volume = args.next().map(PathBuf::from),
             "--demo-sweep" => opts.demo_sweep = true,
             "--demo-map" => {
                 if let Some(row) = args.next().and_then(|v| parse_map_row(&v)) {

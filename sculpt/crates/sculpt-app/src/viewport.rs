@@ -176,18 +176,30 @@ pub struct Viewport {
     pub wait_gpu: bool,
     /// The volume playground's surface, drawn instead of the mesh while it is open.
     volume: Option<VolumeGpu>,
+    levels_pipeline: wgpu::RenderPipeline,
+    levels_bgl: wgpu::BindGroupLayout,
+    /// Hide clusters outside the view or facing away (the volume playground).
+    pub cull: bool,
+    /// What the last frame drew of the volume: clusters' pages drawn, of those holding surface.
+    pub volume_draws: u32,
 }
 
-/// The volume playground's surface on the GPU: each block's vertices and quads in fixed-size chunks, drawn in one
-/// multi-draw with an indirect entry per quad chunk.
+/// The volume playground's surface on the GPU: built there by `gpu_levels`, and drawn from its buffers, a page of
+/// quads per indirect draw for the clusters the cull pass keeps.
 struct VolumeGpu {
-    quant: Quant,
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    indirect: wgpu::Buffer,
-    /// Vertex chunks and quad chunks the buffers hold.
-    capacity: (u32, u32),
-    high: u32,
+    gpu: crate::gpu_levels::GpuLevels,
+    uniforms: wgpu::Buffer,
+    group: wgpu::BindGroup,
+    /// The GPU buffers `group` binds, and the volume `gpu` copies.
+    buffers_made: u64,
+    generation: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LevelsUniforms {
+    origin: [f32; 4],
+    misc: [f32; 4],
 }
 
 fn linear(c: egui::Color32) -> [f32; 4] {
@@ -256,6 +268,35 @@ impl Viewport {
             })
         };
         let flat_pipeline = mesh_pipeline("mesh flat", "vs_flat", "fs_flat", &flat_buffers);
+        // The volume's surface: vertices pulled from the GPU extractor's buffers.
+        let ro = |binding: u32| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let levels_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("viewport levels"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                ro(1),
+                ro(2),
+                ro(3),
+            ],
+        });
+        let levels_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("viewport levels"), bind_group_layouts: &[Some(&bgl), Some(&levels_bgl)], immediate_size: 0 });
+        let levels_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("volume levels"),
+            layout: Some(&levels_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_levels"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_levels"), compilation_options: Default::default(), targets: &target }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: ms,
+            multiview_mask: None,
+            cache: None,
+        });
         let smooth_pipeline = mesh_pipeline("mesh smooth", "vs_smooth", "fs_smooth", &smooth_buffers);
         let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("background"),
@@ -285,6 +326,10 @@ impl Viewport {
             targets: None,
             mesh: None,
             volume: None,
+            levels_pipeline,
+            levels_bgl,
+            cull: true,
+            volume_draws: 0,
             texture_id: None,
             overlay_kind: OverlayKind::None,
             last_upload: UploadStats::default(),
@@ -323,55 +368,48 @@ impl Viewport {
         self.targets = Some(Targets { size, msaa, resolve, depth });
     }
 
-    /// Bring the volume playground's surface up to date: rewrite only the slots and chunks that changed, or
-    /// everything into fresh buffers when the playground's pools grew.
+    /// Bring the volume playground's surface up to date: send the blocks that changed and rebuild the surface around them
+    /// on the GPU (everything, for a new volume or a new level cap).
     pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode) {
-        use crate::volume_mode::{QUADS_PER_CHUNK, VERTS_PER_CHUNK};
         let t = Instant::now();
-        let mut stats = UploadStats::default();
-        let up = mode.take_upload();
-        let (slots, chunks) = mode.capacity();
-        if mode.reset || self.volume.as_ref().is_none_or(|v| v.capacity != (slots, chunks)) {
-            let make = |label, size: u64, usage| rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            self.volume = Some(VolumeGpu {
-                quant: Quant::fit(mode.bounds()),
-                vertices: make("volume vertices", slots as u64 * VERTS_PER_CHUNK as u64 * 8, wgpu::BufferUsages::VERTEX),
-                indices: make("volume indices", chunks as u64 * (QUADS_PER_CHUNK * 6) as u64 * 4, wgpu::BufferUsages::INDEX),
-                // DrawIndexedIndirectArgs: index count, instance count, first index, base vertex, first instance.
-                indirect: make("volume indirect", chunks as u64 * 20, wgpu::BufferUsages::INDIRECT),
-                capacity: (slots, chunks),
-                high: 0,
-            });
-            // Fresh buffers start empty: every chunk draws nothing until written.
-            let zeros = vec![0u8; chunks as usize * 20];
-            rs.queue.write_buffer(&self.volume.as_ref().unwrap().indirect, 0, &zeros);
-            mode.reset = false;
+        if self.volume.as_ref().is_none_or(|v| v.generation != mode.generation) {
+            let gpu = crate::gpu_levels::GpuLevels::new(&rs.device, &rs.queue, &mode.vol, mode.cap);
+            let uniforms = rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some("volume levels uniforms"), size: std::mem::size_of::<LevelsUniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let group = Self::levels_group(&rs.device, &self.levels_bgl, &uniforms, &gpu);
+            self.volume = Some(VolumeGpu { buffers_made: gpu.buffers_made, gpu, uniforms, group, generation: mode.generation });
         }
         let v = self.volume.as_mut().unwrap();
-        v.high = mode.draw_count();
-        // Cleared first: a chunk given up can be handed to another block in the same upload.
-        for c in &up.cleared {
-            rs.queue.write_buffer(&v.indirect, *c as u64 * 20, bytemuck::cast_slice(&[0u32; 5]));
+        v.gpu.set_cap(mode.cap);
+        let s = v.gpu.sync(&mut mode.vol);
+        if v.gpu.buffers_made != v.buffers_made {
+            v.group = Self::levels_group(&rs.device, &self.levels_bgl, &v.uniforms, &v.gpu);
+            v.buffers_made = v.gpu.buffers_made;
         }
-        let mut packed = vec![[0u16; 4]; VERTS_PER_CHUNK];
-        for (c, positions) in &up.verts {
-            let out = &mut packed[..positions.len()];
-            pack(&v.quant, positions, None, out);
-            rs.queue.write_buffer(&v.vertices, *c as u64 * VERTS_PER_CHUNK as u64 * 8, bytemuck::cast_slice(out));
-            stats.bytes += out.len() * 8;
+        let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc: [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, 0.0, 0.0] };
+        rs.queue.write_buffer(&v.uniforms, 0, bytemuck::bytes_of(&u));
+        mode.blocks = v.gpu.slots();
+        if s.uploaded > 0 || s.full {
+            mode.sync = s;
         }
-        let per = (QUADS_PER_CHUNK * 6) as u32;
-        for (c, idx) in &up.chunks {
-            if !idx.is_empty() {
-                rs.queue.write_buffer(&v.indices, *c as u64 * per as u64 * 4, bytemuck::cast_slice(idx));
-            }
-            let args: [u32; 5] = [idx.len() as u32, 1, c * per, 0, 0];
-            rs.queue.write_buffer(&v.indirect, *c as u64 * 20, bytemuck::cast_slice(&args));
-            stats.bytes += idx.len() * 4 + 20;
-        }
-        stats.ranges = up.verts.len();
-        stats.ms = t.elapsed().as_secs_f32() * 1e3;
-        self.last_upload = stats;
+        self.volume_draws = v.gpu.status[2].max(0) as u32;
+        mode.pages_drawn = self.volume_draws;
+        mode.gpu_ms = v.gpu.gpu_ms;
+        mode.pages_used = v.gpu.page_capacity().saturating_sub(v.gpu.status[0].max(0) as u32);
+        self.last_upload = UploadStats { bytes: s.bytes, ranges: s.uploaded, ms: t.elapsed().as_secs_f32() * 1e3 };
+    }
+
+    fn levels_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, uniforms: &wgpu::Buffer, gpu: &crate::gpu_levels::GpuLevels) -> wgpu::BindGroup {
+        let (_, _, _, verts, cells) = gpu.buffers_for_draw();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("volume levels"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: verts.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: cells.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: gpu.meta_buffer().as_entire_binding() },
+            ],
+        })
     }
 
     /// Leave the volume playground: draw the document again.
@@ -544,14 +582,17 @@ impl Viewport {
             cursor: cursor.map_or(Vec4::ZERO, |(c, r, _)| c.extend(r)).to_array(),
             // Alpha carries the falloff hardness (inner cursor ring).
             cursor_color: { let mut cc = linear(vp.cursor.0); cc[3] = cursor.map_or(0.0, |(_, _, h)| h); cc },
-            box_min: self.volume.as_ref().map(|v| &v.quant).or(self.mesh.as_ref().map(|m| &m.quant)).map_or(Vec4::ZERO, |q| q.min.extend(0.0)).to_array(),
-            box_size: self.volume.as_ref().map(|v| &v.quant).or(self.mesh.as_ref().map(|m| &m.quant)).map_or(Vec4::ONE, |q| q.size.extend(1.0)).to_array(),
+            box_min: self.mesh.as_ref().map(|m| &m.quant).map_or(Vec4::ZERO, |q| q.min.extend(0.0)).to_array(),
+            box_size: self.mesh.as_ref().map(|m| &m.quant).map_or(Vec4::ONE, |q| q.size.extend(1.0)).to_array(),
         };
         rs.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
         let draws = self.prepare_lod(rs, lod_in, cam, size, view_proj);
         let targets = self.targets.as_ref().unwrap();
         let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
+        if let Some(v) = &self.volume {
+            v.gpu.cull(&mut enc, view_proj, cam.eye(), self.cull);
+        }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport"),
@@ -574,11 +615,14 @@ impl Viewport {
             pass.set_pipeline(&self.bg_pipeline);
             pass.draw(0..3, 0..1);
             if let Some(v) = &self.volume {
-                if v.high > 0 {
-                    pass.set_pipeline(&self.flat_pipeline);
-                    pass.set_vertex_buffer(0, v.vertices.slice(..));
-                    pass.set_index_buffer(v.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.multi_draw_indexed_indirect(&v.indirect, 0, v.high);
+                let (pages, draws, status, _, _) = v.gpu.buffers_for_draw();
+                pass.set_pipeline(&self.levels_pipeline);
+                pass.set_bind_group(1, &v.group, &[]);
+                pass.set_index_buffer(pages.slice(..), wgpu::IndexFormat::Uint32);
+                if v.gpu.indirect_count {
+                    pass.multi_draw_indexed_indirect_count(draws, 0, status, 8, v.gpu.page_capacity());
+                } else {
+                    pass.multi_draw_indexed_indirect(draws, 0, v.gpu.page_capacity());
                 }
             } else if let Some(m) = &self.mesh {
                 pass.set_pipeline(if m.normals.is_some() { &self.smooth_pipeline } else { &self.flat_pipeline });
@@ -603,6 +647,9 @@ impl Viewport {
             }
         }
         rs.queue.submit([enc.finish()]);
+        if let Some(v) = &self.volume {
+            v.gpu.after_submit();
+        }
         if self.wait_gpu {
             let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
         }

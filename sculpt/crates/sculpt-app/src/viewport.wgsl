@@ -70,6 +70,10 @@ fn fs_smooth(i: MeshOut) -> @location(0) vec4<f32> {
 }
 
 fn shade(i: MeshOut, normal: vec3<f32>) -> vec4<f32> {
+    return lit(i, normal, mix(u.clay.rgb, u.overlay.rgb, clamp(i.overlay, 0.0, 1.0) * u.overlay.a));
+}
+
+fn lit(i: MeshOut, normal: vec3<f32>, base: vec3<f32>) -> vec4<f32> {
     let v = normalize(u.eye.xyz - i.world);
     var n = normal;
     if (dot(n, v) < 0.0) {
@@ -87,7 +91,6 @@ fn shade(i: MeshOut, normal: vec3<f32>) -> vec4<f32> {
     let fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
     let spec = pow(max(dot(n, normalize(key + v)), 0.0), 28.0) * 0.12 + pow(max(dot(n, normalize(key + v)), 0.0), 6.0) * 0.04;
 
-    let base = mix(u.clay.rgb, u.overlay.rgb, clamp(i.overlay, 0.0, 1.0) * u.overlay.a);
     var c = base * (hemi + diffuse * 0.85 + fill_d) + base * vec3<f32>(1.0, 0.45, 0.3) * sss + vec3<f32>(spec) + vec3<f32>(0.75, 0.8, 0.9) * fres * 0.22;
 
     // Brush cursor: outer ring with a dark halo for contrast, inner falloff ring.
@@ -135,4 +138,79 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
     let g = pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
     let noise = fract(sin(dot(i.clip.xy, vec2<f32>(12.9898, 78.233))) * 43758.547) - 0.5;
     return vec4<f32>(g + vec3<f32>(noise / 255.0), 1.0);
+}
+
+// ------------------------------------------------------------------ the multi-resolution volume (gpu_levels)
+//
+// Vertices are pulled from the buffers the GPU extractor writes: an index names (slot, piece, cell), the cell's word
+// says where its vertices are, the slot's block coordinates and level place them.
+
+struct LevelsU {
+    origin: vec4<f32>,
+    // x: level 0's step; y: tint by level when 1.
+    misc: vec4<f32>,
+};
+
+@group(1) @binding(0) var<uniform> L: LevelsU;
+@group(1) @binding(1) var<storage, read> lv_verts: array<vec2<u32>>;
+@group(1) @binding(2) var<storage, read> lv_cells: array<u32>;
+@group(1) @binding(3) var<storage, read> lv_meta: array<vec4<i32>>;
+
+fn lv_oct_decode(w: u32) -> vec3<f32> {
+    let e = unpack2x16snorm(w);
+    var n = vec3<f32>(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) {
+        let xy = (vec2<f32>(1.0) - abs(n.yx)) * select(vec2<f32>(-1.0), vec2<f32>(1.0), n.xy >= vec2<f32>(0.0));
+        n = vec3<f32>(xy, n.z);
+    }
+    return normalize(n);
+}
+
+@vertex
+fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
+    var o: MeshOut;
+    let slot = idx >> 11u;
+    let piece = (idx >> 9u) & 3u;
+    let info = lv_cells[slot * 512u + (idx & 511u)];
+    let count = (info >> 10u) & 7u;
+    if (count == 0u) {
+        // A corner with no vertex (never expected): outside the view, so the triangle is clipped away.
+        o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        return o;
+    }
+    let v = lv_verts[slot * 768u + (info & 1023u) + min(piece, count - 1u)];
+    let m = lv_meta[slot];
+    let level = u32(max(m.w, 0));
+    let vx = L.misc.x / f32(1u << level);
+    let local = vec3<f32>(f32(v.x & 1023u), f32((v.x >> 10u) & 1023u), f32((v.x >> 20u) & 1023u)) / 1023.0 * 8.0;
+    let pos = L.origin.xyz + (vec3<f32>(m.xyz * 8) + local) * vx;
+    o.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    o.world = pos;
+    // The field's gradient points out of the solid.
+    o.normal = lv_oct_decode(v.y);
+    o.overlay = f32(level);
+    return o;
+}
+
+@fragment
+fn fs_levels(i: MeshOut) -> @location(0) vec4<f32> {
+    var base = u.clay.rgb;
+    if (L.misc.y > 0.5) {
+        // Level 0 the clay itself, then cool to warm as the levels get finer.
+        let l = u32(clamp(round(i.overlay), 0.0, 7.0));
+        if (l == 1u) {
+            base = vec3<f32>(0.45, 0.62, 0.85);
+        } else if (l == 2u) {
+            base = vec3<f32>(0.42, 0.78, 0.62);
+        } else if (l == 3u) {
+            base = vec3<f32>(0.88, 0.80, 0.42);
+        } else if (l == 4u) {
+            base = vec3<f32>(0.92, 0.58, 0.38);
+        } else if (l == 5u) {
+            base = vec3<f32>(0.86, 0.42, 0.55);
+        } else if (l >= 6u) {
+            base = vec3<f32>(0.70, 0.45, 0.85);
+        }
+    }
+    return lit(i, normalize(i.normal), base);
 }

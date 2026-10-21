@@ -25,7 +25,6 @@ use sculpt_core::generator::level_volume::{Key, LevelVolume, VERTS_PER_BLOCK, pi
 pub mod check;
 
 const SHADER: &str = include_str!("levels.wgsl");
-pub const PAGE_QUADS: u32 = 64;
 const PAGE_INDICES: u64 = 384;
 const SLOT_WORDS: u64 = 32;
 const SAMPLE_WORDS: u64 = 365;
@@ -114,10 +113,19 @@ pub struct GpuLevels {
     status_staging: wgpu::Buffer,
     status_state: Arc<AtomicU8>,
     pub status: [i32; 4],
+    /// Set when a cull pass recorded a status copy that the frame's submit has not mapped yet.
+    status_copy: std::sync::atomic::AtomicBool,
+    /// GPU timestamps around the extraction passes, when the device has them: the queries, where they resolve, a
+    /// buffer to read them from and its state, and nanoseconds per tick.
+    timer: Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer, Arc<AtomicU8>, f32)>,
+    /// GPU time of the last extraction read back, in milliseconds.
+    pub gpu_ms: f64,
     pub indirect_count: bool,
     /// Set when the pages ran out: the next sync grows them and rebuilds.
     grow_pages: bool,
     cap_changed: bool,
+    /// Bumped whenever the buffers are made afresh, so whoever draws from them binds them again.
+    pub buffers_made: u64,
 }
 
 fn hash_of(c: IVec3, l: u32) -> u32 {
@@ -125,7 +133,7 @@ fn hash_of(c: IVec3, l: u32) -> u32 {
 }
 
 /// A block's 9x9x9 samples as the GPU holds them: 16 bits each, two to a word.
-fn packed_samples(vol: &LevelVolume, k: Key) -> Vec<u32> {
+pub(super) fn packed_samples(vol: &LevelVolume, k: Key) -> Vec<u32> {
     let (l, bc) = (k.0 as usize, k.1);
     let band = vol.band(l);
     let g = vol.gather9(l, bc);
@@ -190,8 +198,17 @@ impl GpuLevels {
             status_staging,
             status_state: Arc::new(AtomicU8::new(0)),
             status: [0; 4],
+            status_copy: std::sync::atomic::AtomicBool::new(false),
+            timer: device.features().contains(wgpu::Features::TIMESTAMP_QUERY).then(|| {
+                let set = device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("levels timer"), ty: wgpu::QueryType::Timestamp, count: 2 });
+                let resolve = device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels timer resolve"), size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+                let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels timer staging"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                (set, resolve, staging, Arc::new(AtomicU8::new(0)), queue.get_timestamp_period())
+            }),
+            gpu_ms: 0.0,
             indirect_count,
             grow_pages: false,
+            buffers_made: 1,
             cap_changed: false,
         };
         g.queue.write_buffer(&g.buf.table, 0, bytemuck::cast_slice(&piece_table()));
@@ -352,11 +369,12 @@ impl GpuLevels {
         let slots = ((blocks.len() as u32) * 2).max(self.buf.slots).max(4096);
         let mut pages = self.buf.pages.max(slots * 4);
         if self.grow_pages {
-            pages = pages * 2;
+            pages *= 2;
             self.grow_pages = false;
         }
         if slots != self.buf.slots || pages != self.buf.pages {
             self.buf = Self::buffers(&self.device, &self.layout, slots, pages, 1024);
+            self.buffers_made += 1;
             self.queue.write_buffer(&self.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         }
         self.slot_of.clear();
@@ -387,6 +405,7 @@ impl GpuLevels {
             let pages = self.buf.pages;
             let slots = self.buf.slots;
             let old = std::mem::replace(&mut self.buf, Self::buffers(&self.device, &self.layout, slots, pages, len));
+            self.buffers_made += 1;
             self.copy_contents(&old);
         }
         self.queue.write_buffer(&self.buf.hash, 0, bytemuck::cast_slice(&self.hash));
@@ -452,7 +471,9 @@ impl GpuLevels {
         self.queue.write_buffer(&self.buf.params, 0, bytemuck::bytes_of(&p));
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("levels extract") });
         {
-            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("levels extract"), timestamp_writes: None });
+            let timing = self.timer.as_ref().filter(|t| t.3.load(Ordering::Acquire) == 0);
+            let writes = timing.map(|t| wgpu::ComputePassTimestampWrites { query_set: &t.0, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) });
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("levels extract"), timestamp_writes: writes });
             cp.set_bind_group(0, &self.buf.group, &[]);
             let threads = work.len() as u32;
             let (x, y) = grid(threads.div_ceil(64));
@@ -466,6 +487,15 @@ impl GpuLevels {
                 cp.dispatch_workgroups(x, y, 1);
             }
         }
+        let timed = if let Some((set, resolve, staging, state, _)) = &self.timer
+            && state.load(Ordering::Acquire) == 0
+        {
+            enc.resolve_query_set(set, 0..2, resolve, 0);
+            enc.copy_buffer_to_buffer(resolve, 0, staging, 0, 16);
+            true
+        } else {
+            false
+        };
         // Read back the status (free pages, whether they ran out) when the GPU gets to it.
         if self.status_state.load(Ordering::Acquire) == 0 {
             enc.copy_buffer_to_buffer(&self.buf.status, 0, &self.status_staging, 0, 16);
@@ -474,6 +504,11 @@ impl GpuLevels {
         if self.status_state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             let state = self.status_state.clone();
             self.status_staging.slice(..).map_async(wgpu::MapMode::Read, move |r| state.store(if r.is_ok() { 2 } else { 0 }, Ordering::Release));
+        }
+        if timed && let Some((_, _, staging, state, _)) = &self.timer {
+            state.store(1, Ordering::Release);
+            let state = state.clone();
+            staging.slice(..).map_async(wgpu::MapMode::Read, move |r| state.store(if r.is_ok() { 2 } else { 0 }, Ordering::Release));
         }
         stats.extracted += ex.len();
         stats.released += released.len();
@@ -491,6 +526,17 @@ impl GpuLevels {
     /// Pick up the status the GPU last reported.
     fn read_status(&mut self) {
         let _ = self.device.poll(wgpu::PollType::Poll);
+        if let Some((_, _, staging, state, period)) = &self.timer
+            && state.load(Ordering::Acquire) == 2
+        {
+            {
+                let data = staging.slice(..).get_mapped_range().expect("mapped");
+                let t: &[u64] = bytemuck::cast_slice(&data[..16]);
+                self.gpu_ms = t[1].saturating_sub(t[0]) as f64 * *period as f64 * 1e-6;
+            }
+            staging.unmap();
+            state.store(0, Ordering::Release);
+        }
         if self.status_state.load(Ordering::Acquire) == 2 {
             {
                 let data = self.status_staging.slice(..).get_mapped_range().expect("mapped");
@@ -553,6 +599,9 @@ impl GpuLevels {
             stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
             return stats;
         }
+        // A slot freed here and handed straight to a new block is released with that block's extraction: listing it
+        // twice would have two threads give its pages back at once, and two blocks would then share them.
+        released.retain(|&s| self.key_of[s as usize].is_none());
         if self.hash_fit() {
             self.send_hash_whole();
         } else {
@@ -577,7 +626,8 @@ impl GpuLevels {
         stats
     }
 
-    /// Record the cull pass: the pages of the clusters in view, facing the eye, as indirect draws.
+    /// Record the cull pass: the pages of the clusters in view, facing the eye, as indirect draws. The status (draws
+    /// written among it) is read back after it when no other read is under way.
     pub fn cull(&self, enc: &mut wgpu::CommandEncoder, view_proj: Mat4, eye: Vec3, cull: bool) {
         let mut p = self.params(0, 0);
         p.cull = cull as u32;
@@ -600,6 +650,19 @@ impl GpuLevels {
         cp.set_pipeline(&self.cull);
         let (x, y) = grid(self.high.div_ceil(64).max(1));
         cp.dispatch_workgroups(x, y, 1);
+        drop(cp);
+        if self.status_state.load(Ordering::Acquire) == 0 {
+            enc.copy_buffer_to_buffer(&self.buf.status, 0, &self.status_staging, 0, 16);
+            self.status_copy.store(true, Ordering::Release);
+        }
+    }
+
+    /// After the frame holding [`Self::cull`] was submitted: map the status it copied, to read on a later sync.
+    pub fn after_submit(&self) {
+        if self.status_copy.swap(false, Ordering::AcqRel) && self.status_state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let state = self.status_state.clone();
+            self.status_staging.slice(..).map_async(wgpu::MapMode::Read, move |r| state.store(if r.is_ok() { 2 } else { 0 }, Ordering::Release));
+        }
     }
 
     pub fn origin(&self) -> Vec3 {

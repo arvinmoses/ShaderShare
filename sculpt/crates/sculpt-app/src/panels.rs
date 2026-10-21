@@ -165,6 +165,16 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                         app.dialog = Some(Dialog::SaveVolume(app.volume_path.clone().unwrap_or("untitled.svol".into())));
                         ui.close();
                     }
+                    ui.separator();
+                    if let Some(m) = app.volume_mode.as_mut() {
+                        let top = m.vol.levels() - 1;
+                        ui.add(egui::Slider::new(&mut m.cap, 0..=top).text("Detail shown up to level"));
+                        ui.checkbox(&mut m.tint, "Tint by level");
+                    }
+                    if let Some(vp) = app.viewport.as_mut() {
+                        ui.checkbox(&mut vp.cull, "Skip clusters out of view or facing away");
+                    }
+                    ui.separator();
                     if ui.button("Leave volume playground").clicked() {
                         app.close_volume();
                         ui.close();
