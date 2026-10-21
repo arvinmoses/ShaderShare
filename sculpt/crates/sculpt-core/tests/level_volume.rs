@@ -291,9 +291,11 @@ fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
         }
         // Each bump's height over the mean of the surface either side of it.
         // Each bump's height over the surface beside it, wherever it ended up within a little of where it was made.
+        // Heights along the strokes' push (their planes face +z over the top of the ball): detail carried along it
+        // stays where it was seen that way.
         let h2 = |v: &LevelVolume, x: f32, y: f32| {
-            let dir = Vec3::new(x, y, 1.0).normalize();
-            v.raycast(dir * 3.0, -dir, v.levels() - 1, false).map_or(f32::NAN, |(h, _)| h.length() - 1.0)
+            let p = Vec3::new(x, y, 1.0).normalize();
+            v.raycast(Vec3::new(p.x, p.y, 3.0), -Vec3::Z, v.levels() - 1, false).map_or(f32::NAN, |(h, _)| h.z - 1.0)
         };
         let relief = |v: &LevelVolume| {
             xs.iter()
@@ -401,4 +403,335 @@ fn stroke_open(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32) -> Level
         }
     }
     w
+}
+
+/// Across a groove cut at `level` along `along` through `patch`, at 40 stations over `+-half` along it and `+-width`
+/// across, seen along `push`: how far the surface lies below the surface without the groove's level (the ground),
+/// and where its bottom is across (the middle of where it is more than half as deep).
+#[allow(clippy::too_many_arguments)]
+fn groove_profile(v: &LevelVolume, level: usize, patch: Vec3, along: Vec3, across: Vec3, push: Vec3, half: f32, width: f32) -> Vec<(f32, f32)> {
+    let all = v.levels() - 1;
+    (0..40)
+        .map(|i| {
+            let s = -half + 2.0 * half * i as f32 / 39.0;
+            let depths: Vec<(f32, f32)> = (0..81)
+                .map(|j| {
+                    let u = -width + 2.0 * width * j as f32 / 80.0;
+                    let o = patch + along * s + across * u + push * 2.0;
+                    let h = |cap: usize| v.raycast(o, -push, cap, false).map_or(f32::NAN, |(p, _)| p.dot(push));
+                    (h(level - 1) - h(all), u)
+                })
+                .collect();
+            let deepest = depths.iter().map(|q| q.0).fold(f32::NEG_INFINITY, f32::max);
+            let (sum, weight) = depths.iter().fold((0.0, 0.0), |(s, w), q| {
+                let x = (q.0 - 0.5 * deepest).max(0.0);
+                (s + x * q.1, w + x)
+            });
+            (deepest, if weight > 0.0 { sum / weight } else { 0.0 })
+        })
+        .collect()
+}
+
+/// The review session's case: clay at level 1, four level 4 trim grooves close together over it, on a level 0 of 1M
+/// triangles' step, then a big level 0 clay stroke right over them, its detail carried in jobs as the app carries it
+/// (one job of a few hundred blocks at a time, started once a frame, two dabs a frame, so its result lands two dabs
+/// late). Each groove stays whole, as deep along its length as it was, where they used to break into stepped pieces.
+#[test]
+fn trim_grooves_ride_a_big_stroke_carried_in_jobs() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let plane_stroke = |v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, jobs: bool| {
+        v.begin_stroke();
+        let steps = (((b - a).length() / (0.15 * r)).ceil() as usize).max(1);
+        let mut along = Vec3::ZERO;
+        let mut held: Option<sculpt_core::generator::level_volume::CarryJob> = None;
+        for k in 0..=steps {
+            let d = a.lerp(b, k as f32 / steps as f32).normalize();
+            let Some((hit, n)) = v.raycast(d * 3.0, -d, l, true) else { continue };
+            let h = r * if trim { 0.075 } else { 0.095 };
+            let rough = if along == Vec3::ZERO { n } else { along };
+            if let Some((n, _)) = v.plane_dab(l, hit, rough, r, h, 0.2, 0.4, trim) {
+                along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+            }
+            if jobs && k % 2 == 1 {
+                if let Some(job) = held.take() {
+                    v.carry_apply(job.run());
+                }
+                held = v.carry_take(384);
+            }
+        }
+        if let Some(job) = held.take() {
+            v.carry_apply(job.run());
+        }
+        v.end_stroke();
+    };
+    // Clay at level 1 either side of the grooves, so the levels between hold form, and the grooves sit on its slope.
+    for k in 0..2 {
+        let o = t2 * (0.05 * k as f32 - 0.025);
+        plane_stroke(&mut v, 1, patch + o - t1 * 0.08, patch + o + t1 * 0.08, 0.06, false, false);
+    }
+    for k in 0..4 {
+        let o = t2 * (0.004 * k as f32 - 0.006);
+        plane_stroke(&mut v, 4, patch + o - t1 * 0.01, patch + o + t1 * 0.01, 0.0025, true, false);
+    }
+    let push = patch;
+    let along = (t1 - push * t1.dot(push)).normalize();
+    let across = push.cross(along);
+    let grooves: Vec<Vec3> = (0..4).map(|k| patch + t2 * (0.004 * k as f32 - 0.006)).collect();
+    let profiles = |v: &LevelVolume| -> Vec<Vec<(f32, f32)>> { grooves.iter().map(|&g| groove_profile(v, 4, g, along, across, push, 0.006, 0.0018)).collect() };
+    let before = profiles(&v);
+    let blocks0 = v.memory().0;
+    v.carry_budget = Some(0.0);
+    let t = std::time::Instant::now();
+    plane_stroke(&mut v, 0, patch - t1 * 0.05, patch + t1 * 0.05, 0.29, false, true);
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let after = profiles(&v);
+    let rise = v.raycast(patch * 3.0, -patch, 0, false).map_or(0.0, |(p, _)| p.length() - 1.0);
+    let median = |p: &[(f32, f32)]| {
+        let mut d: Vec<f32> = p.iter().map(|x| x.0).collect();
+        d.sort_by(f32::total_cmp);
+        d[d.len() / 2]
+    };
+    let (open, _, dropped, _) = check(&v, 5);
+    assert_eq!((open, dropped), (0, 0));
+    assert!(rise > 0.02, "the clay did not build there");
+    for (k, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+        let least = a.iter().map(|x| x.0).fold(f32::INFINITY, f32::min);
+        let jump = a.windows(2).map(|w| (w[1].1 - w[0].1).abs()).fold(0.0f32, f32::max);
+        eprintln!("groove {k}: depth median {:.5} -> {:.5}, least {least:.5} after; largest jump of its bottom between stations {jump:.5} (level 4 step {:.5})", median(b), median(a), v.voxel(4));
+        if std::env::var("GROOVE_DUMP").is_ok() {
+            eprintln!("   depth by station, in 1e-5: {}", a.iter().map(|x| format!("{:.0}", x.0 * 1e5)).collect::<Vec<_>>().join(" "));
+            eprintln!("   bottom by station, in 1e-4: {}", a.iter().map(|x| format!("{:+.1}", x.1 * 1e4)).collect::<Vec<_>>().join(" "));
+        }
+        assert!(least > 0.7 * median(b), "groove {k} broke: somewhere it is {least:.5} deep, against {:.5}", median(b));
+        assert!(jump < 2.0 * v.voxel(4), "groove {k} jumps sideways by {jump:.5}");
+    }
+    eprintln!("the ground rose {rise:.4} in {ms:.0} ms; blocks per level {blocks0:?} -> {:?}", v.memory().0);
+}
+
+/// A groove at level 4 on the slope a big level 0 clay stroke leaves at its rim: it rides along whole, as deep along
+/// its length as it was and without jumping sideways, where it used to break into pieces cut off at block faces.
+#[test]
+fn a_groove_on_a_big_strokes_rim_rides_along_whole() {
+    // The rim close to the groove (it rises 0.05 over two passes), and nearer the stroke's line (steeper).
+    for (off, passes) in [(0.12f32, 1usize), (0.15, 2)] {
+        let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+        let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+        let (t1, t2) = patch.any_orthonormal_pair();
+        let plane_stroke = |v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool| {
+            v.begin_stroke();
+            let steps = (((b - a).length() / (0.15 * r)).ceil() as usize).max(1);
+            let mut along = Vec3::ZERO;
+            for k in 0..=steps {
+                let d = a.lerp(b, k as f32 / steps as f32).normalize();
+                let Some((hit, n)) = v.raycast(d * 3.0, -d, l, true) else { continue };
+                let h = r * if trim { 0.075 } else { 0.095 };
+                let rough = if along == Vec3::ZERO { n } else { along };
+                if let Some((n, _)) = v.plane_dab(l, hit, rough, r, h, 0.2, 0.4, trim) {
+                    along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+                }
+            }
+            if std::env::var("RIM_NOEND").is_ok() && l == 0 {
+                v.carry_pending(None);
+                return;
+            }
+            v.end_stroke();
+        };
+        plane_stroke(&mut v, 4, patch - t1 * 0.012, patch + t1 * 0.012, 0.0025, true);
+        // The clay's push (its planes face about the middle of the stroke), and the groove's frame seen along it.
+        let push = (patch + t2 * off).normalize();
+        let along = (t1 - push * t1.dot(push)).normalize();
+        let across = push.cross(along);
+        // Across the groove at stations along it, seen along the push: its depth below the ground and where its bottom
+        // is. The ground is the surface without the groove's level (a groove this shallow is never moved down a
+        // level): a line through the sides would read the rim's curve as lost depth, a quarter of it after one pass.
+        let profile = |v: &LevelVolume| -> Vec<(f32, f32)> { groove_profile(v, 4, patch, along, across, push, 0.008, 0.008) };
+        let before = profile(&v);
+        let blocks0 = v.memory().0;
+        // Big clay, its line `off` to the side, so the groove lies on the slope of its rim.
+        for _ in 0..passes {
+            plane_stroke(&mut v, 0, patch + t2 * off - t1 * 0.06, patch + t2 * off + t1 * 0.06, 0.29, false);
+        }
+        let after = profile(&v);
+        if std::env::var("GROOVE_DUMP").is_ok() {
+            for (i, (b, q)) in before.iter().zip(after.iter()).enumerate() {
+                eprintln!("  station {i:2}: depth {:.5} -> {:.5}, bottom at {:+.5} -> {:+.5}", b.0, q.0, b.1, q.1);
+            }
+        }
+        let median = |p: &[(f32, f32)]| {
+            let mut d: Vec<f32> = p.iter().map(|x| x.0).collect();
+            d.sort_by(f32::total_cmp);
+            d[d.len() / 2]
+        };
+        let least = after.iter().map(|x| x.0).fold(f32::INFINITY, f32::min);
+        let jump = after.windows(2).map(|w| (w[1].1 - w[0].1).abs()).fold(0.0f32, f32::max);
+        let rise = v.raycast(patch * 3.0, -patch, 0, false).map_or(0.0, |(p, _)| p.length() - 1.0);
+        eprintln!(
+            "clay {off} to the side, {passes} passes: groove depth along it: median {:.5} before, {:.5} after, least {least:.5} after; largest jump of its bottom between stations {jump:.5} (level 4 step {:.5}); the ground rose {rise:.4}; blocks per level {blocks0:?} -> {:?}",
+            median(&before),
+            median(&after),
+            v.voxel(4),
+            v.memory().0
+        );
+        let (open, _, dropped, _) = check(&v, 5);
+        assert_eq!((open, dropped), (0, 0));
+        assert!(rise > 0.01, "the clay did not build there");
+        assert!(least > 0.7 * median(&before), "the groove broke: somewhere it is {least:.5} deep, against {:.5}", median(&before));
+        assert!(jump < 2.0 * v.voxel(4), "the groove jumps sideways by {jump:.5}");
+    }
+}
+
+/// The review session's whole patch: rolling clay built at level 1 (with a little level 2 and 3 work on it), four
+/// level 4 trim grooves and a row of level 4 dots on it, then a big level 0 clay stroke over all of it. The rolls keep
+/// their height and shape, the grooves and dots their depth, and the surface between them gets no rougher.
+#[test]
+fn a_whole_patch_of_fine_work_rides_a_big_stroke() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let plane_stroke = |v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool| {
+        v.begin_stroke();
+        let steps = (((b - a).length() / (0.15 * r)).ceil() as usize).max(1);
+        let mut along = Vec3::ZERO;
+        for k in 0..=steps {
+            let d = a.lerp(b, k as f32 / steps as f32).normalize();
+            let Some((hit, n)) = v.raycast(d * 3.0, -d, l, true) else { continue };
+            let h = r * if trim { 0.075 } else { 0.095 };
+            let rough = if along == Vec3::ZERO { n } else { along };
+            if let Some((n, _)) = v.plane_dab(l, hit, rough, r, h, 0.2, 0.4, trim) {
+                along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+            }
+        }
+        v.end_stroke();
+    };
+    // Rolls: three level 1 clay strokes along t1, 0.05 apart, scrubbed twice; a level 2 stroke and a level 3 trim on the
+    // middle one.
+    for _ in 0..2 {
+        for k in 0..3 {
+            let o = t2 * (0.05 * k as f32 - 0.05);
+            plane_stroke(&mut v, 1, patch + o - t1 * 0.1, patch + o + t1 * 0.1, 0.05, false);
+        }
+    }
+    plane_stroke(&mut v, 2, patch - t1 * 0.06, patch + t1 * 0.06, 0.02, false);
+    plane_stroke(&mut v, 3, patch - t2 * 0.05 - t1 * 0.04, patch - t2 * 0.05 + t1 * 0.04, 0.01, true);
+    // Grooves and dots at level 4, to one side along t1.
+    let g0 = patch + t1 * 0.03;
+    for k in 0..4 {
+        let o = t2 * (0.004 * k as f32 - 0.006);
+        plane_stroke(&mut v, 4, g0 + o - t1 * 0.01, g0 + o + t1 * 0.01, 0.0025, true);
+    }
+    let dots: Vec<Vec3> = (0..5)
+        .map(|k| {
+            let d = (patch - t1 * 0.03 + t2 * (0.006 * k as f32 - 0.012)).normalize();
+            v.raycast(d * 3.0, -d, 5, false).unwrap().0
+        })
+        .collect();
+    for &d in &dots {
+        v.begin_stroke();
+        v.ball_dab(4, d, 0.002, 0.0005, false);
+        v.end_stroke();
+    }
+    let push = patch;
+    let along = (t1 - push * t1.dot(push)).normalize();
+    let across = push.cross(along);
+    let h = |v: &LevelVolume, p: Vec3, cap: usize| v.raycast(p + push * 2.0, -push, cap, false).map_or(f32::NAN, |(q, _)| q.dot(push));
+    // The rolls: the surface over level 0 along a line across them (away from the grooves and dots).
+    let rolls = |v: &LevelVolume| -> Vec<f32> { (0..121).map(|j| { let p = patch + across * (-0.09 + 0.0015 * j as f32); h(v, p, 5) - h(v, p, 0) }).collect() };
+    // Grooves and dots over the ground without level 4.
+    let grooves: Vec<Vec3> = (0..4).map(|k| g0 + t2 * (0.004 * k as f32 - 0.006)).collect();
+    let groove_profiles = |v: &LevelVolume| -> Vec<Vec<(f32, f32)>> { grooves.iter().map(|&g| groove_profile(v, 4, g, along, across, push, 0.006, 0.0018)).collect() };
+    // Each dot's relief: the surface's peak within 0.0018 of it over its mean along that window's rim (the ground
+    // under the dots is a roll, with form at levels 1 to 3 that the stroke carries less exactly than the dots).
+    let dot_heights = |v: &LevelVolume| -> Vec<f32> {
+        dots.iter()
+            .map(|&d| {
+                let (mut peak, mut rim, mut n) = (f32::NEG_INFINITY, 0.0, 0);
+                for i in 0..13 {
+                    for j in 0..13 {
+                        let p = d + along * (0.0003 * (i as f32 - 6.0)) + across * (0.0003 * (j as f32 - 6.0));
+                        let x = h(v, p, 5);
+                        peak = peak.max(x);
+                        if i == 0 || i == 12 || j == 0 || j == 12 {
+                            rim += x;
+                            n += 1;
+                        }
+                    }
+                }
+                peak - rim / n as f32
+            })
+            .collect()
+    };
+    // Roughness: the RMS second difference of the surface along lines across a roll's flank, 0.0025 apart.
+    let roughness_at = |v: &LevelVolume, cap: usize| -> f32 {
+        let (mut sum, mut n) = (0.0f32, 0);
+        for i in 0..5 {
+            let base = patch + across * (0.03 + 0.005 * i as f32) - along * 0.06;
+            let hs: Vec<f32> = (0..49).map(|j| h(v, base + along * (0.0025 * j as f32), cap)).collect();
+            for w in hs.windows(3) {
+                let d2 = w[0] - 2.0 * w[1] + w[2];
+                sum += d2 * d2;
+                n += 1;
+            }
+        }
+        (sum / n as f32).sqrt()
+    };
+    let roughness = |v: &LevelVolume| roughness_at(v, 5);
+    let (rolls0, grooves0, dots0, rough0, blocks0) = (rolls(&v), groove_profiles(&v), dot_heights(&v), roughness(&v), v.memory().0);
+    plane_stroke(&mut v, 0, patch - t1 * 0.05, patch + t1 * 0.05, 0.29, false);
+    let (rolls1, grooves1, dots1, rough1) = (rolls(&v), groove_profiles(&v), dot_heights(&v), roughness(&v));
+    let rise = v.raycast(patch * 3.0, -patch, 0, false).map_or(0.0, |(p, _)| p.length() - 1.0);
+    let span = |r: &[f32]| r.iter().cloned().fold(f32::NEG_INFINITY, f32::max) - r.iter().cloned().fold(f32::INFINITY, f32::min);
+    let roll_diff = rolls0.iter().zip(rolls1.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let median = |p: &[(f32, f32)]| {
+        let mut d: Vec<f32> = p.iter().map(|x| x.0).collect();
+        d.sort_by(f32::total_cmp);
+        d[d.len() / 2]
+    };
+    eprintln!("rolls: height {:.4} -> {:.4}, largest change of the profile over level 0 {:.5}", span(&rolls0), span(&rolls1), roll_diff);
+    if std::env::var("GROOVE_DUMP").is_ok() {
+        eprintln!("   rolls before, in 1e-4: {}", rolls0.iter().map(|x| format!("{:.0}", x * 1e4)).collect::<Vec<_>>().join(" "));
+        eprintln!("   rolls after,  in 1e-4: {}", rolls1.iter().map(|x| format!("{:.0}", x * 1e4)).collect::<Vec<_>>().join(" "));
+    }
+    for (k, (b, a)) in grooves0.iter().zip(grooves1.iter()).enumerate() {
+        let least = a.iter().map(|x| x.0).fold(f32::INFINITY, f32::min);
+        let jump = a.windows(2).map(|w| (w[1].1 - w[0].1).abs()).fold(0.0f32, f32::max);
+        eprintln!("groove {k}: depth median {:.5} -> {:.5}, least {least:.5}; largest jump of its bottom {jump:.5}", median(b), median(a));
+        if std::env::var("GROOVE_DUMP").is_ok() {
+            eprintln!("   depth by station, in 1e-5: {}", a.iter().map(|x| format!("{:.0}", x.0 * 1e5)).collect::<Vec<_>>().join(" "));
+            for i in [2usize, 37] {
+                let s = -0.006 + 0.012 * i as f32 / 39.0;
+                let line: Vec<String> = (0..41)
+                    .map(|j| {
+                        let u = -0.004 + 0.0002 * j as f32;
+                        let p = grooves[k] + along * s + across * u;
+                        format!("{:.0}", (h(&v, p, 3) - h(&v, p, 5)) * 1e5)
+                    })
+                    .collect();
+                eprintln!("   across at station {i}, u -0.004..0.004, in 1e-5: {}", line.join(" "));
+            }
+        }
+    }
+    eprintln!("dots: {:.5?} -> {:.5?}", dots0, dots1);
+    if std::env::var("GROOVE_DUMP").is_ok() {
+        eprintln!("   roughness by cap after: {:?}", (0..=5).map(|c| format!("{:.6}", roughness_at(&v, c))).collect::<Vec<_>>());
+    }
+    eprintln!("roughness (RMS second difference over 0.0025): {rough0:.6} -> {rough1:.6}; the ground rose {rise:.4}; blocks per level {blocks0:?} -> {:?}", v.memory().0);
+    let (open, _, dropped, _) = check(&v, 5);
+    assert_eq!((open, dropped), (0, 0));
+    assert!(rise > 0.02, "the clay did not build there");
+    assert!(span(&rolls0) > 0.002, "the rolls did not build");
+    // The bars are where the engine stood before this work (rolls 0.0031 of 0.0034 with the profile off by 0.0014
+    // after a dip in a roll's top; grooves at a median of 0.00013 to 0.00018 of 0.00019, fading at one end; two of
+    // the five dots lost; roughness 0.00036), and the regression this test was written for (rolls 0.0067, grooves
+    // gone, roughness 0.0038).
+    assert!(span(&rolls1) > 0.7 * span(&rolls0), "the rolls lost height: {:.5} of {:.5}", span(&rolls1), span(&rolls0));
+    assert!(roll_diff < 0.5 * span(&rolls0), "the rolls changed shape by {roll_diff:.5} of {:.5}", span(&rolls0));
+    for (k, (b, a)) in grooves0.iter().zip(grooves1.iter()).enumerate() {
+        assert!(median(a) > 0.6 * median(b), "groove {k} faded: {:.5} against {:.5}", median(a), median(b));
+    }
+    for (k, (b, a)) in dots0.iter().zip(dots1.iter()).enumerate() {
+        assert!(*a > 0.6 * b, "dot {k} faded: {a:.5} against {b:.5}");
+    }
+    assert!(rough1 < 0.0006, "the surface got rougher: {rough1:.6} (it was {rough0:.6})");
 }

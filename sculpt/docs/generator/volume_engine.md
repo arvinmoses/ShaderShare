@@ -77,8 +77,11 @@ on DX12 earlier in this work; DX12's shader compiler now fails on the vertex pas
 non-manifold edges and no dropped quads at any level cap; rebuilding only the blocks a stroke touched matches a full
 rebuild exactly; a groove keeps 93% of its depth under level 0 clay that raises the area 0.18, and a level 4 groove
 102% under a rise of 116 of its steps, without spawning blocks (47 before, 35 after); bumps and pits at levels 3-5
-keep 71-86% of their height under two level 0 clay strokes raising the area 0.064 (20 to 100 of their steps),
-carried a little at a time, and 64% under six such strokes raising it 0.26 (200 steps); a ridge built at level 2 shows half its height from afar; a crumb left by a stroke is
+keep 94-107% of their height under two level 0 clay strokes raising the area 0.064 (20 to 100 of their steps),
+carried a little at a time, and 92% under six such strokes raising it 0.26 (200 steps), in place as seen along the
+brush; a level 4 groove on the sloping rim of a big stroke keeps its whole depth along its length (it used to break
+into pieces cut off at block faces); a patch of mixed work (level 1 rolls, level 2-3 strokes, level 4 grooves and
+dots) under a big level 0 stroke keeps its rolls, grooves and dots without new roughness; a ridge built at level 2 shows half its height from afar; a crumb left by a stroke is
 removed and a real lump kept; undo, redo and saving restore exactly. `sculpt-cli volume-spike levels-carry DIR` draws
 such bumps before and after.
 
@@ -160,6 +163,30 @@ half are skipped as facing away.
 * Carrying detail sized its source grid by the stroke's whole movement in fine steps: under a big level 0 stroke that
   was hundreds of steps and gigabytes; it is now sized by where the samples actually come from.
 
+## Carrying detail under big strokes, fixed
+
+`volume/carry_big_stroke_compare.png` is one view after the demo's big stroke: top left as it was (grooves in stepped
+pieces), top right a wrong turn on the way (rolls exaggerated, pebbly), bottom left as it is now, bottom right the
+same with linear resampling. What was wrong, and what changed:
+
+* **Where detail lands and where it is read back disagreed.** Which blocks to rebuild was worked out per source block
+  along the stroke-start normal, the rebuild read detail back along the new normal; where a stroke tilts the surface
+  (its rim) the blocks the detail needed were never built, so grooves were cut off at block faces. Both now follow
+  the same direction, point by point.
+* **That direction is the brush's push**, not the surface's normal: each dab's plane normal, weighted by the brush's
+  falloff, blended between blocks. Along the normal, detail slid sideways wherever the stroke left a slope (0.027
+  after six strokes; now 0.004). Near walls of hard brushes, where the push runs along the surface, the normal.
+* **How far the surface moved is measured more finely where it varies**: on every 4th level 0 step, and where a cell's
+  centre is off what its corners say by more than half a fine step, at every point of the cell. Form at the levels
+  between (rolls rebased into level 0) made the move vary faster than the coarse lattice, so detail was read a few
+  steps off and vanished.
+* **Detail is taken and put back the same way**: the level as stored less the level below clamped to the level's band,
+  added to the new level below clamped the same way, as reading a level from the one below does. Before, it was put
+  back onto the unclamped level below, so samples just above a bump came out short and bumps shrank 8-10% a stroke.
+  (Leaving both unclamped exaggerated everything a level stood off the one below: the wrong turn above.)
+* **Detail is resampled with a cubic** (Catmull-Rom over 4x4x4) rather than linearly, which lost 3-15% of a feature a
+  few steps wide each stroke.
+
 ## Driver workarounds (Vulkan, this AMD driver)
 
 Two things in the compute shaders lost the device or silently gave wrong results on Vulkan while DX12 was fine:
@@ -183,10 +210,10 @@ one array of atomics at fixed places. The exact check runs on both backends.
 * **DX12 fails to compile the vertex pass** (its FXC compiler aborts with an internal error). The app picks Vulkan on
   this machine; on DX12-only machines the volume mode would not start. Trying the newer DXC compiler, or splitting the
   transition-cell code out of the vertex pass, is next.
-* **Small steps where carried detail meets the edge of a finer region**, and the finest dots come through faint.
-* **Detail drifts sideways where clay builds a slope.** It moves along the surface's normal, so where a scrubbed
-  stroke leaves the area sloping, small bumps end up off where they were, a few thousandths after a rise of 0.06 and
-  up to 0.03 after 0.26 (they keep most of their height). Carrying along the brushes' own push direction instead
-  would hold them in place under plane brushes.
+* **The finest work on a slope fades at one end under a big stroke.** In the demo the lower two grooves and the dots
+  come through faint: the finest detail shears sideways by about 0.004 over 0.012 there. Not yet diagnosed.
+* **Level 1 gains a little texture under a big stroke** (its roughness about 1.4 times what it was before the
+  cubic resampling below; the texture itself was already there).
+* Bumps taller than 2.5 of their level's bands read 3-5% taller after two strokes.
 * **The field is edited on the CPU.** Dabs cost 1-3 ms; the GPU does what grows with the model (extraction, drawing,
   culling). Moving dabs to compute shaders is possible later without changing the layout.
