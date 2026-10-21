@@ -118,6 +118,9 @@ pub struct GpuLevels {
     /// GPU timestamps around the extraction passes, when the device has them: the queries, where they resolve, a
     /// buffer to read them from and its state, and nanoseconds per tick.
     timer: Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer, Arc<AtomicU8>, f32)>,
+    /// Per slot, a hash of the samples last sent (0: none yet): a block whose 16-bit samples come out the same is
+    /// neither sent nor rebuilt, since the GPU would build exactly what it has.
+    sent: Vec<u64>,
     /// GPU time of the last extraction read back, in milliseconds.
     pub gpu_ms: f64,
     pub indirect_count: bool,
@@ -133,10 +136,21 @@ fn hash_of(c: IVec3, l: u32) -> u32 {
 }
 
 /// A block's 9x9x9 samples as the GPU holds them: 16 bits each, two to a word.
+/// A hash of a block's packed samples (never 0, which means none sent).
+fn sample_hash(data: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &w in data {
+        h = (h ^ w as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        h ^= h >> 29;
+    }
+    h | 1
+}
+
 pub(super) fn packed_samples(vol: &LevelVolume, k: Key) -> Vec<u32> {
     let (l, bc) = (k.0 as usize, k.1);
     let band = vol.band(l);
-    let g = vol.gather9(l, bc);
+    let mut g = [0.0f32; 729];
+    vol.gather9_into(l, bc, &mut g);
     let mut out = vec![0u32; SAMPLE_WORDS as usize];
     for (i, v) in g.iter().enumerate() {
         let q = quantize(*v, band) as u16 as u32;
@@ -206,6 +220,7 @@ impl GpuLevels {
                 (set, resolve, staging, Arc::new(AtomicU8::new(0)), queue.get_timestamp_period())
             }),
             gpu_ms: 0.0,
+            sent: Vec::new(),
             indirect_count,
             grow_pages: false,
             buffers_made: 1,
@@ -331,6 +346,10 @@ impl GpuLevels {
             self.key_of.resize(s as usize + 1, None);
         }
         self.key_of[s as usize] = Some(k);
+        if self.sent.len() <= s as usize {
+            self.sent.resize(s as usize + 1, 0);
+        }
+        self.sent[s as usize] = 0;
         self.slot_of.insert(k, s);
         Some(s)
     }
@@ -422,16 +441,37 @@ impl GpuLevels {
     }
 
     fn send_meta(&self, keys: &[Key]) {
-        for k in keys {
-            if let Some(&s) = self.slot_of.get(k) {
-                let m = [k.1.x, k.1.y, k.1.z, k.0 as i32];
-                self.queue.write_buffer(&self.buf.meta, s as u64 * 16, bytemuck::cast_slice(&m));
+        // Runs of consecutive slots in one write each: a write per slot costs far more than its 16 bytes.
+        let mut m: Vec<(u32, [i32; 4])> = keys.iter().filter_map(|k| Some((*self.slot_of.get(k)?, [k.1.x, k.1.y, k.1.z, k.0 as i32]))).collect();
+        m.sort_unstable_by_key(|e| e.0);
+        let mut i = 0;
+        while i < m.len() {
+            let mut j = i + 1;
+            while j < m.len() && m[j].0 == m[j - 1].0 + 1 {
+                j += 1;
             }
+            let data: Vec<[i32; 4]> = m[i..j].iter().map(|e| e.1).collect();
+            self.queue.write_buffer(&self.buf.meta, m[i].0 as u64 * 16, bytemuck::cast_slice(&data));
+            i = j;
         }
     }
 
-    fn upload(&self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats) {
-        let packed: Vec<(u32, Vec<u32>)> = keys.par_iter().filter_map(|k| Some((*self.slot_of.get(k)?, packed_samples(vol, *k)))).collect();
+    /// Send the samples of `keys` that differ from what their slots hold; returns those sent.
+    fn upload(&mut self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats) -> Vec<Key> {
+        let sent = &self.sent;
+        let packed: Vec<(u32, Vec<u32>, u64, Key)> = keys
+            .par_iter()
+            .filter_map(|k| {
+                let s = *self.slot_of.get(k)?;
+                let data = packed_samples(vol, *k);
+                let h = sample_hash(&data);
+                (sent[s as usize] != h).then_some((s, data, h, *k))
+            })
+            .collect();
+        for p in &packed {
+            self.sent[p.0 as usize] = p.2;
+        }
+        let out: Vec<Key> = packed.iter().map(|p| p.3).collect();
         // Runs of consecutive slots go up in one write.
         let mut sorted = packed;
         sorted.sort_unstable_by_key(|p| p.0);
@@ -447,6 +487,7 @@ impl GpuLevels {
             i = j;
         }
         stats.uploaded += sorted.len();
+        out
     }
 
     /// Record and submit the passes for `extract` (slots re-extracted) and `released` (slots that only give pages back).
@@ -585,10 +626,13 @@ impl GpuLevels {
         }
         let uploads = vol.upload_set(&dirty);
         let mut out_of_slots = false;
+        // Blocks given a slot now: only their slots' block coordinates need sending.
+        let mut placed = Vec::new();
         for k in &uploads {
             if !self.slot_of.contains_key(k) {
                 if let Some(s) = self.take_slot(*k) {
                     self.hash_insert(*k, s);
+                    placed.push(*k);
                 } else {
                     out_of_slots = true;
                 }
@@ -616,8 +660,8 @@ impl GpuLevels {
         for &s in &released {
             self.queue.write_buffer(&self.buf.meta, s as u64 * 16, bytemuck::cast_slice(&[0i32, 0, 0, -1]));
         }
-        self.send_meta(&uploads);
-        self.upload(vol, &uploads, &mut stats);
+        self.send_meta(&placed);
+        let uploads = self.upload(vol, &uploads, &mut stats);
         let mut changed: Vec<Key> = uploads.clone();
         changed.extend(gone);
         let extract = vol.extract_set(&changed, self.cap);

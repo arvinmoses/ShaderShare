@@ -256,23 +256,33 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             s.extracted
         ));
     }
-    // A big level 0 stroke right over the fine work: every finer level's detail under it rides along.
+    // A big level 0 stroke right over the fine work: every finer level's detail under it rides along. Frame by frame
+    // as the app does it: the frame's dabs (two, the app's spacing apart, a brisk stroke) only queue the carrying,
+    // then 6 ms of it, then the sync.
     {
-        let (mut dab_ms, mut sync_ms, mut carried) = (Vec::new(), Vec::new(), 0);
+        let (mut frame_ms, mut dab_ms, mut carry_ms, mut sync_ms, mut queued) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
+        vol.carry_budget = Some(0.0);
         vol.begin_stroke();
         let mut along = Vec3::ZERO;
-        for k in 0..=12 {
-            let dir = Vec3::new(-0.15 + 0.02 * k as f32, 0.1, 1.0).normalize();
-            let Some((hit, n)) = vol.raycast(dir * 3.0, -dir, 0, true) else { continue };
+        let r = 0.3;
+        for frame in 0..6 {
             let t = Instant::now();
-            let rough = if along == Vec3::ZERO { n } else { along };
-            if let Some((n, d)) = vol.plane_dab(0, hit, rough, 0.3, 0.3 * 0.09, 0.5, 0.4, false) {
-                along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
-                carried = carried.max(d.carried);
+            for d in 0..2 {
+                let x = -0.25 + 0.15 * r * (2 * frame + d) as f32;
+                let dir = Vec3::new(x, 0.1, 1.0).normalize();
+                let Some((hit, n)) = vol.raycast(dir * 3.0, -dir, 0, true) else { continue };
+                let rough = if along == Vec3::ZERO { n } else { along };
+                if let Some((n, _)) = vol.plane_dab(0, hit, rough, r, r * 0.09, 0.5, 0.4, false) {
+                    along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+                }
             }
             dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            let tc = Instant::now();
+            queued = queued.max(vol.carry_pending(Some(6.0)));
+            carry_ms.push(tc.elapsed().as_secs_f64() * 1e3);
             let s = gpu.sync(&mut vol);
             sync_ms.push(s.cpu_ms);
+            frame_ms.push(t.elapsed().as_secs_f64() * 1e3);
         }
         let t = Instant::now();
         let mut frames = 0;
@@ -284,7 +294,10 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
         let catch_up = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
         vol.end_stroke();
-        println!("a level 0 stroke (radius 0.3) over the fine work: dab {:.1} ms CPU (median, within a 6 ms carrying budget; up to {carried} finer blocks a dab), sync {:.1} ms; the queued detail caught up in {frames} more frames ({catch_up:.0} ms); stroke end {:.0} ms", median(dab_ms), median(sync_ms), t.elapsed().as_secs_f64() * 1e3);
+        let end_ms = t.elapsed().as_secs_f64() * 1e3;
+        gpu.sync(&mut vol);
+        vol.carry_budget = Some(6.0);
+        println!("a level 0 stroke (radius 0.3) over the fine work, two dabs a frame: frame {:.1} ms CPU (median: dabs {:.1}, carrying {:.1}, up to {queued} finer blocks a frame, sync {:.1}); the queued detail caught up in {frames} more frames ({catch_up:.0} ms); stroke end {end_ms:.0} ms", median(frame_ms), median(dab_ms), median(carry_ms), median(sync_ms));
     }
     println!();
     println!("| level | step | brush radius (steps) | dab ms CPU | sync ms CPU | sync to GPU done ms | blocks uploaded / extracted (most) | stroke end ms | extracted after |");

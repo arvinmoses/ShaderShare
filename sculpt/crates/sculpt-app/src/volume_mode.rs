@@ -20,6 +20,7 @@ const PIXELS_PER_STEP: f32 = 1.0;
 /// The most lattice steps across a brush's radius: bigger brushes work a level coarser.
 const MAX_STEPS_PER_RADIUS: f32 = 48.0;
 /// Milliseconds a frame may spend carrying finer detail along under a coarse stroke; the rest follows next frame.
+/// Spent once a frame in [`VolumeMode::tick`], however many dabs the frame has: dabs only queue the work.
 const CARRY_MS: f64 = 6.0;
 
 pub struct VolumeMode {
@@ -60,7 +61,7 @@ impl VolumeMode {
 
     pub fn new(mut vol: LevelVolume) -> VolumeMode {
         let cap = vol.levels() - 1;
-        vol.carry_budget = Some(CARRY_MS);
+        vol.carry_budget = Some(0.0);
         VolumeMode {
             vol,
             generation: 1,

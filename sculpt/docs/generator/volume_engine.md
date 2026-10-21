@@ -85,22 +85,34 @@ such bumps before and after.
 
 | level | step | brush radius (steps) | dab, CPU | sync, CPU | until the GPU is done | blocks rebuilt (most) | pen lift |
 |---|---|---|---|---|---|---|---|
-| 0 | 0.0035 | 71 | 4.0 ms | 5.9 ms | 10.0 ms | 2798 | 77 ms |
-| 1 | 0.0018 | 46 | 1.5 ms | 1.2 ms | 3.7 ms | 570 | 44 ms |
-| 2 | 0.0009 | 46 | 1.5 ms | 1.4 ms | 4.2 ms | 607 | 50 ms |
-| 3 | 0.0004 | 34 | 1.2 ms | 1.0 ms | 4.1 ms | 362 | 30 ms |
-| 4 | 0.0002 | 37 | 1.4 ms | 1.1 ms | 4.6 ms | 589 | 37 ms |
-| 5 | 0.0001 | 37 | 1.1 ms | 1.0 ms | 5.2 ms | 617 | 31 ms |
+| 0 | 0.0035 | 71 | 2.9 ms | 2.9 ms | 4.1 ms | 2381 | 77 ms |
+| 1 | 0.0018 | 46 | 1.1 ms | 1.0 ms | 3.9 ms | 523 | 36 ms |
+| 2 | 0.0009 | 46 | 1.2 ms | 1.1 ms | 4.2 ms | 539 | 41 ms |
+| 3 | 0.0004 | 34 | 0.9 ms | 0.8 ms | 3.4 ms | 312 | 25 ms |
+| 4 | 0.0002 | 37 | 1.0 ms | 0.9 ms | 3.0 ms | 347 | 31 ms |
+| 5 | 0.0001 | 37 | 0.9 ms | 0.9 ms | 4.6 ms | 323 | 25 ms |
 
-A level 0 stroke of radius 0.3 right over the fine work is the slow case: 72 ms a dab on the CPU (the dab's own
-work; carrying is held to 6 ms of it) and 29 ms of syncing, up to 236 finer blocks carried a dab; the queued detail
-then catches up over about 100 frames (1.8 s) and the pen lift takes 0.38 s. Nearly all of it is rebuilding the
-carried blocks themselves (`carry_block`, about 2 ms per block across the cores); measuring how far the surface moved
-is now about a tenth of it.
+A level 0 stroke of radius 0.3 right over the fine work is the slow case. Timed frame by frame as the app runs it
+(two dabs a frame, the app's spacing apart; dabs only queue the carrying, which then gets 6 ms a frame): 30 ms of CPU
+a frame (dabs 10.6, carrying 8.3, sync 11.2), up to 387 finer blocks carried a frame; the queued detail then catches
+up in about 60 frames (0.66 s) and the pen lift takes 0.31 s.
 
-The first upload and full extraction of the 92k blocks takes 0.43 s (134 MB sent). After the strokes the samples
-take 102 MB; one
-lattice at the finest step everywhere would need about 60 GB. In the app the readout shows the GPU's own time for each
+That case was 100 ms a frame and 1.8 s of catching up. What it took:
+
+* Every point whose move a carried block reads is measured once per batch. Some were missed and measured again by
+  every block reading them: three quarters of the carrying time.
+* The move is measured every 4 lattice steps of the stroke's level and interpolated (it is smooth over a brush), and
+  after a dab only the measurements and carried blocks within two blocks of what it changed are redone.
+* The finer blocks under a dab are found from the finer levels' side (thousands of blocks) rather than by walking
+  down from the 2000-odd coarse blocks a big dab touches.
+* The carrying budget is spent once a frame, not once per dab.
+* The volume's maps hash block coordinates the fast way, not with the default hash, built to resist crafted keys.
+* Syncing: a block whose 16-bit samples come out as the GPU already has them is neither sent nor rebuilt (about
+  half under a big stroke). Block coordinates go only to slots given a new block, in runs of consecutive slots,
+  not one small write each. The sets of blocks to send and rebuild are found in parallel.
+
+The first upload and full extraction of the 92k blocks takes 0.24 s (134 MB sent). After the strokes the samples
+take 102 MB; one lattice at the finest step everywhere would need about 60 GB. In the app the readout shows the GPU's own time for each
 rebuild (timestamps), the blocks sent and rebuilt, and the pages drawn of those in use: on a 1M-triangle ball about
 half are skipped as facing away.
 
@@ -140,10 +152,11 @@ one array of atomics at fixed places. The exact check runs on both backends.
   the Mesh menu. Choosing the level per region by distance and by how much detail it holds (the error per block is
   stored for it), and a vertex budget, are next.
 * **No occlusion culling yet**, only view and facing.
-* **Big strokes over much fine detail are slow**: 70-100 ms a frame (a radius of 0.3 over a patch with detail at
-  levels 2-5), and the carried detail then takes about 2 s to catch up. Lifting the pen after ordinary strokes costs
-  30-80 ms (distances again, form moved down, speck search, all on the CPU). Rebuilding carried blocks should move to
-  the GPU or a worker thread that does not hold up the frame.
+* **Big strokes over much fine detail are still not smooth**: about 30 ms a frame on this machine (a radius of 0.3
+  over a patch with detail at levels 2-5), and the carried detail takes about 0.7 s to catch up. Carrying on a
+  worker thread, which needs blocks that can be shared without copying, would take its 6-8 ms out of the frame.
+  Lifting the pen after ordinary strokes costs 25-80 ms (distances again, form moved down, speck search, on the
+  CPU).
 * **DX12 fails to compile the vertex pass** (its FXC compiler aborts with an internal error). The app picks Vulkan on
   this machine; on DX12-only machines the volume mode would not start. Trying the newer DXC compiler, or splitting the
   transition-cell code out of the vertex pass, is next.

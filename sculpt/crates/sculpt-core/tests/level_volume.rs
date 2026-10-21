@@ -1,7 +1,7 @@
 //! The multi-resolution volume: brushes at every level keep the surface closed, fine detail rides coarse strokes, the
 //! surface rebuilt block by block matches a full rebuild, and strokes undo and save exactly.
 
-use std::collections::HashMap;
+use sculpt_core::generator::level_volume::HashMap;
 
 use glam::Vec3;
 use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
