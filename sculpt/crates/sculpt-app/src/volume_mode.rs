@@ -13,6 +13,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
 use glam::Vec3;
+use sculpt_core::generator::detail_layer::Layered;
 use sculpt_core::generator::level_volume::{CarryDone, EndDone, LevelVolume};
 
 /// Levels in a new volume: level 0 and five finer, the finest 32 times finer.
@@ -24,8 +25,25 @@ const MAX_STEPS_PER_RADIUS: f32 = 48.0;
 /// Finer blocks a carrying job takes at most: one job runs at a time, on its own threads, while the frames go on.
 const CARRY_JOB: usize = 384;
 
+/// What strokes work on once the volume has a detail layer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    /// The form under the layer: the layer's detail follows it.
+    Form,
+    /// The detail layer: strokes paint on what is shown, and go into the layer when they end.
+    Detail,
+    /// The layer's mask: hiding the layer where painted, or (`show`) showing it again.
+    Mask { show: bool },
+}
+
 pub struct VolumeMode {
+    /// What is drawn (with a detail layer, the form with the layer on it).
     pub vol: LevelVolume,
+    /// The detail layer over the form, if any, and what strokes work on.
+    pub layer: Option<Layered>,
+    pub target: Target,
+    /// The stroke under way works on the detail layer (taken into it when it ends).
+    on_layer: bool,
     /// Bumped when `vol` is replaced, so the viewport rebuilds its GPU copy.
     pub generation: u64,
     /// The level the stroke under way works at.
@@ -83,6 +101,9 @@ impl VolumeMode {
         let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("carry {i}")).build().expect("a thread pool"));
         VolumeMode {
             vol,
+            layer: None,
+            target: Target::Detail,
+            on_layer: false,
             generation: 1,
             level: 0,
             cap,
@@ -129,17 +150,45 @@ impl VolumeMode {
     /// the level the stroke works at, on its first dab.
     pub fn dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, carve: bool) {
         let t = Instant::now();
+        let target = self.layer.as_ref().map(|_| self.target);
+        if let (Some(Target::Mask { show }), Some(layer)) = (target, self.layer.as_mut()) {
+            layer.paint_mask(&mut self.vol, at, radius, if show { 1.0 } else { 0.0 });
+            return;
+        }
         if !self.chosen {
             self.level = self.level_for(radius, px);
+            // The form is the levels under the layer's; the layer, its own.
+            match (target, self.layer.as_ref()) {
+                (Some(Target::Form), Some(layer)) => self.level = self.level.min(layer.from() - 1),
+                (Some(Target::Detail), Some(layer)) => self.level = self.level.clamp(layer.from(), layer.level()),
+                _ => {}
+            }
             self.chosen = true;
         }
-        let along = if self.stroke_n == Vec3::ZERO { self.vol.normal_upto(at, self.level, true) } else { self.stroke_n };
+        let form = target == Some(Target::Form);
+        let along = if self.stroke_n != Vec3::ZERO {
+            self.stroke_n
+        } else if let (true, Some(layer)) = (form, self.layer.as_ref()) {
+            layer.form().normal_upto(at, self.level, true)
+        } else {
+            self.vol.normal_upto(at, self.level, true)
+        };
         if along == Vec3::ZERO {
             return;
         }
         let s = strength.clamp(0.0, 1.0);
         let height = radius * if carve { 0.015 + 0.06 * s } else { 0.015 + 0.08 * s };
-        let Some((n, _)) = self.vol.plane_dab(self.level, at, along, radius, height, hardness, 0.1 + 0.3 * s, carve) else { return };
+        let dabbed = match (form, self.layer.as_mut()) {
+            (true, Some(layer)) => {
+                let out = layer.plane_dab(&mut self.vol, self.level, at, along, radius, height, hardness, 0.1 + 0.3 * s, carve);
+                if std::env::var_os("SCULPT_LAYER_LOG").is_some() {
+                    eprintln!("form dab at level {} r {radius:.3}: {:.1} ms; layer {} blocks; follow {:?}", self.level, t.elapsed().as_secs_f64() * 1e3, layer.blocks(), layer.last);
+                }
+                out
+            }
+            _ => self.vol.plane_dab(self.level, at, along, radius, height, hardness, 0.1 + 0.3 * s, carve),
+        };
+        let Some((n, _)) = dabbed else { return };
         // The original surface's plane is steady already; easing it a little more smooths the turn over sharp forms.
         self.stroke_n = if self.stroke_n == Vec3::ZERO { n } else { (self.stroke_n * 0.5 + n * 0.5).try_normalize().unwrap_or(n) };
         let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -206,6 +255,11 @@ impl VolumeMode {
 
     fn take_end(&mut self, done: EndDone) {
         let end = self.vol.end_stroke_apply(done);
+        if std::mem::take(&mut self.on_layer)
+            && let Some(layer) = self.layer.as_mut()
+        {
+            layer.take_detail(&mut self.vol);
+        }
         self.end_ms = end.ms;
         self.ended_specks = Some(end.specks);
         self.end_job = None;
@@ -256,7 +310,14 @@ impl VolumeMode {
 
     pub fn begin_stroke(&mut self) {
         self.settle();
-        self.vol.begin_stroke();
+        match (self.layer.as_mut(), self.target) {
+            (Some(layer), Target::Form) => layer.begin_stroke(),
+            (Some(layer), Target::Mask { .. }) => layer.begin_edit(),
+            (layer, _) => {
+                self.on_layer = layer.is_some();
+                self.vol.begin_stroke();
+            }
+        }
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
     }
@@ -266,26 +327,63 @@ impl VolumeMode {
     pub fn end_stroke(&mut self) {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
-        if self.vol.in_stroke() {
-            self.ending = true;
+        match (self.layer.as_mut(), self.target) {
+            (Some(layer), Target::Form) => {
+                if layer.form().in_stroke() {
+                    let t = Instant::now();
+                    let end = layer.end_stroke(&mut self.vol);
+                    self.end_ms = t.elapsed().as_secs_f64() * 1e3;
+                    self.ended_specks = Some(end.specks);
+                }
+            }
+            (Some(layer), Target::Mask { .. }) => layer.end_edit(),
+            _ => {
+                if self.vol.in_stroke() {
+                    self.ending = true;
+                }
+            }
         }
+    }
+
+    /// Move the work at levels `from` and finer into a detail layer over the rest (the form).
+    pub fn make_layer(&mut self, from: usize) {
+        self.settle();
+        let from = from.clamp(1, self.vol.levels() - 1);
+        self.layer = Some(Layered::new(&mut self.vol, from));
+        self.target = Target::Detail;
+    }
+
+    /// Merge the detail layer into the form: one volume again, as shown. Undo starts afresh.
+    pub fn merge_layer(&mut self) {
+        self.settle();
+        self.layer = None;
+        self.vol.clear_history();
     }
 
     pub fn undo(&mut self) -> bool {
         self.settle();
         self.stroke_n = Vec3::ZERO;
-        self.vol.undo()
+        match self.layer.as_mut() {
+            Some(layer) => layer.undo(&mut self.vol),
+            None => self.vol.undo(),
+        }
     }
 
     pub fn redo(&mut self) -> bool {
         self.settle();
         self.stroke_n = Vec3::ZERO;
-        self.vol.redo()
+        match self.layer.as_mut() {
+            Some(layer) => layer.redo(&mut self.vol),
+            None => self.vol.redo(),
+        }
     }
 
     /// The surface under a ray: during a stroke, the one it began on at its level (so dabs do not climb what the stroke
     /// builds); otherwise the surface shown.
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(Vec3, Vec3)> {
+        if let Some(layer) = self.layer.as_ref().filter(|l| self.target == Target::Form && l.form().in_stroke() && self.chosen) {
+            return layer.form().raycast(origin, dir, self.level, true);
+        }
         if self.vol.in_stroke() && self.chosen {
             self.vol.raycast(origin, dir, self.level, true)
         } else {

@@ -211,6 +211,48 @@ same with linear resampling. What was wrong, and what changed:
   under touched fine blocks (a lattice a block across); it now moves them wherever the fine level has a block.
   A test replays the review session's patch dab for dab (`the_review_sessions_patch_rides_its_big_stroke`).
 
+## A detail layer over the form
+
+The way to keep fine work under big strokes without softening it: a layer stack, as sculpting a lower subdivision
+level does in ZBrush, but with a mask on every layer. `sculpt_core::generator::detail_layer` (`Layered`); in the app,
+the Layers panel shows the volume's stack while the playground is open.
+
+* **The layer holds heights, not field values.** At each lattice point of the finest level near the form's surface:
+  how far the detail stands out of the form at the nearest point of its surface (the same along the normal), and a
+  mask from 0 to 1. Heights come from roots of the fields (where they change sign along the form's normal), so
+  neither the band clamp nor a field that is not a distance mid-stroke enters them.
+* **Making one**: "Move detail to a layer" takes the work at a chosen level and finer out of the volume into the layer
+  (the form keeps the coarser levels). The bumps of the test come through as sculpted (0.00402 against 0.00402).
+* **Sculpting the form carries it along.** Each new surface point takes the height of the point it came from: from a
+  lattice point, along its normal to the new surface, then along the stroke's push back to the surface the stroke
+  began on, and out from there along that surface's normal as far as the point was out of the new one. That last
+  part matters on the rim of a big stroke, where the surface tilts (15 to 45 degrees in the test): offsetting along
+  the new normal instead slid bumps 0.001 uphill and changed their shape by 45%. Heights are read from the layer as
+  the stroke began, never dab after dab. Mid-stroke the move is measured at the blocks' corners and the heights read
+  linearly, a preview; when the stroke ends, every 4 steps and with a cubic. A search that finds no surface leaves
+  its point out (the corners that found one say), rather than reading as no move: that tore pieces out in the app.
+* **What is drawn is the form read inward by the masked height**: the form's field at the point moved back along its
+  normal by the height. That puts the surface exactly the height out whatever the field's slope (subtracting the
+  height from the field would scale it by one over the slope, which strokes leave off one until they end).
+* **Results** (`tests/detail_layer.rs`): two big level 0 clay strokes (the bury test's) over two rows of bumps. Under
+  the strokes the form rose 0.068; the bumps went from 0.00399 to 0.00398 out of it, each bump's shape about its
+  centre within 0.00033, centres moved 0.00038 (along the stroke's push). On the falloff, a 45 degree rim: 0.00382
+  to 0.00381, shape within 0.00039, moved 0.00021. The surface stays closed. The same with the app's six levels and
+  the layer taken from a level with no work of its own (`bumps_ride_a_layer_taken_from_a_level_coarser_than_the_work`).
+* **Speed**: 4-6 ms a dab with a layer of a few hundred blocks under the brush. At the demo's scale (a brush of
+  radius 0.5 over a layer of 2400 blocks, `demo_scale_timing`) about 125 ms a dab and 0.4 s when the stroke ends:
+  every dab follows every layer block under the brush again. Following off the frame, as carrying is, is next.
+* **Painting on the layer**: a stroke with the layer selected works on what is shown, and when it ends the layer takes
+  it in as heights (the form keeps none of it) and undoes it with its own history.
+* **Its mask** hides it where painted ("Mask: hide" and "Mask: show" in the Layers panel), and rides the form as the
+  heights do.
+* **Undo and redo** run over the stack: a form stroke brings back the form and the layer as they were; a layer stroke
+  or mask stroke the layer alone.
+
+Not done yet: following off the frame (above); one detail layer only; saving keeps what is shown, not the layer; merging the layer back resets undo;
+measuring the move every 2 steps halves what is left of the shape change on a steep rim (0.0004 to 0.0002) at three
+times the cost, and an adaptive lattice would get that for little.
+
 ## Driver workarounds (Vulkan, this AMD driver)
 
 Two things in the compute shaders lost the device or silently gave wrong results on Vulkan while DX12 was fine:
@@ -236,7 +278,8 @@ one array of atomics at fixed places. The exact check runs on both backends.
   transition-cell code out of the vertex pass, is next.
 * **The finest work on a slope fades at one end under a big stroke.** In the demo the lower two grooves and the dots
   come through faint: the finest detail shears sideways by about 0.004 over 0.012 there. Not yet diagnosed.
-* **Kept under a big stroke, fine work comes through soft** (`volume/carry_texture_compare.png`: before the stroke, the
+* **Kept under a big stroke ("Big brushes keep finer detail"), fine work comes through soft** (the detail layer above
+  is the fix; this option stays for now) (`volume/carry_texture_compare.png`: before the stroke, the
   build before the last fixes, now): the grooves all survive but faint, with a fine grain and faint block seams, and
   the demo's dots are lost. The cause is the design of carrying: each finer level is carried as a difference of field
   values against the level below, and those fields are not distances while a stroke lasts, nor read at the same

@@ -49,6 +49,10 @@ pub fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
     if crate::panels::sync_mask_edit(app) {
         app.selection = Selection::Layer;
     }
+    if app.volume_mode.is_some() {
+        crate::panels::volume_stack(app, ui);
+        return;
+    }
     if app.doc.is_none() {
         ui.label("Loading…");
         return;

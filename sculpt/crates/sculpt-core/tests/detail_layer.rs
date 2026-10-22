@@ -156,7 +156,17 @@ fn big_strokes(lv: &mut Lv) -> (f64, usize) {
 
 #[test]
 fn bumps_on_a_detail_layer_ride_a_big_stroke_whole() {
-    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
+    rides(5, 4);
+}
+
+/// As the app's volume has it: a sixth level, finer than the work, and the layer taking a level with none of it.
+#[test]
+fn bumps_ride_a_layer_taken_from_a_level_coarser_than_the_work() {
+    rides(6, 3);
+}
+
+fn rides(levels: usize, from: usize) {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, levels);
     for &y in &ROWS {
         for &x in &xs() {
             v.begin_stroke();
@@ -166,7 +176,7 @@ fn bumps_on_a_detail_layer_ride_a_big_stroke_whole() {
     }
     let ground0: Vec<f32> = ROWS.iter().map(|&y| h(&v, 0.06, y)).collect();
     let t = Instant::now();
-    let mut lv = Lv::new(v, 4);
+    let mut lv = Lv::new(v, from);
     eprintln!("into a layer: {} blocks in {:.0} ms", lv.blocks(), t.elapsed().as_secs_f64() * 1e3);
     let before: Vec<(f32, Vec<(f32, f32)>)> = ROWS.iter().map(|&y| relief(&lv, y)).collect();
     let shapes0: Vec<_> = ROWS.iter().map(|&y| shapes(&lv, y)).collect();
@@ -252,4 +262,36 @@ fn detail_painted_on_the_layer_goes_into_it_and_rides_the_form() {
     assert!(last < 0.0002, "undo did not take the last bump back out of the layer");
     assert!(left[0].1.iter().fold(0.0f32, |a, b| a.max(*b)) > 0.003, "undo took too much");
     assert_eq!(check(lv.shown(), 4), (0, 0, 0));
+}
+
+/// At the demo's scale (a ball of 1M triangles at level 0, six levels), how long following takes, part by part.
+#[test]
+#[ignore]
+fn demo_scale_timing() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+    for j in 0..12 {
+        for i in 0..60 {
+            let p = Vec3::new(-0.06 + 0.002 * i as f32, -0.06 + 0.01 * j as f32, 1.0).normalize();
+            v.begin_stroke();
+            v.ball_dab(4, p, 0.0015, 0.0004, true);
+            v.end_stroke();
+        }
+    }
+    let mut lv = Lv::new(v, 4);
+    eprintln!("layer: {} blocks", lv.blocks());
+    lv.begin_stroke();
+    let mut along = Vec3::ZERO;
+    for k in 0..=8 {
+        let d = Vec3::new(-0.1 + 0.2 * k as f32 / 8.0, 0.0, 1.0).normalize();
+        let Some((hit, n)) = lv.form().raycast(d * 3.0, -d, 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        let t = Instant::now();
+        if let Some((n, _)) = lv.plane_dab(0, hit, rough, 0.5, 0.5 * 0.095, 0.5, 0.4, false) {
+            along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+        }
+        eprintln!("dab {k}: {:.1} ms, layer {} blocks; follow {:?}", t.elapsed().as_secs_f64() * 1e3, lv.blocks(), lv.l.last);
+    }
+    let t = Instant::now();
+    lv.end_stroke();
+    eprintln!("end: {:.1} ms; follow {:?}", t.elapsed().as_secs_f64() * 1e3, lv.l.last);
 }

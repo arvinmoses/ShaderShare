@@ -54,8 +54,10 @@ enum Act {
     CapSweep(usize, usize),
     Tint(bool),
     Cull(bool),
-    /// Whether big brushes keep the finer detail under them (Mesh menu).
-    KeepDetail(bool),
+    /// Move the work at this level and finer into a detail layer.
+    MakeLayer(usize),
+    /// What strokes work on, with a detail layer.
+    Target(crate::volume_mode::Target),
     Undo,
     Redo,
     /// A caption for `dur` seconds.
@@ -79,6 +81,8 @@ pub struct Frame {
     pub cap: Option<usize>,
     pub tint: Option<bool>,
     pub keep_detail: Option<bool>,
+    pub make_layer: Option<usize>,
+    pub target: Option<crate::volume_mode::Target>,
     pub cull: Option<bool>,
     pub undo: bool,
     pub redo: bool,
@@ -152,28 +156,33 @@ impl VolumeDemo {
         at(53.0, 7.0, Caption("A big level 0 stroke over the fine work: like clay, it builds over it and buries the grooves and dots under it"));
         at(53.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.50, 0.40), (0.60, 0.42), 0.0, 8) });
         at(56.5, 3.0, Camera(Pose::at(patch * 1.05, 0.34)));
-        // The same stroke keeping the detail.
+        // The same stroke on the form under a detail layer.
         at(60.0, 0.0, Undo);
         at(60.0, 2.0, Camera(Pose::at(patch, 3.0)));
-        at(60.0, 9.0, Caption("Undone, and again with \"Big brushes keep finer detail\" on (Mesh menu): the detail rides along on the new form, as at a lower subdivision level"));
-        at(62.0, 0.0, KeepDetail(true));
+        at(60.0, 9.0, Caption("Undone. Now the grooves and dots go into a detail layer (Layers panel), and the big stroke works on the form under it: the layer rides along"));
+        at(61.5, 0.0, MakeLayer(4));
+        at(62.0, 0.0, Target(crate::volume_mode::Target::Form));
         at(62.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.50, 0.40), (0.60, 0.42), 0.0, 8) });
         at(65.5, 3.0, Camera(Pose::at(patch * 1.05, 0.34)));
-        at(69.0, 5.0, Caption("Undo and redo: the whole stroke, at every level it touched"));
-        at(70.0, 0.0, Undo);
-        at(71.5, 0.0, Redo);
-        at(72.5, 0.0, Undo);
-        at(73.5, 0.0, Redo);
-        at(74.0, 0.0, KeepDetail(false));
+        at(69.0, 4.5, Caption("Undo and redo work on the stack: the form's stroke, and the layer as it was"));
+        at(69.5, 0.0, Undo);
+        at(71.0, 0.0, Redo);
+        // The layer's mask.
+        at(73.5, 0.0, Target(crate::volume_mode::Target::Mask { show: false }));
+        at(73.5, 6.5, Caption("Every layer has a mask: painting it hides the detail layer there, and painting it back shows it again"));
+        at(74.5, 1.8, Stroke { tool: Tool::ClayBuildup, size: 100.0, strength: 1.0, path: line((0.50, 0.75), (0.92, 0.75), 0.0, 12) });
+        at(77.0, 0.0, Target(crate::volume_mode::Target::Mask { show: true }));
+        at(77.3, 1.2, Stroke { tool: Tool::ClayBuildup, size: 100.0, strength: 1.0, path: line((0.50, 0.75), (0.70, 0.75), 0.0, 8) });
+        at(79.0, 0.0, Target(crate::volume_mode::Target::Detail));
         // Culling.
-        at(74.0, 3.0, Camera(Pose::whole(3.4, 0.9, 0.25)));
-        at(74.5, 8.0, Caption("Each block's surface is a cluster: those out of view or facing away are skipped (see the pages drawn)"));
-        at(77.0, 0.0, Cull(false));
-        at(79.0, 0.0, Cull(true));
-        at(79.5, 3.0, Camera(Pose::whole(3.4, 2.2, 0.1)));
-        at(82.5, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
-        at(82.5, 3.0, Caption("Next: choosing the level per region by distance and by how much detail each region holds"));
-        let end = 86.0;
+        at(80.0, 3.0, Camera(Pose::whole(3.4, 0.9, 0.25)));
+        at(80.5, 8.0, Caption("Each block's surface is a cluster: those out of view or facing away are skipped (see the pages drawn)"));
+        at(83.0, 0.0, Cull(false));
+        at(85.0, 0.0, Cull(true));
+        at(85.5, 3.0, Camera(Pose::whole(3.4, 2.2, 0.1)));
+        at(88.5, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
+        at(88.5, 3.0, Caption("Next: painting straight onto the layer in the app, more layers, and the level per region by distance"));
+        let end = 92.0;
         let n = items.len();
         VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
     }
@@ -255,7 +264,8 @@ impl VolumeDemo {
                     match item.act {
                         Act::Cap(c) => f.cap = Some(c),
                         Act::Tint(on) => f.tint = Some(on),
-                        Act::KeepDetail(on) => f.keep_detail = Some(on),
+                        Act::MakeLayer(from) => f.make_layer = Some(from),
+                        Act::Target(t) => f.target = Some(t),
                         Act::Cull(on) => f.cull = Some(on),
                         Act::Undo => f.undo = true,
                         Act::Redo => f.redo = true,

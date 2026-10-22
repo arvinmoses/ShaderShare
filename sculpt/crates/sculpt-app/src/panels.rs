@@ -450,6 +450,60 @@ fn falloff_tray(app: &mut SculptApp, ui: &mut Ui, tile: f32) {
 
 // --------------------------------------------------------------- right dock
 
+/// The volume's stack in the Layers panel: one volume, or the form with a detail layer (and its mask) over it, and
+/// which of them strokes work on.
+pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
+    use crate::volume_mode::Target;
+    let weak = app.theme.weak_text();
+    let Some(m) = app.volume_mode.as_mut() else { return };
+    ui.add_space(6.0);
+    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| {
+        match m.layer.as_ref().map(|l| (l.from(), l.blocks())) {
+            None => {
+                ui.label("One volume: strokes work on all of it.");
+                ui.add_space(4.0);
+                let id = ui.id().with("layer_from");
+                let top = m.vol.levels() - 1;
+                let mut from = ui.data_mut(|d| *d.get_temp_mut_or(id, 3usize)).clamp(1, top);
+                ui.add(egui::Slider::new(&mut from, 1..=top).text("Detail from level"));
+                ui.data_mut(|d| d.insert_temp(id, from));
+                if ui
+                    .button("Move detail to a layer")
+                    .on_hover_text("The work at this level and finer goes into a detail layer over the rest. Sculpting the form under it then carries the detail along, and its mask hides it where painted.")
+                    .clicked()
+                {
+                    m.make_layer(from);
+                }
+            }
+            Some((from, blocks)) => {
+                ui.label(RichText::new("Strokes work on").small().color(weak));
+                ui.add_space(2.0);
+                if ui.selectable_label(m.target == Target::Detail, format!("Detail layer  (levels {from} and finer, {blocks} blocks)")).clicked() {
+                    m.target = Target::Detail;
+                }
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    if ui.selectable_label(m.target == Target::Mask { show: false }, "Mask: hide").clicked() {
+                        m.target = Target::Mask { show: false };
+                    }
+                    if ui.selectable_label(m.target == Target::Mask { show: true }, "Mask: show").clicked() {
+                        m.target = Target::Mask { show: true };
+                    }
+                });
+                if ui.selectable_label(m.target == Target::Form, format!("Form  (levels 0 to {})", from - 1)).clicked() {
+                    m.target = Target::Form;
+                }
+                ui.add_space(6.0);
+                if ui.button("Merge the layer into the form").clicked() {
+                    m.merge_layer();
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Sculpting the form carries the detail layer along. Saving keeps what is shown, not the layer.").small().color(weak));
+            }
+        }
+    });
+}
+
 pub fn right_panel(app: &mut SculptApp, ui: &mut Ui) {
     let fill = app.theme.ui.panel.0;
     egui::Panel::right("dock").default_size(340.0).min_size(280.0).frame(egui::Frame::side_top_panel(ui.style()).fill(fill).inner_margin(0)).show(ui, |ui| {

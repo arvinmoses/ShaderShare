@@ -1174,6 +1174,12 @@ impl SculptApp {
             if let Some(k) = f.keep_detail {
                 m.vol.keep_detail = k;
             }
+            if let Some(from) = f.make_layer {
+                m.make_layer(from);
+            }
+            if let Some(t) = f.target {
+                m.target = t;
+            }
             if let Some(t) = f.tint {
                 m.tint = t;
             }
@@ -1280,12 +1286,26 @@ impl SculptApp {
             } else {
                 format!("{:.0} fps", if self.stats.interval_ms > 0.0 { 1000.0 / self.stats.interval_ms } else { 0.0 })
             };
-            let lines = [
+            let mut lines = vec![
                 format!("Volume  ·  {} levels, showing 0-{}  ·  blocks per level {}  ·  {:.0} MB", counts.len(), m.cap, per.join(" / "), bytes as f64 / 1e6),
                 format!("Last stroke at level {} (step {:.5})  ·  {:.2} ms a dab on the CPU", m.stroke_level, m.vol.voxel(m.stroke_level), m.dab_ms),
                 format!("Surface rebuilt on the GPU: {} blocks in {:.2} ms ({} blocks sent, {:.2} ms CPU)", fmt_count(m.sync.extracted), m.gpu_ms, fmt_count(m.sync.uploaded), m.sync.cpu_ms),
                 format!("Drawing {} of {} pages of quads{}  ·  {pace}", fmt_count(m.pages_drawn as usize), fmt_count(m.pages_used as usize), if self.viewport.as_ref().is_some_and(|v| v.cull) { " (the rest out of view or facing away)" } else { " (culling off)" }),
             ];
+            if let Some(layer) = &m.layer {
+                let f = layer.last;
+                lines.push(format!(
+                    "Detail layer: {} blocks  ·  last follow {:.1} ms over {} blocks, {} points (find {:.1}, move {:.1}, heights {:.1}, compose {:.1})",
+                    fmt_count(layer.blocks()),
+                    f.ms,
+                    fmt_count(f.blocks),
+                    fmt_count(f.points),
+                    f.parts_ms[0],
+                    f.parts_ms[1],
+                    f.parts_ms[2],
+                    f.parts_ms[3]
+                ));
+            }
             let font = egui::FontId::proportional(12.5);
             let width = lines.iter().map(|l| painter.layout_no_wrap(l.clone(), font.clone(), Color32::WHITE).size().x).fold(0.0f32, f32::max);
             painter.rect_filled(Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::new(width + 14.0, 17.0 * lines.len() as f32 + 8.0)), 6.0, Color32::from_black_alpha(150));
