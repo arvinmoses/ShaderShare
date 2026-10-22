@@ -170,9 +170,9 @@ impl VolumeDemo {
         // The layer's mask.
         at(73.5, 0.0, Target(crate::volume_mode::Target::Mask { show: false }));
         at(73.5, 6.5, Caption("Every layer has a mask: painting it hides the detail layer there, and painting it back shows it again"));
-        at(74.5, 1.8, Stroke { tool: Tool::ClayBuildup, size: 100.0, strength: 1.0, path: line((0.50, 0.75), (0.92, 0.75), 0.0, 12) });
+        at(74.5, 1.8, Stroke { tool: Tool::ClayBuildup, size: 80.0, strength: 1.0, path: line((0.40, 0.615), (0.80, 0.615), 0.0, 12) });
         at(77.0, 0.0, Target(crate::volume_mode::Target::Mask { show: true }));
-        at(77.3, 1.2, Stroke { tool: Tool::ClayBuildup, size: 100.0, strength: 1.0, path: line((0.50, 0.75), (0.70, 0.75), 0.0, 8) });
+        at(77.3, 1.2, Stroke { tool: Tool::ClayBuildup, size: 80.0, strength: 1.0, path: line((0.40, 0.615), (0.58, 0.615), 0.0, 8) });
         at(79.0, 0.0, Target(crate::volume_mode::Target::Detail));
         // Culling.
         at(80.0, 3.0, Camera(Pose::whole(3.4, 0.9, 0.25)));

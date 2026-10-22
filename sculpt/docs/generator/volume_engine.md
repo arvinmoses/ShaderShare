@@ -215,7 +215,8 @@ same with linear resampling. What was wrong, and what changed:
 
 The way to keep fine work under big strokes without softening it: a layer stack, as sculpting a lower subdivision
 level does in ZBrush, but with a mask on every layer. `sculpt_core::generator::detail_layer` (`Layered`); in the app,
-the Layers panel shows the volume's stack while the playground is open.
+the Layers panel shows the volume's stack while the playground is open. `volume/detail_layer_compare.png`: the demo's
+patch before the big stroke, under it as one volume (buried), and under it with the grooves and dots in a layer.
 
 * **The layer holds heights, not field values.** At each lattice point of the finest level near the form's surface:
   how far the detail stands out of the form at the nearest point of its surface (the same along the normal), and a

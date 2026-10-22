@@ -397,6 +397,32 @@ impl VolumeMode {
 mod tests {
     use super::*;
 
+    /// With a detail layer, a mask stroke hides the layer where it passes, and undo brings it back.
+    #[test]
+    fn a_mask_stroke_hides_the_detail_layer() {
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5));
+        let dot = Vec3::new(0.0, 0.0, 1.0);
+        mode.vol.begin_stroke();
+        mode.vol.ball_dab(4, dot, 0.004, 0.001, false);
+        mode.vol.end_stroke();
+        let top = |m: &VolumeMode| m.vol.raycast(dot * 3.0, -dot, 4, false).map_or(f32::NAN, |(p, _)| p.z);
+        let raised = top(&mode);
+        mode.make_layer(3);
+        assert!((top(&mode) - raised).abs() < 2e-4, "the layer does not show the dot");
+        mode.target = Target::Mask { show: false };
+        mode.begin_stroke();
+        let (hit, _) = mode.raycast(dot * 3.0, -dot).unwrap();
+        for _ in 0..4 {
+            mode.dab(hit, 0.02, 0.001, 1.0, 0.5, false);
+        }
+        mode.end_stroke();
+        let hidden = top(&mode);
+        eprintln!("dot top {raised:.5}, hidden {hidden:.5}");
+        assert!(hidden < raised - 0.002, "the mask did not hide the dot");
+        assert!(mode.undo());
+        assert!((top(&mode) - raised).abs() < 2e-4, "undo did not bring the dot back");
+    }
+
     /// Big brushes work coarse, small brushes zoomed in work fine, and nothing finer than the volume has.
     #[test]
     fn brushes_pick_their_level_from_their_size_on_screen() {

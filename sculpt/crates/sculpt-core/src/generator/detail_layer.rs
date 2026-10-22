@@ -92,11 +92,7 @@ impl Dense {
     fn cubic(&self, g: Vec3) -> f32 {
         let i = g.floor().as_ivec3();
         let f = g - i.as_vec3();
-        let w = |t: f32| {
-            let (t2, t3) = (t * t, t * t * t);
-            [0.5 * (-t3 + 2.0 * t2 - t), 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0), 0.5 * (-3.0 * t3 + 4.0 * t2 + t), 0.5 * (t3 - t2)]
-        };
-        let (wx, wy, wz) = (w(f.x), w(f.y), w(f.z));
+        let (wx, wy, wz) = (catmull(f.x), catmull(f.y), catmull(f.z));
         let mut sum = 0.0;
         for (z, wz) in wz.iter().enumerate() {
             for (y, wy) in wy.iter().enumerate() {
@@ -148,6 +144,27 @@ impl<'a> Sparse<'a> {
         }
         sum
     }
+
+    fn cubic(&self, g: Vec3) -> f32 {
+        let i = g.floor().as_ivec3();
+        let f = g - i.as_vec3();
+        let (wx, wy, wz) = (catmull(f.x), catmull(f.y), catmull(f.z));
+        let mut sum = 0.0;
+        for (z, wz) in wz.iter().enumerate() {
+            for (y, wy) in wy.iter().enumerate() {
+                for (x, wx) in wx.iter().enumerate() {
+                    sum += wx * wy * wz * self.at(i + IVec3::new(x as i32 - 1, y as i32 - 1, z as i32 - 1));
+                }
+            }
+        }
+        sum
+    }
+}
+
+/// Catmull-Rom weights at `t` for the four samples around it.
+fn catmull(t: f32) -> [f32; 4] {
+    let (t2, t3) = (t * t, t * t * t);
+    [0.5 * (-t3 + 2.0 * t2 - t), 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0), 0.5 * (-3.0 * t3 + 4.0 * t2 + t), 0.5 * (t3 - t2)]
 }
 
 /// Where `f` changes sign along the line through `p` along `d`, toward the surface from `p`: stepping by the field's
@@ -667,7 +684,8 @@ impl Layered {
                 // Mid-stroke a preview, read linearly straight from the blocks; at the end with the cubic, from the source
                 // region read once.
                 let (h0, m0) = (Sparse::new(&layer0.h, 0.0), Sparse::new(&layer0.m, 1.0));
-                let dense = end.then(|| {
+                // (Unless the source region is large: a block the stroke stretched or tore across, read as needed.)
+                let dense = end.then(|| -> Option<(Dense, Dense, bool)> {
                     let (mut lo, mut hi) = (corner, corner + IVec3::splat(B - 1));
                     for (i, o) in offs.iter().enumerate() {
                         if let Some(o) = o {
@@ -677,12 +695,17 @@ impl Layered {
                         }
                     }
                     let (lo, hi) = (lo - IVec3::splat(2), hi + IVec3::splat(2));
+                    let n = hi - lo + IVec3::ONE;
+                    if n.x as i64 * n.y as i64 * n.z as i64 > 32 * 32 * 32 {
+                        return None;
+                    }
                     let m = Dense::of(&layer0.m, lo, hi, 1.0);
                     let shown = m.all(1.0);
-                    (Dense::of(&layer0.h, lo, hi, 0.0), m, shown)
+                    Some((Dense::of(&layer0.h, lo, hi, 0.0), m, shown))
                 });
                 let read = |g: Vec3| match &dense {
-                    Some((h, m, shown)) => (h.cubic(g), if *shown { 1.0 } else { m.cubic(g).clamp(0.0, 1.0) }),
+                    Some(Some((h, m, shown))) => (h.cubic(g), if *shown { 1.0 } else { m.cubic(g).clamp(0.0, 1.0) }),
+                    Some(None) => (h0.cubic(g), m0.cubic(g).clamp(0.0, 1.0)),
                     None => (h0.linear(g), m0.linear(g).clamp(0.0, 1.0)),
                 };
                 let mut h = Box::new([0.0f32; N]);
