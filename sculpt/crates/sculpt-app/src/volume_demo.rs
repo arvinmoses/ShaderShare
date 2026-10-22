@@ -54,6 +54,8 @@ enum Act {
     CapSweep(usize, usize),
     Tint(bool),
     Cull(bool),
+    /// Whether big brushes keep the finer detail under them (Mesh menu).
+    KeepDetail(bool),
     Undo,
     Redo,
     /// A caption for `dur` seconds.
@@ -76,6 +78,7 @@ pub struct Frame {
     pub end: bool,
     pub cap: Option<usize>,
     pub tint: Option<bool>,
+    pub keep_detail: Option<bool>,
     pub cull: Option<bool>,
     pub undo: bool,
     pub redo: bool,
@@ -146,23 +149,31 @@ impl VolumeDemo {
         at(50.5, 0.0, Tint(false));
         // A big coarse stroke over the detail.
         at(50.5, 2.5, Camera(Pose::at(patch, 3.0)));
-        at(53.0, 7.0, Caption("A big level 0 stroke right over the fine work: the grooves ride along whole on the new form (the lowest ones and the dots come through faint)"));
+        at(53.0, 7.0, Caption("A big level 0 stroke over the fine work: like clay, it builds over it and buries the grooves and dots under it"));
         at(53.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.50, 0.40), (0.60, 0.42), 0.0, 8) });
         at(56.5, 3.0, Camera(Pose::at(patch * 1.05, 0.34)));
-        at(60.0, 5.0, Caption("Undo and redo: the whole stroke, at every level it touched"));
-        at(61.0, 0.0, Undo);
-        at(62.5, 0.0, Redo);
-        at(63.5, 0.0, Undo);
-        at(64.5, 0.0, Redo);
+        // The same stroke keeping the detail.
+        at(60.0, 0.0, Undo);
+        at(60.0, 2.0, Camera(Pose::at(patch, 3.0)));
+        at(60.0, 9.0, Caption("Undone, and again with \"Big brushes keep finer detail\" on (Mesh menu): the detail rides along on the new form, as at a lower subdivision level"));
+        at(62.0, 0.0, KeepDetail(true));
+        at(62.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.50, 0.40), (0.60, 0.42), 0.0, 8) });
+        at(65.5, 3.0, Camera(Pose::at(patch * 1.05, 0.34)));
+        at(69.0, 5.0, Caption("Undo and redo: the whole stroke, at every level it touched"));
+        at(70.0, 0.0, Undo);
+        at(71.5, 0.0, Redo);
+        at(72.5, 0.0, Undo);
+        at(73.5, 0.0, Redo);
+        at(74.0, 0.0, KeepDetail(false));
         // Culling.
-        at(65.0, 3.0, Camera(Pose::whole(3.4, 0.9, 0.25)));
-        at(65.5, 8.0, Caption("Each block's surface is a cluster: those out of view or facing away are skipped (see the pages drawn)"));
-        at(68.0, 0.0, Cull(false));
-        at(70.0, 0.0, Cull(true));
-        at(70.5, 3.0, Camera(Pose::whole(3.4, 2.2, 0.1)));
-        at(73.5, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
-        at(73.5, 3.0, Caption("Next: choosing the level per region by distance and by how much detail each region holds"));
-        let end = 77.0;
+        at(74.0, 3.0, Camera(Pose::whole(3.4, 0.9, 0.25)));
+        at(74.5, 8.0, Caption("Each block's surface is a cluster: those out of view or facing away are skipped (see the pages drawn)"));
+        at(77.0, 0.0, Cull(false));
+        at(79.0, 0.0, Cull(true));
+        at(79.5, 3.0, Camera(Pose::whole(3.4, 2.2, 0.1)));
+        at(82.5, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
+        at(82.5, 3.0, Caption("Next: choosing the level per region by distance and by how much detail each region holds"));
+        let end = 86.0;
         let n = items.len();
         VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
     }
@@ -244,6 +255,7 @@ impl VolumeDemo {
                     match item.act {
                         Act::Cap(c) => f.cap = Some(c),
                         Act::Tint(on) => f.tint = Some(on),
+                        Act::KeepDetail(on) => f.keep_detail = Some(on),
                         Act::Cull(on) => f.cull = Some(on),
                         Act::Undo => f.undo = true,
                         Act::Redo => f.redo = true,

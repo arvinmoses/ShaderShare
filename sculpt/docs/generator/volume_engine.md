@@ -27,6 +27,15 @@ This is the engine spike 4 (`volume_spike.md`) chose the layout for.
   every dab (detail moved far can sit outside a dab's own reach). How far the surface moved is measured along the
   normal from the new surface back to the old one: the samples' change says the same only while the move stays within
   the band. Level 0 keeps distances out to 16 of its steps, wide enough for a big stroke's move at 1M triangles.
+* **A big stroke buries the fine detail under it, unless asked to keep it.** By default a coarse stroke works on the
+  finer levels' blocks under it as it does on its own level, so it fills grooves and covers bumps wherever it builds
+  above them, and leaves what sticks out of it: as clay does on one surface (ZBrush's top subdivision level, or a
+  DynaMesh). With "Big brushes keep finer detail" (Mesh menu, `keep_detail`) the detail is carried along on the new
+  surface instead, as sculpting at a lower subdivision level does; that is the carrying described here, and it still
+  softens the finest work under a big rise (see the gaps). Detail that should ride on changing form (moving, posing,
+  generators) belongs in layers: a detail layer kept as heights over the form beneath it, composed geometrically,
+  rides along without the softening. `volume/bury_or_keep_detail.png`: before, buried (0.07 of clay over the patch),
+  kept.
 * **Form built at a fine level moves down.** When a stroke ends, wherever a finer level's surface lies further from
   the level below than small detail would (40% of its band), the level below moves toward it, smoothed over about one
   of its own steps. Narrow detail, however tall, stays where it was sculpted; broad form built up zoomed in also shows
@@ -227,7 +236,7 @@ one array of atomics at fixed places. The exact check runs on both backends.
   transition-cell code out of the vertex pass, is next.
 * **The finest work on a slope fades at one end under a big stroke.** In the demo the lower two grooves and the dots
   come through faint: the finest detail shears sideways by about 0.004 over 0.012 there. Not yet diagnosed.
-* **Fine work under a big stroke comes through soft** (`volume/carry_texture_compare.png`: before the stroke, the
+* **Kept under a big stroke, fine work comes through soft** (`volume/carry_texture_compare.png`: before the stroke, the
   build before the last fixes, now): the grooves all survive but faint, with a fine grain and faint block seams, and
   the demo's dots are lost. The cause is the design of carrying: each finer level is carried as a difference of field
   values against the level below, and those fields are not distances while a stroke lasts, nor read at the same

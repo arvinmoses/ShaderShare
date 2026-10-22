@@ -149,6 +149,8 @@ pub fn run(args: &[String]) -> Res<()> {
         // Carrying detail a little at a time, so the GPU sees the queued blocks arrive late: first 0.5 ms after each dab,
         // then (with `jobs`) as the app does, in jobs taken after a dab and brought in after the next.
         vol.carry_budget = Some(if jobs { 0.0 } else { 0.5 });
+        // The first pass buries finer detail under coarse strokes (the default); the second keeps it, carried in jobs.
+        vol.keep_detail = jobs;
         let mut gpu = GpuLevels::new(&device, &queue, &vol, 3);
         gpu.sync(&mut vol);
         compare(&device, &queue, &gpu, &vol, &format!("{pass}fresh ball"))?;
@@ -313,6 +315,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
         };
         let (mut frame_ms, mut dab_ms, mut tick_ms, mut sync_ms, mut most) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
         vol.carry_budget = Some(0.0);
+        vol.keep_detail = true;
         vol.begin_stroke();
         let mut along = Vec3::ZERO;
         let r = 0.3;

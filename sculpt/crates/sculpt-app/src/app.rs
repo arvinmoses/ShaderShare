@@ -1171,6 +1171,9 @@ impl SculptApp {
             if let Some(c) = f.cap {
                 m.cap = c.min(m.vol.levels() - 1);
             }
+            if let Some(k) = f.keep_detail {
+                m.vol.keep_detail = k;
+            }
             if let Some(t) = f.tint {
                 m.tint = t;
             }

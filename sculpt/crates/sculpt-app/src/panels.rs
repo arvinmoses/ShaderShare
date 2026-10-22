@@ -170,6 +170,9 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                         let top = m.vol.levels() - 1;
                         ui.add(egui::Slider::new(&mut m.cap, 0..=top).text("Detail shown up to level"));
                         ui.checkbox(&mut m.tint, "Tint by level");
+                        ui.checkbox(&mut m.vol.keep_detail, "Big brushes keep finer detail").on_hover_text(
+                            "On: a big brush moves the finer detail under it along with the new surface, as sculpting at a lower subdivision level does.\nOff: it builds over the detail like clay, filling grooves and covering bumps where it builds above them.",
+                        );
                     }
                     if let Some(vp) = app.viewport.as_mut() {
                         ui.checkbox(&mut vp.cull, "Skip clusters out of view or facing away");

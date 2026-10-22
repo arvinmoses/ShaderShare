@@ -7,8 +7,13 @@ use glam::Vec3;
 use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
 use sculpt_core::generator::levels::edge_counts;
 
+/// A ball whose coarse strokes keep the finer detail under them (the tests of carrying it want that; burying it is
+/// tested on its own).
 fn ball(levels: usize) -> LevelVolume {
-    LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, levels)
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, levels);
+    v.keep_detail = true;
+    v.keep_detail = true;
+    v
 }
 
 /// A clay (or trim) stroke at level `l` from direction `a` to `b` (each lands on the surface under it).
@@ -236,6 +241,7 @@ fn fine_detail_rides_a_big_rise_without_spawning_blocks() {
     // A groove at level 4 (16 times finer than level 0), then broad clay at level 0 raising the area by many level 4
     // steps.
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
+    v.keep_detail = true;
     v.begin_stroke();
     for i in 0..60 {
         let y = -0.05 + 0.1 * i as f32 / 59.0;
@@ -280,6 +286,7 @@ fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
         (3, false, 2, 0.005, true),
     ] {
         let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel0, fine + 1);
+        v.keep_detail = true;
         v.carry_budget = Some(if jobs { 0.0 } else { 2.0 });
         // A row of separate bumps (or pits) at a fine level, each its own stroke.
         let xs: Vec<f32> = (0..5).map(|i| -0.024 + 0.012 * i as f32).collect();
@@ -439,6 +446,7 @@ fn groove_profile(v: &LevelVolume, level: usize, patch: Vec3, along: Vec3, acros
 #[test]
 fn trim_grooves_ride_a_big_stroke_carried_in_jobs() {
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+    v.keep_detail = true;
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
     let (t1, t2) = patch.any_orthonormal_pair();
     let plane_stroke = |v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, jobs: bool| {
@@ -517,6 +525,7 @@ fn a_groove_on_a_big_strokes_rim_rides_along_whole() {
     // The rim close to the groove (it rises 0.05 over two passes), and nearer the stroke's line (steeper).
     for (off, passes) in [(0.12f32, 1usize), (0.15, 2)] {
         let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+        v.keep_detail = true;
         let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
         let (t1, t2) = patch.any_orthonormal_pair();
         let plane_stroke = |v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool| {
@@ -590,6 +599,7 @@ fn a_groove_on_a_big_strokes_rim_rides_along_whole() {
 #[test]
 fn the_review_sessions_patch_rides_its_big_stroke() {
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+    v.keep_detail = true;
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
     let (t1, t2) = patch.any_orthonormal_pair();
     let at = |a: f32, b: f32| (patch + t1 * a + t2 * b).normalize();
@@ -839,4 +849,66 @@ fn the_review_sessions_patch_rides_its_big_stroke() {
         assert!(*a > 0.75 * b, "dot {k} faded: {a:.5} against {b:.5}");
     }
     assert!(rough1 < 3.5 * rough0, "the surface got rougher: {rough1:.6} against {rough0:.6}");
+}
+
+/// By default a coarse clay stroke buries the fine detail under it as much as it adds clay there, as clay does: bumps
+/// under the middle of a big stroke go (it built 0.07 over them), bumps out at the edge of its plateau, where it built
+/// about their height, stay.
+#[test]
+fn big_clay_buries_the_fine_detail_under_it() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
+    assert!(!v.keep_detail, "burying is the default");
+    // Two rows of bumps at level 4: one under the strokes' line (y = 0), one out on their falloff.
+    let rows = [0.0f32, 0.29];
+    let xs: Vec<f32> = (0..5).map(|i| -0.024 + 0.012 * i as f32).collect();
+    for &y in &rows {
+        for &x in &xs {
+            v.begin_stroke();
+            v.ball_dab(4, Vec3::new(x, y, 1.0).normalize(), 0.004, 0.001, false);
+            v.end_stroke();
+        }
+    }
+    // A bump's height over the ground beside it, seen along the strokes' push (+z), best within a little of its place.
+    let h = |v: &LevelVolume, x: f32, y: f32| {
+        let p = Vec3::new(x, y, 1.0).normalize();
+        v.raycast(Vec3::new(p.x, p.y, 3.0), -Vec3::Z, v.levels() - 1, false).map_or(f32::NAN, |(q, _)| q.z)
+    };
+    let relief = |v: &LevelVolume, y0: f32| {
+        xs.iter()
+            .map(|&x0| {
+                let mut best = 0.0f32;
+                for i in 0..21 {
+                    for j in 0..9 {
+                        let (x, y) = (x0 - 0.004 + 0.001 * j as f32, y0 - 0.01 + 0.001 * i as f32);
+                        best = best.max(h(v, x, y) - 0.5 * (h(v, x - 0.006, y) + h(v, x + 0.006, y)));
+                    }
+                }
+                best
+            })
+            .sum::<f32>()
+            / xs.len() as f32
+    };
+    let before: Vec<f32> = rows.iter().map(|&y| relief(&v, y)).collect();
+    let ground0: Vec<f32> = rows.iter().map(|&y| h(&v, 0.06, y)).collect();
+    for _ in 0..2 {
+        v.begin_stroke();
+        let mut along = Vec3::ZERO;
+        for k in 0..=8 {
+            let d = Vec3::new(-0.1 + 0.2 * k as f32 / 8.0, 0.0, 1.0).normalize();
+            let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
+            let rough = if along == Vec3::ZERO { n } else { along };
+            if let Some((n, _)) = v.plane_dab(0, hit, rough, 0.3, 0.3 * 0.095, 0.5, 0.4, false) {
+                along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+            }
+        }
+        v.end_stroke();
+    }
+    let after: Vec<f32> = rows.iter().map(|&y| relief(&v, y)).collect();
+    let rise: Vec<f32> = rows.iter().zip(&ground0).map(|(&y, g)| h(&v, 0.06, y) - g).collect();
+    eprintln!("under the strokes' line: {:.5} -> {:.5} (the clay rose {:.4}); on their falloff: {:.5} -> {:.5} (rose {:.4})", before[0], after[0], rise[0], before[1], after[1], rise[1]);
+    assert!(before.iter().all(|&b| b > 0.0003), "the dabs did not make bumps");
+    assert!(after[0] < 0.25 * before[0], "the bumps under the clay were not buried");
+    assert!(after[1] > 0.5 * before[1], "the bumps out on the falloff should mostly stay");
+    let (open, _, dropped, _) = check(&v, 4);
+    assert_eq!((open, dropped), (0, 0));
 }

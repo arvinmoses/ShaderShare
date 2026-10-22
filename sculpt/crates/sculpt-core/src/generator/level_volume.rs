@@ -492,6 +492,10 @@ pub struct LevelVolume {
     /// How long a dab may spend carrying detail, in milliseconds; the rest waits for [`Self::carry_pending`]. `None`
     /// (the default) carries it all at once.
     pub carry_budget: Option<f64>,
+    /// Whether a coarse stroke keeps the finer detail under it, carried along on the new surface (as sculpting at a
+    /// lower subdivision level does). Off by default: the stroke works on the finer levels under it as it does on its
+    /// own, as clay on one surface does, filling grooves and covering bumps wherever it builds over them.
+    pub keep_detail: bool,
 }
 
 /// Queued detail to carry on another thread: a copy of the volume (see [`LevelVolume::carry_take`]) and, per level,
@@ -562,7 +566,7 @@ impl LevelVolume {
     pub fn from_field<F: Fn(Vec3) -> f32 + Sync>(field: &F, half: f32, voxel0: f32, levels: usize) -> LevelVolume {
         let levels = levels.clamp(1, MAX_LEVELS);
         let origin = Vec3::ZERO;
-        let mut v = LevelVolume { voxel0, origin, blocks: vec![Shared::default(); levels], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0, origin, blocks: vec![Shared::default(); levels], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false };
         let band = v.band(0);
         let step = voxel0 * B as f32;
         let lo = ((Vec3::splat(-half) - origin) / step).floor().as_ivec3() - IVec3::ONE;
@@ -1022,6 +1026,58 @@ impl LevelVolume {
                 any.then_some((bc, s, d, flips))
             })
             .collect();
+        // Unless the finer detail is kept (carried), the finer levels under the dab take it as their own: each of their
+        // stored blocks under it, from the field as it is.
+        let finer: Vec<(usize, IVec3, Block)> = if self.keep_detail || l + 1 >= self.levels() {
+            Vec::new()
+        } else {
+            let under: HashSet<IVec3> = cand.iter().copied().collect();
+            let under = &under;
+            let blocks: Vec<(usize, IVec3)> = (l + 1..self.levels())
+                .flat_map(|m| {
+                    let s = (m - l) as i32;
+                    self.blocks[m].keys().filter(|c| under.contains(&IVec3::new(c.x >> s, c.y >> s, c.z >> s))).map(move |&c| (m, c)).collect::<Vec<_>>()
+                })
+                .collect();
+            let me = &*self;
+            blocks
+                .par_iter()
+                .filter_map(|&(m, bc)| {
+                    let (vm, fband) = (me.voxel(m), me.band(m));
+                    let old = me.blocks[m].get(&bc)?;
+                    // The level below over the block, for samples this level holds only clamped.
+                    let below = me.grid(m - 1, (bc * B).div_euclid(IVec3::splat(2)) - IVec3::ONE, (bc * B + B3).div_euclid(IVec3::splat(2)) + IVec3::ONE, false);
+                    let corner = origin + (bc * B).as_vec3() * vm;
+                    let mut s: Block = Box::new(**old);
+                    let mut any = false;
+                    for (i, v) in s.iter_mut().enumerate() {
+                        let p = corner + cell_of(i).as_vec3() * vm;
+                        let w = weight(p);
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        // A sample at its band holds only a bound; the level below, on the same side and farther, says
+                        // how far. Blended from the bound, the dab would reach it sooner here than on the level below,
+                        // and clay would show at this level's blocks before it shows around them.
+                        let mut was = *v;
+                        if was.abs() >= 0.999 * fband {
+                            let b = below.trilinear((bc * B + cell_of(i)).as_vec3() * 0.5);
+                            if (b < 0.0) == (was < 0.0) && b.abs() > was.abs() {
+                                was = b;
+                            }
+                        }
+                        let blob = shape(p);
+                        let full = if carve { was.max(-blob) } else { was.min(blob) };
+                        let next = (was + w * (full - was)).clamp(-fband, fband);
+                        if next != *v {
+                            *v = next;
+                            any = true;
+                        }
+                    }
+                    any.then_some((m, bc, s))
+                })
+                .collect()
+        };
         // Outside a stroke, the dab is a stroke of its own: detail is carried from the field as it was before it.
         let own = self.stroke.is_none();
         if own {
@@ -1052,6 +1108,10 @@ impl LevelVolume {
                 flipped.insert(bc, flips);
             }
         }
+        for (m, bc, s) in finer {
+            self.put(m, bc, s);
+            stats.carried += 1;
+        }
         stats.changed = changed.len();
         // Moves measured near what changed are measured again: a measurement marches through the field around it.
         if !self.moved.is_empty() {
@@ -1059,7 +1119,9 @@ impl LevelVolume {
             self.moved.retain(|p, _| !near.contains(&p.div_euclid(B3)));
         }
         self.clear_checkerboards(l, flipped);
-        stats.carried = self.carry_detail(l, &changed);
+        if self.keep_detail {
+            stats.carried = self.carry_detail(l, &changed);
+        }
         if own {
             stats.carried += self.carry_pending(None);
             self.stroke = None;
@@ -1137,6 +1199,7 @@ impl LevelVolume {
             moved: HashMap::default(),
             carried: vec![HashSet::default(); MAX_LEVELS],
             carry_budget: None,
+            keep_detail: self.keep_detail,
         }
     }
 
@@ -2973,7 +3036,7 @@ impl LevelVolume {
             r.read_exact(&mut b)?;
             Ok(IVec3::new(i32::from_le_bytes(b[0..4].try_into().unwrap()), i32::from_le_bytes(b[4..8].try_into().unwrap()), i32::from_le_bytes(b[8..12].try_into().unwrap())))
         };
-        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![Shared::default(); n.max(levels.min(MAX_LEVELS))], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![Shared::default(); n.max(levels.min(MAX_LEVELS))], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false };
         for _ in 0..u32_(r)? {
             v.inside0.insert(ivec(r)?);
         }
@@ -3004,7 +3067,7 @@ impl LevelVolume {
     /// A single-resolution volume as level 0 of a new one with `levels` levels.
     pub fn from_volume(old: &super::volume::Volume, levels: usize) -> LevelVolume {
         let (origin, dims) = old.grid();
-        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![Shared::default(); levels.clamp(1, MAX_LEVELS)], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None };
+        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![Shared::default(); levels.clamp(1, MAX_LEVELS)], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false };
         let band = v.band(0);
         let stored: HashMap<u32, &[f32; N]> = old.stored().collect();
         for (b, &sign) in old.signs().iter().enumerate() {
