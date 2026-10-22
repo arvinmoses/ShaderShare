@@ -847,8 +847,67 @@ impl LevelVolume {
         g
     }
 
+    /// Level `l`'s samples over the lattice box `lo..=hi` (x fastest), stored or interpolated from coarser levels.
+    pub(crate) fn samples(&self, l: usize, lo: IVec3, hi: IVec3) -> Vec<f32> {
+        self.grid(l, lo, hi, false).v
+    }
+
+    /// The direction the stroke under way (or the last one) pushed the surface at world point `p` where its normal is
+    /// `n` (see [`Self::carry_dir`]).
+    pub(crate) fn push_dir(&self, p: Vec3, n: Vec3) -> Vec3 {
+        self.carry_dir((p - self.origin) / self.voxel(self.carry_level), n)
+    }
+
+    /// Make block `k` here what it is in `src` (stored, missing, or wholly inside), outside any stroke. A block finer
+    /// levels here still hang from is kept, as the coarser level shows it.
+    pub(crate) fn mirror(&mut self, src: &LevelVolume, k: Key) {
+        let (l, bc) = (k.0 as usize, k.1);
+        if let Some(b) = src.blocks[l].get(&bc) {
+            self.put_stored(l, bc, b.clone());
+            return;
+        }
+        let had = self.blocks[l].remove(&bc).is_some();
+        if l == 0 {
+            if src.inside0.contains(&bc) {
+                self.inside0.insert(bc);
+            } else {
+                self.inside0.remove(&bc);
+            }
+        }
+        self.dirty.insert(k);
+        let children = l + 1 < self.levels() && (0..8).any(|q| self.blocks[l + 1].contains_key(&(bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))));
+        if had && children {
+            self.ensure(l, bc);
+        }
+    }
+
+    /// Make block `bc` of level `l` again from the coarser level, outside any stroke (a block held only as a parent,
+    /// whose coarser level changed).
+    pub(crate) fn refill(&mut self, l: usize, bc: IVec3) {
+        if self.blocks[l].remove(&bc).is_some() {
+            let s = self.block_values(l, bc, false);
+            self.blocks[l].insert(bc, Stored::from(s));
+            self.dirty.insert((l as u8, bc));
+        }
+    }
+
+    /// Remove every block of level `l` (and finer levels' blocks under none), outside any stroke.
+    pub(crate) fn remove_level(&mut self, l: usize) {
+        let keys: Vec<IVec3> = self.blocks[l].keys().copied().collect();
+        for bc in keys {
+            self.blocks[l].remove(&bc);
+            self.dirty.insert((l as u8, bc));
+        }
+    }
+
+    /// Mark every stored block changed.
+    pub(crate) fn mark_all_dirty(&mut self) {
+        let keys = self.keys();
+        self.dirty.extend(keys);
+    }
+
     /// Block `bc` of level `l`'s 512 samples, stored or interpolated from coarser levels.
-    fn block_values(&self, l: usize, bc: IVec3, base: bool) -> Block {
+    pub(crate) fn block_values(&self, l: usize, bc: IVec3, base: bool) -> Block {
         if let Some(s) = self.stored(l, bc, base) {
             return Box::new(*s);
         }
@@ -925,7 +984,7 @@ impl LevelVolume {
         self.put_stored(l, bc, Stored::from(s));
     }
 
-    fn put_stored(&mut self, l: usize, bc: IVec3, s: Stored) {
+    pub(crate) fn put_stored(&mut self, l: usize, bc: IVec3, s: Stored) {
         if !self.blocks[l].contains_key(&bc) && l > 0 {
             self.ensure(l - 1, bc.div_euclid(IVec3::splat(2)));
         }
@@ -938,7 +997,7 @@ impl LevelVolume {
     }
 
     /// Make block `bc` of level `l` (from the coarser level) and its parents, if they do not exist.
-    fn ensure(&mut self, l: usize, bc: IVec3) {
+    pub(crate) fn ensure(&mut self, l: usize, bc: IVec3) {
         if self.blocks[l].contains_key(&bc) {
             return;
         }
@@ -1181,7 +1240,7 @@ impl LevelVolume {
     }
 
     /// A copy of the volume to carry detail on, made in a moment (its maps share their shards with this one's).
-    fn snapshot(&self) -> LevelVolume {
+    pub(crate) fn snapshot(&self) -> LevelVolume {
         LevelVolume {
             voxel0: self.voxel0,
             origin: self.origin,
