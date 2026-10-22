@@ -900,11 +900,22 @@ impl LevelVolume {
         }
     }
 
-    /// Mark every stored block changed.
-    pub(crate) fn mark_all_dirty(&mut self) {
-        let keys = self.keys();
-        self.dirty.extend(keys);
+    /// The blocks the last stroke kept for undo changed.
+    pub fn last_stroke_keys(&self) -> Vec<Key> {
+        self.history.last().map(|h| h.keys().copied().collect()).unwrap_or_default()
     }
+
+    /// Drop the last stroke from the history (something else undoes it).
+    pub fn forget_last(&mut self) {
+        self.history.pop();
+    }
+
+    /// Drop all the history.
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.redo.clear();
+    }
+
 
     /// Block `bc` of level `l`'s 512 samples, stored or interpolated from coarser levels.
     pub(crate) fn block_values(&self, l: usize, bc: IVec3, base: bool) -> Block {

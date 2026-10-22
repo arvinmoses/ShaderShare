@@ -212,8 +212,11 @@ enum Undo {
 /// A form with one detail layer over it.
 pub struct Layered {
     form: LevelVolume,
-    shown: LevelVolume,
+    /// The layer's level (the finest), and the first level whose work it took from the form.
     level: usize,
+    from: usize,
+    /// While the layer itself is edited (its mask painted): the layer as the edit began.
+    edit: Option<Layer>,
     layer: Layer,
     /// While a stroke on the form is under way: the form and the layer as it began, and the blocks it changed.
     start: Option<(LevelVolume, Layer)>,
@@ -224,21 +227,56 @@ pub struct Layered {
 }
 
 impl Layered {
-    /// Put the detail `form` holds at level `level` in a layer of its own over the rest.
-    pub fn new(mut form: LevelVolume, level: usize) -> Layered {
-        assert!(level >= 1 && level < form.levels());
-        let full = form.snapshot();
-        let keys: Vec<IVec3> = form.keys().into_iter().filter(|k| k.0 as usize == level).map(|k| k.1).collect();
-        for l in level..form.levels() {
+    /// Put the work `shown` holds at levels `from` and finer in a layer of its own over the rest, held at the finest
+    /// level. `shown` becomes what is drawn: the form with the layer on it.
+    pub fn new(shown: &mut LevelVolume, from: usize) -> Layered {
+        let level = shown.levels() - 1;
+        assert!(from >= 1 && from <= level);
+        let full = shown.snapshot();
+        let mut form = shown.snapshot();
+        for l in from..form.levels() {
             form.remove_level(l);
         }
-        let (v, band, origin) = (form.voxel(level), form.band(level), form.origin());
-        let below = level - 1;
+        form.drain_dirty();
+        form.clear_history();
+        let mut out = Layered { form, level, from, edit: None, layer: Layer::default(), start: None, touched: HashSet::default(), history: Vec::new(), redo: Vec::new(), last: FollowStats::default() };
+        let keys = out.finest_under(&full, &full.keys());
+        out.take_heights(shown, &full, &keys);
+        shown.clear_history();
+        out
+    }
+
+    /// Finest-level blocks under `keys` (of levels `from` and finer) near the surface of `vol`.
+    fn finest_under(&self, vol: &LevelVolume, keys: &[Key]) -> Vec<IVec3> {
+        let l = self.level;
+        let (v, band, origin) = (vol.voxel(l), vol.band(l), vol.origin());
+        let near = 4.0 * 3f32.sqrt() * v + band + MOST * v;
+        let mut out: HashSet<IVec3> = HashSet::default();
+        for &(m, bc) in keys {
+            let m = m as usize;
+            if m < self.from {
+                continue;
+            }
+            let k = 1i32 << (l - m);
+            for q in 0..k * k * k {
+                out.insert(bc * k + IVec3::new(q % k, (q / k) % k, q / (k * k)));
+            }
+        }
+        let out: Vec<IVec3> = out.into_iter().collect();
+        out.into_par_iter().filter(|bc| vol.value_upto(origin + (*bc * B + IVec3::splat(B / 2)).as_vec3() * v, l, false).abs() < near).collect()
+    }
+
+    /// Make the layer's heights over finest-level blocks `keys` what `detail` stands out of the form there (keeping the
+    /// mask), and show them; `shown` then holds the form's blocks again at the levels the layer took.
+    fn take_heights(&mut self, shown: &mut LevelVolume, detail: &LevelVolume, keys: &[IVec3]) {
+        let (l, form) = (self.level, &self.form);
+        let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
+        let below = self.from - 1;
         let built: Vec<(IVec3, Option<Box<[f32; N]>>)> = keys
             .par_iter()
             .map(|&bc| {
                 let base = |p: Vec3| form.value_upto(p, below, false);
-                let detail = |p: Vec3| full.value_upto(p, level, false);
+                let top = |p: Vec3| detail.value_upto(p, l, false);
                 let mut h = Box::new([0.0f32; N]);
                 let mut any = false;
                 for (i, out) in h.iter_mut().enumerate() {
@@ -246,46 +284,74 @@ impl Layered {
                     if base(x).abs() > band + MOST * v {
                         continue;
                     }
-                    let n = normal(&form, x, below, false);
+                    let n = normal(form, x, below, false);
                     let Some(foot) = root(&base, x, n, 0.25 * v, 2.0 * v, 8.0 * band) else { continue };
-                    let n = normal(&form, foot, below, false);
-                    let Some(y) = root(&detail, foot, n, 0.1 * v, 0.5 * v, MOST * v + v) else { continue };
+                    let n = normal(form, foot, below, false);
+                    let Some(y) = root(&top, foot, n, 0.1 * v, 0.5 * v, MOST * v + v) else { continue };
                     *out = (y - foot).dot(n).clamp(-MOST * v, MOST * v);
                     any |= out.abs() > 1e-4 * v;
                 }
                 (bc, any.then_some(h))
             })
             .collect();
-        let mut layer = Layer::default();
-        let mut made = Vec::new();
         for (bc, h) in built {
-            if let Some(h) = h {
-                layer.h.insert(bc, Stored::from(h));
-                layer.m.insert(bc, Stored::from(Box::new([1.0f32; N])));
-                made.push(bc);
+            match h {
+                Some(h) => {
+                    self.layer.h.insert(bc, Stored::from(h));
+                    if !self.layer.m.contains_key(&bc) {
+                        self.layer.m.insert(bc, Stored::from(Box::new([1.0f32; N])));
+                    }
+                }
+                None => {
+                    self.layer.h.remove(&bc);
+                    self.layer.m.remove(&bc);
+                }
             }
         }
-        form.drain_dirty();
-        let shown = form.snapshot();
-        let mut out = Layered { form, shown, level, layer, start: None, touched: HashSet::default(), history: Vec::new(), redo: Vec::new(), last: FollowStats::default() };
-        out.compose(&made);
-        out.shown.mark_all_dirty();
-        out
+        // The form's blocks again, coarsest first, where `shown` held the work the layer now has.
+        let mut coarse: Vec<Key> = detail.keys().into_iter().chain(shown.keys()).filter(|k| (k.0 as usize) >= self.from && (k.0 as usize) < l).collect();
+        coarse.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        coarse.dedup();
+        for k in coarse {
+            shown.mirror(&self.form, k);
+        }
+        let stray: Vec<Key> = shown.keys().into_iter().filter(|k| k.0 as usize == l && !self.layer.h.contains_key(&k.1)).collect();
+        for k in stray {
+            shown.mirror(&self.form, k);
+        }
+        self.compose(shown, keys);
+    }
+
+    /// A stroke on what is shown (`shown`'s last stroke, on the layer) has ended: take it into the layer's heights,
+    /// to undo with the layer's history rather than with the stroke's own.
+    pub fn take_detail(&mut self, shown: &mut LevelVolume) {
+        let keys = shown.last_stroke_keys();
+        shown.forget_last();
+        if keys.is_empty() {
+            return;
+        }
+        let was = self.layer.clone();
+        let detail = shown.snapshot();
+        let blocks = self.finest_under(&detail, &keys);
+        // Coarser blocks the stroke changed (making parents, moving form down) go back to the form's.
+        let mut coarse: Vec<Key> = keys.iter().copied().filter(|k| (k.0 as usize) < self.from).collect();
+        coarse.sort_unstable_by_key(|k| k.0);
+        for k in coarse {
+            shown.mirror(&self.form, k);
+        }
+        self.take_heights(shown, &detail, &blocks);
+        self.history.push(Undo::Layer(was));
+        self.redo.clear();
+    }
+
+    /// The first level the layer took work from: strokes on the layer work there or finer.
+    pub fn from(&self) -> usize {
+        self.from
     }
 
     /// The form under the layer: brushes find the surface on it.
     pub fn form(&self) -> &LevelVolume {
         &self.form
-    }
-
-    /// What is drawn: the form with the layer on it.
-    pub fn shown(&self) -> &LevelVolume {
-        &self.shown
-    }
-
-    /// Blocks of what is drawn changed since the last call.
-    pub fn drain_dirty(&mut self) -> Vec<Key> {
-        self.shown.drain_dirty()
     }
 
     pub fn level(&self) -> usize {
@@ -309,22 +375,22 @@ impl Layered {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn plane_dab(&mut self, l: usize, at: Vec3, along: Vec3, r: f32, h: f32, hardness: f32, alpha: f32, trim: bool) -> Option<(Vec3, LevelDab)> {
+    pub fn plane_dab(&mut self, shown: &mut LevelVolume, l: usize, at: Vec3, along: Vec3, r: f32, h: f32, hardness: f32, alpha: f32, trim: bool) -> Option<(Vec3, LevelDab)> {
         let out = self.form.plane_dab(l, at, along, r, h, hardness, alpha, trim);
-        self.follow(false);
+        self.follow(shown, false);
         out
     }
 
-    pub fn ball_dab(&mut self, l: usize, c: Vec3, r: f32, k: f32, carve: bool) -> LevelDab {
+    pub fn ball_dab(&mut self, shown: &mut LevelVolume, l: usize, c: Vec3, r: f32, k: f32, carve: bool) -> LevelDab {
         let out = self.form.ball_dab(l, c, r, k, carve);
-        self.follow(false);
+        self.follow(shown, false);
         out
     }
 
     /// End the stroke on the form, and carry the layer over the form as it is now, its distances made again.
-    pub fn end_stroke(&mut self) -> StrokeEnd {
+    pub fn end_stroke(&mut self, shown: &mut LevelVolume) -> StrokeEnd {
         let out = self.form.end_stroke();
-        self.follow(true);
+        self.follow(shown, true);
         if let Some((_, layer)) = self.start.take() {
             self.history.push(Undo::Form(layer));
             self.redo.clear();
@@ -333,7 +399,7 @@ impl Layered {
     }
 
     /// Fade the layer toward `to` (0 hides it, 1 shows it) within `r` of `c`, softly.
-    pub fn paint_mask(&mut self, c: Vec3, r: f32, to: f32) {
+    pub fn paint_mask(&mut self, shown: &mut LevelVolume, c: Vec3, r: f32, to: f32) {
         let (v, origin) = (self.form.voxel(self.level), self.form.origin());
         let lo = ((c - Vec3::splat(r) - origin) / (v * B as f32)).floor().as_ivec3();
         let hi = ((c + Vec3::splat(r) - origin) / (v * B as f32)).floor().as_ivec3();
@@ -357,27 +423,41 @@ impl Layered {
             }
         }
         if !changed.is_empty() {
-            self.history.push(Undo::Layer(was));
-            self.redo.clear();
-            self.compose(&changed);
+            if self.edit.is_none() {
+                self.history.push(Undo::Layer(was));
+                self.redo.clear();
+            }
+            self.compose(shown, &changed);
         }
     }
 
-    pub fn undo(&mut self) -> bool {
+    /// Begin an edit of the layer itself (a mask stroke): undone as one.
+    pub fn begin_edit(&mut self) {
+        self.edit = Some(self.layer.clone());
+    }
+
+    pub fn end_edit(&mut self) {
+        if let Some(was) = self.edit.take() {
+            self.history.push(Undo::Layer(was));
+            self.redo.clear();
+        }
+    }
+
+    pub fn undo(&mut self, shown: &mut LevelVolume) -> bool {
         let Some(entry) = self.history.pop() else { return false };
-        let back = self.swap(entry, true);
+        let back = self.swap(shown, entry, true);
         self.redo.push(back);
         true
     }
 
-    pub fn redo(&mut self) -> bool {
+    pub fn redo(&mut self, shown: &mut LevelVolume) -> bool {
         let Some(entry) = self.redo.pop() else { return false };
-        let back = self.swap(entry, false);
+        let back = self.swap(shown, entry, false);
         self.history.push(back);
         true
     }
 
-    fn swap(&mut self, entry: Undo, undo: bool) -> Undo {
+    fn swap(&mut self, shown: &mut LevelVolume, entry: Undo, undo: bool) -> Undo {
         let (layer, form) = match entry {
             Undo::Form(l) => (l, true),
             Undo::Layer(l) => (l, false),
@@ -392,7 +472,7 @@ impl Layered {
         let old = std::mem::replace(&mut self.layer, layer);
         let region = self.form.drain_dirty();
         for &k in &region {
-            self.shown.mirror(&self.form, k);
+            shown.mirror(&self.form, k);
         }
         // Every layer block either version holds that differs, or whose form changed.
         let mut keys: HashSet<IVec3> = HashSet::default();
@@ -408,7 +488,7 @@ impl Layered {
         }
         keys.extend(self.under(&region, &self.layer));
         let keys: Vec<IVec3> = keys.into_iter().collect();
-        self.compose(&keys);
+        self.compose(shown, &keys);
         if form { Undo::Form(old) } else { Undo::Layer(old) }
     }
 
@@ -426,16 +506,16 @@ impl Layered {
 
     /// Carry the layer over the form as the stroke has left it. Mid-stroke, only where the last dab changed it; at the
     /// end, everywhere the stroke did, now that the form's fields are distances again.
-    fn follow(&mut self, end: bool) {
+    fn follow(&mut self, shown: &mut LevelVolume, end: bool) {
         let t = Instant::now();
         let dirty = self.form.drain_dirty();
         for &k in &dirty {
-            self.shown.mirror(&self.form, k);
+            shown.mirror(&self.form, k);
         }
         self.touched.extend(dirty.iter().copied());
         let Some((form0, layer0)) = &self.start else {
             let keys = self.under(&dirty, &self.layer);
-            self.compose(&keys);
+            self.compose(shown, &keys);
             return;
         };
         let region: Vec<Key> = if end { self.touched.iter().copied().collect() } else { dirty };
@@ -548,13 +628,13 @@ impl Layered {
             keys.push(bc);
         }
         self.last = FollowStats { ms: 0.0, blocks: keys.len(), points: points.len() };
-        self.compose(&keys);
+        self.compose(shown, &keys);
         self.last.ms = t.elapsed().as_secs_f64() * 1e3;
     }
 
     /// Write what is shown at level `L` for layer blocks `keys`: the form pushed out by the layer, or the form alone
     /// where the layer holds nothing.
-    fn compose(&mut self, keys: &[IVec3]) {
+    fn compose(&mut self, shown: &mut LevelVolume, keys: &[IVec3]) {
         let l = self.level;
         let (v, band) = (self.form.voxel(l), self.form.band(l));
         let (form, layer) = (&self.form, &self.layer);
@@ -628,12 +708,12 @@ impl Layered {
         let mut parents: Vec<Key> = parents.into_iter().collect();
         parents.sort_unstable_by_key(|k| k.0);
         for (m, a) in parents {
-            self.shown.refill(m as usize, a);
+            shown.refill(m as usize, a);
         }
         for (bc, s) in built {
             match s {
-                Some(s) => self.shown.put_stored(l, bc, s),
-                None => self.shown.mirror(&self.form, (l as u8, bc)),
+                Some(s) => shown.put_stored(l, bc, s),
+                None => shown.mirror(&self.form, (l as u8, bc)),
             }
         }
     }
