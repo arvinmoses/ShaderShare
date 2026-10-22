@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
 use glam::Vec3;
-use sculpt_core::generator::detail_layer::Layered;
+use sculpt_core::generator::detail_layer::{FollowDone, Layered};
 use sculpt_core::generator::level_volume::{CarryDone, EndDone, LevelVolume};
 
 /// Levels in a new volume: level 0 and five finer, the finest 32 times finer.
@@ -44,6 +44,10 @@ pub struct VolumeMode {
     pub target: Target,
     /// The stroke under way works on the detail layer (taken into it when it ends).
     on_layer: bool,
+    /// The detail layer following the form, off the frame (see `Layered::follow_take`), and the end of a stroke on the
+    /// form under it.
+    follow_job: Option<Receiver<FollowDone>>,
+    form_end: Option<Receiver<EndDone>>,
     /// Bumped when `vol` is replaced, so the viewport rebuilds its GPU copy.
     pub generation: u64,
     /// The level the stroke under way works at.
@@ -104,6 +108,8 @@ impl VolumeMode {
             layer: None,
             target: Target::Detail,
             on_layer: false,
+            follow_job: None,
+            form_end: None,
             generation: 1,
             level: 0,
             cap,
@@ -202,6 +208,49 @@ impl VolumeMode {
     /// `LevelVolume::carry_take`).
     pub fn tick(&mut self) {
         let t = Instant::now();
+        // The detail layer following the form: bring in a job that finished, start the next on what dabs queued.
+        if let Some(layer) = self.layer.as_mut() {
+            if let Some(rx) = &self.form_end {
+                match rx.try_recv() {
+                    Ok(done) => {
+                        let end = layer.end_form_apply(done);
+                        self.end_ms = end.ms;
+                        self.ended_specks = Some(end.specks);
+                        self.form_end = None;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => self.form_end = None,
+                }
+            }
+            if let Some(rx) = &self.follow_job {
+                match rx.try_recv() {
+                    Ok(done) => {
+                        layer.follow_apply(&mut self.vol, done);
+                        self.follow_job = None;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => self.follow_job = None,
+                }
+            }
+            if self.follow_job.is_none()
+                && let Some(job) = layer.follow_take()
+            {
+                // Mid-stroke on the carrying threads (a quarter of the cores), so the dabs and the sync keep the rest;
+                // the stroke's last on all of them.
+                let (tx, rx) = channel();
+                if job.last() {
+                    rayon::spawn(move || {
+                        let _ = tx.send(job.run());
+                    });
+                } else {
+                    let pool = self.pool.clone();
+                    self.pool.spawn(move || {
+                        let _ = tx.send(pool.install(|| job.run()));
+                    });
+                }
+                self.follow_job = Some(rx);
+            }
+        }
         if let Some(rx) = &self.job {
             match rx.try_recv() {
                 Ok(done) => {
@@ -269,6 +318,21 @@ impl VolumeMode {
     /// Finish a stroke whose end is still being worked out, now: before anything that needs the volume settled (a
     /// new stroke, undo, saving).
     pub fn settle(&mut self) {
+        if let Some(layer) = self.layer.as_mut() {
+            if let Some(rx) = self.form_end.take()
+                && let Ok(done) = rx.recv()
+            {
+                let end = layer.end_form_apply(done);
+                self.end_ms = end.ms;
+                self.ended_specks = Some(end.specks);
+            }
+            if let Some(rx) = self.follow_job.take()
+                && let Ok(done) = rx.recv()
+            {
+                layer.follow_apply(&mut self.vol, done);
+            }
+            layer.settle(&mut self.vol);
+        }
         if !self.ending {
             return;
         }
@@ -286,7 +350,7 @@ impl VolumeMode {
 
     /// Whether frames should keep coming to finish carrying or ending a stroke.
     pub fn busy(&self) -> bool {
-        self.ending || self.carrying()
+        self.ending || self.carrying() || self.follow_job.is_some() || self.form_end.is_some() || self.layer.as_ref().is_some_and(|l| l.busy())
     }
 
     /// The specks the last stroke to end left, removed, once.
@@ -329,11 +393,15 @@ impl VolumeMode {
         self.chosen = false;
         match (self.layer.as_mut(), self.target) {
             (Some(layer), Target::Form) => {
-                if layer.form().in_stroke() {
-                    let t = Instant::now();
-                    let end = layer.end_stroke(&mut self.vol);
-                    self.end_ms = t.elapsed().as_secs_f64() * 1e3;
-                    self.ended_specks = Some(end.specks);
+                // The form's end off the frame too; the layer's last follow comes after it (see `tick`).
+                if layer.form().in_stroke()
+                    && let Some(job) = layer.end_form_take()
+                {
+                    let (tx, rx) = channel();
+                    rayon::spawn(move || {
+                        let _ = tx.send(job.run());
+                    });
+                    self.form_end = Some(rx);
                 }
             }
             (Some(layer), Target::Mask { .. }) => layer.end_edit(),
@@ -349,7 +417,10 @@ impl VolumeMode {
     pub fn make_layer(&mut self, from: usize) {
         self.settle();
         let from = from.clamp(1, self.vol.levels() - 1);
-        self.layer = Some(Layered::new(&mut self.vol, from));
+        let mut layer = Layered::new(&mut self.vol, from);
+        // Dabs on the form only queue the layer's following: jobs off the frame do it.
+        layer.deferred = true;
+        self.layer = Some(layer);
         self.target = Target::Detail;
     }
 
@@ -396,6 +467,64 @@ impl VolumeMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// At the demo's scale (a ball of 1M triangles at level 0, a layer of a few thousand blocks), a big brush on the
+    /// form: what a frame costs while the layer follows off the frame, and how long it takes to catch up.
+    #[test]
+    #[ignore]
+    fn big_form_strokes_under_a_layer_stay_cheap_a_frame() {
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, LEVELS));
+        for j in 0..12 {
+            for i in 0..60 {
+                let p = Vec3::new(-0.06 + 0.002 * i as f32, -0.06 + 0.01 * j as f32, 1.0).normalize();
+                mode.vol.begin_stroke();
+                mode.vol.ball_dab(4, p, 0.0015, 0.0004, true);
+                mode.vol.end_stroke();
+            }
+        }
+        let layered = std::env::var_os("NO_LAYER").is_none();
+        if layered {
+            mode.make_layer(4);
+            mode.target = Target::Form;
+        }
+        let blocks = mode.layer.as_ref().map_or(0, |l| l.blocks());
+        let (mut dab_ms, mut tick_ms) = (0.0f64, 0.0f64);
+        let mut worst = 0.0f64;
+        let mut total = 0.0f64;
+        let mut frames = 0;
+        mode.begin_stroke();
+        for k in 0..=24 {
+            let d = Vec3::new(-0.1 + 0.2 * k as f32 / 24.0, 0.0, 1.0).normalize();
+            let t = Instant::now();
+            if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
+                mode.dab(hit, 0.5, 0.05, 1.0, 0.5, false);
+            }
+            dab_ms += t.elapsed().as_secs_f64() * 1e3;
+            let t2 = Instant::now();
+            mode.tick();
+            tick_ms += t2.elapsed().as_secs_f64() * 1e3;
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            worst = worst.max(ms);
+            total += ms;
+            frames += 1;
+        }
+        let t = Instant::now();
+        mode.end_stroke();
+        let pen_up = t.elapsed().as_secs_f64() * 1e3;
+        let landed = mode.layer.as_ref().map_or(0, |l| l.follows);
+        let t = Instant::now();
+        let mut ticks = 0;
+        while mode.busy() {
+            mode.tick();
+            ticks += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let catch_up = t.elapsed().as_secs_f64() * 1e3;
+        let last = mode.layer.as_ref().map(|l| l.last).unwrap_or_default();
+        eprintln!("dabs {:.1} ms, ticks {:.1} ms a frame; {landed} follows landed during the stroke", dab_ms / frames as f64, tick_ms / frames as f64);
+        eprintln!("layer {blocks} blocks: a frame (dab and tick) {:.1} ms on average, {worst:.1} at most; pen up {pen_up:.1} ms; caught up {catch_up:.0} ms later ({ticks} ticks); last follow {last:?}", total / frames as f64);
+        assert!(!mode.busy());
+    }
 
     /// With a detail layer, a mask stroke hides the layer where it passes, and undo brings it back.
     #[test]

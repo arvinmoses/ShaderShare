@@ -181,9 +181,7 @@ fn rides(levels: usize, from: usize) {
     let before: Vec<(f32, Vec<(f32, f32)>)> = ROWS.iter().map(|&y| relief(&lv, y)).collect();
     let shapes0: Vec<_> = ROWS.iter().map(|&y| shapes(&lv, y)).collect();
     eprintln!("bumps out of the form: {:.5} {:.5}", before[0].0, before[1].0);
-    for r in 0..2 {
-        assert!(before[r].0 > 0.003, "the layer does not hold the bumps");
-    }
+    assert!(before.iter().all(|r| r.0 > 0.003), "the layer does not hold the bumps");
     assert_eq!(check(lv.shown(), 4), (0, 0, 0));
 
     let (ms, dabs) = big_strokes(&mut lv);
@@ -294,4 +292,58 @@ fn demo_scale_timing() {
     let t = Instant::now();
     lv.end_stroke();
     eprintln!("end: {:.1} ms; follow {:?}", t.elapsed().as_secs_f64() * 1e3, lv.l.last);
+}
+
+/// Following in jobs that land late (here after every third dab) ends the same as following at once: the stroke's
+/// last follow redoes all it touched from the layer as the stroke began.
+#[test]
+fn following_in_jobs_ends_as_following_at_once() {
+    let make = || {
+        let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
+        for &y in &ROWS {
+            for &x in &xs() {
+                v.begin_stroke();
+                v.ball_dab(4, Vec3::new(x, y, 1.0).normalize(), 0.004, 0.001, false);
+                v.end_stroke();
+            }
+        }
+        Lv::new(v, 4)
+    };
+    let mut at_once = make();
+    big_strokes(&mut at_once);
+    let mut jobs = make();
+    jobs.l.deferred = true;
+    for _ in 0..2 {
+        jobs.l.begin_stroke();
+        let mut along = Vec3::ZERO;
+        for k in 0..=8 {
+            let d = Vec3::new(-0.1 + 0.2 * k as f32 / 8.0, 0.0, 1.0).normalize();
+            let Some((hit, n)) = jobs.l.form().raycast(d * 3.0, -d, 0, true) else { continue };
+            let rough = if along == Vec3::ZERO { n } else { along };
+            if let Some((n, _)) = jobs.l.plane_dab(&mut jobs.s, 0, hit, rough, 0.3, 0.3 * 0.095, 0.5, 0.4, false) {
+                along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+            }
+            assert!(jobs.l.busy());
+            if k % 3 == 2
+                && let Some(job) = jobs.l.follow_take()
+            {
+                let done = job.run();
+                jobs.l.follow_apply(&mut jobs.s, done);
+            }
+        }
+        jobs.l.end_stroke(&mut jobs.s);
+        assert!(jobs.l.busy(), "the stroke's last follow is left to do");
+        jobs.l.settle(&mut jobs.s);
+        assert!(!jobs.l.busy());
+    }
+    for &y in &ROWS {
+        let (a, b) = (relief(&at_once, y).0, relief(&jobs, y).0);
+        let (shape, moved) = compare(&shapes(&at_once, y), &shapes(&jobs, y));
+        eprintln!("row {y}: at once {a:.5}, in jobs {b:.5}; shapes differ {shape:.7}, centres {moved:.6}");
+        assert!((a - b).abs() < 2e-5 && shape < 2e-5, "following in jobs ended differently");
+    }
+    assert_eq!(check(jobs.shown(), 4), (0, 0, 0));
+    jobs.undo();
+    at_once.undo();
+    assert!((relief(&at_once, 0.0).0 - relief(&jobs, 0.0).0).abs() < 2e-5);
 }

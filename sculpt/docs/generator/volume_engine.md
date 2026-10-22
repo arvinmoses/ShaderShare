@@ -240,9 +240,18 @@ patch before the big stroke, under it as one volume (buried), and under it with 
   centre within 0.00033, centres moved 0.00038 (along the stroke's push). On the falloff, a 45 degree rim: 0.00382
   to 0.00381, shape within 0.00039, moved 0.00021. The surface stays closed. The same with the app's six levels and
   the layer taken from a level with no work of its own (`bumps_ride_a_layer_taken_from_a_level_coarser_than_the_work`).
-* **Speed**: 4-6 ms a dab with a layer of a few hundred blocks under the brush. At the demo's scale (a brush of
-  radius 0.5 over a layer of 2400 blocks, `demo_scale_timing`) about 125 ms a dab and 0.4 s when the stroke ends:
-  every dab follows every layer block under the brush again. Following off the frame, as carrying is, is next.
+* **Speed: following runs off the frame.** A dab on the form shows at once where no layer is under it, and queues
+  what is; a job on a quarter of the cores (the carrying threads) follows the queue with the form as it was when the
+  job began, and the frame takes its result in, the form there with the layer on it. When the pen lifts, the form's
+  end and then the stroke's last follow (exact, over all the stroke touched and every layer block it changed) run on
+  all the cores. At the demo's scale (a brush of radius 0.5 over a layer of 2400 blocks, a ball of 1M triangles):
+  10.6 ms a frame with the layer against 11.4 without, pen up 0.2 ms, the layer caught up 0.7 s after
+  (`big_form_strokes_under_a_layer_stay_cheap_a_frame`). Following in jobs ends exactly as following at once does
+  (`following_in_jobs_ends_as_following_at_once`). On the way there: a block whose corners all lie farther from the
+  new surface than a height reaches is dropped before any more is measured; a search with no direction (a flat field
+  deep inside new clay) gives up at once; a block with none of the layer where its heights come from is skipped; a
+  block whose move changed less than a quarter step since it was last followed is left as it is. Mid-stroke the
+  layer is a preview that trails the brush: on a short stroke it may only show once the pen is up.
 * **Painting on the layer**: a stroke with the layer selected works on what is shown, and when it ends the layer takes
   it in as heights (the form keeps none of it) and undoes it with its own history.
 * **Its mask** hides it where painted ("Mask: hide" and "Mask: show" in the Layers panel), and rides the form as the
@@ -250,7 +259,7 @@ patch before the big stroke, under it as one volume (buried), and under it with 
 * **Undo and redo** run over the stack: a form stroke brings back the form and the layer as they were; a layer stroke
   or mask stroke the layer alone.
 
-Not done yet: following off the frame (above); one detail layer only; saving keeps what is shown, not the layer; merging the layer back resets undo;
+Not done yet: one detail layer only; saving keeps what is shown, not the layer; merging the layer back resets undo;
 measuring the move every 2 steps halves what is left of the shape change on a steep rim (0.0004 to 0.0002) at three
 times the cost, and an adaptive lattice would get that for little.
 
