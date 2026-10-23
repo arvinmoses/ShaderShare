@@ -458,7 +458,7 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
     let Some(m) = app.volume_mode.as_mut() else { return };
     ui.add_space(6.0);
     egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| {
-        match m.layer.as_ref().map(|l| (l.from(), l.blocks())) {
+        match m.layer.as_ref().map(|_| ()) {
             None => {
                 ui.label("One volume: strokes work on all of it.");
                 ui.add_space(4.0);
@@ -475,30 +475,93 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                     m.make_layer(from);
                 }
             }
-            Some((from, blocks)) => {
-                ui.label(RichText::new("Strokes work on").small().color(weak));
+            Some(_) => {
+                let layer = m.layer.as_ref().unwrap();
+                let (from, active, layers) = (layer.from(), layer.active(), layer.layers());
+                let top = m.vol.levels() - 1;
+                let texts: Vec<String> = (0..=top).map(|l| format!("level {l}  (step {:.5})", m.vol.voxel(l))).collect();
+                ui.label(RichText::new("Layers, top first: strokes work on the one selected").small().color(weak));
                 ui.add_space(2.0);
-                if ui.selectable_label(m.target == Target::Detail, format!("Detail layer  (levels {from} and finer, {blocks} blocks)")).clicked() {
-                    m.target = Target::Detail;
+                // What the rows asked for, done after drawing them.
+                let mut select = None;
+                let mut visible = None;
+                let mut level = None;
+                let mut remove = None;
+                for k in (0..layers.len()).rev() {
+                    let info = &layers[k];
+                    ui.horizontal(|ui| {
+                        let mut on = info.visible;
+                        if ui.checkbox(&mut on, "").on_hover_text("Show or hide this layer").changed() {
+                            visible = Some((k, on));
+                        }
+                        let picked = m.target == Target::Detail && active == k;
+                        if ui.selectable_label(picked, format!("{}  ({} blocks)", info.name, info.blocks)).clicked() {
+                            select = Some(k);
+                        }
+                        let mut l = info.level;
+                        egui::ComboBox::from_id_salt(("layer_level", k)).selected_text(format!("level {l}")).show_ui(ui, |ui| {
+                            for (c, t) in texts.iter().enumerate().skip(from) {
+                                ui.selectable_value(&mut l, c, t.as_str());
+                            }
+                        });
+                        if l != info.level {
+                            level = Some((k, l));
+                        }
+                        if ui.small_button("✕").on_hover_text("Remove this layer (undo brings it back)").clicked() {
+                            remove = Some(k);
+                        }
+                    });
+                    if active == k {
+                        ui.horizontal(|ui| {
+                            ui.add_space(26.0);
+                            if ui.selectable_label(m.target == Target::Mask { show: false }, "Mask: hide").clicked() {
+                                m.target = Target::Mask { show: false };
+                            }
+                            if ui.selectable_label(m.target == Target::Mask { show: true }, "Mask: show").clicked() {
+                                m.target = Target::Mask { show: true };
+                            }
+                        });
+                    }
                 }
-                ui.horizontal(|ui| {
-                    ui.add_space(18.0);
-                    if ui.selectable_label(m.target == Target::Mask { show: false }, "Mask: hide").clicked() {
-                        m.target = Target::Mask { show: false };
-                    }
-                    if ui.selectable_label(m.target == Target::Mask { show: true }, "Mask: show").clicked() {
-                        m.target = Target::Mask { show: true };
-                    }
-                });
                 if ui.selectable_label(m.target == Target::Form, format!("Form  (levels 0 to {})", from - 1)).clicked() {
                     m.target = Target::Form;
                 }
+                if let Some(k) = select {
+                    m.set_active_layer(k);
+                    m.target = Target::Detail;
+                }
+                if let Some((k, on)) = visible {
+                    m.set_layer_visible(k, on);
+                }
+                if let Some((k, l)) = level {
+                    m.set_layer_level(k, l);
+                }
+                if let Some(k) = remove {
+                    m.remove_layer(k);
+                }
                 ui.add_space(6.0);
-                if ui.button("Merge the layer into the form").clicked() {
+                ui.horizontal(|ui| {
+                    let id = ui.id().with("new_layer_level");
+                    let mut l = ui.data_mut(|d| *d.get_temp_mut_or(id, top)).clamp(from, top);
+                    if ui.button("New layer").on_hover_text("An empty layer on top, at the resolution beside").clicked() {
+                        m.add_layer(l);
+                    }
+                    egui::ComboBox::from_id_salt("new_layer_level").selected_text(format!("level {l}")).show_ui(ui, |ui| {
+                        for (c, t) in texts.iter().enumerate().skip(from) {
+                            ui.selectable_value(&mut l, c, t.as_str());
+                        }
+                    });
+                    ui.data_mut(|d| d.insert_temp(id, l));
+                });
+                if ui.button("Merge the layers into the form").clicked() {
                     m.merge_layer();
                 }
                 ui.add_space(4.0);
-                ui.label(RichText::new("Sculpting the form carries the detail layer along. Saving keeps what is shown, not the layer.").small().color(weak));
+                ui.label(
+                    RichText::new("Sculpting the form carries every layer along. Each layer has its own resolution: coarse ones cost little, and hold broad detail; fine ones hold the smallest. Layers add up, so their order does not matter. Saved with the volume.")
+                        .small()
+                        .color(weak),
+                );
             }
         }
     });

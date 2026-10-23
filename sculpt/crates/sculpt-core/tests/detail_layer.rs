@@ -347,3 +347,93 @@ fn following_in_jobs_ends_as_following_at_once() {
     at_once.undo();
     assert!((relief(&at_once, 0.0).0 - relief(&jobs, 0.0).0).abs() < 2e-5);
 }
+
+/// Two layers of different resolutions: a broad bump on a coarse layer and a row of small ones on a fine layer over
+/// it. Each rides a big stroke on the form whole; each can be hidden, its resolution changed, removed and brought
+/// back; and the whole stack saves and opens again as it was.
+#[test]
+fn layers_of_two_resolutions_ride_together_and_save() {
+    let v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
+    let mut lv = Lv::new(v, 3);
+    assert_eq!(lv.l.layers().len(), 1);
+    let fine = 0;
+    let broad = lv.l.add_layer("Broad", 3);
+    assert_eq!((lv.l.layers()[fine].level, lv.l.layers()[broad].level), (4, 3));
+    // A broad bump on the coarse layer, then small bumps on the fine one, over and beside it.
+    lv.l.set_active(broad);
+    lv.s.begin_stroke();
+    lv.s.ball_dab(3, Vec3::new(0.0, 0.0, 1.0), 0.012, 0.003, false);
+    lv.s.end_stroke();
+    lv.l.take_detail(&mut lv.s);
+    lv.l.set_active(fine);
+    for &x in &xs() {
+        // On the surface shown (over the broad bump, where it is).
+        let d = Vec3::new(x, 0.0, 1.0).normalize();
+        let (at, _) = lv.s.raycast(d * 3.0, -d, 4, false).unwrap();
+        lv.s.begin_stroke();
+        lv.s.ball_dab(4, at, 0.004, 0.001, false);
+        lv.s.end_stroke();
+        lv.l.take_detail(&mut lv.s);
+    }
+    let infos = lv.l.layers();
+    eprintln!("blocks: fine {} at level 4, broad {} at level 3", infos[fine].blocks, infos[broad].blocks);
+    assert!(infos[broad].blocks > 0 && infos[fine].blocks > 0);
+    // Each layer alone: the broad bump's top, and the small bumps' shapes.
+    let alone = |lv: &mut Lv, k: usize| {
+        let other = 1 - k;
+        lv.l.set_visible(&mut lv.s, other, false);
+        let out = (out_of(lv, 0.0, 0.0), shapes(lv, 0.0));
+        lv.l.set_visible(&mut lv.s, other, true);
+        out
+    };
+    let (top0, _) = alone(&mut lv, broad);
+    let (_, small0) = alone(&mut lv, fine);
+    let both0 = out_of(&lv, 0.0, 0.0);
+    eprintln!("broad bump {top0:.5}; both layers there {both0:.5}");
+    assert!(top0 > 0.004, "the broad bump is not in its layer");
+    assert!(both0 > top0 + 0.002, "the small bump over the broad one does not add to it");
+    assert_eq!(check(lv.shown(), 4), (0, 0, 0));
+
+    big_strokes(&mut lv);
+    let (top1, _) = alone(&mut lv, broad);
+    let (_, small1) = alone(&mut lv, fine);
+    let (shape, moved) = compare(&small0, &small1);
+    eprintln!("after the big strokes: broad bump {top1:.5}; small bumps' shapes changed {shape:.6}, moved {moved:.5}");
+    assert!((top1 - top0).abs() < 0.1 * top0, "the broad bump did not ride the strokes");
+    assert!(shape < 0.0006 && moved < 0.0015, "the small bumps did not ride the strokes");
+    assert_eq!(check(lv.shown(), 4), (0, 0, 0));
+
+    // Saved and opened again: the same surface, the same layers.
+    let mut file = Vec::new();
+    lv.l.write_to(&mut file).unwrap();
+    let (s2, l2) = Layered::read_from(&mut &file[..], 5).unwrap();
+    let l2 = l2.expect("the layers were not saved");
+    assert_eq!(l2.layers().len(), 2);
+    let mut worst = 0.0f32;
+    for j in 0..21 {
+        for i in 0..21 {
+            let (x, y) = (-0.05 + 0.005 * i as f32, -0.05 + 0.005 * j as f32);
+            worst = worst.max((h(&s2, x, y) - h(lv.shown(), x, y)).abs());
+        }
+    }
+    eprintln!("opened again: off by at most {worst:.7}");
+    assert!(worst < 2e-5, "the opened stack does not show as it did");
+
+    // The broad layer held finer, then coarser again: about the same bump.
+    lv.l.set_level(&mut lv.s, broad, 4);
+    let (top2, _) = alone(&mut lv, broad);
+    lv.l.set_level(&mut lv.s, broad, 3);
+    let (top3, _) = alone(&mut lv, broad);
+    eprintln!("broad bump at level 4 {top2:.5}, back at level 3 {top3:.5}");
+    assert!((top2 - top1).abs() < 0.05 * top1 && (top3 - top1).abs() < 0.1 * top1);
+    assert_eq!(check(lv.shown(), 4), (0, 0, 0));
+
+    // Removed, and back with undo.
+    lv.l.remove_layer(&mut lv.s, broad);
+    let gone = out_of(&lv, 0.0, 0.0);
+    lv.undo();
+    let back = out_of(&lv, 0.0, 0.0);
+    eprintln!("both layers at the broad bump {:.5}; with it removed {gone:.5}; back {back:.5}", out_of(&lv, 0.0, 0.0));
+    assert!(gone < back - 0.004, "removing the layer did not take its bump away");
+    assert_eq!(check(lv.shown(), 4), (0, 0, 0));
+}

@@ -1,18 +1,24 @@
-//! A detail layer over a sculpted form: fine work kept as heights over the form's surface, with a mask, so sculpting
-//! the form carries it along (as sculpting a lower subdivision level does), and the mask fades it anywhere.
+//! Detail layers over a sculpted form: fine work kept as heights over the form's surface, each layer with a mask and a
+//! resolution of its own, so sculpting the form carries them all along (as sculpting a lower subdivision level does),
+//! a mask fades its layer anywhere, and a coarse layer costs little.
 //!
-//! * **Heights.** At each lattice point of one fine level `L` near the form's surface, the layer holds `h`, how far the
-//!   detail stands out of the form at the point of its surface nearest (the same along the normal), and a mask `m`
-//!   from 0 to 1. What is shown is the form pushed out by `m * h`: the field `φ - m h`, where `φ` is the form's.
+//! * **Heights.** A layer holds, at each lattice point of its level near the form's surface, `h`, how far its detail
+//!   stands out of the form at the point of its surface nearest (the same along the normal), and a mask `m` (0 to 1).
+//!   Layers are displacements along the form's normal and add up: what is shown is the form pushed out by the sum
+//!   of the visible layers' `m h`. Their order does not change what is shown.
+//! * **Resolution.** Each layer lives at one level, coarse or fine. What is shown at a level holds the layers at that
+//!   level or coarser (finer ones show at their own level), so a distant view that leaves fine levels out leaves fine
+//!   layers out too.
 //! * **Following the form.** When a stroke moves the form, each new surface point takes the height of the point of
 //!   the surface it came from: found along the normal (or the stroke's push) by where the fields change sign, which
-//!   holds mid-stroke, when the fields are not distances yet. The move is measured every four lattice steps and
-//!   interpolated, so it is smooth; the heights are read from the layer as the stroke began, so a stroke resamples
-//!   them once, never a dab after a dab, and where the surface hardly moved they are copied exactly.
-//! * **Shown.** A second volume holds what is drawn: the form's blocks, and at level `L` the composed field, made a
-//!   distance again near the surface (its slope can be steeper than one on a groove's wall) so the extractor's
+//!   holds mid-stroke, when the fields are not distances yet. The move is measured on each layer's own lattice, every
+//!   four steps, and interpolated; heights are read from the layers as the stroke began, so a stroke resamples them
+//!   once, and where the surface hardly moved they are copied exactly. It runs in jobs off the frame when deferred.
+//! * **Shown.** A second volume holds what is drawn: the form's blocks, and at each layer's level the composed field,
+//!   made a distance again near the surface (its slope can be steeper than one on a groove's wall) so the extractor's
 //!   crossings and the 16-bit samples stay exact.
 
+use std::io::{Read, Write};
 use std::time::Instant;
 
 use glam::{IVec3, Vec3};
@@ -24,8 +30,14 @@ const B: i32 = 8;
 const N: usize = 512;
 /// Lattice steps between the points the move is measured at.
 const EVERY: i32 = 4;
-/// The most a height may be, in level `L` steps: more is form, and belongs in the form.
+/// The most a height may be, in steps of the layers' first (coarsest) level, whatever a layer's own: more is form,
+/// and belongs in the form. A layer's resolution then never limits what it holds.
 const MOST: f32 = 6.0;
+
+/// The tallest height `layer` holds.
+fn tallest(layer: &Layer) -> f32 {
+    layer.h.values().flat_map(|b| b.iter()).fold(0.0f32, |a, b| a.max(b.abs()))
+}
 /// A sample whose source moved less than this (in steps) copies its height rather than resampling it.
 const SNAP: f32 = 0.05;
 
@@ -38,11 +50,38 @@ fn local(i: IVec3) -> usize {
     (l.x + 8 * l.y + 64 * l.z) as usize
 }
 
-/// The layer's samples: heights and mask, per level `L` block.
-#[derive(Clone, Default)]
+/// Trilinear weights of corner `q` (bits x, y, z) at fraction `f`.
+fn corner_weight(q: i32, f: Vec3) -> f32 {
+    (if q & 1 == 1 { f.x } else { 1.0 - f.x }) * (if (q >> 1) & 1 == 1 { f.y } else { 1.0 - f.y }) * (if (q >> 2) & 1 == 1 { f.z } else { 1.0 - f.z })
+}
+
+fn corner_offset(q: i32) -> IVec3 {
+    IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)
+}
+
+/// One layer: its name, level, whether it shows, and its samples (heights and mask) per block of its level.
+#[derive(Clone)]
 struct Layer {
+    name: String,
+    level: usize,
+    visible: bool,
     h: Shared<IVec3, Stored>,
     m: Shared<IVec3, Stored>,
+}
+
+impl Layer {
+    fn new(name: &str, level: usize) -> Layer {
+        Layer { name: name.to_string(), level, visible: true, h: Shared::default(), m: Shared::default() }
+    }
+}
+
+/// What a layer is, for a layer list.
+#[derive(Clone, Debug)]
+pub struct LayerInfo {
+    pub name: String,
+    pub level: usize,
+    pub visible: bool,
+    pub blocks: usize,
 }
 
 /// A layer map's samples over a box of lattice points, read once.
@@ -86,6 +125,12 @@ impl Dense {
     /// Whether every sample is `x`.
     fn all(&self, x: f32) -> bool {
         self.v.iter().all(|&v| v == x)
+    }
+
+    fn linear(&self, g: Vec3) -> f32 {
+        let i = g.floor().as_ivec3();
+        let f = g - i.as_vec3();
+        (0..8).map(|q| corner_weight(q, f) * self.at(i + corner_offset(q))).sum()
     }
 
     /// Catmull-Rom at lattice coordinates `g`.
@@ -136,13 +181,7 @@ impl<'a> Sparse<'a> {
     fn linear(&self, g: Vec3) -> f32 {
         let i = g.floor().as_ivec3();
         let f = g - i.as_vec3();
-        let mut sum = 0.0;
-        for q in 0..8 {
-            let d = IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
-            let w = (if d.x == 1 { f.x } else { 1.0 - f.x }) * (if d.y == 1 { f.y } else { 1.0 - f.y }) * (if d.z == 1 { f.z } else { 1.0 - f.z });
-            sum += w * self.at(i + d);
-        }
-        sum
+        (0..8).map(|q| corner_weight(q, f) * self.at(i + corner_offset(q))).sum()
     }
 
     fn cubic(&self, g: Vec3) -> f32 {
@@ -165,6 +204,12 @@ impl<'a> Sparse<'a> {
 fn catmull(t: f32) -> [f32; 4] {
     let (t2, t3) = (t * t, t * t * t);
     [0.5 * (-t3 + 2.0 * t2 - t), 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0), 0.5 * (-3.0 * t3 + 4.0 * t2 + t), 0.5 * (t3 - t2)]
+}
+
+/// Whether `map` has a block over any of the lattice box `lo..=hi`.
+fn any_block(map: &Shared<IVec3, Stored>, lo: IVec3, hi: IVec3) -> bool {
+    let (blo, bhi) = (lo.div_euclid(IVec3::splat(B)), hi.div_euclid(IVec3::splat(B)));
+    (blo.z..=bhi.z).any(|z| (blo.y..=bhi.y).any(|y| (blo.x..=bhi.x).any(|x| map.contains_key(&IVec3::new(x, y, z)))))
 }
 
 /// Where `f` changes sign along the line through `p` along `d`, toward the surface from `p`: stepping by the field's
@@ -211,11 +256,11 @@ fn root(f: &dyn Fn(Vec3) -> f32, p: Vec3, d: Vec3, lo: f32, hi: f32, reach: f32)
 }
 
 /// The form's field at level `l` over the lattice box `lo..=hi` (x fastest): its own samples where it has a block there,
-/// else level `below`'s (the form's finest under the layer), interpolated but not held to level `l`'s band, since
-/// heights can stand out farther.
+/// else level `below`'s (the form's finest), interpolated but not held to level `l`'s band, since heights can stand
+/// out farther.
 fn unclamped(form: &LevelVolume, l: usize, below: usize, lo: IVec3, hi: IVec3) -> Vec<f32> {
     let bc = lo.div_euclid(IVec3::splat(B)) + IVec3::ONE;
-    if form.exists(l, bc) {
+    if l <= below || form.exists(l, bc) {
         return form.samples(l, lo, hi);
     }
     let k = 1i32 << (l - below);
@@ -231,13 +276,7 @@ fn unclamped(form: &LevelVolume, l: usize, below: usize, lo: IVec3, hi: IVec3) -
                 let g = IVec3::new(x, y, z).as_vec3() / k as f32 - clo.as_vec3();
                 let i = g.floor().as_ivec3().clamp(IVec3::ZERO, cn - IVec3::splat(2));
                 let f = g - i.as_vec3();
-                let mut v = 0.0;
-                for q in 0..8 {
-                    let d = IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
-                    let w = (if d.x == 1 { f.x } else { 1.0 - f.x }) * (if d.y == 1 { f.y } else { 1.0 - f.y }) * (if d.z == 1 { f.z } else { 1.0 - f.z });
-                    v += w * at(i + d);
-                }
-                out.push(v);
+                out.push((0..8).map(|q| corner_weight(q, f) * at(i + corner_offset(q))).sum());
             }
         }
     }
@@ -246,7 +285,7 @@ fn unclamped(form: &LevelVolume, l: usize, below: usize, lo: IVec3, hi: IVec3) -
 
 /// The form's outward normal at `p` from the finest level up to `below` whose band reaches `p` (farther out, a fine
 /// level's field is flat, and has none).
-fn normal(form: &LevelVolume, p: Vec3, below: usize, _base: bool) -> Vec3 {
+fn normal(form: &LevelVolume, p: Vec3, below: usize) -> Vec3 {
     for l in (0..=below).rev() {
         if form.value_upto(p, l, false).abs() < 0.8 * form.band(l) {
             let n = form.normal_upto(p, l, false);
@@ -258,81 +297,137 @@ fn normal(form: &LevelVolume, p: Vec3, below: usize, _base: bool) -> Vec3 {
     form.normal_upto(p, 0, false)
 }
 
-/// What a follow did.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FollowStats {
-    pub ms: f64,
-    /// Layer blocks worked out again, and the points the move was measured at.
-    pub blocks: usize,
-    pub points: usize,
-    /// Its parts: finding where the layer's blocks went, measuring the move, the heights, and composing.
-    pub parts_ms: [f64; 4],
+/// The visible layers' masked heights summed, over the lattice box `lo..=hi` of level `l` (x fastest): the layers at
+/// level `l` or coarser (with `finer`, all of them), but for layer `except`.
+fn offsets(stack: &[Layer], l: usize, lo: IVec3, hi: IVec3, finer: bool, except: Option<usize>) -> Vec<f32> {
+    let n = hi - lo + IVec3::ONE;
+    let mut out = vec![0.0f32; (n.x * n.y * n.z) as usize];
+    for (k, layer) in stack.iter().enumerate() {
+        if !layer.visible || Some(k) == except || (!finer && layer.level > l) {
+            continue;
+        }
+        // The layer's lattice over the box: coarser, read linearly; finer, at the points it shares.
+        let (scale, up) = if layer.level <= l { (1i32 << (l - layer.level), false) } else { (1i32 << (layer.level - l), true) };
+        let (llo, lhi) = if up { (lo * scale, hi * scale) } else { (lo.div_euclid(IVec3::splat(scale)), hi.div_euclid(IVec3::splat(scale)) + IVec3::ONE) };
+        if !any_block(&layer.h, llo, lhi) {
+            continue;
+        }
+        let (h, m) = (Dense::of(&layer.h, llo, lhi, 0.0), Dense::of(&layer.m, llo, lhi, 1.0));
+        for z in 0..n.z {
+            for y in 0..n.y {
+                for x in 0..n.x {
+                    let i = lo + IVec3::new(x, y, z);
+                    let s = if up {
+                        let j = i * scale;
+                        m.at(j) * h.at(j)
+                    } else if scale == 1 {
+                        m.at(i) * h.at(i)
+                    } else {
+                        let g = i.as_vec3() / scale as f32;
+                        m.linear(g) * h.linear(g)
+                    };
+                    out[((z * n.y + y) * n.x + x) as usize] += s;
+                }
+            }
+        }
+    }
+    out
 }
 
-enum Undo {
-    /// A stroke on the form, with the layer as it was before it.
-    Form(Layer),
-    /// A change to the layer alone.
-    Layer(Layer),
+/// Whether block `bc` of level `l` is composed (a visible layer there has it).
+fn composed(stack: &[Layer], l: usize, bc: IVec3) -> bool {
+    stack.iter().any(|x| x.visible && x.level == l && x.h.contains_key(&bc))
 }
 
-/// A form with one detail layer over it.
-pub struct Layered {
-    form: LevelVolume,
-    /// The layer's level (the finest), and the first level whose work it took from the form.
-    level: usize,
-    from: usize,
-    /// While the layer itself is edited (its mask painted): the layer as the edit began.
-    edit: Option<Layer>,
-    layer: Layer,
-    /// While a stroke on the form is under way: the form and the layer as it began, and the blocks it changed.
-    start: Option<(LevelVolume, Layer)>,
-    touched: HashSet<Key>,
-    history: Vec<Undo>,
-    redo: Vec<Undo>,
-    pub last: FollowStats,
-    /// Follows taken in, this stroke.
-    pub follows: usize,
-    /// Whether dabs leave following to [`Self::follow_take`] (jobs on other threads) rather than doing it at once.
-    pub deferred: bool,
-    /// Blocks of the form dabs changed over the layer, waiting for a follow; the pen up, waiting for the last one; a
-    /// follow under way.
-    pending: HashSet<Key>,
-    ending: bool,
-    running: bool,
-    /// Per level up to the layer's, the blocks over any of the layer's (as the stroke began, or since).
-    covered: Vec<HashSet<IVec3>>,
-    /// The move at each layer block's corners when it was last followed this stroke: a block whose move has not
-    /// changed since is left as it is.
-    used: HashMap<IVec3, [Option<Vec3>; 8]>,
-    /// Layer blocks follows changed this stroke: its last follow works them all out again.
-    changed: HashSet<IVec3>,
+/// The shown blocks layer changes `changes` (level, block) reach: themselves, and the finer layers' blocks under them
+/// (which hold the coarser layers too).
+fn affected(stack: &[Layer], changes: &[(usize, IVec3)]) -> Vec<(usize, IVec3)> {
+    let top = stack.iter().map(|x| x.level).max().unwrap_or(0).max(changes.iter().map(|c| c.0).max().unwrap_or(0));
+    let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); top + 1];
+    for &(l, bc) in changes {
+        per[l].insert(bc);
+    }
+    let mut out: HashSet<(usize, IVec3)> = changes.iter().copied().collect();
+    for layer in stack.iter().filter(|x| x.visible) {
+        let lf = layer.level;
+        if (0..lf).all(|lk| per[lk].is_empty()) {
+            continue;
+        }
+        for bc in layer.h.keys() {
+            if (0..lf).any(|lk| !per[lk].is_empty() && per[lk].contains(&(*bc >> (lf - lk) as i32))) {
+                out.insert((lf, *bc));
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
-/// A follow to work out on another thread: copies of what it reads (see [`Layered::follow_take`]).
-pub struct FollowJob {
-    form: LevelVolume,
-    form0: LevelVolume,
-    layer0: Layer,
-    layer: Layer,
-    level: usize,
-    from: usize,
-    region: Vec<Key>,
-    end: bool,
-    used: HashMap<IVec3, [Option<Vec3>; 8]>,
-    /// Layer blocks to work out besides those under the region (at the end, all the stroke changed).
-    also: Vec<IVec3>,
+/// What is shown at level `l` for blocks `keys`: the form pushed out by the layers at that level or coarser, or (`None`)
+/// nothing of its own where no visible layer at that level has the block.
+fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, keys: &[IVec3]) -> Vec<(IVec3, Option<Stored>)> {
+    let (v, band) = (form.voxel(l), form.band(l));
+    keys.par_iter()
+        .map(|&bc| {
+            if !composed(stack, l, bc) {
+                return (bc, None);
+            }
+            let (lo, hi) = (bc * B - IVec3::ONE, bc * B + IVec3::splat(B));
+            let n = 10;
+            let s = offsets(stack, l, lo, hi, false, None);
+            let most = s.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+            // The form's field around the block, as far out as the heights reach.
+            let pad = (most / v).ceil() as i32 + 2;
+            let (plo, phi) = (lo - IVec3::splat(pad), hi + IVec3::splat(pad));
+            let pn = phi - plo + IVec3::ONE;
+            let field = unclamped(form, l, below, plo, phi);
+            let pa = |i: IVec3| {
+                let d = (i - plo).clamp(IVec3::ZERO, pn - IVec3::ONE);
+                field[((d.z * pn.y + d.y) * pn.x + d.x) as usize]
+            };
+            let tri = |g: Vec3| {
+                let i = g.floor().as_ivec3();
+                let f = g - i.as_vec3();
+                (0..8).map(|q| corner_weight(q, f) * pa(i + corner_offset(q))).sum::<f32>()
+            };
+            let c: Vec<f32> = (0..n * n * n)
+                .map(|k| {
+                    let i = lo + IVec3::new(k % n, (k / n) % n, k / (n * n));
+                    let s = s[k as usize];
+                    // Away from the surface the height moves nothing that shows.
+                    if s == 0.0 || pa(i).abs() > band + s.abs() + v {
+                        return pa(i);
+                    }
+                    // The form's field where this point would be with the height taken off, along the normal: zero
+                    // exactly the height out from the form's surface, however steep or shallow the field is.
+                    let g = Vec3::new(pa(i + IVec3::X) - pa(i - IVec3::X), pa(i + IVec3::Y) - pa(i - IVec3::Y), pa(i + IVec3::Z) - pa(i - IVec3::Z));
+                    tri(i.as_vec3() - g.normalize_or_zero() * (s / v))
+                })
+                .collect();
+            let at = |x: i32, y: i32, z: i32| c[(x + n * (y + n * z)) as usize];
+            let mut out = Box::new([0.0f32; N]);
+            for (i, o) in out.iter_mut().enumerate() {
+                let q = cell(i) + IVec3::ONE;
+                let (x, y, z) = (q.x, q.y, q.z);
+                let g = Vec3::new(at(x + 1, y, z) - at(x - 1, y, z), at(x, y + 1, z) - at(x, y - 1, z), at(x, y, z + 1) - at(x, y, z - 1)) / (2.0 * v);
+                // Steeper than a distance on a groove's wall: made one again, so a crossing sits where it is.
+                *o = (at(x, y, z) / g.length().max(1.0)).clamp(-band, band);
+            }
+            (bc, Some(Stored::from(out)))
+        })
+        .collect()
 }
 
-/// What a [`FollowJob`] worked out, for [`Layered::follow_apply`].
-pub struct FollowDone {
-    form: LevelVolume,
-    region: Vec<Key>,
-    end: bool,
-    layer: Vec<(IVec3, Option<(Stored, Stored)>)>,
-    shown: Vec<(IVec3, Option<Stored>)>,
-    used: Vec<(IVec3, [Option<Vec3>; 8])>,
-    stats: FollowStats,
+/// Compose the shown blocks `targets` (level, block), level by level.
+fn compose_all(form: &LevelVolume, stack: &[Layer], below: usize, targets: &[(usize, IVec3)]) -> Vec<(usize, IVec3, Option<Stored>)> {
+    let mut per: HashMap<usize, Vec<IVec3>> = HashMap::default();
+    for &(l, bc) in targets {
+        per.entry(l).or_default().push(bc);
+    }
+    let mut out = Vec::with_capacity(targets.len());
+    for (l, keys) in per {
+        out.extend(compose_blocks(form, stack, l, below, &keys).into_iter().map(|(bc, s)| (l, bc, s)));
+    }
+    out
 }
 
 /// Layer blocks (of `layer`, at level `l`) under any of the form's blocks `region`.
@@ -344,6 +439,91 @@ fn under(l: usize, region: &[Key], layer: &Layer) -> Vec<IVec3> {
         }
     }
     layer.h.keys().filter(|bc| (0..=l).any(|m| !per[m].is_empty() && per[m].contains(&(**bc >> (l - m) as i32)))).copied().collect()
+}
+
+/// What a follow did.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FollowStats {
+    pub ms: f64,
+    /// Layer blocks worked out again, and the points the move was measured at.
+    pub blocks: usize,
+    pub points: usize,
+    /// Its parts: finding where the layers' blocks went, measuring the move, the heights, and composing.
+    pub parts_ms: [f64; 4],
+}
+
+enum Undo {
+    /// A stroke on the form, with the layers as they were before it.
+    Form(Vec<Layer>),
+    /// A change to the layers alone.
+    Layers(Vec<Layer>),
+}
+
+/// A block's corner moves (each `None` where the search found no surface).
+type Corners = [Option<Vec3>; 8];
+
+/// Corner moves a block was last followed with, keyed by (layer, block).
+type Used = HashMap<(usize, IVec3), Corners>;
+
+/// A form with detail layers over it.
+pub struct Layered {
+    form: LevelVolume,
+    /// The first level the layers took work from: the form keeps the coarser ones, layers live at it or finer.
+    from: usize,
+    stack: Vec<Layer>,
+    active: usize,
+    /// While a layer itself is edited (its mask painted): the layers as the edit began.
+    edit: Option<Vec<Layer>>,
+    /// While a stroke on the form is under way: the form and the layers as it began, and the blocks it changed.
+    start: Option<(LevelVolume, Vec<Layer>)>,
+    touched: HashSet<Key>,
+    history: Vec<Undo>,
+    redo: Vec<Undo>,
+    pub last: FollowStats,
+    /// Follows taken in, this stroke.
+    pub follows: usize,
+    /// Whether dabs leave following to [`Self::follow_take`] (jobs on other threads) rather than doing it at once.
+    pub deferred: bool,
+    /// Blocks of the form dabs changed over the layers, waiting for a follow; the pen up, waiting for the last one; a
+    /// follow under way.
+    pending: HashSet<Key>,
+    ending: bool,
+    running: bool,
+    /// Per level, the blocks over any layer's.
+    covered: Vec<HashSet<IVec3>>,
+    /// The move at each layer block's corners when it was last followed this stroke: a block whose move has not
+    /// changed since is left as it is.
+    used: Used,
+    /// Layer blocks follows changed this stroke: its last follow works them all out again.
+    changed: HashSet<(usize, IVec3)>,
+}
+
+/// A follow to work out on another thread: copies of what it reads (see [`Layered::follow_take`]).
+pub struct FollowJob {
+    form: LevelVolume,
+    form0: LevelVolume,
+    stack0: Vec<Layer>,
+    stack: Vec<Layer>,
+    from: usize,
+    region: Vec<Key>,
+    end: bool,
+    used: Used,
+    /// Layer blocks to work out besides those under the region (at the end, all the stroke changed).
+    also: Vec<(usize, IVec3)>,
+}
+
+/// One layer's new blocks (heights and mask; `None` where it holds nothing any more).
+type LayerBlocks = Vec<(IVec3, Option<(Stored, Stored)>)>;
+
+/// What a [`FollowJob`] worked out, for [`Layered::follow_apply`].
+pub struct FollowDone {
+    form: LevelVolume,
+    region: Vec<Key>,
+    end: bool,
+    layers: Vec<(usize, LayerBlocks)>,
+    shown: Vec<(usize, IVec3, Option<Stored>)>,
+    used: Vec<((usize, IVec3), Corners)>,
+    stats: FollowStats,
 }
 
 impl FollowJob {
@@ -363,35 +543,53 @@ impl FollowJob {
 
     pub fn run(mut self) -> FollowDone {
         let t = Instant::now();
-        let (layer, used, mut stats) = follow_heights(&self);
-        for (bc, hm) in &layer {
-            match hm {
-                Some((h, m)) => {
-                    self.layer.h.insert(*bc, h.clone());
-                    self.layer.m.insert(*bc, m.clone());
-                }
-                None => {
-                    self.layer.h.remove(bc);
-                    self.layer.m.remove(bc);
-                }
+        let mut stats = FollowStats::default();
+        let mut layers = Vec::with_capacity(self.stack.len());
+        let mut used = Vec::new();
+        let mut changes = Vec::new();
+        for k in 0..self.stack.len() {
+            let (built, u, s) = follow_heights(&self, k);
+            stats.blocks += s.blocks;
+            stats.points += s.points;
+            for p in 0..3 {
+                stats.parts_ms[p] += s.parts_ms[p];
             }
+            let layer = &mut self.stack[k];
+            for (bc, hm) in &built {
+                match hm {
+                    Some((h, m)) => {
+                        layer.h.insert(*bc, h.clone());
+                        layer.m.insert(*bc, m.clone());
+                    }
+                    None => {
+                        layer.h.remove(bc);
+                        layer.m.remove(bc);
+                    }
+                }
+                changes.push((layer.level, *bc));
+            }
+            used.extend(u.into_iter().map(|(bc, c)| ((k, bc), c)));
+            layers.push((k, built));
         }
         let t3 = Instant::now();
-        let keys: Vec<IVec3> = layer.iter().map(|(bc, _)| *bc).collect();
-        let shown = compose_blocks(&self.form, &self.layer, self.level, self.from, &keys);
+        let targets = affected(&self.stack, &changes);
+        let shown = compose_all(&self.form, &self.stack, self.from - 1, &targets);
         stats.parts_ms[3] = t3.elapsed().as_secs_f64() * 1e3;
         stats.ms = t.elapsed().as_secs_f64() * 1e3;
-        FollowDone { form: self.form, region: self.region, end: self.end, layer, shown, used, stats }
+        FollowDone { form: self.form, region: self.region, end: self.end, layers, shown, used, stats }
     }
 }
 
-/// The layer's heights over the form as a follow job's copy has it, for the layer blocks its region reaches (those
+/// Layer `k`'s heights over the form as a follow job's copy has it, for the layer's blocks its region reaches (those
 /// whose move changed since they were last followed, mid-stroke).
 #[allow(clippy::type_complexity)]
-fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, Vec<(IVec3, [Option<Vec3>; 8])>, FollowStats) {
-    let (form, form0, layer0, end) = (&job.form, &job.form0, &job.layer0, job.end);
+fn follow_heights(job: &FollowJob, k: usize) -> (LayerBlocks, Vec<(IVec3, Corners)>, FollowStats) {
+    let (form, form0, end) = (&job.form, &job.form0, job.end);
+    let current = &job.stack[k];
+    let empty = Layer::new("", current.level);
+    let layer0 = job.stack0.get(k).filter(|x| x.level == current.level).unwrap_or(&empty);
     let region = &job.region;
-    let l = job.level;
+    let l = current.level;
     let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
     let (top, below) = (form.levels() - 1, job.from - 1);
     let new = |p: Vec3| form.value_upto(p, top, false);
@@ -400,12 +598,18 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
     // The longest step a search takes: the form's fields are distances out to its finest level's band, and only
     // signs are trusted, so a step may go that far.
     let far = (4.0 * v).max(form.band(below));
+    // How far heights may stand out, and how far this layer's do (what decides which blocks hold any of it).
+    let limit = MOST * form.voxel(job.from);
+    let tall = tallest(layer0).max(tallest(current)).min(limit) + v;
     let src = under(l, region, layer0);
     let mut dest: HashSet<IVec3> = src.iter().copied().collect();
-    dest.extend(under(l, region, &job.layer));
-    dest.extend(job.also.iter().copied());
+    dest.extend(under(l, region, current));
+    dest.extend(job.also.iter().filter(|a| a.0 == k).map(|a| a.1));
+    if dest.is_empty() {
+        return (Vec::new(), Vec::new(), FollowStats::default());
+    }
     // Where the surface in each source block went: blocks there may need the layer too.
-    let near = 4.0 * 3f32.sqrt() * v + band + MOST * v;
+    let near = 4.0 * 3f32.sqrt() * v + band + tall;
     let t0 = Instant::now();
     let grown: Vec<IVec3> = src
         .par_iter()
@@ -413,9 +617,9 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
             // Mid-stroke from the block's centre (a preview); at the end from its corners as well.
             (if end { 0..9 } else { 8..9 })
                 .filter_map(|q| {
-                    let g = if q == 8 { IVec3::splat(B / 2) } else { IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1) * B };
+                    let g = if q == 8 { IVec3::splat(B / 2) } else { corner_offset(q) * B };
                     let c = origin + (bc * B + g).as_vec3() * v;
-                    let n0 = normal(form0, c, below, false);
+                    let n0 = normal(form0, c, below);
                     let y0 = root(&old, c, n0, 0.25 * v, far, reach)?;
                     let u = form.push_dir(y0, n0);
                     let y1 = root(&new, y0, u, 0.25 * v, far, reach)?;
@@ -435,16 +639,16 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
     // out the fields hold only a bound).
     let measure = |i: IVec3| -> Option<(Vec3, f32)> {
         let p = origin + i.as_vec3() * v;
-        let n1 = normal(form, p, below, false);
+        let n1 = normal(form, p, below);
         let o = root(&new, p, n1, 0.25 * v, far, reach).and_then(|y1| {
-            let n0 = normal(form0, y1, below, false);
+            let n0 = normal(form0, y1, below);
             let n0 = if n0 == Vec3::ZERO { n1 } else { n0 };
             let u = form.push_dir(y1, n0);
             // As far out from the surface the stroke began on, along its normal there, as `p` is out of the new one:
             // where the stroke tilted the surface, the same offset along the new normal would land beside the point it
             // came from.
             root(&old, y1, u, 0.25 * v, far, reach).map(|y0| {
-                let n = normal(form0, y0, below, false);
+                let n = normal(form0, y0, below);
                 let n = if n == Vec3::ZERO { n1 } else { n };
                 (y0 + n * (p - y1).dot(n1) - p, (p - y1).dot(n1))
             })
@@ -456,14 +660,12 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
     // than a height can reach (and half the block across) holds nothing that shows, and needs no more. Mid-stroke the
     // corners are all (a preview); at the end every `EVERY` steps.
     let t1 = Instant::now();
-    let corner_points: Vec<IVec3> = dest.iter().flat_map(|bc| (0..27).map(move |q| bc * B + IVec3::new(q % 3, (q / 3) % 3, q / 9) * (B / 2)).filter(|p| p.rem_euclid(IVec3::splat(B)) == IVec3::ZERO)).collect::<HashSet<_>>().into_iter().collect();
+    let corner_points: Vec<IVec3> = dest.iter().flat_map(|bc| (0..8).map(move |q| (*bc + corner_offset(q)) * B)).collect::<HashSet<_>>().into_iter().collect();
     let mut moves: HashMap<IVec3, Option<(Vec3, f32)>> = corner_points.par_iter().map(|&i| (i, measure(i))).collect();
-    let keep = band + MOST * v + 4.0 * 3f32.sqrt() * v;
-    let (dest, gone): (Vec<IVec3>, Vec<IVec3>) = dest
-        .into_iter()
-        .partition(|bc| (0..8).any(|q| moves.get(&(bc * B + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1) * B)).copied().flatten().is_some_and(|(_, d)| d.abs() < keep)));
+    let keep = band + tall + 4.0 * 3f32.sqrt() * v;
+    let (dest, gone): (Vec<IVec3>, Vec<IVec3>) = dest.into_iter().partition(|bc| (0..8).any(|q| moves.get(&((*bc + corner_offset(q)) * B)).copied().flatten().is_some_and(|(_, d)| d.abs() < keep)));
     // Those the layer held go (the surface left them).
-    let gone: Vec<IVec3> = gone.into_iter().filter(|bc| job.layer.h.contains_key(bc)).collect();
+    let gone: Vec<IVec3> = gone.into_iter().filter(|bc| current.h.contains_key(bc)).collect();
     let every = if end { EVERY } else { B };
     let per = B / every + 1;
     let points: Vec<IVec3> = dest
@@ -475,25 +677,25 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
         .collect();
     moves.extend(points.par_iter().map(|&i| (i, measure(i))).collect::<Vec<_>>());
     let t2 = Instant::now();
-    let corners = |bc: IVec3| -> [Option<Vec3>; 8] { std::array::from_fn(|q| moves.get(&(bc * B + IVec3::new(q as i32 & 1, (q as i32 >> 1) & 1, (q as i32 >> 2) & 1) * B)).copied().flatten().map(|m| m.0)) };
+    let corners = |bc: IVec3| -> Corners { std::array::from_fn(|q| moves.get(&((bc + corner_offset(q as i32)) * B)).copied().flatten().map(|m| m.0)) };
     // Mid-stroke, a block whose corners moved less than a quarter step since it was last followed stays as it is.
-    let same = |a: &[Option<Vec3>; 8], b: &[Option<Vec3>; 8]| {
+    let same = |a: &Corners, b: &Corners| {
         a.iter().zip(b).all(|(x, y)| match (x, y) {
             (Some(x), Some(y)) => (*x - *y).length() < 0.25,
             (None, None) => true,
             _ => false,
         })
     };
-    let dest: Vec<IVec3> = if end { dest } else { dest.into_iter().filter(|bc| job.used.get(bc).is_none_or(|u| !same(u, &corners(*bc)))).collect() };
-    let used: Vec<(IVec3, [Option<Vec3>; 8])> = if end { Vec::new() } else { dest.iter().map(|&bc| (bc, corners(bc))).collect() };
-    let built: Vec<(IVec3, Option<(Stored, Stored)>)> = dest
+    let dest: Vec<IVec3> = if end { dest } else { dest.into_iter().filter(|bc| job.used.get(&(k, *bc)).is_none_or(|u| !same(u, &corners(*bc)))).collect() };
+    let used: Vec<(IVec3, Corners)> = if end { Vec::new() } else { dest.iter().map(|&bc| (bc, corners(bc))).collect() };
+    let built: LayerBlocks = dest
         .par_iter()
         .map(|&bc| {
             let at = |i: IVec3| moves.get(&i).copied().flatten();
             let corner = bc * B;
             // Interpolated from the corners measured (where a search found no surface, the others say). Samples
             // farther from the surface than any height reaches need none.
-            let reach_out = band + MOST * v;
+            let reach_out = band + tall;
             let offs: Vec<Option<Vec3>> = (0..N)
                 .map(|i| {
                     let c = cell(i);
@@ -501,9 +703,8 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
                     let f = (c - base).as_vec3() / every as f32;
                     let (mut o, mut dist, mut sum) = (Vec3::ZERO, 0.0, 0.0);
                     for q in 0..8 {
-                        let d = IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
-                        let w = (if d.x == 1 { f.x } else { 1.0 - f.x }) * (if d.y == 1 { f.y } else { 1.0 - f.y }) * (if d.z == 1 { f.z } else { 1.0 - f.z });
-                        if let Some((m, e)) = at(corner + base + d * every) {
+                        let w = corner_weight(q, f);
+                        if let Some((m, e)) = at(corner + base + corner_offset(q) * every) {
                             o += w * m;
                             dist += w * e;
                             sum += w;
@@ -527,12 +728,7 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
             let (lo, hi) = (lo - IVec3::splat(2), hi + IVec3::splat(2));
             let (blo, bhi) = (lo.div_euclid(IVec3::splat(B)), hi.div_euclid(IVec3::splat(B)));
             let span = bhi - blo + IVec3::ONE;
-            let any_source = if span.x as i64 * span.y as i64 * span.z as i64 <= 64 {
-                (blo.z..=bhi.z).any(|z| (blo.y..=bhi.y).any(|y| (blo.x..=bhi.x).any(|x| layer0.h.contains_key(&IVec3::new(x, y, z)))))
-            } else {
-                true
-            };
-            if !any_source {
+            if span.x as i64 * span.y as i64 * span.z as i64 <= 64 && !any_block(&layer0.h, lo, hi) {
                 return (bc, None);
             }
             // Mid-stroke a preview, read linearly straight from the blocks; at the end with the cubic, from the source
@@ -562,7 +758,7 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
                     Some(o) if o.length() < SNAP => (h0.at(x), m0.at(x)),
                     Some(o) => read(x.as_vec3() + o),
                 };
-                h[i] = hv.clamp(-MOST * v, MOST * v);
+                h[i] = hv.clamp(-limit, limit);
                 m[i] = mv;
                 any |= h[i].abs() > 1e-4 * v;
             }
@@ -576,72 +772,9 @@ fn follow_heights(job: &FollowJob) -> (Vec<(IVec3, Option<(Stored, Stored)>)>, V
     (built, used, stats)
 }
 
-/// What is shown at level `l` for layer blocks `keys`: the form pushed out by the layer, or (`None`) the form alone
-/// where the layer holds nothing.
-fn compose_blocks(form: &LevelVolume, layer: &Layer, l: usize, from: usize, keys: &[IVec3]) -> Vec<(IVec3, Option<Stored>)> {
-    let below = from - 1;
-    let (v, band) = (form.voxel(l), form.band(l));
-    keys.par_iter()
-        .map(|&bc| {
-            if !layer.h.contains_key(&bc) {
-                return (bc, None);
-            }
-            let (lo, hi) = (bc * B - IVec3::ONE, bc * B + IVec3::splat(B));
-            let (h, m) = (Dense::of(&layer.h, lo, hi, 0.0), Dense::of(&layer.m, lo, hi, 1.0));
-            let most = h.v.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-            // The form's field around the block, as far out as the heights reach.
-            let pad = (most / v).ceil() as i32 + 2;
-            let (plo, phi) = (lo - IVec3::splat(pad), hi + IVec3::splat(pad));
-            let pn = phi - plo + IVec3::ONE;
-            let field = unclamped(form, l, below, plo, phi);
-            let pa = |i: IVec3| {
-                let d = (i - plo).clamp(IVec3::ZERO, pn - IVec3::ONE);
-                field[((d.z * pn.y + d.y) * pn.x + d.x) as usize]
-            };
-            let tri = |g: Vec3| {
-                let i = g.floor().as_ivec3();
-                let f = g - i.as_vec3();
-                let mut sum = 0.0;
-                for q in 0..8 {
-                    let d = IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
-                    let w = (if d.x == 1 { f.x } else { 1.0 - f.x }) * (if d.y == 1 { f.y } else { 1.0 - f.y }) * (if d.z == 1 { f.z } else { 1.0 - f.z });
-                    sum += w * pa(i + d);
-                }
-                sum
-            };
-            let n = 10;
-            let c: Vec<f32> = (0..n * n * n)
-                .map(|k| {
-                    let i = lo + IVec3::new(k % n, (k / n) % n, k / (n * n));
-                    let s = m.at(i) * h.at(i);
-                    // Away from the surface the height moves nothing that shows.
-                    if s == 0.0 || pa(i).abs() > band + s.abs() + v {
-                        return pa(i);
-                    }
-                    // The form's field where this point would be with the height taken off, along the normal: zero
-                    // exactly the height out from the form's surface, however steep or shallow the field is.
-                    let g = Vec3::new(pa(i + IVec3::X) - pa(i - IVec3::X), pa(i + IVec3::Y) - pa(i - IVec3::Y), pa(i + IVec3::Z) - pa(i - IVec3::Z));
-                    let dir = g.normalize_or_zero();
-                    tri(i.as_vec3() - dir * (s / v))
-                })
-                .collect();
-            let at = |x: i32, y: i32, z: i32| c[(x + n * (y + n * z)) as usize];
-            let mut out = Box::new([0.0f32; N]);
-            for (i, o) in out.iter_mut().enumerate() {
-                let q = cell(i) + IVec3::ONE;
-                let (x, y, z) = (q.x, q.y, q.z);
-                let g = Vec3::new(at(x + 1, y, z) - at(x - 1, y, z), at(x, y + 1, z) - at(x, y - 1, z), at(x, y, z + 1) - at(x, y, z - 1)) / (2.0 * v);
-                // Steeper than a distance on a groove's wall: made one again, so a crossing sits where it is.
-                *o = (at(x, y, z) / g.length().max(1.0)).clamp(-band, band);
-            }
-            (bc, Some(Stored::from(out)))
-        })
-        .collect()
-}
-
 impl Layered {
-    /// Put the work `shown` holds at levels `from` and finer in a layer of its own over the rest, held at the finest
-    /// level. `shown` becomes what is drawn: the form with the layer on it.
+    /// Put the work `shown` holds at levels `from` and finer in a layer of its own over the rest, at the finest level
+    /// that work reaches. `shown` becomes what is drawn: the form with the layer on it.
     pub fn new(shown: &mut LevelVolume, from: usize) -> Layered {
         assert!(from >= 1 && from < shown.levels());
         // The finest level the work reaches (the finest of all, on a volume with none yet).
@@ -653,12 +786,20 @@ impl Layered {
         }
         form.drain_dirty();
         form.clear_history();
-        let mut out = Layered {
+        let mut out = Layered::with_form(form, from, vec![Layer::new("Detail", level)]);
+        let keys = out.finest_under(&full, &full.keys(), level);
+        out.take_heights(shown, &full, 0, &keys, &[]);
+        shown.clear_history();
+        out
+    }
+
+    fn with_form(form: LevelVolume, from: usize, stack: Vec<Layer>) -> Layered {
+        Layered {
             form,
-            level,
             from,
+            stack,
+            active: 0,
             edit: None,
-            layer: Layer::default(),
             start: None,
             touched: HashSet::default(),
             history: Vec::new(),
@@ -672,18 +813,13 @@ impl Layered {
             covered: Vec::new(),
             used: HashMap::default(),
             changed: HashSet::default(),
-        };
-        let keys = out.finest_under(&full, &full.keys());
-        out.take_heights(shown, &full, &keys);
-        shown.clear_history();
-        out
+        }
     }
 
-    /// Finest-level blocks under `keys` (of levels `from` and finer) near the surface of `vol`.
-    fn finest_under(&self, vol: &LevelVolume, keys: &[Key]) -> Vec<IVec3> {
-        let l = self.level;
+    /// Blocks of level `l` under `keys` (of levels `from` and finer) near the surface of `vol`.
+    fn finest_under(&self, vol: &LevelVolume, keys: &[Key], l: usize) -> Vec<IVec3> {
         let (v, band, origin) = (vol.voxel(l), vol.band(l), vol.origin());
-        let near = 4.0 * 3f32.sqrt() * v + band + MOST * v;
+        let near = 4.0 * 3f32.sqrt() * v + band + MOST * vol.voxel(self.from);
         let mut out: HashSet<IVec3> = HashSet::default();
         for &(m, bc) in keys {
             let m = m as usize;
@@ -703,127 +839,274 @@ impl Layered {
         out.into_par_iter().filter(|bc| vol.value_upto(origin + (*bc * B + IVec3::splat(B / 2)).as_vec3() * v, l, false).abs() < near).collect()
     }
 
-    /// Make the layer's heights over finest-level blocks `keys` what `detail` stands out of the form there (keeping the
-    /// mask), and show them; `shown` then holds the form's blocks again at the levels the layer took.
-    fn take_heights(&mut self, shown: &mut LevelVolume, detail: &LevelVolume, keys: &[IVec3]) {
-        let (l, form) = (self.level, &self.form);
+    /// Make layer `k`'s heights over its blocks `keys` what `detail` stands out of the form there, less the other
+    /// layers (keeping its mask, and dividing by it), and show them; `shown` then holds the form's blocks again where it
+    /// held work the layers now have. `also` are other shown blocks the work changed.
+    fn take_heights(&mut self, shown: &mut LevelVolume, detail: &LevelVolume, k: usize, keys: &[IVec3], also: &[Key]) {
+        let l = self.stack[k].level;
+        let (form, stack) = (&self.form, &self.stack);
         let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
         let below = self.from - 1;
+        let limit = MOST * form.voxel(self.from);
         let built: Vec<(IVec3, Option<Box<[f32; N]>>)> = keys
             .par_iter()
             .map(|&bc| {
                 let base = |p: Vec3| form.value_upto(p, below, false);
-                let top = |p: Vec3| detail.value_upto(p, l, false);
+                let top = |p: Vec3| detail.value_upto(p, detail.levels() - 1, false);
+                let others = offsets(stack, l, bc * B, bc * B + IVec3::splat(B - 1), true, Some(k));
+                let mask = stack[k].m.get(&bc).cloned();
+                let old = stack[k].h.get(&bc).cloned();
                 let mut h = Box::new([0.0f32; N]);
                 let mut any = false;
                 for (i, out) in h.iter_mut().enumerate() {
-                    let x = origin + (bc * B + cell(i)).as_vec3() * v;
-                    if base(x).abs() > band + MOST * v {
+                    let m = mask.as_ref().map_or(1.0, |m| m[i]);
+                    let was = old.as_ref().map_or(0.0, |h| h[i]);
+                    *out = was;
+                    // Where the mask hides the layer, painting cannot say what it holds.
+                    if m < 0.05 {
+                        any |= out.abs() > 1e-4 * v;
                         continue;
                     }
-                    let n = normal(form, x, below, false);
+                    let x = origin + (bc * B + cell(i)).as_vec3() * v;
+                    if base(x).abs() > band + limit {
+                        *out = 0.0;
+                        continue;
+                    }
+                    let n = normal(form, x, below);
                     let Some(foot) = root(&base, x, n, 0.25 * v, 2.0 * v, 8.0 * band) else { continue };
-                    let n = normal(form, foot, below, false);
-                    let Some(y) = root(&top, foot, n, 0.1 * v, 0.5 * v, MOST * v + v) else { continue };
-                    *out = (y - foot).dot(n).clamp(-MOST * v, MOST * v);
+                    let n = normal(form, foot, below);
+                    let Some(y) = root(&top, foot, n, 0.1 * v, 0.5 * v, limit + v) else { continue };
+                    *out = (((y - foot).dot(n) - others[i]) / m).clamp(-limit, limit);
                     any |= out.abs() > 1e-4 * v;
                 }
                 (bc, any.then_some(h))
             })
             .collect();
+        let layer = &mut self.stack[k];
         for (bc, h) in built {
             match h {
                 Some(h) => {
-                    self.layer.h.insert(bc, Stored::from(h));
-                    if !self.layer.m.contains_key(&bc) {
-                        self.layer.m.insert(bc, Stored::from(Box::new([1.0f32; N])));
+                    layer.h.insert(bc, Stored::from(h));
+                    if !layer.m.contains_key(&bc) {
+                        layer.m.insert(bc, Stored::from(Box::new([1.0f32; N])));
                     }
                 }
                 None => {
-                    self.layer.h.remove(&bc);
-                    self.layer.m.remove(&bc);
+                    layer.h.remove(&bc);
+                    layer.m.remove(&bc);
                 }
             }
         }
-        // The form's blocks again, coarsest first, where `shown` held the work the layer now has.
-        let mut coarse: Vec<Key> = detail.keys().into_iter().chain(shown.keys()).filter(|k| (k.0 as usize) >= self.from && (k.0 as usize) < l).collect();
-        coarse.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
-        coarse.dedup();
-        for k in coarse {
-            shown.mirror(&self.form, k);
+        // The form's blocks again, coarsest first, where `shown` held work that the layers have (and is not theirs).
+        let mut back: Vec<Key> = detail.keys().into_iter().chain(shown.keys()).filter(|k| (k.0 as usize) >= self.from && !composed(&self.stack, k.0 as usize, k.1)).collect();
+        back.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        back.dedup();
+        for key in back {
+            shown.mirror(&self.form, key);
         }
-        let stray: Vec<Key> = shown.keys().into_iter().filter(|k| k.0 as usize == l && !self.layer.h.contains_key(&k.1)).collect();
-        for k in stray {
-            shown.mirror(&self.form, k);
-        }
-        self.compose(shown, keys);
+        let mut changes: Vec<(usize, IVec3)> = keys.iter().map(|&bc| (l, bc)).collect();
+        changes.extend(also.iter().filter(|a| composed(&self.stack, a.0 as usize, a.1)).map(|a| (a.0 as usize, a.1)));
+        self.compose(shown, &changes);
     }
 
-    /// A stroke on what is shown (`shown`'s last stroke, on the layer) has ended: take it into the layer's heights,
-    /// to undo with the layer's history rather than with the stroke's own.
+    /// A stroke on what is shown (`shown`'s last stroke, on the active layer) has ended: take it into the layer's
+    /// heights, to undo with the layers' history rather than with the stroke's own.
     pub fn take_detail(&mut self, shown: &mut LevelVolume) {
         let keys = shown.last_stroke_keys();
         shown.forget_last();
-        if keys.is_empty() {
+        if keys.is_empty() || self.stack.is_empty() {
             return;
         }
-        let was = self.layer.clone();
+        let was = self.stack.clone();
         let detail = shown.snapshot();
-        let blocks = self.finest_under(&detail, &keys);
+        let k = self.active;
+        let blocks = self.finest_under(&detail, &keys, self.stack[k].level);
         // Coarser blocks the stroke changed (making parents, moving form down) go back to the form's.
         let mut coarse: Vec<Key> = keys.iter().copied().filter(|k| (k.0 as usize) < self.from).collect();
         coarse.sort_unstable_by_key(|k| k.0);
-        for k in coarse {
-            shown.mirror(&self.form, k);
+        for key in coarse {
+            shown.mirror(&self.form, key);
         }
-        self.take_heights(shown, &detail, &blocks);
-        self.history.push(Undo::Layer(was));
+        self.stack[k].visible = true;
+        self.take_heights(shown, &detail, k, &blocks, &keys);
+        self.history.push(Undo::Layers(was));
         self.redo.clear();
     }
 
-    /// The first level the layer took work from: strokes on the layer work there or finer.
+    /// The first level the layers took work from: strokes on a layer work there or finer, on the form coarser.
     pub fn from(&self) -> usize {
         self.from
     }
 
-    /// The form under the layer: brushes find the surface on it.
+    /// The form under the layers: brushes find the surface on it.
     pub fn form(&self) -> &LevelVolume {
         &self.form
     }
 
+    /// The active layer's level (strokes on it work no finer).
     pub fn level(&self) -> usize {
-        self.level
+        self.stack.get(self.active).map_or(self.form.levels() - 1, |x| x.level)
     }
 
-    /// The tallest height the layer holds (for checks).
+    /// The tallest height a layer holds (for checks).
     pub fn tallest(&self) -> f32 {
-        self.layer.h.values().flat_map(|b| b.iter()).fold(0.0f32, |a, b| a.max(b.abs()))
+        self.stack.iter().map(tallest).fold(0.0f32, f32::max)
     }
 
-    /// The layer's blocks.
+    /// The active layer's blocks.
     pub fn blocks(&self) -> usize {
-        self.layer.h.len()
+        self.stack.get(self.active).map_or(0, |x| x.h.len())
+    }
+
+    /// The layers, bottom first.
+    pub fn layers(&self) -> Vec<LayerInfo> {
+        self.stack.iter().map(|x| LayerInfo { name: x.name.clone(), level: x.level, visible: x.visible, blocks: x.h.len() }).collect()
+    }
+
+    /// The layer strokes on the layers (and mask strokes) work on.
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    pub fn set_active(&mut self, k: usize) {
+        if k < self.stack.len() {
+            self.active = k;
+        }
+    }
+
+    /// A new empty layer at `level` (no coarser than the layers' first level) on top, made active.
+    pub fn add_layer(&mut self, name: &str, level: usize) -> usize {
+        let level = level.clamp(self.from, self.form.levels() - 1);
+        self.history.push(Undo::Layers(self.stack.clone()));
+        self.redo.clear();
+        self.stack.push(Layer::new(name, level));
+        self.active = self.stack.len() - 1;
+        self.active
+    }
+
+    /// Remove layer `k`.
+    pub fn remove_layer(&mut self, shown: &mut LevelVolume, k: usize) {
+        if k >= self.stack.len() {
+            return;
+        }
+        self.history.push(Undo::Layers(self.stack.clone()));
+        self.redo.clear();
+        let gone = self.stack.remove(k);
+        self.active = self.active.min(self.stack.len().saturating_sub(1));
+        let changes: Vec<(usize, IVec3)> = gone.h.keys().map(|bc| (gone.level, *bc)).collect();
+        self.compose(shown, &changes);
+    }
+
+    pub fn rename(&mut self, k: usize, name: &str) {
+        if let Some(x) = self.stack.get_mut(k) {
+            x.name = name.to_string();
+        }
+    }
+
+    /// Show or hide layer `k`.
+    pub fn set_visible(&mut self, shown: &mut LevelVolume, k: usize, on: bool) {
+        let Some(x) = self.stack.get_mut(k) else { return };
+        if x.visible == on {
+            return;
+        }
+        x.visible = on;
+        let changes: Vec<(usize, IVec3)> = x.h.keys().map(|bc| (x.level, *bc)).collect();
+        self.compose(shown, &changes);
+    }
+
+    /// Hold layer `k` at another level: finer keeps its detail on a denser lattice; coarser keeps what that lattice
+    /// can hold (averaged over each new step).
+    pub fn set_level(&mut self, shown: &mut LevelVolume, k: usize, level: usize) {
+        let level = level.clamp(self.from, self.form.levels() - 1);
+        let Some(old) = self.stack.get(k).cloned() else { return };
+        if old.level == level {
+            return;
+        }
+        self.history.push(Undo::Layers(self.stack.clone()));
+        self.redo.clear();
+        let mut targets: HashSet<IVec3> = HashSet::default();
+        for bc in old.h.keys() {
+            if level > old.level {
+                let s = 1i32 << (level - old.level);
+                for q in 0..s * s * s {
+                    targets.insert(*bc * s + IVec3::new(q % s, (q / s) % s, q / (s * s)));
+                }
+            } else {
+                targets.insert(*bc >> (old.level - level) as i32);
+            }
+        }
+        let targets: Vec<IVec3> = targets.into_iter().collect();
+        let v = self.form.voxel(level);
+        let limit = MOST * self.form.voxel(self.from);
+        let built: Vec<(IVec3, Option<(Stored, Stored)>)> = targets
+            .par_iter()
+            .map(|&bc| {
+                let (hs, ms) = (Sparse::new(&old.h, 0.0), Sparse::new(&old.m, 1.0));
+                let mut h = Box::new([0.0f32; N]);
+                let mut m = Box::new([1.0f32; N]);
+                let mut any = false;
+                for i in 0..N {
+                    let x = bc * B + cell(i);
+                    let (hv, mv) = if level > old.level {
+                        let g = x.as_vec3() / (1i32 << (level - old.level)) as f32;
+                        (hs.cubic(g), ms.linear(g).clamp(0.0, 1.0))
+                    } else {
+                        // The mean over the new step (a tent over the old lattice points within it).
+                        let s = 1i32 << (old.level - level);
+                        let c = x * s;
+                        let (mut sh, mut sm, mut sw) = (0.0, 0.0, 0.0);
+                        for dz in -s + 1..s {
+                            for dy in -s + 1..s {
+                                for dx in -s + 1..s {
+                                    let w = ((s - dx.abs()) * (s - dy.abs()) * (s - dz.abs())) as f32;
+                                    let j = c + IVec3::new(dx, dy, dz);
+                                    sh += w * hs.at(j);
+                                    sm += w * ms.at(j);
+                                    sw += w;
+                                }
+                            }
+                        }
+                        (sh / sw, sm / sw)
+                    };
+                    h[i] = hv.clamp(-limit, limit);
+                    m[i] = mv;
+                    any |= h[i].abs() > 1e-4 * v;
+                }
+                (bc, any.then(|| (Stored::from(h), Stored::from(m))))
+            })
+            .collect();
+        let mut layer = Layer { name: old.name.clone(), level, visible: old.visible, h: Shared::default(), m: Shared::default() };
+        for (bc, hm) in built {
+            if let Some((h, m)) = hm {
+                layer.h.insert(bc, h);
+                layer.m.insert(bc, m);
+            }
+        }
+        let mut changes: Vec<(usize, IVec3)> = old.h.keys().map(|bc| (old.level, *bc)).collect();
+        changes.extend(layer.h.keys().map(|bc| (level, *bc)));
+        self.stack[k] = layer;
+        self.compose(shown, &changes);
     }
 
     /// Begin a stroke on the form (the last one's following all in: see [`Self::settle`]).
     pub fn begin_stroke(&mut self) {
-        self.start = Some((self.form.snapshot(), self.layer.clone()));
+        self.start = Some((self.form.snapshot(), self.stack.clone()));
         self.touched.clear();
         self.pending.clear();
         self.used.clear();
         self.changed.clear();
         self.follows = 0;
-        let l = self.level;
-        self.covered = vec![HashSet::default(); l + 1];
-        let keys: Vec<IVec3> = self.layer.h.keys().copied().collect();
-        self.cover(&keys);
+        self.covered = vec![HashSet::default(); self.form.levels()];
+        for k in 0..self.stack.len() {
+            let keys: Vec<IVec3> = self.stack[k].h.keys().copied().collect();
+            self.cover(self.stack[k].level, &keys);
+        }
         self.form.begin_stroke();
     }
 
-    /// Mark the blocks over layer blocks `keys`, at every level.
-    fn cover(&mut self, keys: &[IVec3]) {
-        let l = self.level;
-        if self.covered.len() != l + 1 {
+    /// Mark the blocks over blocks `keys` of level `l`, at every level up to it.
+    fn cover(&mut self, l: usize, keys: &[IVec3]) {
+        if self.covered.len() <= l {
             return;
         }
         for &bc in keys {
@@ -846,8 +1129,8 @@ impl Layered {
         out
     }
 
-    /// After a dab on the form: what it changed away from the layer shows at once; over the layer, it waits for a
-    /// follow (at once, unless deferred), which shows it with the layer on it.
+    /// After a dab on the form: what it changed away from the layers shows at once; over them, it waits for a follow
+    /// (at once, unless deferred), which shows it with the layers on it.
     fn dabbed(&mut self, shown: &mut LevelVolume) {
         let dirty = self.form.drain_dirty();
         self.touched.extend(dirty.iter().copied());
@@ -855,16 +1138,15 @@ impl Layered {
             for &k in &dirty {
                 shown.mirror(&self.form, k);
             }
-            let keys = under(self.level, &dirty, &self.layer);
-            self.compose(shown, &keys);
+            let changes: Vec<(usize, IVec3)> = self.stack.iter().flat_map(|x| under(x.level, &dirty, x).into_iter().map(move |bc| (x.level, bc))).collect();
+            self.compose(shown, &changes);
             let stale = self.stale_under(shown, &dirty, &self.form);
             self.tidy(shown, stale, None);
             return;
         }
-        let l = self.level;
         for k in dirty {
             let m = k.0 as usize;
-            if m <= l && self.covered.get(m).is_some_and(|c| c.contains(&k.1)) {
+            if self.covered.get(m).is_some_and(|c| c.contains(&k.1)) {
                 self.pending.insert(k);
             } else {
                 shown.mirror(&self.form, k);
@@ -875,8 +1157,8 @@ impl Layered {
         }
     }
 
-    /// End the stroke on the form; the layer follows the form as it is now, its distances made again (at once, or in
-    /// a last job when deferred).
+    /// End the stroke on the form; the layers follow the form as it is now, its distances made again (at once, or in a
+    /// last job when deferred).
     pub fn end_stroke(&mut self, shown: &mut LevelVolume) -> StrokeEnd {
         let out = self.form.end_stroke();
         let dirty = self.form.drain_dirty();
@@ -891,8 +1173,8 @@ impl Layered {
     }
 
     /// End the stroke on the form on another thread: [`EndJob::run`] works out the form's end on a copy, and
-    /// [`Self::end_form_apply`] takes it, leaving the layer's last follow to do. `None` when the form's stroke changed
-    /// nothing (it has ended, and the layer's last follow is left to do).
+    /// [`Self::end_form_apply`] takes it, leaving the layers' last follow to do. `None` when the form's stroke changed
+    /// nothing (it has ended, and the last follow is left to do).
     pub fn end_form_take(&mut self) -> Option<EndJob> {
         let job = self.form.end_stroke_take();
         if job.is_none() && self.start.is_some() {
@@ -922,7 +1204,7 @@ impl Layered {
         if self.running {
             return None;
         }
-        let (form0, layer0) = self.start.as_ref()?;
+        let (form0, stack0) = self.start.as_ref()?;
         let end = self.ending;
         let region: Vec<Key> = if end {
             self.pending.clear();
@@ -937,9 +1219,8 @@ impl Layered {
         Some(FollowJob {
             form: self.form.snapshot(),
             form0: form0.snapshot(),
-            layer0: layer0.clone(),
-            layer: self.layer.clone(),
-            level: self.level,
+            stack0: stack0.clone(),
+            stack: self.stack.clone(),
             from: self.from,
             region,
             end,
@@ -948,50 +1229,45 @@ impl Layered {
         })
     }
 
-    /// Take what a follow worked out: the layer's blocks, and what is shown over the blocks it covered (the form as
-    /// the job read it, the layer on it).
+    /// Take what a follow worked out: the layers' blocks, and what is shown over the blocks it covered (the form as the
+    /// job read it, the layers on it).
     pub fn follow_apply(&mut self, shown: &mut LevelVolume, done: FollowDone) {
         let t = Instant::now();
         self.running = false;
-        let FollowDone { form, region, end, layer, shown: blocks, used, mut stats } = done;
+        let FollowDone { form, region, end, layers, shown: blocks, used, mut stats } = done;
         let mut sorted = region.clone();
         sorted.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
-        // (The layer's own level only where the layer holds nothing: its blocks there are composed below, or stay.)
-        let l = self.level;
-        for &k in sorted.iter().filter(|k| (k.0 as usize) < l) {
-            shown.mirror(&form, k);
-        }
-        let mut made = Vec::new();
-        if !end {
-            self.changed.extend(layer.iter().map(|(bc, _)| *bc));
-        }
-        for (bc, hm) in layer {
-            match hm {
-                Some((h, m)) => {
-                    self.layer.h.insert(bc, h);
-                    self.layer.m.insert(bc, m);
-                    made.push(bc);
-                }
-                None => {
-                    self.layer.h.remove(&bc);
-                    self.layer.m.remove(&bc);
-                }
+        // (The layers' levels only where no layer is composed: their blocks there are composed below, or stay.)
+        for &key in &sorted {
+            if !composed(&self.stack, key.0 as usize, key.1) {
+                shown.mirror(&form, key);
             }
         }
-        self.cover(&made);
+        for (k, built) in layers {
+            let level = self.stack[k].level;
+            if !end {
+                self.changed.extend(built.iter().map(|(bc, _)| (k, *bc)));
+            }
+            let mut made = Vec::new();
+            let layer = &mut self.stack[k];
+            for (bc, hm) in built {
+                match hm {
+                    Some((h, m)) => {
+                        layer.h.insert(bc, h);
+                        layer.m.insert(bc, m);
+                        made.push(bc);
+                    }
+                    None => {
+                        layer.h.remove(&bc);
+                        layer.m.remove(&bc);
+                    }
+                }
+            }
+            self.cover(level, &made);
+        }
         self.used.extend(used);
-        for &k in sorted.iter().filter(|k| k.0 as usize == l && !self.layer.h.contains_key(&k.1)) {
-            shown.mirror(&form, k);
-        }
-        let keys: Vec<IVec3> = blocks.iter().map(|(bc, _)| *bc).collect();
-        for (bc, s) in blocks {
-            match s {
-                Some(s) => shown.put_stored(l, bc, s),
-                None => shown.mirror(&form, (l as u8, bc)),
-            }
-        }
-        let mut stale: Vec<Key> = keys.iter().flat_map(|&bc| (1..l).map(move |m| (m as u8, bc >> (l - m) as i32))).filter(|&(m, a)| !form.exists(m as usize, a)).collect();
-        stale.extend(self.stale_under(shown, &region, &form));
+        self.put_shown(shown, blocks, &form);
+        let stale = self.stale_under(shown, &region, &form);
         self.tidy(shown, stale, Some(&form));
         stats.ms += t.elapsed().as_secs_f64() * 1e3;
         self.last = stats;
@@ -999,8 +1275,9 @@ impl Layered {
         if end {
             self.ending = false;
             self.used.clear();
-            if let Some((_, layer)) = self.start.take() {
-                self.history.push(Undo::Form(layer));
+            self.changed.clear();
+            if let Some((_, stack)) = self.start.take() {
+                self.history.push(Undo::Form(stack));
                 self.redo.clear();
             }
         }
@@ -1014,18 +1291,20 @@ impl Layered {
         }
     }
 
-    /// Fade the layer toward `to` (0 hides it, 1 shows it) within `r` of `c`, softly.
+    /// Fade the active layer toward `to` (0 hides it, 1 shows it) within `r` of `c`, softly.
     pub fn paint_mask(&mut self, shown: &mut LevelVolume, c: Vec3, r: f32, to: f32) {
-        let (v, origin) = (self.form.voxel(self.level), self.form.origin());
+        let Some(level) = self.stack.get(self.active).map(|x| x.level) else { return };
+        let (v, origin) = (self.form.voxel(level), self.form.origin());
         let lo = ((c - Vec3::splat(r) - origin) / (v * B as f32)).floor().as_ivec3();
         let hi = ((c + Vec3::splat(r) - origin) / (v * B as f32)).floor().as_ivec3();
-        let was = self.layer.clone();
+        let was = self.stack.clone();
         let mut changed = Vec::new();
+        let layer = &mut self.stack[self.active];
         for bz in lo.z..=hi.z {
             for by in lo.y..=hi.y {
                 for bx in lo.x..=hi.x {
                     let bc = IVec3::new(bx, by, bz);
-                    let Some(m) = self.layer.m.get(&bc) else { continue };
+                    let Some(m) = layer.m.get(&bc) else { continue };
                     let mut m = Box::new(**m);
                     for (i, x) in m.iter_mut().enumerate() {
                         let d = (origin + (bc * B + cell(i)).as_vec3() * v - c).length() / r;
@@ -1033,28 +1312,28 @@ impl Layered {
                         let w = t * t * (3.0 - 2.0 * t);
                         *x += w * (to - *x);
                     }
-                    self.layer.m.insert(bc, Stored::from(m));
-                    changed.push(bc);
+                    layer.m.insert(bc, Stored::from(m));
+                    changed.push((level, bc));
                 }
             }
         }
         if !changed.is_empty() {
             if self.edit.is_none() {
-                self.history.push(Undo::Layer(was));
+                self.history.push(Undo::Layers(was));
                 self.redo.clear();
             }
             self.compose(shown, &changed);
         }
     }
 
-    /// Begin an edit of the layer itself (a mask stroke): undone as one.
+    /// Begin an edit of a layer itself (a mask stroke): undone as one.
     pub fn begin_edit(&mut self) {
-        self.edit = Some(self.layer.clone());
+        self.edit = Some(self.stack.clone());
     }
 
     pub fn end_edit(&mut self) {
         if let Some(was) = self.edit.take() {
-            self.history.push(Undo::Layer(was));
+            self.history.push(Undo::Layers(was));
             self.redo.clear();
         }
     }
@@ -1074,9 +1353,9 @@ impl Layered {
     }
 
     fn swap(&mut self, shown: &mut LevelVolume, entry: Undo, undo: bool) -> Undo {
-        let (layer, form) = match entry {
-            Undo::Form(l) => (l, true),
-            Undo::Layer(l) => (l, false),
+        let (stack, form) = match entry {
+            Undo::Form(s) => (s, true),
+            Undo::Layers(s) => (s, false),
         };
         if form {
             if undo {
@@ -1085,65 +1364,83 @@ impl Layered {
                 self.form.redo();
             }
         }
-        let old = std::mem::replace(&mut self.layer, layer);
+        let old = std::mem::replace(&mut self.stack, stack);
+        self.active = self.active.min(self.stack.len().saturating_sub(1));
         let region = self.form.drain_dirty();
         for &k in &region {
             shown.mirror(&self.form, k);
         }
-        // Every layer block either version holds that differs, or whose form changed.
-        let mut keys: HashSet<IVec3> = HashSet::default();
-        for (bc, h) in self.layer.h.iter() {
-            if old.h.get(bc).is_none_or(|o| !std::sync::Arc::ptr_eq(o, h)) || old.m.get(bc).zip(self.layer.m.get(bc)).is_none_or(|(a, b)| !std::sync::Arc::ptr_eq(a, b)) {
-                keys.insert(*bc);
+        // Every layer block either stack holds that differs, or whose form changed.
+        let mut changes: HashSet<(usize, IVec3)> = HashSet::default();
+        let same_shape = old.len() == self.stack.len() && old.iter().zip(&self.stack).all(|(a, b)| a.level == b.level && a.visible == b.visible);
+        if same_shape {
+            for (a, b) in old.iter().zip(&self.stack) {
+                for (bc, h) in b.h.iter() {
+                    if a.h.get(bc).is_none_or(|o| !std::sync::Arc::ptr_eq(o, h)) || a.m.get(bc).zip(b.m.get(bc)).is_none_or(|(x, y)| !std::sync::Arc::ptr_eq(x, y)) {
+                        changes.insert((b.level, *bc));
+                    }
+                }
+                for bc in a.h.keys() {
+                    if !b.h.contains_key(bc) {
+                        changes.insert((a.level, *bc));
+                    }
+                }
+            }
+        } else {
+            for x in old.iter().chain(&self.stack) {
+                changes.extend(x.h.keys().map(|bc| (x.level, *bc)));
             }
         }
-        for bc in old.h.keys() {
-            if !self.layer.h.contains_key(bc) {
-                keys.insert(*bc);
-            }
+        for x in &self.stack {
+            changes.extend(under(x.level, &region, x).into_iter().map(|bc| (x.level, bc)));
         }
-        keys.extend(under(self.level, &region, &self.layer));
-        let keys: Vec<IVec3> = keys.into_iter().collect();
-        self.compose(shown, &keys);
+        let changes: Vec<(usize, IVec3)> = changes.into_iter().collect();
+        self.compose(shown, &changes);
         let stale = self.stale_under(shown, &region, &self.form);
         self.tidy(shown, stale, None);
-        if form { Undo::Form(old) } else { Undo::Layer(old) }
+        if form { Undo::Form(old) } else { Undo::Layers(old) }
     }
 
-    /// Blocks shown holds only as parents (the form has none there) under the form's blocks `region`: they read the
-    /// form as it was when made, whatever the layer does there.
+    /// Blocks shown holds only as parents (neither the form's nor a layer's) under the form's blocks `region`: they read
+    /// the form as it was when made, whatever the layers do there.
     fn stale_under(&self, shown: &LevelVolume, region: &[Key], form: &LevelVolume) -> Vec<Key> {
-        let l = self.level;
-        let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); l + 1];
+        let top = self.form.levels() - 1;
+        let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); top + 1];
         for &(m, bc) in region {
-            if (m as usize) <= l {
-                per[m as usize].insert(bc);
-            }
+            per[m as usize].insert(bc);
         }
-        // Such blocks are parents of the layer's (read through its blocks, not every block shown).
+        // Such blocks are parents of the layers' (read through their blocks, not every block shown).
         let mut out: HashSet<Key> = HashSet::default();
-        for &bc in self.layer.h.keys() {
-            for m in 1..l {
-                let a = bc >> (l - m) as i32;
-                if !out.contains(&(m as u8, a)) && !form.exists(m, a) && shown.exists(m, a) && (0..=m).any(|k| per[k].contains(&(a >> (m - k) as i32))) {
-                    out.insert((m as u8, a));
+        for x in &self.stack {
+            let l = x.level;
+            for &bc in x.h.keys() {
+                for m in 1..l {
+                    let a = bc >> (l - m) as i32;
+                    if !out.contains(&(m as u8, a)) && !form.exists(m, a) && !composed(&self.stack, m, a) && shown.exists(m, a) && (0..=m).any(|k| per[k].contains(&(a >> (m - k) as i32))) {
+                        out.insert((m as u8, a));
+                    }
                 }
             }
         }
         out.into_iter().collect()
     }
 
-    /// Blocks `keys` that shown holds only as parents of finer ones (the form has none there): dropped where they hold
-    /// none any more (finest first, so a parent left with none goes too), else made again from the level below
-    /// (coarsest first, so each reads the one below as it is now).
+    /// Blocks `keys` that shown holds only as parents of finer ones (neither the form's nor a layer's): dropped where
+    /// they hold none any more (finest first, so a parent left with none goes too), else made again from the level
+    /// below (coarsest first, so each reads the one below as it is now).
     fn tidy(&self, shown: &mut LevelVolume, keys: Vec<Key>, form: Option<&LevelVolume>) {
         let form = form.unwrap_or(&self.form);
-        let mut keys: Vec<Key> = keys.into_iter().filter(|&(m, bc)| shown.exists(m as usize, bc)).collect::<HashSet<_>>().into_iter().collect();
+        let mut keys: Vec<Key> = keys
+            .into_iter()
+            .filter(|&(m, bc)| shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(&self.stack, m as usize, bc))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         keys.sort_unstable_by_key(|k| (std::cmp::Reverse(k.0), k.1.z, k.1.y, k.1.x));
         let mut kept = Vec::with_capacity(keys.len());
         for (m, bc) in keys {
             let mu = m as usize;
-            let children = mu + 1 < shown.levels() && (0..8).any(|q| shown.exists(mu + 1, bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)));
+            let children = mu + 1 < shown.levels() && (0..8).any(|q| shown.exists(mu + 1, bc * 2 + corner_offset(q)));
             if children {
                 kept.push((m, bc));
             } else {
@@ -1156,17 +1453,124 @@ impl Layered {
         }
     }
 
-    /// Write what is shown at level `L` for layer blocks `keys` (see [`compose_blocks`]).
-    fn compose(&mut self, shown: &mut LevelVolume, keys: &[IVec3]) {
-        let l = self.level;
-        let built = compose_blocks(&self.form, &self.layer, l, self.from, keys);
-        for (bc, s) in built {
+    /// Put composed blocks into `shown` (or take its own away where no layer is composed there), coarsest first, and
+    /// tidy their parents.
+    fn put_shown(&self, shown: &mut LevelVolume, mut blocks: Vec<(usize, IVec3, Option<Stored>)>, form: &LevelVolume) {
+        blocks.sort_unstable_by_key(|b| (b.0, b.1.z, b.1.y, b.1.x));
+        let mut parents = Vec::new();
+        for (l, bc, s) in blocks {
             match s {
                 Some(s) => shown.put_stored(l, bc, s),
-                None => shown.mirror(&self.form, (l as u8, bc)),
+                None => shown.mirror(form, (l as u8, bc)),
+            }
+            parents.extend((1..l).map(|m| (m as u8, bc >> (l - m) as i32)));
+        }
+        self.tidy(shown, parents, Some(form));
+    }
+
+    /// Write what is shown for layer changes `changes` (level, block): those blocks, and the finer layers' over them.
+    fn compose(&mut self, shown: &mut LevelVolume, changes: &[(usize, IVec3)]) {
+        let targets = affected(&self.stack, changes);
+        let built = compose_all(&self.form, &self.stack, self.from - 1, &targets);
+        self.put_shown(shown, built, &self.form);
+    }
+
+    /// Write the form and the layers (the form as a volume file, the layers after it).
+    pub fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
+        self.form.write_to(w)?;
+        w.write_all(b"SLAY")?;
+        for x in [1u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
+            w.write_all(&x.to_le_bytes())?;
+        }
+        for layer in &self.stack {
+            w.write_all(&(layer.name.len() as u32).to_le_bytes())?;
+            w.write_all(layer.name.as_bytes())?;
+            w.write_all(&(layer.level as u32).to_le_bytes())?;
+            w.write_all(&[layer.visible as u8])?;
+            let mut keys: Vec<IVec3> = layer.h.keys().copied().collect();
+            keys.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+            w.write_all(&(keys.len() as u32).to_le_bytes())?;
+            let mut buf = Vec::with_capacity(N * 8);
+            for bc in keys {
+                for x in bc.to_array() {
+                    w.write_all(&x.to_le_bytes())?;
+                }
+                buf.clear();
+                let m = layer.m.get(&bc);
+                for i in 0..N {
+                    buf.extend_from_slice(&layer.h[&bc][i].to_le_bytes());
+                }
+                for i in 0..N {
+                    buf.extend_from_slice(&m.map_or(1.0f32, |m| m[i]).to_le_bytes());
+                }
+                w.write_all(&buf)?;
             }
         }
-        let parents: Vec<Key> = keys.iter().flat_map(|&bc| (1..l).map(move |m| (m as u8, bc >> (l - m) as i32))).filter(|&(m, a)| !self.form.exists(m as usize, a)).collect();
-        self.tidy(shown, parents, None);
+        Ok(())
+    }
+
+    /// Read a volume file: what is shown, and the layers if it has any (`None` for a file of one volume).
+    pub fn read_from(r: &mut impl Read, levels: usize) -> std::io::Result<(LevelVolume, Option<Layered>)> {
+        use std::io::{Error, ErrorKind};
+        let mut form = LevelVolume::read_from(r, levels)?;
+        let mut magic = [0u8; 4];
+        match r.read_exact(&mut magic) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok((form, None)),
+            Err(e) => return Err(e),
+        }
+        let bad = |m: &str| Error::new(ErrorKind::InvalidData, m.to_string());
+        if &magic != b"SLAY" {
+            return Err(bad("not a layer section"));
+        }
+        let u32s = |r: &mut dyn Read| -> std::io::Result<u32> {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            Ok(u32::from_le_bytes(b))
+        };
+        let version = u32s(r)?;
+        if version != 1 {
+            return Err(bad("unknown layer section version"));
+        }
+        let (from, count, active) = (u32s(r)? as usize, u32s(r)? as usize, u32s(r)? as usize);
+        let top = form.levels() - 1;
+        if from == 0 || from > top {
+            return Err(bad("layers' first level out of range"));
+        }
+        let mut stack = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = u32s(r)? as usize;
+            let mut name = vec![0u8; len.min(4096)];
+            r.read_exact(&mut name)?;
+            let level = (u32s(r)? as usize).clamp(from, top);
+            let mut vis = [0u8; 1];
+            r.read_exact(&mut vis)?;
+            let mut layer = Layer::new(&String::from_utf8_lossy(&name), level);
+            layer.visible = vis[0] != 0;
+            let blocks = u32s(r)? as usize;
+            let mut buf = vec![0u8; N * 8];
+            for _ in 0..blocks {
+                let mut c = [0i32; 3];
+                for x in &mut c {
+                    *x = u32s(r)? as i32;
+                }
+                r.read_exact(&mut buf)?;
+                let f = |i: usize| f32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]]);
+                let h: Box<[f32; N]> = Box::new(std::array::from_fn(f));
+                let m: Box<[f32; N]> = Box::new(std::array::from_fn(|i| f(N + i)));
+                let bc = IVec3::from_array(c);
+                layer.h.insert(bc, Stored::from(h));
+                layer.m.insert(bc, Stored::from(m));
+            }
+            stack.push(layer);
+        }
+        form.drain_dirty();
+        let mut shown = form.snapshot();
+        let mut out = Layered::with_form(form, from, stack);
+        out.active = active.min(out.stack.len().saturating_sub(1));
+        let changes: Vec<(usize, IVec3)> = out.stack.iter().flat_map(|x| x.h.keys().map(move |bc| (x.level, *bc))).collect();
+        out.compose(&mut shown, &changes);
+        shown.clear_history();
+        Ok((shown, Some(out)))
     }
 }

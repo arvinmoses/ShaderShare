@@ -573,7 +573,7 @@ impl SculptApp {
                 mode.settle();
                 let r = std::fs::File::create(&p).and_then(|f| {
                     let mut w = std::io::BufWriter::new(f);
-                    mode.vol.write_to(&mut w)?;
+                    mode.write_to(&mut w)?;
                     std::io::Write::flush(&mut w)
                 });
                 self.status = match r {
@@ -584,13 +584,12 @@ impl SculptApp {
             }
             Dialog::OpenVolume(p) => {
                 let t = Instant::now();
-                let r = std::fs::File::open(&p).and_then(|f| sculpt_core::generator::level_volume::LevelVolume::read_from(&mut std::io::BufReader::new(f), crate::volume_mode::LEVELS));
+                let r = std::fs::File::open(&p).and_then(|f| crate::volume_mode::VolumeMode::read_from(&mut std::io::BufReader::new(f)));
                 match r {
-                    Ok(vol) => {
+                    Ok(mut mode) => {
                         self.end_stroke();
-                        let (lo, hi) = vol.bounds();
+                        let (lo, hi) = mode.vol.bounds();
                         let generation = self.volume_mode.as_ref().map_or(0, |m| m.generation) + 1;
-                        let mut mode = crate::volume_mode::VolumeMode::new(vol);
                         mode.generation = generation;
                         self.volume_mode = Some(mode);
                         if let Some(vp) = self.viewport.as_mut() {

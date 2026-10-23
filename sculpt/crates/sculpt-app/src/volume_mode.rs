@@ -424,7 +424,66 @@ impl VolumeMode {
         self.target = Target::Detail;
     }
 
-    /// Merge the detail layer into the form: one volume again, as shown. Undo starts afresh.
+    /// A new empty layer at `level` on top, made what strokes work on.
+    pub fn add_layer(&mut self, level: usize) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut() {
+            let n = layer.layers().len();
+            layer.add_layer(&format!("Layer {}", n + 1), level);
+            self.target = Target::Detail;
+        }
+    }
+
+    pub fn remove_layer(&mut self, k: usize) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut() {
+            layer.remove_layer(&mut self.vol, k);
+        }
+    }
+
+    pub fn set_layer_visible(&mut self, k: usize, on: bool) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut() {
+            layer.set_visible(&mut self.vol, k, on);
+        }
+    }
+
+    /// Hold layer `k` at another level (its resolution).
+    pub fn set_layer_level(&mut self, k: usize, level: usize) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut() {
+            layer.set_level(&mut self.vol, k, level);
+        }
+    }
+
+    pub fn set_active_layer(&mut self, k: usize) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut() {
+            layer.set_active(k);
+        }
+    }
+
+    /// Write the volume (with its layers, if any) as a `.svol` file.
+    pub fn write_to(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        self.settle();
+        match &self.layer {
+            Some(layer) => layer.write_to(w),
+            None => self.vol.write_to(w),
+        }
+    }
+
+    /// A volume read from a `.svol` file, with its layers if it has any.
+    pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<VolumeMode> {
+        let (vol, layer) = Layered::read_from(r, LEVELS)?;
+        let mut mode = VolumeMode::new(vol);
+        if let Some(mut layer) = layer {
+            layer.deferred = true;
+            mode.layer = Some(layer);
+        }
+        Ok(mode)
+    }
+
+    /// Merge the detail layers into the form: one volume again, as shown. Undo starts afresh.
     pub fn merge_layer(&mut self) {
         self.settle();
         self.layer = None;
@@ -524,6 +583,34 @@ mod tests {
         eprintln!("dabs {:.1} ms, ticks {:.1} ms a frame; {landed} follows landed during the stroke", dab_ms / frames as f64, tick_ms / frames as f64);
         eprintln!("layer {blocks} blocks: a frame (dab and tick) {:.1} ms on average, {worst:.1} at most; pen up {pen_up:.1} ms; caught up {catch_up:.0} ms later ({ticks} ticks); last follow {last:?}", total / frames as f64);
         assert!(!mode.busy());
+    }
+
+    /// A volume with two layers of different resolutions saves and opens again with both, showing the same.
+    #[test]
+    fn layers_save_and_open_with_the_volume() {
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5));
+        let dot = Vec3::new(0.0, 0.0, 1.0);
+        mode.vol.begin_stroke();
+        mode.vol.ball_dab(4, dot, 0.004, 0.001, false);
+        mode.vol.end_stroke();
+        mode.make_layer(3);
+        mode.add_layer(3);
+        mode.begin_stroke();
+        let (hit, _) = mode.raycast(Vec3::new(0.03, 0.0, 3.0), -Vec3::Z).unwrap();
+        mode.dab(hit, 0.012, 0.01, 1.0, 0.5, false);
+        mode.end_stroke();
+        mode.settle();
+        let top = |m: &VolumeMode, x: f32| m.vol.raycast(Vec3::new(x, 0.0, 3.0), -Vec3::Z, 4, false).map_or(f32::NAN, |(p, _)| p.z);
+        let mut file = Vec::new();
+        mode.write_to(&mut file).unwrap();
+        let opened = VolumeMode::read_from(&mut &file[..]).unwrap();
+        let layers = opened.layer.as_ref().map(|l| l.layers()).unwrap_or_default();
+        eprintln!("opened {} layers: {:?}", layers.len(), layers.iter().map(|l| (l.level, l.blocks)).collect::<Vec<_>>());
+        assert_eq!(layers.len(), 2);
+        assert!(layers[1].blocks > 0, "the stroke on the second layer was not kept");
+        for x in [0.0, 0.03] {
+            assert!((top(&opened, x) - top(&mode, x)).abs() < 2e-5, "opened, the surface is not where it was");
+        }
     }
 
     /// With a detail layer, a mask stroke hides the layer where it passes, and undo brings it back.
