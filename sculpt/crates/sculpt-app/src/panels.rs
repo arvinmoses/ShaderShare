@@ -169,6 +169,10 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                     if let Some(m) = app.volume_mode.as_mut() {
                         let top = m.vol.levels() - 1;
                         ui.add(egui::Slider::new(&mut m.cap, 0..=top).text("Detail shown up to level"));
+                        ui.checkbox(&mut m.by_distance, "Level by distance").on_hover_text(
+                            "Each region shows only the levels whose detail would show on screen from here: far work is drawn from coarser levels, near work in full.",
+                        );
+                        ui.add_enabled(m.by_distance, egui::Slider::new(&mut m.level_px, 0.25..=4.0).logarithmic(true).text("Detail shown down to (pixels)"));
                         ui.checkbox(&mut m.tint, "Tint by level");
                         ui.checkbox(&mut m.vol.keep_detail, "Big brushes keep finer detail").on_hover_text(
                             "On: a big brush moves the finer detail under it along with the new surface, as sculpting at a lower subdivision level does.\nOff: it builds over the detail like clay, filling grooves and covering bumps where it builds above them.",

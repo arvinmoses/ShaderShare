@@ -69,9 +69,9 @@ fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, m
 
 /// Compare the GPU's surface with the reference, block by block. Returns (blocks, quads) compared.
 fn compare(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, vol: &LevelVolume, when: &str) -> Res<(usize, usize)> {
-    let cap = gpu.cap;
-    let keys: Vec<Key> = vol.keys().into_iter().filter(|k| k.0 as usize <= cap).collect();
-    let (want, _) = vol.extract(&keys, cap);
+    let show = gpu.show();
+    let keys: Vec<Key> = vol.keys().into_iter().filter(|k| !show.hides(*k)).collect();
+    let (want, _) = vol.extract_in(&keys, &show);
     let cells = read(device, queue, &gpu.buf.cells);
     let verts = read(device, queue, &gpu.buf.verts);
     let slot_pages = read(device, queue, &gpu.buf.slot_pages);
@@ -98,7 +98,7 @@ fn compare(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, vol: &Le
             let off = (gp - *p).length() / vx;
             if off > 0.05 && std::env::var("SCULPT_CHECK_DIAG").is_ok() {
                 let samples = read(device, queue, &gpu.buf.samples);
-                let want_s = packed_samples(vol, *k);
+                let want_s = packed_samples(vol, *k, Some(gpu.view.hidden()));
                 let got_s = &samples[s * 365..s * 365 + 365];
                 let diffs: Vec<String> = (0..729)
                     .filter(|&j| (got_s[j / 2] >> (16 * (j % 2))) & 0xffff != (want_s[j / 2] >> (16 * (j % 2))) & 0xffff)
@@ -205,7 +205,7 @@ pub fn run(args: &[String]) -> Res<()> {
                     failed = Some(e.to_string());
                     if std::env::var("SCULPT_CHECK_DIAG").is_ok() {
                         let samples = read(&device, &queue, &gpu.buf.samples);
-                        let stale: Vec<Key> = v.keys().into_iter().filter(|k| gpu.slot_of.get(k).is_some_and(|&sl| samples[sl as usize * 365..sl as usize * 365 + 365] != packed_samples(v, *k)[..])).collect();
+                        let stale: Vec<Key> = v.keys().into_iter().filter(|k| gpu.slot_of.get(k).is_some_and(|&sl| samples[sl as usize * 365..sl as usize * 365 + 365] != packed_samples(v, *k, Some(gpu.view.hidden()))[..])).collect();
                         eprintln!("blocks whose GPU samples are stale: {stale:?}");
                         let c = gpu.cap;
                         gpu.set_cap(c.saturating_sub(1));
@@ -237,6 +237,25 @@ pub fn run(args: &[String]) -> Res<()> {
             gpu.sync(&mut vol);
             compare(&device, &queue, &gpu, &vol, &format!("{pass}levels up to {cap}"))?;
         }
+        // The level chosen by distance: the camera moving about, near and far, with a stroke now and then, each
+        // view's blocks shown or hidden on the GPU as they are in the reference.
+        let eyes = [Vec3::new(0.0, 0.0, 1.3), Vec3::new(0.0, 0.0, 6.0), Vec3::new(2.0, 0.5, -1.5), Vec3::new(0.0, 0.0, 30.0), Vec3::new(0.2, 0.1, 1.15), Vec3::new(0.0, 0.0, 3.0)];
+        for (i, eye) in eyes.iter().enumerate() {
+            if i % 2 == 1 {
+                let a = Vec3::new(-0.2 + 0.1 * i as f32, 0.0, 1.0);
+                stroke(&mut vol, 1 + i % 3, a, a + Vec3::new(0.15, 0.05, 0.0), [0.06, 0.03, 0.012][i % 3], false, |v| { v.carry_pending(None); }, |_| {});
+            }
+            gpu.set_eye(*eye, 1000.0);
+            gpu.sync(&mut vol);
+            while gpu.view.stats.stale > 0 {
+                gpu.sync(&mut vol);
+            }
+            let st = gpu.view.stats;
+            compare(&device, &queue, &gpu, &vol, &format!("{pass}seen from {eye} ({} blocks shown, {} hidden)", st.shown, st.hidden))?;
+        }
+        gpu.view.on = false;
+        gpu.sync(&mut vol);
+        compare(&device, &queue, &gpu, &vol, &format!("{pass}every level again"))?;
     }
     println!("the GPU surface matches the reference at every step");
     Ok(())
@@ -255,6 +274,9 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     vol.carry_budget = Some(6.0);
     println!("ball at level 0 step {voxel0} ({} blocks) in {:.0} ms", vol.keys().len(), t.elapsed().as_secs_f64() * 1e3);
     let mut gpu = GpuLevels::new(device, queue, &vol, 5);
+    // Seen as the app sees it, from in front, choosing the level by distance (`SCULPT_BENCH_ALL` shows every level).
+    gpu.set_eye(Vec3::new(0.0, 0.0, 2.6), 1100.0);
+    gpu.view.on = std::env::var("SCULPT_BENCH_ALL").is_err();
     let t = Instant::now();
     let s = gpu.sync(&mut vol);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -417,5 +439,14 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     }
     let (counts, bytes) = vol.memory();
     println!("blocks per level {counts:?}, {:.1} MB of samples", bytes as f64 / 1e6);
+    while gpu.view.stats.stale > 0 {
+        gpu.sync(&mut vol);
+    }
+    for eye in [Vec3::new(0.0, 0.0, 2.6), Vec3::new(0.0, 0.0, 1.15), Vec3::new(0.0, 0.0, 8.0), Vec3::new(3.0, 0.0, 0.0)] {
+        gpu.set_eye(eye, 1100.0);
+        let s = gpu.sync(&mut vol);
+        let st = gpu.view.stats;
+        println!("seen from {eye}: {} blocks shown, {} hidden, choosing {:.2} ms, {} shown or hidden, sync {:.1} ms CPU ({} uploaded, {} extracted)", st.shown, st.hidden, st.ms, st.flips, s.cpu_ms, s.uploaded, s.extracted);
+    }
     Ok(())
 }

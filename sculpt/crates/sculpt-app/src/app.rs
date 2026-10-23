@@ -1059,7 +1059,8 @@ impl SculptApp {
                 if mode.busy() {
                     ctx.request_repaint();
                 }
-                vp.sync_volume(rs, mode);
+                let focal_px = px[1].max(1) as f32 / (2.0 * (self.camera.fov_y * 0.5).tan());
+                vp.sync_volume(rs, mode, self.camera.eye(), focal_px);
                 self.stats.upload = vp.last_upload;
             } else if let Some(doc) = self.doc.as_mut() {
                 // Meshes dense enough that a generator edit would not fit a frame update their surface a little each frame.
@@ -1308,6 +1309,11 @@ impl SculptApp {
             };
             let mut lines = vec![
                 format!("Volume  ·  {} levels, showing 0-{}  ·  blocks per level {}  ·  {:.0} MB", counts.len(), m.cap, per.join(" / "), bytes as f64 / 1e6),
+                if m.by_distance {
+                    format!("Level by distance (detail down to {:.2} px): {} blocks shown, {} left to coarser levels{}  ·  {:.2} ms", m.level_px, fmt_count(m.view.shown), fmt_count(m.view.hidden), if m.view.stale > 0 { format!(", {} to measure", fmt_count(m.view.stale)) } else { String::new() }, m.view.ms)
+                } else {
+                    "Level by distance off: every level shown".to_string()
+                },
                 format!("Last stroke at level {} (step {:.5})  ·  {:.2} ms a dab on the CPU", m.stroke_level, m.vol.voxel(m.stroke_level), m.dab_ms),
                 format!("Surface rebuilt on the GPU: {} blocks in {:.2} ms ({} blocks sent, {:.2} ms CPU)", fmt_count(m.sync.extracted), m.gpu_ms, fmt_count(m.sync.uploaded), m.sync.cpu_ms),
                 format!("Drawing {} of {} pages of quads{}  ·  {pace}", fmt_count(m.pages_drawn as usize), fmt_count(m.pages_used as usize), if self.viewport.as_ref().is_some_and(|v| v.cull) { " (the rest out of view or facing away)" } else { " (culling off)" }),

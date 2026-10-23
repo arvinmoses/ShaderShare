@@ -54,6 +54,12 @@ pub struct VolumeMode {
     pub level: usize,
     /// Show levels up to this one (a distant view leaves the finer ones out).
     pub cap: usize,
+    /// Choose the level shown region by region, by distance: a block shows while its detail comes to more than
+    /// `level_px` pixels on screen.
+    pub by_distance: bool,
+    pub level_px: f32,
+    /// What that choice last came to.
+    pub view: sculpt_core::generator::level_view::ViewStats,
     /// Tint the surface by the level each part comes from.
     pub tint: bool,
     /// Timing of the last frame's dabs, for the status line.
@@ -113,6 +119,9 @@ impl VolumeMode {
             generation: 1,
             level: 0,
             cap,
+            by_distance: true,
+            level_px: 1.0,
+            view: Default::default(),
             tint: false,
             last_ms: 0.0,
             last_dabs: 0,

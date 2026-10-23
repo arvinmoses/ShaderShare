@@ -20,7 +20,8 @@ use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu::wgpu;
 use glam::{IVec3, Mat4, Vec3};
 use rayon::prelude::*;
-use sculpt_core::generator::level_volume::{Key, LevelVolume, VERTS_PER_BLOCK, piece_table, quantize};
+use sculpt_core::generator::level_view::LevelView;
+use sculpt_core::generator::level_volume::{HashSet as KeySet, Key, LevelVolume, Show, VERTS_PER_BLOCK, piece_table, quantize};
 
 pub mod check;
 
@@ -29,6 +30,8 @@ const PAGE_INDICES: u64 = 384;
 const SLOT_WORDS: u64 = 32;
 const SAMPLE_WORDS: u64 = 365;
 const VSTRIDE: u64 = VERTS_PER_BLOCK as u64;
+/// Blocks whose detail is measured again per sync, after they changed (for choosing the level by distance).
+const MEASURE_PER_SYNC: usize = 768;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -127,6 +130,10 @@ pub struct GpuLevels {
     /// Set when the pages ran out: the next sync grows them and rebuilds.
     grow_pages: bool,
     cap_changed: bool,
+    /// Which blocks are shown, chosen by distance from the eye (a hidden block is not on the GPU at all, as if it
+    /// were not stored), and the eye with its pixels per unit at distance one.
+    pub view: LevelView,
+    eye: Option<(Vec3, f32)>,
     /// Bumped whenever the buffers are made afresh, so whoever draws from them binds them again.
     pub buffers_made: u64,
 }
@@ -146,11 +153,11 @@ fn sample_hash(data: &[u32]) -> u64 {
     h | 1
 }
 
-pub(super) fn packed_samples(vol: &LevelVolume, k: Key) -> Vec<u32> {
+pub(super) fn packed_samples(vol: &LevelVolume, k: Key, hidden: Option<&KeySet<Key>>) -> Vec<u32> {
     let (l, bc) = (k.0 as usize, k.1);
     let band = vol.band(l);
     let mut g = [0.0f32; 729];
-    vol.gather9_into(l, bc, &mut g);
+    vol.gather9_hiding(l, bc, &mut g, hidden);
     let mut out = vec![0u32; SAMPLE_WORDS as usize];
     for (i, v) in g.iter().enumerate() {
         let q = quantize(*v, band) as u16 as u32;
@@ -225,6 +232,8 @@ impl GpuLevels {
             grow_pages: false,
             buffers_made: 1,
             cap_changed: false,
+            view: LevelView::default(),
+            eye: None,
         };
         g.queue.write_buffer(&g.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         g
@@ -382,9 +391,19 @@ impl GpuLevels {
         }
     }
 
-    /// Everything from scratch: buffers sized for the volume, every block uploaded and extracted.
+    /// Choose the levels shown from `eye` (with `focal_px` pixels per unit at distance one) on the next syncs.
+    pub fn set_eye(&mut self, eye: Vec3, focal_px: f32) {
+        self.eye = Some((eye, focal_px));
+    }
+
+    /// The view the GPU's surface is of: levels up to the cap, less the blocks hidden.
+    pub fn show(&self) -> Show<'_> {
+        self.view.show(self.cap)
+    }
+
+    /// Everything from scratch: buffers sized for the volume, every block shown uploaded and extracted.
     fn rebuild(&mut self, vol: &LevelVolume, stats: &mut SyncStats) {
-        let blocks = vol.keys();
+        let blocks: Vec<Key> = vol.keys().into_iter().filter(|k| !self.view.hides(*k)).collect();
         let slots = ((blocks.len() as u32) * 2).max(self.buf.slots).max(4096);
         let mut pages = self.buf.pages.max(slots * 4);
         if self.grow_pages {
@@ -459,11 +478,12 @@ impl GpuLevels {
     /// Send the samples of `keys` that differ from what their slots hold; returns those sent.
     fn upload(&mut self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats) -> Vec<Key> {
         let sent = &self.sent;
+        let hidden = Some(self.view.hidden());
         let packed: Vec<(u32, Vec<u32>, u64, Key)> = keys
             .par_iter()
             .filter_map(|k| {
                 let s = *self.slot_of.get(k)?;
-                let data = packed_samples(vol, *k);
+                let data = packed_samples(vol, *k, hidden);
                 let h = sample_hash(&data);
                 (sent[s as usize] != h).then_some((s, data, h, *k))
             })
@@ -596,8 +616,22 @@ impl GpuLevels {
         let t = Instant::now();
         let mut stats = SyncStats::default();
         self.read_status();
-        let dirty = vol.drain_dirty();
+        let mut dirty = vol.drain_dirty();
         let first = self.slot_of.is_empty() && self.high == 0;
+        // The levels shown: blocks that changed are measured again (showing until they are), and those shown or
+        // hidden since the last sync go up or come down as blocks that came or went do.
+        if first || vol.origin() != self.origin {
+            self.view.clear();
+            self.view.note(vol, &vol.keys());
+        } else {
+            self.view.note(vol, &dirty);
+        }
+        self.view.refresh(vol, MEASURE_PER_SYNC);
+        if let Some((eye, focal)) = self.eye {
+            dirty.extend(self.view.choose(vol, eye, focal));
+            dirty.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+            dirty.dedup();
+        }
         if first || self.grow_pages || self.cap_changed || vol.origin() != self.origin {
             self.cap_changed = false;
             self.origin = vol.origin();
@@ -612,7 +646,7 @@ impl GpuLevels {
         let mut released = Vec::new();
         let mut gone = Vec::new();
         for k in &dirty {
-            if vol.block(*k).is_none()
+            if (vol.block(*k).is_none() || self.view.hides(*k))
                 && let Some(s) = self.slot_of.remove(k)
             {
                 self.key_of[s as usize] = None;
@@ -624,7 +658,7 @@ impl GpuLevels {
         for k in &gone {
             self.hash_remove(*k);
         }
-        let uploads = vol.upload_set(&dirty);
+        let uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
         let mut out_of_slots = false;
         // Blocks given a slot now: only their slots' block coordinates need sending.
         let mut placed = Vec::new();
@@ -664,7 +698,7 @@ impl GpuLevels {
         let uploads = self.upload(vol, &uploads, &mut stats);
         let mut changed: Vec<Key> = uploads.clone();
         changed.extend(gone);
-        let extract = vol.extract_set(&changed, self.cap);
+        let extract = vol.extract_set_in(&changed, &self.view.show(self.cap));
         self.extract(&extract, &released, &mut stats);
         stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
         stats

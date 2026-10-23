@@ -503,6 +503,27 @@ pub struct ExtractStats {
     pub dropped: usize,
 }
 
+/// What a view draws: the stored blocks of levels up to `cap`, less those in `hidden`. A hidden block's stored finer
+/// blocks must be hidden too, so that what is shown nests as the stored blocks do (a shown block's parent is shown).
+#[derive(Clone, Copy)]
+pub struct Show<'a> {
+    pub cap: usize,
+    pub hidden: Option<&'a HashSet<Key>>,
+}
+
+impl Show<'static> {
+    /// Every stored block of levels up to `cap`.
+    pub fn upto(cap: usize) -> Show<'static> {
+        Show { cap, hidden: None }
+    }
+}
+
+impl Show<'_> {
+    pub fn hides(&self, k: Key) -> bool {
+        k.0 as usize > self.cap || self.hidden.is_some_and(|h| h.contains(&k))
+    }
+}
+
 pub struct LevelVolume {
     pub voxel0: f32,
     origin: Vec3,
@@ -695,6 +716,16 @@ impl LevelVolume {
         self.blocks[l].contains_key(&bc)
     }
 
+    /// The stored blocks of level `l`, in no order.
+    pub fn level_keys(&self, l: usize) -> Vec<IVec3> {
+        self.blocks.get(l).map_or(Vec::new(), |m| m.keys().copied().collect())
+    }
+
+    /// How many blocks level `l` stores.
+    pub fn level_len(&self, l: usize) -> usize {
+        self.blocks.get(l).map_or(0, |m| m.len())
+    }
+
     /// Every stored block.
     pub fn keys(&self) -> Vec<Key> {
         let mut out: Vec<Key> = self.blocks.iter().enumerate().flat_map(|(l, m)| m.keys().map(move |bc| (l as u8, *bc))).collect();
@@ -861,6 +892,11 @@ impl LevelVolume {
 
     /// Level `l`'s samples over the lattice box `lo..=hi`, stored or interpolated from coarser levels.
     fn grid(&self, l: usize, lo: IVec3, hi: IVec3, base: bool) -> Grid {
+        self.grid_hiding(l, lo, hi, base, None)
+    }
+
+    /// [`Self::grid`] as if the blocks in `hidden` were not stored: what a view that hides them reads.
+    fn grid_hiding(&self, l: usize, lo: IVec3, hi: IVec3, base: bool, hidden: Option<&HashSet<Key>>) -> Grid {
         let n = hi - lo + IVec3::ONE;
         let mut g = Grid { lo, n, v: vec![f32::NAN; (n.x * n.y * n.z) as usize] };
         let (blo, bhi) = (lo.div_euclid(B3), hi.div_euclid(B3));
@@ -872,7 +908,7 @@ impl LevelVolume {
                     let bc = IVec3::new(bx, by, bz);
                     let a = (bc * B).max(lo);
                     let b = (bc * B + IVec3::splat(B - 1)).min(hi);
-                    let stored = self.stored(l, bc, base);
+                    let stored = self.stored(l, bc, base).filter(|_| !hidden.is_some_and(|h| h.contains(&(l as u8, bc))));
                     let fill = if l == 0 && stored.is_none() { Some(if self.inside0_at(bc, base) { -band } else { band }) } else { None };
                     if stored.is_none() && fill.is_none() {
                         missing = true;
@@ -894,7 +930,7 @@ impl LevelVolume {
             }
         }
         if missing {
-            let coarse = self.grid(l - 1, lo.div_euclid(IVec3::splat(2)), (hi + IVec3::ONE).div_euclid(IVec3::splat(2)), base);
+            let coarse = self.grid_hiding(l - 1, lo.div_euclid(IVec3::splat(2)), (hi + IVec3::ONE).div_euclid(IVec3::splat(2)), base, hidden);
             for z in lo.z..=hi.z {
                 for y in lo.y..=hi.y {
                     for x in lo.x..=hi.x {
@@ -996,7 +1032,17 @@ impl LevelVolume {
     /// [`Self::gather9`] into `out`, without allocating where the block and the seven past it are all stored at its
     /// level (most blocks): their samples are copied straight across.
     pub fn gather9_into(&self, l: usize, bc: IVec3, out: &mut [f32; 729]) {
-        let nb: [Option<&Stored>; 8] = std::array::from_fn(|q| self.blocks[l].get(&(bc + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32))));
+        self.gather9_hiding(l, bc, out, None)
+    }
+
+    /// [`Self::gather9_into`] as a view hiding the blocks in `hidden` reads them: the first layer past the block,
+    /// where it falls in a hidden block, is interpolated from the coarser levels shown, as it is where no block is
+    /// stored. So both sides of a face between a shown block and a hidden one read the same values on it.
+    pub fn gather9_hiding(&self, l: usize, bc: IVec3, out: &mut [f32; 729], hidden: Option<&HashSet<Key>>) {
+        let nb: [Option<&Stored>; 8] = std::array::from_fn(|q| {
+            let c = bc + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32);
+            self.blocks[l].get(&c).filter(|_| !hidden.is_some_and(|h| h.contains(&(l as u8, c))))
+        });
         if nb.iter().all(|b| b.is_some()) {
             for z in 0..9usize {
                 for y in 0..9usize {
@@ -1008,7 +1054,13 @@ impl LevelVolume {
             }
             return;
         }
-        out.copy_from_slice(&self.grid(l, bc * B, bc * B + IVec3::splat(B), false).v);
+        out.copy_from_slice(&self.grid_hiding(l, bc * B, bc * B + IVec3::splat(B), false, hidden).v);
+    }
+
+    fn gather9_in(&self, l: usize, bc: IVec3, v: &Show) -> Box<[f32; 729]> {
+        let mut out = Box::new([0.0f32; 729]);
+        self.gather9_hiding(l, bc, &mut out, v.hidden);
+        out
     }
 
     pub fn gather9(&self, l: usize, bc: IVec3) -> Box<[f32; 729]> {
@@ -2652,7 +2704,7 @@ impl LevelVolume {
         let mut edits: Vec<(usize, IVec3, f32)> = Vec::new();
         for (r, cells) in &cells_of {
             // The samples at its cells' corners, where they are stored: the side with fewer is what the speck encloses.
-            let mut corners: Vec<(usize, IVec3)> = cells.iter().flat_map(|&(l, c)| (0..8).map(move |k| (l, c + IVec3::new(k & 1, (k >> 1) & 1, (k >> 2) & 1)))).map(|(l, p)| self.canonical(l, p, cap)).collect();
+            let mut corners: Vec<(usize, IVec3)> = cells.iter().flat_map(|&(l, c)| (0..8).map(move |k| (l, c + IVec3::new(k & 1, (k >> 1) & 1, (k >> 2) & 1)))).map(|(l, p)| self.canonical(l, p, &Show::upto(cap))).collect();
             corners.sort_unstable_by_key(|(l, p)| (*l, p.z, p.y, p.x));
             corners.dedup();
             let value = |(l, p): (usize, IVec3)| self.sample(l, p, false);
@@ -2694,9 +2746,9 @@ impl LevelVolume {
 
     /// The level and lattice point whose value level `l`'s point `i` takes in a view capped at `cap`: the finest level
     /// holding a block there.
-    fn canonical(&self, l: usize, i: IVec3, cap: usize) -> (usize, IVec3) {
+    fn canonical(&self, l: usize, i: IVec3, v: &Show) -> (usize, IVec3) {
         let (mut l, mut i) = (l, i);
-        while l < cap && self.blocks[l + 1].contains_key(&(i * 2).div_euclid(B3)) {
+        while self.shows(v, l + 1, (i * 2).div_euclid(B3)) {
             l += 1;
             i *= 2;
         }
@@ -2704,16 +2756,21 @@ impl LevelVolume {
     }
 
     /// Whether level `l`'s cell `q` is split by finer cells in a view capped at `cap`.
-    fn covered(&self, l: usize, q: IVec3, cap: usize) -> bool {
-        l < cap && self.blocks[l + 1].contains_key(&(q * 2).div_euclid(B3))
+    fn covered(&self, l: usize, q: IVec3, v: &Show) -> bool {
+        self.shows(v, l + 1, (q * 2).div_euclid(B3))
+    }
+
+    /// Whether the view `v` draws level `l`'s block `bc` (stored, not past the cap, not hidden).
+    fn shows(&self, v: &Show, l: usize, bc: IVec3) -> bool {
+        l <= v.cap && l < self.blocks.len() && self.blocks[l].contains_key(&bc) && !v.hidden.is_some_and(|h| h.contains(&(l as u8, bc)))
     }
 
     /// The smallest cell holding level `l`'s cell `q` (which must not be covered): its level and coordinates, if that
     /// level has a block there (level 0 cells of unstored blocks have none).
-    fn leaf_down(&self, l: usize, q: IVec3) -> Option<(usize, IVec3)> {
+    fn leaf_down(&self, l: usize, q: IVec3, v: &Show) -> Option<(usize, IVec3)> {
         for m in (0..=l).rev() {
             let c = q.div_euclid(IVec3::splat(1 << (l - m)));
-            if self.blocks[m].contains_key(&c.div_euclid(B3)) {
+            if self.shows(v, m, c.div_euclid(B3)) {
                 return Some((m, c));
             }
             if m == 0 {
@@ -2728,6 +2785,12 @@ impl LevelVolume {
     /// samples), and the finer blocks near it (whose first layer past them may fall where their level has no block and
     /// so read its level, interpolated).
     pub fn upload_set(&self, changed: &[Key]) -> Vec<Key> {
+        self.upload_set_in(changed, &Show::upto(self.levels() - 1))
+    }
+
+    /// [`Self::upload_set`] for a view `v` (whose samples are [`Self::gather9_hiding`] with its hidden blocks):
+    /// `changed` may also name blocks it began or stopped showing. Only blocks it shows are listed.
+    pub fn upload_set_in(&self, changed: &[Key], v: &Show) -> Vec<Key> {
         // Per changed block, in parallel, then merged.
         let mut v: Vec<Key> = changed.par_iter().flat_map_iter(|&(l8, bc)| {
             let mut out: Vec<Key> = Vec::new();
@@ -2737,7 +2800,7 @@ impl LevelVolume {
             }
             for o in 0..8 {
                 let n = bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1);
-                if self.blocks[l].contains_key(&n) {
+                if self.shows(v, l, n) {
                     out.push((l8, n));
                 }
             }
@@ -2753,12 +2816,12 @@ impl LevelVolume {
                     for q in 0..8 {
                         let c = *p * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
                         let (clo, chi) = (c * B, c * B + B3);
-                        if chi.cmplt(flo).any() || clo.cmpgt(fhi).any() || !self.blocks[m].contains_key(&c) {
+                        if chi.cmplt(flo).any() || clo.cmpgt(fhi).any() || !self.shows(v, m, c) {
                             continue;
                         }
                         // Only a block with a missing neighbour above it reads its first layer past it from coarser
                         // levels; one inside a finer region reads its neighbours, which this change leaves alone.
-                        if (1..8).any(|o| !self.blocks[m].contains_key(&(c + IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1)))) {
+                        if (1..8).any(|o| !self.shows(v, m, c + IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1))) {
                             out.push((m as u8, c));
                         }
                         next.push(c);
@@ -2783,7 +2846,12 @@ impl LevelVolume {
     /// or whose quads point at their vertices. That is, at every level, the stored blocks meeting a changed block's box
     /// grown by two of its cells.
     pub fn extract_set(&self, changed: &[Key], cap: usize) -> Vec<Key> {
-        let cap = cap.min(self.levels() - 1);
+        self.extract_set_in(changed, &Show::upto(cap))
+    }
+
+    /// [`Self::extract_set`] in the view `v`: `changed` may also name blocks the view began or stopped showing.
+    pub fn extract_set_in(&self, changed: &[Key], v: &Show) -> Vec<Key> {
+        let cap = v.cap.min(self.levels() - 1);
         // Per changed block, in parallel, then merged.
         let mut v: Vec<Key> = changed.par_iter().flat_map_iter(|&(l, bc)| {
             let mut out: Vec<Key> = Vec::new();
@@ -2802,14 +2870,14 @@ impl LevelVolume {
                     for y in a.y..=b.y {
                         for x in a.x..=b.x {
                             let c = IVec3::new(x, y, z);
-                            if self.blocks[m].contains_key(&c) {
+                            if self.shows(v, m, c) {
                                 out.push((m as u8, c));
                             }
                         }
                     }
                 }
             }
-            // Finer levels: stored descendants of the box, found through the nesting.
+            // Finer levels: shown descendants of the box, found through the nesting.
             let mut frontier: Vec<IVec3> = Vec::new();
             {
                 let (a, b) = (lo.div_euclid(B3), (hi - IVec3::ONE).div_euclid(B3));
@@ -2832,10 +2900,10 @@ impl LevelVolume {
                         if chi.cmple(flo).any() || clo.cmpge(fhi).any() {
                             continue;
                         }
-                        if self.blocks[m].contains_key(&c) {
+                        if self.shows(v, m, c) {
                             // Only a block at the edge of its region (a neighbour missing) reads coarser samples or
                             // points its quads at coarser cells; one inside it is untouched by a coarser change.
-                            if (0..27).any(|q| q != 13 && !self.blocks[m].contains_key(&(c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)))) {
+                            if (0..27).any(|q| q != 13 && !self.shows(v, m, c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1))) {
                                 out.push((m as u8, c));
                             }
                             next.push(c);
@@ -2867,24 +2935,29 @@ impl LevelVolume {
     ///   the edge's start, then the one below along the second axis, then below along the first, then below along both)
     ///   owns it; where two corners are one coarser cell the quad is a triangle.
     pub fn extract(&self, work: &[Key], cap: usize) -> (HashMap<Key, BlockSurface>, ExtractStats) {
+        self.extract_in(work, &Show::upto(cap))
+    }
+
+    /// [`Self::extract`] in the view `v`: the blocks of `work` it shows.
+    pub fn extract_in(&self, work: &[Key], v: &Show) -> (HashMap<Key, BlockSurface>, ExtractStats) {
         let t = Instant::now();
-        let cap = cap.min(self.levels() - 1);
+        let v = &Show { cap: v.cap.min(self.levels() - 1), hidden: v.hidden };
         let table = piece_table();
         let mut stats = ExtractStats::default();
-        let mut surf: HashMap<Key, BlockSurface> = work.par_iter().filter(|k| self.block(**k).is_some() && (k.0 as usize) <= cap).map(|&k| (k, self.block_vertices(k, cap, &table))).collect();
+        let mut surf: HashMap<Key, BlockSurface> = work.par_iter().filter(|k| self.shows(v, k.0 as usize, k.1)).map(|&k| (k, self.block_vertices(k, v, &table))).collect();
         // Quads read the vertices of blocks outside `work` too: extract those (vertices only) on demand.
         let mut extra: HashMap<Key, BlockSurface> = HashMap::default();
         let quads: Vec<(Key, Vec<[Corner; 4]>, usize)> = {
             let need: HashSet<Key> = work
                 .par_iter()
                 .filter(|k| surf.contains_key(k))
-                .flat_map_iter(|&k| self.quad_neighbours(k, cap))
+                .flat_map_iter(|&k| self.quad_neighbours(k, v))
                 .filter(|k| !surf.contains_key(k))
                 .collect();
-            extra.extend(need.into_par_iter().map(|k| (k, self.block_vertices(k, cap, &table))).collect::<Vec<_>>());
+            extra.extend(need.into_par_iter().map(|k| (k, self.block_vertices(k, v, &table))).collect::<Vec<_>>());
             let all = |k: &Key| surf.get(k).or(extra.get(k));
             work.par_iter().filter(|k| surf.contains_key(k)).map(|&k| {
-                let (q, dropped) = self.block_quads(k, cap, &table, &all);
+                let (q, dropped) = self.block_quads(k, v, &table, &all);
                 (k, q, dropped)
             }).collect()
         };
@@ -2906,19 +2979,19 @@ impl LevelVolume {
     }
 
     /// Blocks whose vertices block `k`'s quads can point at: the stored blocks around it at its level and coarser.
-    fn quad_neighbours(&self, k: Key, cap: usize) -> Vec<Key> {
+    fn quad_neighbours(&self, k: Key, v: &Show) -> Vec<Key> {
         let (l, bc) = (k.0 as usize, k.1);
         let mut out = Vec::new();
         let lo = bc * B - IVec3::ONE;
         let hi = bc * B + B3;
-        for m in 0..=l.min(cap) {
+        for m in 0..=l.min(v.cap) {
             let s = 1i32 << (l - m);
             let (a, b) = (lo.div_euclid(IVec3::splat(s)).div_euclid(B3), hi.div_euclid(IVec3::splat(s)).div_euclid(B3));
             for z in a.z..=b.z {
                 for y in a.y..=b.y {
                     for x in a.x..=b.x {
                         let c = IVec3::new(x, y, z);
-                        if self.blocks[m].contains_key(&c) {
+                        if self.shows(v, m, c) {
                             out.push((m as u8, c));
                         }
                     }
@@ -2929,8 +3002,8 @@ impl LevelVolume {
     }
 
     /// The value at level `l`'s point `i` for a cell of block `bc` (whose 9x9x9 samples are `g`).
-    fn corner_value(&self, l: usize, bc: IVec3, g: &[f32; 729], i: IVec3, cap: usize) -> f32 {
-        let (m, j) = self.canonical(l, i, cap);
+    fn corner_value(&self, l: usize, bc: IVec3, g: &[f32; 729], i: IVec3, v: &Show) -> f32 {
+        let (m, j) = self.canonical(l, i, v);
         if m > l {
             return as_held(self.blocks[m][&j.div_euclid(B3)][local(j)], self.band(m));
         }
@@ -2938,11 +3011,11 @@ impl LevelVolume {
         g[(d.z * 81 + d.y * 9 + d.x) as usize]
     }
 
-    fn block_vertices(&self, k: Key, cap: usize, table: &[u32; 256]) -> BlockSurface {
+    fn block_vertices(&self, k: Key, v: &Show, table: &[u32; 256]) -> BlockSurface {
         let (l, bc) = (k.0 as usize, k.1);
         // Every value as the GPU's 16-bit samples hold it, so that the surface here is the GPU's to the last bit of
         // arithmetic: a value interpolated from full-precision samples can land on the other side of zero.
-        let mut g = self.gather9(l, bc);
+        let mut g = self.gather9_in(l, bc, v);
         let held_band = self.band(l);
         for v in g.iter_mut() {
             *v = as_held(*v, held_band);
@@ -2952,12 +3025,12 @@ impl LevelVolume {
         let mut out = BlockSurface { cells: vec![0; N], ..Default::default() };
         // Which level `l` cells around the block are split by finer ones: a 10x10x10 neighbourhood.
         let mut finer = [false; 1000];
-        if l < cap {
+        if l < v.cap {
             for z in -1..9 {
                 for y in -1..9 {
                     for x in -1..9 {
                         let q = base + IVec3::new(x, y, z);
-                        finer[((z + 1) * 100 + (y + 1) * 10 + (x + 1)) as usize] = self.covered(l, q, cap);
+                        finer[((z + 1) * 100 + (y + 1) * 10 + (x + 1)) as usize] = self.covered(l, q, v);
                     }
                 }
             }
@@ -2971,9 +3044,9 @@ impl LevelVolume {
                 continue;
             }
             // Within the band, as the GPU's 16-bit samples hold them: mid-stroke, fresh clay can lie past it.
-            let d: [f32; 8] = std::array::from_fn(|q| self.corner_value(l, bc, &g, base + c + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32), cap).clamp(-band, band));
+            let d: [f32; 8] = std::array::from_fn(|q| self.corner_value(l, bc, &g, base + c + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32), v).clamp(-band, band));
             let config = (0..8).fold(0u32, |a, q| a | ((d[q] < 0.0) as u32) << q);
-            let transition = l < cap && (0..27).any(|q| q != 13 && fin(c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)));
+            let transition = l < v.cap && (0..27).any(|q| q != 13 && fin(c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)));
             let corner_pos = |q: usize| Vec3::new(corner(q)[0] as f32, corner(q)[1] as f32, corner(q)[2] as f32);
             // Where in the cell each of its vertices lies.
             let mut at: Vec<Vec3> = Vec::with_capacity(4);
@@ -2985,8 +3058,8 @@ impl LevelVolume {
                 let half = |h: IVec3| -> f32 {
                     // `h` in half-cell units (0..2 per axis).
                     let p = (base + c) * 2 + h;
-                    let (m, j) = self.canonical(l + 1, p, cap);
-                    if m > l + 1 || self.blocks[l + 1].contains_key(&p.div_euclid(B3)) {
+                    let (m, j) = self.canonical(l + 1, p, v);
+                    if m > l + 1 || self.shows(v, l + 1, p.div_euclid(B3)) {
                         let j = if m > l + 1 { j } else { p };
                         // As the 16-bit samples hold it (within the band: mid-stroke, carried detail can lie past it).
                         let m = m.max(l + 1);
@@ -2995,8 +3068,8 @@ impl LevelVolume {
                     trilinear(h.as_vec3() * 0.5, d)
                 };
                 for axis in 0..3 {
-                    let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
-                    // Half-edges along `axis` on the cell's boundary: those with u or v at 0 or 2.
+                    let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+                    // Half-edges along `axis` on the cell's boundary: those with u or w at 0 or 2.
                     for a in 0..3 {
                         for b in 0..3 {
                             if a == 1 && b == 1 {
@@ -3005,7 +3078,7 @@ impl LevelVolume {
                             for s in 0..2 {
                                 let mut p0 = IVec3::ZERO;
                                 p0[u] = a;
-                                p0[v] = b;
+                                p0[w] = b;
                                 p0[axis] = s;
                                 let mut p1 = p0;
                                 p1[axis] += 1;
@@ -3081,16 +3154,16 @@ impl LevelVolume {
         Some((key, local(q) as u16, piece as u8))
     }
 
-    fn block_quads<'a>(&self, k: Key, cap: usize, table: &[u32; 256], surf: &impl Fn(&Key) -> Option<&'a BlockSurface>) -> (Vec<[Corner; 4]>, usize) {
+    fn block_quads<'a>(&self, k: Key, v: &Show, table: &[u32; 256], surf: &impl Fn(&Key) -> Option<&'a BlockSurface>) -> (Vec<[Corner; 4]>, usize) {
         let (l, bc) = (k.0 as usize, k.1);
-        let g = self.gather9(l, bc);
+        let g = self.gather9_in(l, bc, v);
         let base = bc * B;
         let mut out = Vec::new();
         let mut dropped = 0;
         let Some(me) = surf(&k) else { return (out, 0) };
         for i in 0..N {
             let c = base + cell_of(i);
-            if self.covered(l, c, cap) {
+            if self.covered(l, c, v) {
                 continue;
             }
             // Its crossing edges have both ends at its corners: none when they are all one sign.
@@ -3104,22 +3177,22 @@ impl LevelVolume {
                 let start = c + IVec3::new(ca[0] as i32, ca[1] as i32, ca[2] as i32);
                 let mut end = start;
                 end[axis] += 1;
-                let va = self.corner_value(l, bc, &g, start, cap);
-                let vb = self.corner_value(l, bc, &g, end, cap);
+                let va = self.corner_value(l, bc, &g, start, v);
+                let vb = self.corner_value(l, bc, &g, end, v);
                 if (va < 0.0) == (vb < 0.0) {
                     continue;
                 }
-                let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+                let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
                 let mut eu = IVec3::ZERO;
                 eu[u] = 1;
                 let mut ev = IVec3::ZERO;
-                ev[v] = 1;
+                ev[w] = 1;
                 // The four cells around the edge, in quad order, and the corner each starts the edge at.
                 let around = [start - eu - ev, start - ev, start, start - eu];
-                if around.iter().any(|&q| self.covered(l, q, cap)) {
+                if around.iter().any(|&q| self.covered(l, q, v)) {
                     continue;
                 }
-                let level_of = |q: IVec3| self.leaf_down(l, q).map(|(m, _)| m);
+                let level_of = |q: IVec3| self.leaf_down(l, q, v).map(|(m, _)| m);
                 // The owner: the first at this level in the order start, below along v, below along u, below along both.
                 let owner = [2usize, 1, 3, 0].into_iter().find(|&j| level_of(around[j]) == Some(l));
                 if owner.map(|j| around[j]) != Some(c) {
@@ -3128,7 +3201,7 @@ impl LevelVolume {
                 let corners: Option<Vec<Corner>> = around
                     .iter()
                     .map(|&q| {
-                        let (m, qc) = self.leaf_down(l, q)?;
+                        let (m, qc) = self.leaf_down(l, q, v)?;
                         let edge = (m == l).then(|| {
                             let lo = start - q;
                             let k0 = (lo.x | lo.y << 1 | lo.z << 2) as usize;
@@ -3149,8 +3222,13 @@ impl LevelVolume {
 
     /// The whole surface (levels up to `cap`) as one mesh, for pictures, checks and export.
     pub fn surface(&self, cap: usize) -> (PolyMesh, ExtractStats) {
+        self.surface_in(&Show::upto(cap))
+    }
+
+    /// [`Self::surface`] in the view `v`.
+    pub fn surface_in(&self, v: &Show) -> (PolyMesh, ExtractStats) {
         let work: Vec<Key> = self.keys();
-        let (surf, stats) = self.extract(&work, cap);
+        let (surf, stats) = self.extract_in(&work, v);
         let mut first: HashMap<Key, u32> = HashMap::default();
         let mut positions = Vec::new();
         let mut keys: Vec<&Key> = surf.keys().collect();

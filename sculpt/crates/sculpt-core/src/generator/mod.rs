@@ -36,6 +36,7 @@ pub mod density;
 pub mod instances;
 pub mod layer;
 pub mod detail_layer;
+pub mod level_view;
 pub mod level_volume;
 pub mod levels;
 pub mod mapping;

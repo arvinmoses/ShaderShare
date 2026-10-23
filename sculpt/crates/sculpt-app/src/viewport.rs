@@ -370,7 +370,7 @@ impl Viewport {
 
     /// Bring the volume playground's surface up to date: send the blocks that changed and rebuild the surface around them
     /// on the GPU (everything, for a new volume or a new level cap).
-    pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode) {
+    pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode, eye: glam::Vec3, focal_px: f32) {
         let t = Instant::now();
         if self.volume.as_ref().is_none_or(|v| v.generation != mode.generation) {
             let gpu = crate::gpu_levels::GpuLevels::new(&rs.device, &rs.queue, &mode.vol, mode.cap);
@@ -380,7 +380,11 @@ impl Viewport {
         }
         let v = self.volume.as_mut().unwrap();
         v.gpu.set_cap(mode.cap);
+        v.gpu.view.on = mode.by_distance;
+        v.gpu.view.tau_px = mode.level_px;
+        v.gpu.set_eye(eye, focal_px);
         let s = v.gpu.sync(&mut mode.vol);
+        mode.view = v.gpu.view.stats;
         if v.gpu.buffers_made != v.buffers_made {
             v.group = Self::levels_group(&rs.device, &self.levels_bgl, &v.uniforms, &v.gpu);
             v.buffers_made = v.gpu.buffers_made;
