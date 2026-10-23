@@ -1204,6 +1204,9 @@ impl SculptApp {
             if let Some(t) = f.tint {
                 m.tint = t;
             }
+            if let Some(on) = f.by_distance {
+                m.by_distance = on;
+            }
         }
         if let (Some(on), Some(vp)) = (f.cull, self.viewport.as_mut()) {
             vp.cull = on;

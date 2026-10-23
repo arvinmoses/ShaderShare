@@ -54,6 +54,8 @@ enum Act {
     CapSweep(usize, usize),
     Tint(bool),
     Cull(bool),
+    /// Choosing the level by distance on or off.
+    ByDistance(bool),
     /// Move the work at this level and finer into a detail layer.
     MakeLayer(usize),
     /// What strokes work on, with a detail layer.
@@ -89,6 +91,7 @@ pub struct Frame {
     pub add_layer: Option<usize>,
     pub layer_visible: Option<(usize, bool)>,
     pub cull: Option<bool>,
+    pub by_distance: Option<bool>,
     pub undo: bool,
     pub redo: bool,
 }
@@ -200,10 +203,22 @@ impl VolumeDemo {
         at(98.5, 8.0, Caption("Each block's surface is a cluster: those out of view or facing away are skipped (see the pages drawn)"));
         at(101.0, 0.0, Cull(false));
         at(103.0, 0.0, Cull(true));
-        at(103.5, 3.0, Camera(Pose::whole(3.4, 2.2, 0.1)));
-        at(106.5, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
-        at(106.5, 3.0, Caption("Next: the level per region by distance, and the layers' work on the GPU"));
-        let end = 110.0;
+        // The level by distance.
+        at(103.5, 2.5, Camera(Pose::at(patch, 0.6)));
+        at(103.5, 0.0, Tint(true));
+        at(104.0, 6.0, Caption("The level by distance: each region shows only the levels whose detail would show on screen from here (tinted by level)"));
+        at(106.5, 9.0, Camera(Pose::at(patch, 9.0)));
+        at(110.0, 6.0, Caption("Pulling back, the fine levels hand over to coarser ones as their detail drops under a pixel: the readout counts the blocks left out"));
+        at(116.0, 0.0, ByDistance(false));
+        at(116.0, 2.5, Caption("Off: every level drawn, from afar too"));
+        at(118.5, 0.0, ByDistance(true));
+        at(118.5, 2.0, Caption("On again"));
+        at(120.5, 2.5, Camera(Pose::at(patch, 0.6)));
+        at(120.5, 3.0, Caption("Back in close, the detail is all there"));
+        at(124.0, 0.0, Tint(false));
+        at(124.0, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
+        at(124.0, 3.0, Caption("Next: generator layers in the stack, and the layers' work on the GPU"));
+        let end = 127.5;
         let n = items.len();
         VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
     }
@@ -290,6 +305,7 @@ impl VolumeDemo {
                         Act::AddLayer(l) => f.add_layer = Some(l),
                         Act::LayerVisible(k, on) => f.layer_visible = Some((k, on)),
                         Act::Cull(on) => f.cull = Some(on),
+                        Act::ByDistance(on) => f.by_distance = Some(on),
                         Act::Undo => f.undo = true,
                         Act::Redo => f.redo = true,
                         _ => continue,

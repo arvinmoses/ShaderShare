@@ -274,6 +274,39 @@ patch before the big stroke, under it as one volume (buried), and under it with 
 Not done yet: merging the layers back resets undo; layers per region of the form (a layer is the whole volume's);
 the layers' following and composing on the GPU.
 
+## The level by distance
+
+Each region of the view shows only the levels whose detail would show on screen from where the eye is ("Level by
+distance" in the Mesh menu, on by default, with the pixels it takes):
+
+* **The measure.** A block above level 0 holds detail over the level below; how far its surface lies from that
+  level's is stored per block, and per block the most its own detail and that of any block under it add up to. A
+  block shows while that comes to more than a pixel (by default) at its distance from the eye, and goes once it falls
+  under half that, so a slowly moving camera does not make blocks flicker. Level 0 always shows.
+* **Hidden blocks are as if not stored.** What is hidden nests (a hidden block's finer blocks go with it), so the
+  surface's rules, which only ask which blocks are there, close it as they close the stored surface. The one thing a
+  hidden block changes for its shown neighbours is the first layer of samples past them: read as interpolated from
+  the coarser levels, as it is where nothing is stored, so both sides of a face agree on it (read from the hidden
+  block's own samples, the far view opened 11 edges in the test). On the GPU a hidden block gives up its slot, and
+  showing it again uploads it, as a block that came or went does; the shaders are unchanged.
+* **Measured after it changes.** A changed block's detail is measured again a few hundred blocks a frame, in parallel,
+  and not while the stroke under way keeps changing it; until then it counts as unbounded and shows, so the block
+  being sculpted always does.
+* **Cost.** At about 1M triangles at level 0 with five finer levels (the bench): choosing takes 0.4-1 ms when the
+  camera moves and nothing when it does not; a dab's sync costs 1.3-1.8 ms against 1.1-1.4 ms with every level shown;
+  moving the camera from 2.6 to 1.15 away shows 1,100 blocks again in one 9 ms sync. From 8 away, 4,700 of the 5,000
+  finer blocks are left to coarser levels.
+* **Seen.** `volume/level_by_distance.png` (from the review, tinted by level): close in, the patch's levels; pulled
+  back, none of the finer levels drawn (9.8k of 18.6k pages); off, every level drawn from afar too (14.0k of 22.8k
+  pages); close in again, all there.
+* **Tests.** `tests/level_view.rs`: near work shows and far work falls back (from afar the view is level 0's exactly),
+  the surface closes in every view, a block being sculpted shows until measured, and rebuilding only around the
+  blocks shown or hidden (with strokes between camera moves) matches rebuilding everything. The GPU check
+  (`--gpu-levels-check`) compares six views from near and far, with strokes between, against the reference exactly.
+
+Not done yet: a triangle budget (raising the pixels when a view would draw too much), blending between levels as
+they hand over (a block appears or goes at once, about a pixel's change), and choosing by occlusion.
+
 ## Driver workarounds (Vulkan, this AMD driver)
 
 Two things in the compute shaders lost the device or silently gave wrong results on Vulkan while DX12 was fine:
@@ -284,9 +317,8 @@ one array of atomics at fixed places. The exact check runs on both backends.
 
 ## Known gaps
 
-* **Level choice is per stroke, display cap is global.** The view shows every level, or all levels up to a cap set in
-  the Mesh menu. Choosing the level per region by distance and by how much detail it holds (the error per block is
-  stored for it), and a vertex budget, are next.
+* **Level choice by distance has no triangle budget yet** (see the level by distance): a view of a lot of near
+  detail draws all of it.
 * **No occlusion culling yet**, only view and facing.
 * **Starting a stroke right after a big one waits** for the last one's end (up to about 0.3 s after a big stroke
   over detail, if the pen comes down at once).
