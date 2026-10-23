@@ -192,3 +192,426 @@ fn the_mask_fades_a_rock_away() {
     assert_eq!((open, dropped), (0, 0));
     let _ = Quat::IDENTITY;
 }
+
+/// At the app's scale: adding a generator, dragging its size, a seed change (scattered again), and a big form stroke
+/// under it, timed.
+#[test]
+#[ignore]
+fn timing_at_app_scale() {
+    use std::time::Instant;
+    let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, 0.0035 * 2.0, 6);
+    let mut l = Layered::new(&mut s, 5);
+    let size = 4.0 * s.voxel(0);
+    let spec = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 1, size, lift: 0.15, random_spin: true, min_spacing: 3.0 * size, size_var: 0.4, stretch_var: 0.35, tilt: 25.0, blend: 0.3, ..GeneratorSpec::default() };
+    for level in [1usize, 2, 3] {
+        let t = Instant::now();
+        let k = l.add_generator(&mut s, "Rocks", level, &spec);
+        let add = t.elapsed().as_secs_f64() * 1e3;
+        let mut drag = Vec::new();
+        l.begin_edit();
+        for i in 1..=5 {
+            let t = Instant::now();
+            l.preview_generator(&mut s, k, &GeneratorSpec { size: size * (1.0 + 0.05 * i as f32), ..spec.clone() });
+            drag.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let t = Instant::now();
+        l.end_edit_in(&mut s);
+        let release = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        l.set_generator(&mut s, k, &GeneratorSpec { seed: 9, ..spec.clone() });
+        let reseed = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!("level {level}: {} blocks; add {add:.0} ms, size drag (preview) {drag:.0?} ms, at its level on release {release:.0} ms, new seed {reseed:.0} ms", l.layers()[k].blocks);
+        l.remove_layer(&mut s, k);
+    }
+}
+
+#[test]
+fn a_previewed_drag_ends_as_the_edit_made_at_once() {
+    let mut a = Lv::ball();
+    let k = a.add(3, &rocks());
+    let to = GeneratorSpec { size: 0.1 + 0.005 * 4.0, ..rocks() };
+    a.l.begin_edit();
+    for i in 1..=4 {
+        a.l.preview_generator(&mut a.s, k, &GeneratorSpec { size: 0.1 + 0.005 * i as f32, ..rocks() });
+    }
+    a.l.end_edit_in(&mut a.s);
+    let mut b = Lv::ball();
+    let kb = b.add(3, &rocks());
+    b.l.set_generator(&mut b.s, kb, &to);
+    assert!(surface_key(&a.s, 3) == surface_key(&b.s, 3), "the drag ended elsewhere");
+    // One undo takes the whole drag back.
+    a.l.undo(&mut a.s);
+    let mut c = Lv::ball();
+    c.add(3, &rocks());
+    assert!(surface_key(&a.s, 3) == surface_key(&c.s, 3), "undo did not take the drag back whole");
+}
+
+/// Fine detail in layers (at two levels) under rocks: every rock stays round over it.
+#[test]
+fn rocks_over_detail_layers_stay_whole() {
+    let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+    // Fine work over the front, at levels 2 and 3, then layers made of it.
+    s.begin_stroke();
+    for i in 0..60 {
+        let a = i as f32 * 0.37;
+        let p = Vec3::new(0.25 * a.cos() * (i as f32 / 60.0), 0.25 * a.sin() * (i as f32 / 60.0), 1.0).normalize();
+        s.ball_dab(3, p * 1.002, 0.02, 0.004, i % 2 == 0);
+        s.ball_dab(2, p * 1.004, 0.05, 0.01, false);
+    }
+    s.end_stroke();
+    let mut l = Layered::new(&mut s, 2);
+    let spec = GeneratorSpec { count: 300, min_spacing: 0.13, size: 0.06, ..rocks() };
+    for level in [0usize, 1, 2] {
+        let k = l.add_generator(&mut s, "Rocks", level, &spec);
+        let bad: Vec<(Vec3, f32)> = l.generator_instances(k).iter().map(|i| (i.translation, top(&s, i, 3))).filter(|(_, t)| (t - 0.06).abs() > 0.006).collect();
+        let front = l.generator_instances(k).iter().filter(|i| i.translation.z > 0.85).count();
+        eprintln!("generator at level {level}: {front} rocks over the front; tops off: {bad:?}");
+        let (open, _, dropped) = closed(&s, 3);
+        assert_eq!((open, dropped), (0, 0));
+        assert!(bad.is_empty(), "level {level}: rocks not whole over the detail");
+        l.remove_layer(&mut s, k);
+    }
+}
+
+/// Rocks with a wide blend over form blocks of a finer level and over detail layers, pictured
+/// (`SCULPT_GEN_PICTURE=dir`): the shown surface from the front, shaded, finest and level 0 alone.
+#[test]
+#[ignore]
+fn picture_a_wide_blend() {
+    let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+    s.begin_stroke();
+    for i in 0..30 {
+        let p = Vec3::new(-0.3 + 0.02 * i as f32, 0.05 * (i as f32 * 0.7).sin(), 1.0).normalize();
+        s.ball_dab(1, p * 1.003, 0.06, 0.012, false);
+    }
+    for i in 0..60 {
+        let a = i as f32 * 0.37;
+        let p = Vec3::new(0.3 * a.cos() * (i as f32 / 60.0), 0.3 * a.sin() * (i as f32 / 60.0), 1.0).normalize();
+        s.ball_dab(3, p * 1.002, 0.02, 0.004, i % 2 == 0);
+        s.ball_dab(2, p * 1.004, 0.05, 0.01, false);
+    }
+    s.end_stroke();
+    let mut l = Layered::new(&mut s, 2);
+    let spec = GeneratorSpec { count: 300, min_spacing: 0.13, size: 0.06, blend: 0.6, ..rocks() };
+    l.add_generator(&mut s, "Rocks", 0, &spec);
+    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(".".into());
+    let n = 500;
+    for cap in [0usize, 3] {
+        let mut img = vec![0u8; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let (px, py) = (-0.4 + 0.8 * x as f32 / n as f32, 0.4 - 0.8 * y as f32 / n as f32);
+                if let Some((_, nrm)) = s.raycast(Vec3::new(px, py, 3.0), -Vec3::Z, cap, false) {
+                    let lgt = Vec3::new(-0.4, 0.5, 0.8).normalize();
+                    img[y * n + x] = (40.0 + 215.0 * nrm.dot(lgt).max(0.0)) as u8;
+                }
+            }
+        }
+        let mut out = format!("P5 {n} {n} 255
+").into_bytes();
+        out.extend(img);
+        std::fs::write(format!("{dir}/blend_cap{cap}.pgm"), out).unwrap();
+    }
+}
+
+/// A dumped volume (`SCULPT_GEN_DUMP=file.svol`) pictured around a direction (`SCULPT_GEN_AT=x,y,z`) at every cap, into
+/// `SCULPT_GEN_PICTURE`.
+#[test]
+#[ignore]
+fn picture_a_dump() {
+    let path = std::env::var("SCULPT_GEN_DUMP").expect("SCULPT_GEN_DUMP");
+    let v = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(path).unwrap()), 6).unwrap();
+    let at: Vec<f32> = std::env::var("SCULPT_GEN_AT").unwrap_or("0.3,0.34,0.89".into()).split(',').map(|x| x.parse().unwrap()).collect();
+    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(".".into());
+    let w = Vec3::new(at[0], at[1], at[2]).normalize();
+    let u = w.any_orthonormal_vector();
+    let t = w.cross(u);
+    let half: f32 = std::env::var("SCULPT_GEN_HALF").ok().and_then(|x| x.parse().ok()).unwrap_or(0.25);
+    let n = 500;
+    for cap in 0..v.levels() {
+        let mut img = vec![0u8; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let (a, b) = (-half + 2.0 * half * x as f32 / n as f32, half - 2.0 * half * y as f32 / n as f32);
+                let o = w * 2.0 + u * a + t * b;
+                if let Some((_, nrm)) = v.raycast(o, -w, cap, false) {
+                    let lgt = (w * 0.8 + u * -0.4 + t * 0.5).normalize();
+                    img[y * n + x] = (40.0 + 215.0 * nrm.dot(lgt).max(0.0)) as u8;
+                }
+            }
+        }
+        let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+        out.extend(img);
+        std::fs::write(format!("{dir}/dump_cap{cap}.pgm"), out).unwrap();
+    }
+    eprintln!("blocks per level {:?}", v.memory().0);
+}
+
+/// The review's edits in order (count 12, 30, 60, size 1.5 times, blend 0.6) over detail layers at levels 4 and 5:
+/// level 0 holds every rock whole after each.
+#[test]
+fn the_reviews_edits_keep_every_rock_whole_at_level_0() {
+    let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 6);
+    s.begin_stroke();
+    for i in 0..80 {
+        let a = i as f32 * 0.37;
+        let p = Vec3::new(0.2 * a.cos() * (i as f32 / 80.0), 0.2 * a.sin() * (i as f32 / 80.0), 1.0).normalize();
+        s.ball_dab(5, p * 1.0005, 0.004, 0.001, i % 2 == 0);
+        s.ball_dab(4, p * 1.001, 0.01, 0.002, false);
+    }
+    s.end_stroke();
+    let mut l = Layered::new(&mut s, 4);
+    let size = 0.03 * 2.6;
+    let mut spec = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 1, size, lift: 0.15, random_spin: true, min_spacing: 3.0 * size, size_var: 0.4, stretch_var: 0.35, tilt: 25.0, blend: 0.3, ..GeneratorSpec::default() };
+    let k = l.add_generator(&mut s, "Generator 1", 0, &spec);
+    let edits: [fn(&mut GeneratorSpec); 4] = [|s| s.count = 30, |s| s.count = 60, |s| s.size *= 1.5, |s| s.blend = 0.6];
+    for (e, edit) in edits.iter().enumerate() {
+        edit(&mut spec);
+        l.set_generator(&mut s, k, &spec);
+        // Against composing it afresh on the same stack: the same at level 0.
+        let mut fresh = Vec::new();
+        l.write_to(&mut fresh).unwrap();
+        let (again, _) = Layered::read_from(&mut &fresh[..], 6).unwrap();
+        let most = s.level_keys(0).iter().map(|bc| {
+            let (a, b) = (s.block((0, *bc)).unwrap(), again.block((0, *bc)));
+            b.map_or(f32::INFINITY, |b| a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max))
+        }).fold(0.0f32, f32::max);
+        let (mut extra, mut missing) = (0, 0);
+        for l in 0..s.levels() {
+            let (a, b): (std::collections::HashSet<_>, std::collections::HashSet<_>) = (s.level_keys(l).into_iter().map(|v| v.to_array()).collect(), again.level_keys(l).into_iter().map(|v| v.to_array()).collect());
+            extra += a.difference(&b).count();
+            missing += b.difference(&a).count();
+        }
+        eprintln!("edit {}: level 0 against composing afresh: at most {most:.5} apart; blocks only live {extra}, only afresh {missing}", e + 1);
+        assert!(most < 1e-3, "edit {}: level 0 differs from composing afresh by {most}", e + 1);
+        assert_eq!((extra, missing), (0, 0), "edit {}: the blocks differ from composing afresh", e + 1);
+    }
+}
+
+/// Jumps across level 0's block faces in a dump (`SCULPT_GEN_DUMP`): where neighbouring samples differ by more than a
+/// distance field's would.
+#[test]
+#[ignore]
+fn jumps_in_a_dump() {
+    let path = std::env::var("SCULPT_GEN_DUMP").expect("SCULPT_GEN_DUMP");
+    let v = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(path).unwrap()), 6).unwrap();
+    let vx = v.voxel(0);
+    let mut out = Vec::new();
+    for bc in v.level_keys(0) {
+        let a = v.block((0, bc)).unwrap();
+        for axis in 0..3 {
+            let mut o = glam::IVec3::ZERO;
+            o[axis] = 1;
+            let Some(b) = v.block((0, bc + o)) else { continue };
+            let mut worst = 0.0f32;
+            for p in 0..8 {
+                for q in 0..8 {
+                    let (mut i, mut j) = (glam::IVec3::ZERO, glam::IVec3::ZERO);
+                    i[axis] = 7;
+                    i[(axis + 1) % 3] = p;
+                    i[(axis + 2) % 3] = q;
+                    j[(axis + 1) % 3] = p;
+                    j[(axis + 2) % 3] = q;
+                    let (x, y) = (a[(i.x + 8 * i.y + 64 * i.z) as usize], b[(j.x + 8 * j.y + 64 * j.z) as usize]);
+                    if x.abs() < 0.5 * v.band(0) || y.abs() < 0.5 * v.band(0) {
+                        worst = worst.max((x - y).abs() / vx);
+                    }
+                }
+            }
+            if worst > 1.6 {
+                out.push((worst, bc, axis, v.origin() + (bc * 8).as_vec3() * vx));
+            }
+        }
+    }
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    eprintln!("{} faces jump; worst: {:?}", out.len(), &out[..out.len().min(12)]);
+}
+
+/// Along one pixel's ray of [`picture_a_dump`] (`SCULPT_GEN_PIXEL=x,y`): level 0's field, and its blocks.
+#[test]
+#[ignore]
+fn ray_in_a_dump() {
+    let path = std::env::var("SCULPT_GEN_DUMP").expect("SCULPT_GEN_DUMP");
+    let v = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(path).unwrap()), 6).unwrap();
+    let px: Vec<f32> = std::env::var("SCULPT_GEN_PIXEL").unwrap().split(',').map(|x| x.parse().unwrap()).collect();
+    let w = Vec3::new(0.3, 0.34, 0.89).normalize();
+    let u = w.any_orthonormal_vector();
+    let t = w.cross(u);
+    let (half, n) = (0.35f32, 500.0f32);
+    let (a, b) = (-half + 2.0 * half * px[0] / n, half - 2.0 * half * px[1] / n);
+    let o = w * 2.0 + u * a + t * b;
+    let hit = v.raycast(o, -w, 0, false);
+    eprintln!("hit {hit:?}");
+    let Some((h, _)) = hit else { return };
+    for k in -12..=12 {
+        let p = h + w * (k as f32 * 0.005);
+        let bc = ((p - v.origin()) / (v.voxel(0) * 8.0)).floor().as_ivec3();
+        eprintln!("  {:+.3}: level 0 {:+.4}, block {bc} stored {}", k as f32 * 0.005, v.value_upto(p, 0, false), v.exists(0, bc));
+    }
+}
+
+/// A live dump (`SCULPT_GEN_DUMP`) against its layers (`SCULPT_GEN_LAYERS`) composed afresh: the level 0 blocks that
+/// differ, and whether the generators' blocks hold them.
+#[test]
+#[ignore]
+fn live_against_afresh() {
+    let open = |v: &str| std::io::BufReader::new(std::fs::File::open(std::env::var(v).unwrap()).unwrap());
+    let live = LevelVolume::read_from(&mut open("SCULPT_GEN_DUMP"), 6).unwrap();
+    let (afresh, layered) = Layered::read_from(&mut open("SCULPT_GEN_LAYERS"), 6).unwrap();
+    let layered = layered.unwrap();
+    let gens: Vec<usize> = layered.layers().iter().enumerate().filter(|(_, x)| x.generator).map(|(k, _)| k).collect();
+    eprintln!("layers {:?}", layered.layers().iter().map(|x| (x.name.clone(), x.level, x.blocks, x.generator)).collect::<Vec<_>>());
+    for l in 0..live.levels() {
+        let mut keys: Vec<_> = live.level_keys(l);
+        keys.extend(afresh.level_keys(l));
+        keys.sort_unstable_by_key(|k| (k.z, k.y, k.x));
+        keys.dedup();
+        let mut differ = Vec::new();
+        for bc in keys {
+            let (a, b) = (live.block((l as u8, bc)), afresh.block((l as u8, bc)));
+            let d = match (a, b) {
+                (Some(a), Some(b)) => a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max),
+                _ => f32::INFINITY,
+            };
+            if d > 1e-3 {
+                differ.push((bc, d, a.is_some(), b.is_some()));
+            }
+        }
+        eprintln!("level {l}: {} blocks differ; first {:?}", differ.len(), &differ[..differ.len().min(6)]);
+        if !differ.is_empty() {
+            let inst = layered.generator_instances(gens[0]);
+            let size = live.voxel(l) * 8.0;
+            let near = differ.iter().filter(|(bc, ..)| {
+                let c = live.origin() + (bc.as_vec3() + Vec3::splat(0.5)) * size;
+                inst.iter().any(|i| { let b = i.aabb(); (c.clamp(b.min, b.max) - c).length() < 0.1 })
+            }).count();
+            let form = differ.iter().filter(|(bc, ..)| layered.form().exists(l, *bc)).count();
+            let stale_values = differ.iter().filter(|(bc, ..)| {
+                let (a, f) = (live.block((l as u8, *bc)), layered.form().block((l as u8, *bc)));
+                a.zip(f).is_some_and(|(a, f)| a.iter().zip(f.iter()).any(|(x, y)| (x - y).abs() > 1e-4))
+            }).count();
+            eprintln!("   of them near a rock {near}; the form's own {form}; differing from the form's {stale_values}");
+        }
+    }
+    // Lattice points across the first notch's jump: stored, against the form joined with the rocks by hand.
+    {
+        let spec = layered.generator(gens[0]).unwrap().clone();
+        let inst = layered.generator_instances(gens[0]);
+        let k = spec.blend * spec.size;
+        let set = sculpt_core::generator::InstanceSet::new(inst.clone(), k);
+        let v0 = afresh.voxel(0);
+        let p0 = Vec3::new(0.5378121, 0.47325364, 1.0140688) + Vec3::new(0.3, 0.34, 0.89).normalize() * 0.027;
+        let g = ((p0 - afresh.origin()) / v0).round().as_ivec3();
+        for dz in -2..=2 {
+            for dy in -2..=2 {
+                let i = g + glam::IVec3::new(0, dy, dz);
+                let p = afresh.origin() + i.as_vec3() * v0;
+                let bc = i.div_euclid(glam::IVec3::splat(8));
+                let l = i.rem_euclid(glam::IVec3::splat(8));
+                let stored = afresh.block((0, bc)).map(|b| b[(l.x + 8 * l.y + 64 * l.z) as usize]);
+                let c = layered.form().block((0, bc)).map(|b| b[(l.x + 8 * l.y + 64 * l.z) as usize]);
+                let d = (0..set.len() as u32).map(|j| set.sdf(j, p)).fold(f32::INFINITY, |a, b| if a.is_infinite() { b } else { sculpt_core::generator::volume_gen::smin(a, b, k) });
+                let want = c.map(|c| sculpt_core::generator::volume_gen::smin(c, d, k));
+                eprintln!("  point {i} (block {bc}): stored {stored:?}, form {c:?}, rocks {d:+.4}, joined {want:?}");
+            }
+        }
+    }
+    // Along the ray of a notch: the level 0 blocks, whether the generator holds them, and the instances near.
+    let k = gens[0];
+    let inst = layered.generator_instances(k);
+    let w = Vec3::new(0.3, 0.34, 0.89).normalize();
+    let u = w.any_orthonormal_vector();
+    let t = w.cross(u);
+    for px in [(300.0f32, 380.0f32), (390.0, 440.0), (350.0, 400.0)] {
+        let (a, b) = (-0.35 + 0.7 * px.0 / 500.0, 0.35 - 0.7 * px.1 / 500.0);
+        let o = w * 2.0 + u * a + t * b;
+        let Some((h, _)) = afresh.raycast(o, -w, 0, false) else { continue };
+        eprintln!("pixel {px:?}: hit {h}");
+        for s in -6..=8 {
+            let p = h + w * (s as f32 * 0.005);
+            let bc = ((p - afresh.origin()) / (afresh.voxel(0) * 8.0)).floor().as_ivec3();
+            let lo = afresh.origin() + (bc * 8).as_vec3() * afresh.voxel(0);
+            let hi = lo + Vec3::splat(8.0 * afresh.voxel(0));
+            let nearest = inst.iter().map(|i| {
+                let bb = i.aabb();
+                let d = (p.clamp(bb.min, bb.max) - p).length();
+                (d, (lo.cmple(bb.max).all() && hi.cmpge(bb.min).all()))
+            }).fold((f32::INFINITY, false), |a, b| if b.0 < a.0 { b } else { a });
+            eprintln!("   {:+.3}: field {:+.4}; block {bc} held {}; nearest instance box {:.4} away (meets the block {})", s as f32 * 0.005, afresh.value_upto(p, 0, false), layered.generator_holds(k, 0, bc), nearest.0, nearest.1);
+        }
+    }
+}
+
+/// The layers of a dump (`SCULPT_GEN_LAYERS`) composed afresh, pictured as [`picture_a_dump`] does, at level 0.
+#[test]
+#[ignore]
+fn picture_layers_afresh() {
+    let (v, _) = Layered::read_from(&mut std::io::BufReader::new(std::fs::File::open(std::env::var("SCULPT_GEN_LAYERS").unwrap()).unwrap()), 6).unwrap();
+    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(".".into());
+    let w = Vec3::new(0.3, 0.34, 0.89).normalize();
+    let u = w.any_orthonormal_vector();
+    let t = w.cross(u);
+    let (half, n) = (0.35f32, 500usize);
+    for cap in [0usize, 5] {
+        let mut img = vec![0u8; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let (a, b) = (-half + 2.0 * half * x as f32 / n as f32, half - 2.0 * half * y as f32 / n as f32);
+                if let Some((_, nrm)) = v.raycast(w * 2.0 + u * a + t * b, -w, cap, false) {
+                    img[y * n + x] = (40.0 + 215.0 * nrm.dot((w * 0.8 + u * -0.4 + t * 0.5).normalize()).max(0.0)) as u8;
+                }
+            }
+        }
+        let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+        out.extend(img);
+        std::fs::write(format!("{dir}/afresh_cap{cap}.pgm"), out).unwrap();
+    }
+}
+
+/// A blend wider than level 0 holds distances (six of its steps), over a form a stroke made distances again (so its
+/// blocks hold a bound past six steps, and the blocks past them their band): level 0's field stays whole, with no
+/// jump at any block's face.
+#[test]
+fn a_blend_wider_than_the_form_holds_distances_leaves_no_steps() {
+    let mut lv = Lv::ball();
+    lv.l.begin_stroke();
+    for s in 0..10 {
+        let dir = Vec3::new(-0.3 + 0.06 * s as f32, 0.1, 1.0).normalize();
+        let Some((hit, n)) = lv.l.form().raycast(dir * 3.0, -dir, 0, true) else { continue };
+        let _ = lv.l.plane_dab(&mut lv.s, 0, hit, n, 0.4, 0.03, 0.5, 0.4, false);
+    }
+    lv.l.end_stroke(&mut lv.s);
+    lv.l.settle(&mut lv.s);
+    let v0 = lv.s.voxel(0);
+    let spec = GeneratorSpec { count: 8, min_spacing: 0.5, size: 0.25, blend: 0.9, ..rocks() };
+    assert!(spec.blend * spec.size > 6.0 * v0);
+    let k = lv.add(0, &spec);
+    let _ = k;
+    // Neighbouring samples near the surface differ by no more than a distance field's would.
+    let mut worst = 0.0f32;
+    let band = lv.s.band(0);
+    for bc in lv.s.level_keys(0) {
+        let Some(a) = lv.s.block((0, bc)) else { continue };
+        for axis in 0..3 {
+            let mut o = glam::IVec3::ZERO;
+            o[axis] = 1;
+            let Some(b) = lv.s.block((0, bc + o)) else { continue };
+            for p in 0..8 {
+                for q in 0..8 {
+                    let (mut i, mut j) = (glam::IVec3::ZERO, glam::IVec3::ZERO);
+                    i[axis] = 7;
+                    i[(axis + 1) % 3] = p;
+                    i[(axis + 2) % 3] = q;
+                    j[(axis + 1) % 3] = p;
+                    j[(axis + 2) % 3] = q;
+                    let (x, y) = (a[(i.x + 8 * i.y + 64 * i.z) as usize], b[(j.x + 8 * j.y + 64 * j.z) as usize]);
+                    if x.abs() < 3.0 * v0 || y.abs() < 3.0 * v0 {
+                        worst = worst.max((x - y).abs() / v0);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("level 0 near the surface: neighbouring samples across block faces at most {worst:.2} steps apart (band {:.0} steps)", band / v0);
+    assert!(worst < 1.6, "a step at a block's face: {worst} steps");
+}

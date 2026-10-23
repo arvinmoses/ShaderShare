@@ -1154,10 +1154,14 @@ impl SculptApp {
         // For looking into a frame: the volume as it is when that frame begins (`SCULPT_DEMO_DUMP=frame,frame,...`).
         if let Ok(list) = std::env::var("SCULPT_DEMO_DUMP")
             && list.split(',').any(|x| x.trim().parse::<u32>().ok() == Some(shot))
-            && let Some(m) = self.volume_mode.as_ref()
+            && let Some(m) = self.volume_mode.as_mut()
             && let Ok(file) = std::fs::File::create(demo.dir.join(format!("dump_{shot:05}.svol")))
         {
             let _ = m.vol.write_to(&mut std::io::BufWriter::new(file));
+            // And with its layers, to work them out again.
+            if let Ok(file) = std::fs::File::create(demo.dir.join(format!("layers_{shot:05}.svol"))) {
+                let _ = m.write_to(&mut std::io::BufWriter::new(file));
+            }
         }
         // And a full rebuild of the GPU's copy at these frames (`SCULPT_DEMO_REBUILD=frame,...`).
         if let Ok(list) = std::env::var("SCULPT_DEMO_REBUILD")
@@ -1206,6 +1210,18 @@ impl SculptApp {
             }
             if let Some(on) = f.by_distance {
                 m.by_distance = on;
+            }
+            if f.add_generator {
+                m.add_generator();
+            }
+            if let Some(edit) = f.generator
+                && let Some(layer) = m.layer.as_ref()
+            {
+                let k = layer.active();
+                if let Some(mut spec) = layer.generator(k).cloned() {
+                    edit(&mut spec);
+                    m.set_generator(k, &spec, false);
+                }
             }
         }
         if let (Some(on), Some(vp)) = (f.cull, self.viewport.as_mut()) {

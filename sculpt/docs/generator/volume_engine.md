@@ -274,6 +274,42 @@ patch before the big stroke, under it as one volume (buried), and under it with 
 Not done yet: merging the layers back resets undo; layers per region of the form (a layer is the whole volume's);
 the layers' following and composing on the GPU.
 
+## Generator layers in the stack
+
+A generator layer scatters a primitive over the form and joins it to the surface softly, or cuts it, exactly, in the
+field ("New generator" in the Layers panel; its settings under Properties). It sits in the same stack as the detail
+layers, with a level, a mask and visibility of its own, and saves with them (layer section version 2).
+
+* **Placement.** Points are drawn over level 0's surface by the lattice edges it crosses (about evenly by area, with
+  no surface to extract), kept apart by the spacing if there is one, and moved onto the finest surface the form has.
+  Each instance hangs from its point and the normal there, varied by the seed as on a mesh (size, stretch, lift,
+  tilt, spin, and the mapping rows that read the slope): the code is shared with the mesh generator.
+* **Joining.** What is shown is the form, pushed out by the detail layers, then each generator on it in the stack's
+  order: a polynomial smooth minimum over the blend (a fraction of the size) with its instances, which also join one
+  another so, or a smooth maximum for cutters. Unlike the mesh generator's displacement, nothing limits it to what is
+  single-valued along a normal: a rock can lean over, a cutter can undercut.
+* **At every level up to its own.** It changes level 0 through each instance's box and the finer levels up to its
+  own in a shell round its surface, so the inside of a large rock reads it from the coarser levels and a distant view
+  that leaves fine levels out keeps it (rocks 0.1 across stood within 0.0015 of their size at level 0, 0.0001 at
+  level 2). Past its own level, the form's own blocks within its reach take it in too, and so do detail layers'.
+* **Riding the form.** A form stroke over a generator queues its blocks as it does a detail layer's (and form blocks
+  the stroke makes within its reach); at the stroke's end each anchor is found again on the new surface along its
+  normal, an anchor whose surface did not move staying exactly. In the test the form rose 0.0440 under a rock and the
+  rock moved 0.0440; rocks away from the stroke did not move at all.
+* **Editing.** A parameter change places the instances again (scattering again only for a new count, seed or
+  spacing) and composes the blocks it had and has. While a slider is dragged the layer is held no finer than level 1,
+  and at its own level again when the drag ends, one undo step for all of it. At about the app's scale (a ball at a
+  level 0 step of 0.007, twelve rocks): a drag step 6-8 ms at any level; on release 32 ms at level 2, 150 ms at
+  level 3. The default size is 3% of the object, at the coarsest level giving a dozen steps a radius.
+* **Its mask** fades it, starting whole wherever it changes the field.
+* **Tests.** `tests/volume_gen.rs`: rocks stand on the form closed at every level, cutters dig pits, rocks ride a big
+  stroke, an edit shows what building it afresh shows and undoes, a previewed drag ends as the edit made at once,
+  saving and opening, the mask fading a rock away.
+
+Not done yet: noise and edge generators in the stack (the mesh's noise layer and edge cutters), density and painted
+placement, intersect, and generators over detail layers (detail painted on a rock rides the form under it, not the
+rock).
+
 ## The level by distance
 
 Each region of the view shows only the levels whose detail would show on screen from where the eye is ("Level by

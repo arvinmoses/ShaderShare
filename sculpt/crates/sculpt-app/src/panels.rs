@@ -475,6 +475,9 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                 let mut from = ui.data_mut(|d| *d.get_temp_mut_or(id, 3usize)).clamp(1, top);
                 ui.add(egui::Slider::new(&mut from, 1..=top).text("Detail from level"));
                 ui.data_mut(|d| d.insert_temp(id, from));
+                if ui.button("New generator").on_hover_text("A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with.").clicked() {
+                    m.add_generator();
+                }
                 if ui
                     .button("Move detail to a layer")
                     .on_hover_text("The work at this level and finer goes into a detail layer over the rest. Sculpting the form under it then carries the detail along, and its mask hides it where painted.")
@@ -503,12 +506,15 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                             visible = Some((k, on));
                         }
                         let picked = m.target == Target::Detail && active == k;
-                        if ui.selectable_label(picked, format!("{}  ({} blocks)", info.name, info.blocks)).clicked() {
+                        let label = if info.generator { format!("{}  (generator, {} blocks)", info.name, info.blocks) } else { format!("{}  ({} blocks)", info.name, info.blocks) };
+                        if ui.selectable_label(picked, label).clicked() {
                             select = Some(k);
                         }
                         let mut l = info.level;
+                        // A generator's resolution can be any level; a detail layer's, the layers' first or finer.
+                        let first = if info.generator { 0 } else { from };
                         egui::ComboBox::from_id_salt(("layer_level", k)).selected_text(format!("level {l}")).show_ui(ui, |ui| {
-                            for (c, t) in texts.iter().enumerate().skip(from) {
+                            for (c, t) in texts.iter().enumerate().skip(first) {
                                 ui.selectable_value(&mut l, c, t.as_str());
                             }
                         });
@@ -561,6 +567,13 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                     });
                     ui.data_mut(|d| d.insert_temp(id, l));
                 });
+                if ui
+                    .button("New generator")
+                    .on_hover_text("A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with. Its settings are under Properties; sculpting the form carries it along.")
+                    .clicked()
+                {
+                    m.add_generator();
+                }
                 if ui.button("Merge the layers into the form").clicked() {
                     m.merge_layer();
                 }
@@ -790,6 +803,7 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
     ui.painter().line_segment([ui.cursor().left_top(), ui.cursor().right_top()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+            crate::generator_ui::volume_generator_props(app, ui);
             match (app.selection, target) {
                 _ if app.layers.selection.len() > 1 => multi_props(app, ui),
                 (Selection::Effect(i), Some((id, false))) if active == Some(id) => effect_props(app, ui, i),

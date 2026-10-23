@@ -78,12 +78,17 @@ struct Layer {
 struct GenPart {
     g: VolumeGen,
     blocks: std::sync::Arc<Vec<HashSet<IVec3>>>,
+    /// The finest level it is held at in full: the layer's own, or coarser while a drag previews it.
+    upto: usize,
 }
+
+/// The finest level a generator's drag preview holds it at.
+const PREVIEW: usize = 1;
 
 impl GenPart {
     fn new(form: &LevelVolume, g: VolumeGen, own: usize) -> GenPart {
         let blocks = (0..form.levels()).map(|l| g.blocks(form, l, own)).collect();
-        GenPart { g, blocks: std::sync::Arc::new(blocks) }
+        GenPart { g, blocks: std::sync::Arc::new(blocks), upto: own }
     }
 }
 
@@ -406,7 +411,8 @@ fn affected(stack: &[Layer], changes: &[(usize, IVec3)]) -> Vec<(usize, IVec3)> 
 fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, keys: &[IVec3]) -> Vec<(IVec3, Option<Stored>)> {
     let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
     // The generators shown, in the stack's order, each with its mask's lattice scale against this level's.
-    let gens: Vec<(&VolumeGen, &Shared<IVec3, Stored>, f32)> = stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref().map(|g| (&g.g, &x.m, 2f32.powi(x.level as i32 - l as i32)))).collect();
+    let gens: Vec<(&VolumeGen, Option<&Shared<IVec3, Stored>>, f32)> =
+        stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref().map(|g| (&g.g, (!x.m.is_empty()).then_some(&x.m), 2f32.powi(x.level as i32 - l as i32)))).collect();
     keys.par_iter()
         .map(|&bc| {
             if !composed(stack, l, bc) {
@@ -432,14 +438,43 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
             };
             // The generators' instances within reach of the block, and their masks.
             let (wlo, whi) = (origin + lo.as_vec3() * v, origin + hi.as_vec3() * v);
-            let near: Vec<(&VolumeGen, Sparse, f32, Vec<u32>)> = gens
+            let near: Vec<(&VolumeGen, Option<Sparse>, f32, Vec<u32>)> = gens
                 .iter()
                 .filter_map(|&(g, m, scale)| {
                     let mut near = Vec::new();
                     g.near(wlo, whi, g.blend() + v, &mut near);
-                    (!near.is_empty()).then(|| (g, Sparse::new(m, 1.0), scale, near))
+                    (!near.is_empty()).then(|| (g, m.map(|m| Sparse::new(m, 1.0)), scale, near))
                 })
                 .collect();
+            // A soft join reads the form's distance out to its blend's width, farther than a fine level holds one (it
+            // clamps at its band): where this level's is near its clamp, level 0's (which reaches 16 of its steps)
+            // takes over, so every level joins the same surface.
+            let sat = if l <= below { band } else { form.band(below) };
+            // And past what level 0 holds as distances (six of its steps: past them, a stored block holds a bound and
+            // an unstored one its band) the form counts as that far, everywhere alike: a blend wider than that reads
+            // the same value on both sides of every block's face.
+            let reach = 0.95 * form.plateau(0);
+            let coarse = (l > 0 && !near.is_empty()).then(|| {
+                let s = 1i32 << l;
+                let (clo, chi) = (lo.div_euclid(IVec3::splat(s)), hi.div_euclid(IVec3::splat(s)) + IVec3::ONE);
+                (clo, chi - clo + IVec3::ONE, form.samples(0, clo, chi), s as f32)
+            });
+            let far = |i: IVec3, c: f32| -> f32 {
+                let Some((clo, cn, g, s)) = &coarse else { return c };
+                let t = ((c.abs() - 0.5 * sat) / (0.4 * sat)).clamp(0.0, 1.0);
+                if t == 0.0 {
+                    return c;
+                }
+                let q = i.as_vec3() / *s - clo.as_vec3();
+                let b = q.floor().as_ivec3().clamp(IVec3::ZERO, *cn - IVec3::splat(2));
+                let f = q - b.as_vec3();
+                let c0: f32 = (0..8).map(|k| {
+                    let j = b + corner_offset(k);
+                    corner_weight(k, f) * g[((j.z * cn.y + j.y) * cn.x + j.x) as usize]
+                }).sum();
+                let t = t * t * (3.0 - 2.0 * t);
+                c + (c0 - c) * t
+            };
             let c: Vec<f32> = (0..n * n * n)
                 .map(|k| {
                     let i = lo + IVec3::new(k % n, (k / n) % n, k / (n * n));
@@ -454,8 +489,12 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
                         tri(i.as_vec3() - g.normalize_or_zero() * (s / v))
                     };
                     // Then each generator on it, in order.
+                    if !near.is_empty() {
+                        c = far(i, c).clamp(-reach, reach);
+                    }
                     for (g, mask, scale, near) in &near {
-                        c = g.apply(c, origin + i.as_vec3() * v, near, mask.linear(i.as_vec3() * *scale).clamp(0.0, 1.0));
+                        let m = mask.as_ref().map_or(1.0, |m| m.linear(i.as_vec3() * *scale).clamp(0.0, 1.0));
+                        c = g.apply(c, origin + i.as_vec3() * v, near, m);
                     }
                     c
                 })
@@ -647,7 +686,7 @@ impl FollowJob {
                             }
                         }
                     }
-                    let part = GenPart { g: part.g, blocks: std::sync::Arc::new(blocks) };
+                    let part = GenPart { g: part.g, blocks: std::sync::Arc::new(blocks), upto: part.upto };
                     self.stack[k].scatter = Some(part.clone());
                     part
                 };
@@ -1110,6 +1149,11 @@ impl Layered {
         self.stack.get(k)?.scatter.as_ref().map(|g| &g.g.spec)
     }
 
+    /// Whether generator layer `k` changes block `bc` of level `l`, for checks.
+    pub fn generator_holds(&self, k: usize, l: usize, bc: IVec3) -> bool {
+        self.stack.get(k).is_some_and(|x| x.scatter.is_some() && x.holds(l, bc))
+    }
+
     /// Generator layer `k`'s instances as placed, for checks.
     pub fn generator_instances(&self, k: usize) -> Vec<super::Instance> {
         self.stack.get(k).and_then(|x| x.scatter.as_ref()).map_or(Vec::new(), |g| g.g.instances().to_vec())
@@ -1118,17 +1162,30 @@ impl Layered {
     /// Change generator layer `k`'s parameters (scattered again only if the count, seed or spacing changed). Within
     /// an edit ([`Self::begin_edit`]) a run of changes undoes as one.
     pub fn set_generator(&mut self, shown: &mut LevelVolume, k: usize, spec: &GeneratorSpec) {
+        self.set_generator_at(shown, k, spec, false);
+    }
+
+    /// [`Self::set_generator`], shown no finer than level 1 for now: a slider drag's preview, many times cheaper on a
+    /// fine layer. [`Self::set_generator`] (or [`Self::end_edit`]) shows it at its own level again.
+    pub fn preview_generator(&mut self, shown: &mut LevelVolume, k: usize, spec: &GeneratorSpec) {
+        self.set_generator_at(shown, k, spec, true);
+    }
+
+    fn set_generator_at(&mut self, shown: &mut LevelVolume, k: usize, spec: &GeneratorSpec, preview: bool) {
         let Some(old) = self.stack.get(k).and_then(|x| x.scatter.clone()) else { return };
-        if old.g.spec == *spec {
+        let own = self.stack[k].level;
+        let upto = if preview { own.min(PREVIEW) } else { own };
+        if old.g.spec == *spec && old.upto == upto {
             return;
         }
-        if self.edit.is_none() {
+        if self.edit.is_none() && old.g.spec != *spec {
             self.history.push(Undo::Layers(self.stack.clone()));
             self.redo.clear();
         }
-        let own = self.stack[k].level;
         let mut changes = self.stack[k].all_keys();
-        self.stack[k].scatter = Some(GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), own));
+        let mut part = GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), upto);
+        part.upto = upto;
+        self.stack[k].scatter = Some(part);
         changes.extend(self.stack[k].all_keys());
         self.compose(shown, &changes);
     }
@@ -1536,6 +1593,17 @@ impl Layered {
     /// Begin an edit of a layer itself (a mask stroke): undone as one.
     pub fn begin_edit(&mut self) {
         self.edit = Some(self.stack.clone());
+    }
+
+    pub fn end_edit_in(&mut self, shown: &mut LevelVolume) {
+        // A generator previewed coarser during the edit: at its own level again.
+        for k in 0..self.stack.len() {
+            if let Some(part) = self.stack[k].scatter.clone().filter(|p| p.upto != self.stack[k].level) {
+                let spec = part.g.spec.clone();
+                self.set_generator_at(shown, k, &spec, false);
+            }
+        }
+        self.end_edit();
     }
 
     pub fn end_edit(&mut self) {

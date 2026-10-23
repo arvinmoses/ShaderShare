@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, Layered};
+use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::generator::level_volume::{CarryDone, EndDone, LevelVolume};
 
 /// Levels in a new volume: level 0 and five finer, the finest 32 times finer.
@@ -63,6 +65,11 @@ pub struct VolumeMode {
     pub budget_m: f32,
     /// What that choice last came to.
     pub view: sculpt_core::generator::level_view::ViewStats,
+    /// How long the last generator edit took to show (scattering, placing and composing), and whether a drag of one
+    /// of its parameters is under way.
+    pub generator_ms: f64,
+    pub generator_full_ms: f64,
+    generator_edit: bool,
     /// Tint the surface by the level each part comes from.
     pub tint: bool,
     /// Timing of the last frame's dabs, for the status line.
@@ -126,6 +133,9 @@ impl VolumeMode {
             level_px: 1.0,
             budget_on: true,
             budget_m: 6.0,
+            generator_ms: 0.0,
+            generator_full_ms: 0.0,
+            generator_edit: false,
             view: Default::default(),
             tint: false,
             last_ms: 0.0,
@@ -174,7 +184,7 @@ impl VolumeMode {
         if std::env::var_os("SCULPT_DAB_LOG").is_some() {
             eprintln!("DAB {} {} {} {radius} {px} {strength} {hardness} {carve}", at.x, at.y, at.z);
         }
-        let target = self.layer.as_ref().map(|_| self.target);
+        let target = self.layer.as_ref().map(|_| self.routed());
         if let (Some(Target::Mask { show }), Some(layer)) = (target, self.layer.as_mut()) {
             layer.paint_mask(&mut self.vol, at, radius, if show { 1.0 } else { 0.0 });
             return;
@@ -395,7 +405,8 @@ impl VolumeMode {
             eprintln!("BEGIN");
         }
         self.settle();
-        match (self.layer.as_mut(), self.target) {
+        let target = self.routed();
+        match (self.layer.as_mut(), target) {
             (Some(layer), Target::Form) => layer.begin_stroke(),
             (Some(layer), Target::Mask { .. }) => layer.begin_edit(),
             (layer, _) => {
@@ -412,7 +423,8 @@ impl VolumeMode {
     pub fn end_stroke(&mut self) {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
-        match (self.layer.as_mut(), self.target) {
+        let target = self.routed();
+        match (self.layer.as_mut(), target) {
             (Some(layer), Target::Form) => {
                 // The form's end off the frame too; the layer's last follow comes after it (see `tick`).
                 if layer.form().in_stroke()
@@ -431,6 +443,82 @@ impl VolumeMode {
                     self.ending = true;
                 }
             }
+        }
+    }
+
+    /// What strokes work on: with a generator layer selected, its mask, or else the form under it (a generator holds
+    /// no sculpting of its own).
+    fn routed(&self) -> Target {
+        match (self.target, self.layer.as_ref()) {
+            (Target::Detail, Some(layer)) if layer.generator(layer.active()).is_some() => Target::Form,
+            (t, _) => t,
+        }
+    }
+
+    /// A new generator layer on top (rocks scattered over the form, to start with), made active. With no layers yet,
+    /// the stack is made first, the finest level's work becoming a detail layer.
+    pub fn add_generator(&mut self) {
+        self.settle();
+        let top = self.vol.levels() - 1;
+        if self.layer.is_none() {
+            self.make_layer(top);
+        }
+        let Some(layer) = self.layer.as_mut() else { return };
+        let n = layer.layers().iter().filter(|x| x.generator).count();
+        // Rocks a few hundredths of the object across, at the coarsest level giving them about a dozen steps a radius.
+        let (lo, hi) = self.vol.bounds();
+        let size = 0.03 * (hi - lo).max_element();
+        let level = (0..=top).find(|&l| self.vol.voxel(l) <= size / 12.0).unwrap_or(top);
+        let spec = GeneratorSpec {
+            primitive: Primitive::Sphere,
+            op: BoolOp::Add,
+            count: 12,
+            seed: 1 + n as u64,
+            size,
+            lift: 0.15,
+            random_spin: true,
+            min_spacing: 3.0 * size,
+            size_var: 0.4,
+            stretch_var: 0.35,
+            tilt: 25.0,
+            blend: 0.3,
+            ..GeneratorSpec::default()
+        };
+        let t = Instant::now();
+        layer.add_generator(&mut self.vol, &format!("Generator {}", n + 1), level, &spec);
+        self.generator_ms = t.elapsed().as_secs_f64() * 1e3;
+        self.target = Target::Detail;
+    }
+
+    /// Change generator layer `k`'s parameters. While `dragging`, the changes undo as one, until a change that is not.
+    pub fn set_generator(&mut self, k: usize, spec: &GeneratorSpec, dragging: bool) {
+        self.settle();
+        let Some(layer) = self.layer.as_mut() else { return };
+        if dragging && !self.generator_edit {
+            layer.begin_edit();
+            self.generator_edit = true;
+        }
+        // While dragging, shown no finer than level 1 (a few milliseconds); at its own level once the drag is over.
+        let t = Instant::now();
+        if dragging {
+            layer.preview_generator(&mut self.vol, k, spec);
+        } else {
+            layer.set_generator(&mut self.vol, k, spec);
+        }
+        self.generator_ms = t.elapsed().as_secs_f64() * 1e3;
+        if !dragging {
+            self.end_generator_edit();
+        }
+    }
+
+    /// A drag of a generator's parameter is over: shown at its own level again, one undo step for all of it.
+    pub fn end_generator_edit(&mut self) {
+        if std::mem::take(&mut self.generator_edit)
+            && let Some(layer) = self.layer.as_mut()
+        {
+            let t = Instant::now();
+            layer.end_edit_in(&mut self.vol);
+            self.generator_full_ms = t.elapsed().as_secs_f64() * 1e3;
         }
     }
 

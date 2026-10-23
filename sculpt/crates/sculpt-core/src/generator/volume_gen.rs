@@ -272,7 +272,9 @@ impl VolumeGen {
     pub fn blocks(&self, form: &LevelVolume, l: usize, own: usize) -> HashSet<IVec3> {
         let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
         let k = self.blend();
-        let pad = k + band + v;
+        // Level 0 keeps distances out to a wide band, but what shows is near the surface: two of its steps past the
+        // blend are enough to place it (past them its distances are the form's, as a sculpted block's are past a dab).
+        let pad = k + if l == 0 { 2.0 * v } else { band + v };
         let size = v * B as f32;
         if l > own {
             // Past its own level: the form's blocks within reach (found among the form's, far fewer than the boxes').

@@ -56,6 +56,9 @@ enum Act {
     Cull(bool),
     /// Choosing the level by distance on or off.
     ByDistance(bool),
+    /// A new generator layer (rocks), and a change of its parameters (applied to the active generator's).
+    AddGenerator,
+    Generator(fn(&mut sculpt_core::generator::layer::GeneratorSpec)),
     /// Move the work at this level and finer into a detail layer.
     MakeLayer(usize),
     /// What strokes work on, with a detail layer.
@@ -92,6 +95,8 @@ pub struct Frame {
     pub layer_visible: Option<(usize, bool)>,
     pub cull: Option<bool>,
     pub by_distance: Option<bool>,
+    pub add_generator: bool,
+    pub generator: Option<fn(&mut sculpt_core::generator::layer::GeneratorSpec)>,
     pub undo: bool,
     pub redo: bool,
 }
@@ -216,9 +221,30 @@ impl VolumeDemo {
         at(120.5, 2.5, Camera(Pose::at(patch, 0.6)));
         at(120.5, 3.0, Caption("Back in close, the detail is all there"));
         at(124.0, 0.0, Tint(false));
-        at(124.0, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
-        at(124.0, 3.0, Caption("Next: generator layers in the stack, and the layers' work on the GPU"));
-        let end = 127.5;
+        // A generator layer.
+        at(124.0, 2.5, Camera(Pose::whole(3.0, 0.35, 0.25)));
+        at(126.5, 0.0, AddGenerator);
+        at(126.5, 6.0, Caption("A generator layer in the same stack: rocks scattered over the form, joined to it softly, in the field (no overhang limit)"));
+        at(130.0, 0.0, Generator(|s| s.count = 30));
+        at(131.0, 0.0, Generator(|s| s.count = 60));
+        at(132.5, 0.0, Generator(|s| s.size *= 1.5));
+        at(133.5, 0.0, Generator(|s| s.blend = 0.6));
+        at(132.5, 4.0, Caption("Count, size, blend: each edit is shown at once (a drag previews it no finer than level 1)"));
+        at(136.5, 0.0, Generator(|s| s.op = sculpt_core::generator::BoolOp::Subtract));
+        at(136.5, 3.0, Caption("Subtract: the same scatter cuts pits"));
+        at(139.5, 0.0, Generator(|s| s.op = sculpt_core::generator::BoolOp::Add));
+        at(140.0, 2.5, Camera(Pose::at(patch, 2.2)));
+        at(140.5, 7.0, Caption("Sculpting the form under it carries the rocks along: each hangs from a point of the surface, found again after the stroke"));
+        at(141.0, 0.0, Target(crate::volume_mode::Target::Form));
+        at(142.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 260.0, strength: 1.0, path: line((0.35, 0.45), (0.65, 0.5), 0.0, 10) });
+        at(145.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 260.0, strength: 1.0, path: line((0.65, 0.55), (0.35, 0.5), 0.0, 10) });
+        at(148.5, 0.0, Target(crate::volume_mode::Target::Mask { show: false }));
+        at(148.5, 4.5, Caption("Its mask fades it where painted, as every layer's does"));
+        at(149.0, 2.5, Stroke { tool: Tool::ClayBuildup, size: 200.0, strength: 1.0, path: line((0.40, 0.40), (0.60, 0.42), 0.0, 8) });
+        at(152.0, 0.0, Target(crate::volume_mode::Target::Detail));
+        at(153.0, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
+        at(153.0, 3.0, Caption("Next: generators of other kinds (noise, edges), and the layers' work on the GPU"));
+        let end = 156.5;
         let n = items.len();
         VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
     }
@@ -306,6 +332,8 @@ impl VolumeDemo {
                         Act::LayerVisible(k, on) => f.layer_visible = Some((k, on)),
                         Act::Cull(on) => f.cull = Some(on),
                         Act::ByDistance(on) => f.by_distance = Some(on),
+                        Act::AddGenerator => f.add_generator = true,
+                        Act::Generator(edit) => f.generator = Some(edit),
                         Act::Undo => f.undo = true,
                         Act::Redo => f.redo = true,
                         _ => continue,

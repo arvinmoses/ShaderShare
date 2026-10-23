@@ -172,6 +172,78 @@ fn note(r: &egui::Response, changed: &mut bool, coalesce: &mut bool) {
     }
 }
 
+/// One slider row of the volume generator's section, noting a change and whether it is being dragged.
+fn vslider(ui: &mut Ui, label: &str, w: egui::Slider, hover: Option<&str>, changed: &mut bool, coalesce: &mut bool, dragging: &mut bool) {
+    let r = prop(ui, label, |ui| ui.add(w));
+    let r = match hover {
+        Some(h) => r.on_hover_text(h),
+        None => r,
+    };
+    *dragging |= r.dragged();
+    note(&r, changed, coalesce);
+}
+
+/// The Properties section for the volume's generator layer selected, if one is.
+pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
+    let fs = app.theme.metrics.font_size;
+    let weak = app.theme.weak_text();
+    let Some(m) = app.volume_mode.as_mut() else { return };
+    let Some(layer) = m.layer.as_ref() else { return };
+    let k = layer.active();
+    let Some(spec) = layer.generator(k).cloned() else { return };
+    let (ms, full) = (m.generator_ms, m.generator_full_ms);
+    let mut next = spec.clone();
+    let (mut changed, mut coalesce, mut dragging) = (false, false, false);
+    section(ui, fs, "volume_generator", "GENERATOR", |ui| {
+        prop(ui, "Operation", |ui| {
+            egui::ComboBox::from_id_salt(("vgen_op", k))
+                .selected_text(op_label(next.op))
+                .show_ui(ui, |ui| {
+                    for op in [BoolOp::Add, BoolOp::Subtract] {
+                        if ui.selectable_label(next.op == op, op_label(op)).clicked() {
+                            next.op = op;
+                            changed = true;
+                        }
+                    }
+                })
+                .response
+        });
+        prop(ui, "Primitive", |ui| {
+            egui::ComboBox::from_id_salt(("vgen_prim", k)).selected_text(primitive_label(next.primitive)).show_ui(ui, |ui| {
+                for p in Primitive::ALL {
+                    if ui.selectable_label(next.primitive == p, primitive_label(p)).clicked() {
+                        next.primitive = p;
+                        changed = true;
+                    }
+                }
+            })
+        });
+        let (c, co, d) = (&mut changed, &mut coalesce, &mut dragging);
+        vslider(ui, "Count", egui::Slider::new(&mut next.count, 1..=2000).logarithmic(true), None, c, co, d);
+        vslider(ui, "Size", egui::Slider::new(&mut next.size, 0.005..=0.5).logarithmic(true).max_decimals(3), None, c, co, d);
+        vslider(ui, "Lift", egui::Slider::new(&mut next.lift, -1.0..=1.5).max_decimals(2), Some("How far each instance's centre stands out of the surface, in its size."), c, co, d);
+        let r = prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut next.seed).speed(0.2)));
+        *d |= r.dragged();
+        note(&r, c, co);
+        vslider(ui, "Blend", egui::Slider::new(&mut next.blend, 0.0..=1.0).max_decimals(2), Some("How softly it meets the surface, and the instances one another, as a fraction of their size."), c, co, d);
+        vslider(ui, "Spacing", egui::Slider::new(&mut next.min_spacing, 0.0..=1.0).max_decimals(3), Some("Smallest distance between two instances. 0 places them independently; if the surface is full, fewer are placed."), c, co, d);
+        vslider(ui, "Size variation", egui::Slider::new(&mut next.size_var, 0.0..=1.0).max_decimals(2), None, c, co, d);
+        vslider(ui, "Stretch", egui::Slider::new(&mut next.stretch_var, 0.0..=1.0).max_decimals(2), Some("Varies each axis separately, so instances come out stretched or squashed."), c, co, d);
+        vslider(ui, "Tilt", egui::Slider::new(&mut next.tilt, 0.0..=90.0).suffix(" deg").max_decimals(0), Some("Largest random lean away from the surface normal."), c, co, d);
+        vslider(ui, "Lift jitter", egui::Slider::new(&mut next.lift_var, 0.0..=1.0).max_decimals(2), None, c, co, d);
+        let r = prop(ui, "Spin", |ui| ui.checkbox(&mut next.random_spin, "Random"));
+        note(&r, c, co);
+        ui.add_space(4.0);
+        ui.label(RichText::new(format!("Last edit shown in {ms:.1} ms (while dragging, no finer than level 1; at its own level on release, {full:.0} ms). Sculpting the form carries it along; its mask (Layers panel) fades it.")).small().color(weak));
+    });
+    let Some(m) = app.volume_mode.as_mut() else { return };
+    if changed && next != spec {
+        m.set_generator(k, &next, dragging || coalesce);
+    } else if !dragging {
+        m.end_generator_edit();
+    }
+}
+
 /// The Properties section for a generator layer.
 pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     let Some(spec) = app.doc.as_ref().and_then(|d| d.layer(id)).and_then(|l| l.generator.clone()) else { return };
