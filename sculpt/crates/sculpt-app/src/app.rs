@@ -1176,6 +1176,12 @@ impl SculptApp {
             if let Some(from) = f.make_layer {
                 m.make_layer(from);
             }
+            if let Some(l) = f.add_layer {
+                m.add_layer(l);
+            }
+            if let Some((k, on)) = f.layer_visible {
+                m.set_layer_visible(k, on);
+            }
             if let Some(t) = f.target {
                 m.target = t;
             }

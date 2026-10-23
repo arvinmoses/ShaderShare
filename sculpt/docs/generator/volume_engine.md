@@ -259,9 +259,20 @@ patch before the big stroke, under it as one volume (buried), and under it with 
 * **Undo and redo** run over the stack: a form stroke brings back the form and the layer as they were; a layer stroke
   or mask stroke the layer alone.
 
-Not done yet: one detail layer only; saving keeps what is shown, not the layer; merging the layer back resets undo;
-measuring the move every 2 steps halves what is left of the shape change on a steep rim (0.0004 to 0.0002) at three
-times the cost, and an adaptive lattice would get that for little.
+* **A stack of layers, each at its own resolution.** Layers are displacements along the form's normal and add up
+  (their order does not change what is shown), each with its own mask, level and visibility. A level shows the
+  layers at it or coarser, so a distant view that leaves fine levels out leaves fine layers out too. Following runs
+  per layer on its own lattice, so a coarse layer costs little; heights may stand out as far as the layers' first
+  level allows (6 of its steps), so changing a layer's resolution keeps what it holds (a broad bump 0.0120 tall:
+  0.01196 moved a level finer, 0.01191 back). Painting goes into the layer selected, less what the others add there
+  and divided by its mask. The Layers panel lists the stack top first (show, select, resolution, remove; new layer
+  at a chosen resolution), and `.svol` files keep the layers after the form (a file without them opens as one
+  volume). Tests: `layers_of_two_resolutions_ride_together_and_save` (a broad bump on a level 3 layer and small
+  ones on a level 4 layer over it ride two big strokes, 0.0120 to 0.0119 and shapes within 0.0006; saved and opened
+  within 0.0000045), `layers_save_and_open_with_the_volume`.
+
+Not done yet: merging the layers back resets undo; layers per region of the form (a layer is the whole volume's);
+the layers' following and composing on the GPU.
 
 ## Driver workarounds (Vulkan, this AMD driver)
 

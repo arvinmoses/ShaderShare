@@ -507,7 +507,7 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                         if l != info.level {
                             level = Some((k, l));
                         }
-                        if ui.small_button("✕").on_hover_text("Remove this layer (undo brings it back)").clicked() {
+                        if ui.small_button("×").on_hover_text("Remove this layer (undo brings it back)").clicked() {
                             remove = Some(k);
                         }
                     });

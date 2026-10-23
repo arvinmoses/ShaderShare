@@ -58,6 +58,9 @@ enum Act {
     MakeLayer(usize),
     /// What strokes work on, with a detail layer.
     Target(crate::volume_mode::Target),
+    /// A new layer at this level, and showing or hiding a layer.
+    AddLayer(usize),
+    LayerVisible(usize, bool),
     Undo,
     Redo,
     /// A caption for `dur` seconds.
@@ -83,6 +86,8 @@ pub struct Frame {
     pub keep_detail: Option<bool>,
     pub make_layer: Option<usize>,
     pub target: Option<crate::volume_mode::Target>,
+    pub add_layer: Option<usize>,
+    pub layer_visible: Option<(usize, bool)>,
     pub cull: Option<bool>,
     pub undo: bool,
     pub redo: bool,
@@ -174,15 +179,31 @@ impl VolumeDemo {
         at(77.0, 0.0, Target(crate::volume_mode::Target::Mask { show: true }));
         at(77.3, 1.2, Stroke { tool: Tool::ClayBuildup, size: 80.0, strength: 1.0, path: line((0.40, 0.615), (0.58, 0.615), 0.0, 8) });
         at(79.0, 0.0, Target(crate::volume_mode::Target::Detail));
+        // A second layer, at a resolution of its own.
+        at(79.5, 0.0, AddLayer(5));
+        at(79.5, 6.0, Caption("A second layer, finer (level 5, the first is level 4): fine strokes painted on it go into it. Layers add up, each at its own resolution"));
+        for k in 0..4 {
+            let x = 0.46 + 0.07 * k as f32;
+            at(80.5 + 1.0 * k as f32, 0.8, Stroke { tool: Tool::TrimDynamic, size: 12.0, strength: 1.0, path: line((x, 0.40), (x + 0.04, 0.66), 0.0, 10) });
+        }
+        at(85.0, 2.0, Camera(Pose::at(patch, 3.0)));
+        at(85.0, 9.0, Caption("The form again, under both layers: each rides along, at its own resolution"));
+        at(85.5, 0.0, Target(crate::volume_mode::Target::Form));
+        at(87.0, 2.5, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.48, 0.42), (0.58, 0.44), 0.0, 8) });
+        at(90.0, 3.0, Camera(Pose::at(patch * 1.11, 0.34)));
+        at(94.0, 5.0, Caption("Each layer can be hidden: the finer one off, and on again"));
+        at(94.5, 0.0, LayerVisible(1, false));
+        at(96.5, 0.0, LayerVisible(1, true));
+        at(97.5, 0.0, Target(crate::volume_mode::Target::Detail));
         // Culling.
-        at(80.0, 3.0, Camera(Pose::whole(3.4, 0.9, 0.25)));
-        at(80.5, 8.0, Caption("Each block's surface is a cluster: those out of view or facing away are skipped (see the pages drawn)"));
-        at(83.0, 0.0, Cull(false));
-        at(85.0, 0.0, Cull(true));
-        at(85.5, 3.0, Camera(Pose::whole(3.4, 2.2, 0.1)));
-        at(88.5, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
-        at(88.5, 3.0, Caption("Next: painting straight onto the layer in the app, more layers, and the level per region by distance"));
-        let end = 92.0;
+        at(98.0, 3.0, Camera(Pose::whole(3.4, 0.9, 0.25)));
+        at(98.5, 8.0, Caption("Each block's surface is a cluster: those out of view or facing away are skipped (see the pages drawn)"));
+        at(101.0, 0.0, Cull(false));
+        at(103.0, 0.0, Cull(true));
+        at(103.5, 3.0, Camera(Pose::whole(3.4, 2.2, 0.1)));
+        at(106.5, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
+        at(106.5, 3.0, Caption("Next: the level per region by distance, and the layers' work on the GPU"));
+        let end = 110.0;
         let n = items.len();
         VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
     }
@@ -266,6 +287,8 @@ impl VolumeDemo {
                         Act::Tint(on) => f.tint = Some(on),
                         Act::MakeLayer(from) => f.make_layer = Some(from),
                         Act::Target(t) => f.target = Some(t),
+                        Act::AddLayer(l) => f.add_layer = Some(l),
+                        Act::LayerVisible(k, on) => f.layer_visible = Some((k, on)),
                         Act::Cull(on) => f.cull = Some(on),
                         Act::Undo => f.undo = true,
                         Act::Redo => f.redo = true,
