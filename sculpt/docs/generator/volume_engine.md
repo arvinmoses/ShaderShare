@@ -304,8 +304,18 @@ distance" in the Mesh menu, on by default, with the pixels it takes):
   blocks shown or hidden (with strokes between camera moves) matches rebuilding everything. The GPU check
   (`--gpu-levels-check`) compares six views from near and far, with strokes between, against the reference exactly.
 
-Not done yet: a triangle budget (raising the pixels when a view would draw too much), blending between levels as
-they hand over (a block appears or goes at once, about a pixel's change), and choosing by occlusion.
+* **A triangle budget** (Mesh menu, on at 6M by default). Each block's quads are counted when it changes (the lattice
+  edges its samples cross; within 2% of the surface drawn in the test). A finer block shown adds three quarters of
+  its quads, the rest replacing the coarser cells it covers. When the blocks would come to more than the budget, the
+  pixels a block's detail must come to rise to where the blocks with the most detail on screen first fill it; since
+  a block's detail on screen is never less than that of any finer block under it, any threshold shows a set that
+  nests. Blocks shown keep showing up to 10% over, so the budget does not flicker either. Level 0 always shows. Test:
+  `a_triangle_budget_keeps_the_detail_that_shows_most` (a budget for a third of what the finer levels add: within
+  it, detail shown down to 14 px, the front's finest work under the eye kept); the GPU check compares a view within
+  a budget too.
+
+Not done yet: blending between levels as they hand over (a block appears or goes at once, about a pixel's change),
+and choosing by occlusion.
 
 ## Driver workarounds (Vulkan, this AMD driver)
 
@@ -317,8 +327,6 @@ one array of atomics at fixed places. The exact check runs on both backends.
 
 ## Known gaps
 
-* **Level choice by distance has no triangle budget yet** (see the level by distance): a view of a lot of near
-  detail draws all of it.
 * **No occlusion culling yet**, only view and facing.
 * **Starting a stroke right after a big one waits** for the last one's end (up to about 0.3 s after a big stroke
   over detail, if the pen comes down at once).

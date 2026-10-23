@@ -1313,7 +1313,17 @@ impl SculptApp {
             let mut lines = vec![
                 format!("Volume  ·  {} levels, showing 0-{}  ·  blocks per level {}  ·  {:.0} MB", counts.len(), m.cap, per.join(" / "), bytes as f64 / 1e6),
                 if m.by_distance {
-                    format!("Level by distance (detail down to {:.2} px): {} blocks shown, {} left to coarser levels{}  ·  {:.2} ms", m.level_px, fmt_count(m.view.shown), fmt_count(m.view.hidden), if m.view.stale > 0 { format!(", {} to measure", fmt_count(m.view.stale)) } else { String::new() }, m.view.ms)
+                    format!(
+                        "Level by distance (detail down to {:.2} px{}): {} blocks shown, {} left to coarser levels{}  ·  about {} triangles{}  ·  {:.2} ms",
+                        m.view.tau_used.max(m.level_px),
+                        if m.budget_on && m.view.tau_used > m.level_px * 1.001 { ", raised for the budget" } else { "" },
+                        fmt_count(m.view.shown),
+                        fmt_count(m.view.hidden),
+                        if m.view.stale > 0 { format!(", {} to measure", fmt_count(m.view.stale)) } else { String::new() },
+                        fmt_count(m.view.triangles as usize),
+                        if m.budget_on { format!(" of {:.1}M", m.budget_m) } else { String::new() },
+                        m.view.ms
+                    )
                 } else {
                     "Level by distance off: every level shown".to_string()
                 },

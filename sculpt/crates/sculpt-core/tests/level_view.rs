@@ -170,3 +170,47 @@ fn a_block_being_sculpted_shows_until_its_detail_is_measured() {
     let (open, _, dropped, _) = closed(&v, &view);
     assert_eq!((open, dropped), (0, 0));
 }
+
+/// Triangles of what the view shows (a quad two, a triangle one).
+fn triangles(v: &LevelVolume, view: &LevelView) -> usize {
+    let (_, stats) = v.surface_in(&view.show(v.levels() - 1));
+    stats.quads * 2 + stats.triangles
+}
+
+#[test]
+fn a_triangle_budget_keeps_the_detail_that_shows_most() {
+    let v = worked();
+    let mut view = fresh_view(&v);
+    let near = Vec3::new(0.0, 0.0, 1.25);
+    view.choose(&v, near, FOCAL);
+    let full = (triangles(&v, &view), view.stats.triangles);
+    let base = {
+        let mut only0 = fresh_view(&v);
+        only0.choose(&v, Vec3::new(0.0, 0.0, 1e6), FOCAL);
+        (triangles(&v, &only0), only0.stats.triangles)
+    };
+    eprintln!("no budget: {} triangles (estimated {}); level 0 alone {} (estimated {})", full.0, full.1, base.0, base.1);
+    assert!((full.1 as f32 / full.0 as f32 - 1.0).abs() < 0.25, "estimate off: {full:?}");
+    // Room for about a third of what the finer levels add.
+    let budget = base.1 + (full.1 - base.1) / 3;
+    view.budget = Some(budget);
+    view.choose(&v, near, FOCAL);
+    let got = (triangles(&v, &view), view.stats.triangles);
+    let (open, _, dropped, _) = closed(&v, &view);
+    eprintln!("budget {budget}: {} triangles (estimated {}), detail shown down to {:.2} px; per level (shown, hidden) {:?}; open {open}, dropped {dropped}", got.0, got.1, view.stats.tau_used, per_level(&v, &view));
+    assert_eq!((open, dropped), (0, 0));
+    assert!(got.1 as f32 <= budget as f32 * 1.1, "over budget");
+    assert!(got.1 > base.1, "the budget left out every finer block");
+    assert!(view.stats.tau_used > view.tau_px, "the budget did not raise the pixels");
+    // What it kept is what is nearest: the front's finest work, right under the eye.
+    let under: Vec<Key> = v.keys().into_iter().filter(|k| k.0 == 3 && v.voxel(3) * (k.1.z as f32 * 8.0) + v.origin().z > 0.9).collect();
+    let kept = under.iter().filter(|k| !view.hides(**k)).count();
+    let all3 = v.keys().into_iter().filter(|k| k.0 == 3 && !view.hides(*k)).count();
+    eprintln!("front level 3 blocks kept {kept} of {}; level 3 shown in all {all3}", under.len());
+    assert!(kept * 2 >= under.len(), "the nearest fine work went");
+    // No budget again: back, all but blocks whose detail comes to under a pixel (hidden now, they need a whole one to
+    // show again).
+    view.budget = None;
+    view.choose(&v, near, FOCAL);
+    assert!(view.stats.triangles as f32 > full.1 as f32 * 0.95, "{} of {}", view.stats.triangles, full.1);
+}

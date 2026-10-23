@@ -382,6 +382,7 @@ impl Viewport {
         v.gpu.set_cap(mode.cap);
         v.gpu.view.on = mode.by_distance;
         v.gpu.view.tau_px = mode.level_px;
+        v.gpu.view.budget = mode.budget_on.then(|| (mode.budget_m as f64 * 1e6) as u64);
         v.gpu.set_eye(eye, focal_px);
         let s = v.gpu.sync(&mut mode.vol);
         mode.view = v.gpu.view.stats;

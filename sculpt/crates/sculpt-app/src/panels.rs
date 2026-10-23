@@ -173,6 +173,10 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                             "Each region shows only the levels whose detail would show on screen from here: far work is drawn from coarser levels, near work in full.",
                         );
                         ui.add_enabled(m.by_distance, egui::Slider::new(&mut m.level_px, 0.25..=4.0).logarithmic(true).text("Detail shown down to (pixels)"));
+                        ui.add_enabled(m.by_distance, egui::Checkbox::new(&mut m.budget_on, "Triangle budget")).on_hover_text(
+                            "Past this many triangles, only the detail that shows most is drawn: the pixels a block's detail must come to rise as far as it takes. Level 0 always shows.",
+                        );
+                        ui.add_enabled(m.by_distance && m.budget_on, egui::Slider::new(&mut m.budget_m, 0.5..=40.0).logarithmic(true).text("Million triangles"));
                         ui.checkbox(&mut m.tint, "Tint by level");
                         ui.checkbox(&mut m.vol.keep_detail, "Big brushes keep finer detail").on_hover_text(
                             "On: a big brush moves the finer detail under it along with the new surface, as sculpting at a lower subdivision level does.\nOff: it builds over the detail like clay, filling grooves and covering bumps where it builds above them.",

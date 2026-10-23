@@ -58,6 +58,9 @@ pub struct VolumeMode {
     /// `level_px` pixels on screen.
     pub by_distance: bool,
     pub level_px: f32,
+    /// At most this many million triangles drawn (when on): past it, only the detail that shows most.
+    pub budget_on: bool,
+    pub budget_m: f32,
     /// What that choice last came to.
     pub view: sculpt_core::generator::level_view::ViewStats,
     /// Tint the surface by the level each part comes from.
@@ -121,6 +124,8 @@ impl VolumeMode {
             cap,
             by_distance: true,
             level_px: 1.0,
+            budget_on: true,
+            budget_m: 6.0,
             view: Default::default(),
             tint: false,
             last_ms: 0.0,

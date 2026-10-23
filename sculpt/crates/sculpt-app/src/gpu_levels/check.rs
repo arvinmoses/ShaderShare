@@ -253,6 +253,13 @@ pub fn run(args: &[String]) -> Res<()> {
             let st = gpu.view.stats;
             compare(&device, &queue, &gpu, &vol, &format!("{pass}seen from {eye} ({} blocks shown, {} hidden)", st.shown, st.hidden))?;
         }
+        // A tight triangle budget, near: only the detail that shows most.
+        gpu.view.budget = Some(gpu.view.stats.triangles * 9 / 10);
+        gpu.set_eye(Vec3::new(0.0, 0.0, 1.3), 1000.0);
+        gpu.sync(&mut vol);
+        let st = gpu.view.stats;
+        compare(&device, &queue, &gpu, &vol, &format!("{pass}within a budget ({} triangles, detail down to {:.1} px)", st.triangles, st.tau_used))?;
+        gpu.view.budget = None;
         gpu.view.on = false;
         gpu.sync(&mut vol);
         compare(&device, &queue, &gpu, &vol, &format!("{pass}every level again"))?;

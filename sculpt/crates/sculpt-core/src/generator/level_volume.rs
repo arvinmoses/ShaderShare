@@ -1070,6 +1070,23 @@ impl LevelVolume {
         out
     }
 
+    /// About how many quads block `bc` of level `l` gives the surface when no finer block covers it: the lattice edges
+    /// its surface crosses, counted among its own samples and scaled for the edges into the blocks past it.
+    pub fn surface_quads(&self, l: usize, bc: IVec3) -> u32 {
+        let Some(s) = self.blocks.get(l).and_then(|m| m.get(&bc)) else { return 0 };
+        let mut n = 0u32;
+        for z in 0..8usize {
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let i = x + 8 * y + 64 * z;
+                    let neg = s[i] < 0.0;
+                    n += (x < 7 && (s[i + 1] < 0.0) != neg) as u32 + (y < 7 && (s[i + 8] < 0.0) != neg) as u32 + (z < 7 && (s[i + 64] < 0.0) != neg) as u32;
+                }
+            }
+        }
+        n * 8 / 7
+    }
+
     /// How far the surface of block `bc` at level `l` lies from the level below's (the most a view leaving this level
     /// out would be off by, near the surface).
     pub fn detail_of(&self, l: usize, bc: IVec3) -> f32 {
