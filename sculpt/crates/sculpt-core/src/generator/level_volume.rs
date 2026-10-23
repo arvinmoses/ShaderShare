@@ -737,6 +737,11 @@ impl LevelVolume {
         self.value_at(l, (p - self.origin) / self.voxel(l), base)
     }
 
+    /// The finest level holding a block at world point `p`.
+    pub fn level_of(&self, p: Vec3) -> usize {
+        self.level_at(p, self.levels() - 1, false)
+    }
+
     /// The field with every level, as it is now.
     pub fn value(&self, p: Vec3) -> f32 {
         self.value_upto(p, self.levels() - 1, false)
@@ -1115,8 +1120,13 @@ impl LevelVolume {
                 .filter_map(|&(m, bc)| {
                     let (vm, fband) = (me.voxel(m), me.band(m));
                     let old = me.blocks[m].get(&bc)?;
-                    // The level below over the block, for samples this level holds only clamped.
-                    let below = me.grid(m - 1, (bc * B).div_euclid(IVec3::splat(2)) - IVec3::ONE, (bc * B + B3).div_euclid(IVec3::splat(2)) + IVec3::ONE, false);
+                    // The levels below over the block, for samples this level holds only clamped.
+                    let below: Vec<Grid> = (0..m)
+                        .map(|k| {
+                            let d = IVec3::splat(1 << (m - k));
+                            me.grid(k, (bc * B).div_euclid(d) - IVec3::ONE, (bc * B + B3).div_euclid(d) + IVec3::ONE, false)
+                        })
+                        .collect();
                     let corner = origin + (bc * B).as_vec3() * vm;
                     let mut s: Block = Box::new(**old);
                     let mut any = false;
@@ -1126,17 +1136,24 @@ impl LevelVolume {
                         if w <= 0.0 {
                             continue;
                         }
-                        // A sample at its band holds only a bound; the level below, on the same side and farther, says
-                        // how far. Blended from the bound, the dab would reach it sooner here than on the level below,
-                        // and clay would show at this level's blocks before it shows around them.
+                        // A sample at its band holds only a bound; the levels below, on the same side and farther, say
+                        // how far: down to the first that holds the distance itself (within its own band), since the
+                        // next level down is often clamped too. Blended from a bound, the dab would reach it sooner here
+                        // than on the levels below, and clay would show at this level's blocks (a block at a time, as a
+                        // step) before it shows around them.
+                        let blob = shape(p);
                         let mut was = *v;
                         if was.abs() >= 0.999 * fband {
-                            let b = below.trilinear((bc * B + cell_of(i)).as_vec3() * 0.5);
-                            if (b < 0.0) == (was < 0.0) && b.abs() > was.abs() {
-                                was = b;
+                            for k in (0..m).rev() {
+                                let b = below[k].trilinear((bc * B + cell_of(i)).as_vec3() / (1 << (m - k)) as f32);
+                                if (b < 0.0) == (was < 0.0) && b.abs() > was.abs() {
+                                    was = b;
+                                }
+                                if b.abs() < 0.999 * me.band(k) {
+                                    break;
+                                }
                             }
                         }
-                        let blob = shape(p);
                         let full = if carve { was.max(-blob) } else { was.min(blob) };
                         let next = (was + w * (full - was)).clamp(-fband, fband);
                         if next != *v {

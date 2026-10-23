@@ -143,6 +143,24 @@ pub fn run(args: &[String]) -> Res<()> {
     if args.iter().any(|a| a == "--bench") {
         return bench(&device, &queue);
     }
+    // `--dumps DIR`: volumes saved from the review's frames (`SCULPT_DEMO_DUMP`), each extracted on the GPU from scratch
+    // and compared with the reference.
+    if let Some(dir) = args.iter().position(|a| a == "--dumps").and_then(|i| args.get(i + 1)) {
+        let mut files: Vec<_> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "svol")).collect();
+        files.sort();
+        for f in files {
+            let mut vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(&f)?), crate::volume_mode::LEVELS)?;
+            let cap = vol.levels() - 1;
+            let mut gpu = GpuLevels::new(&device, &queue, &vol, cap);
+            gpu.sync(&mut vol);
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            match compare(&device, &queue, &gpu, &vol, &name) {
+                Ok((blocks, verts)) => println!("{name}: matches ({blocks} blocks, {verts} vertices)"),
+                Err(e) => println!("{name}: {e}"),
+            }
+        }
+        return Ok(());
+    }
     for jobs in [false, true] {
         let pass = if jobs { "jobs: " } else { "" };
         let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);

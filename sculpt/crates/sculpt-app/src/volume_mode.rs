@@ -156,6 +156,10 @@ impl VolumeMode {
     /// the level the stroke works at, on its first dab.
     pub fn dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, carve: bool) {
         let t = Instant::now();
+        // For replaying a session's strokes (`SCULPT_DAB_LOG`): every dab, as given.
+        if std::env::var_os("SCULPT_DAB_LOG").is_some() {
+            eprintln!("DAB {} {} {} {radius} {px} {strength} {hardness} {carve}", at.x, at.y, at.z);
+        }
         let target = self.layer.as_ref().map(|_| self.target);
         if let (Some(Target::Mask { show }), Some(layer)) = (target, self.layer.as_mut()) {
             layer.paint_mask(&mut self.vol, at, radius, if show { 1.0 } else { 0.0 });
@@ -373,6 +377,9 @@ impl VolumeMode {
     }
 
     pub fn begin_stroke(&mut self) {
+        if std::env::var_os("SCULPT_DAB_LOG").is_some() {
+            eprintln!("BEGIN");
+        }
         self.settle();
         match (self.layer.as_mut(), self.target) {
             (Some(layer), Target::Form) => layer.begin_stroke(),
@@ -611,6 +618,251 @@ mod tests {
         for x in [0.0, 0.03] {
             assert!((top(&opened, x) - top(&mode, x)).abs() < 2e-5, "opened, the surface is not where it was");
         }
+    }
+
+    /// Pieces of a surface: their sizes in vertices.
+    fn pieces(mesh: &sculpt_core::mesh::PolyMesh) -> Vec<usize> {
+        let n = mesh.positions.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn root(p: &mut [usize], mut i: usize) -> usize {
+            while p[i] != i {
+                p[i] = p[p[i]];
+                i = p[i];
+            }
+            i
+        }
+        for f in &mesh.faces {
+            let k = if f[3] == sculpt_core::mesh::NO_VERT { 3 } else { 4 };
+            for j in 1..k {
+                let (a, b) = (root(&mut parent, f[0] as usize), root(&mut parent, f[j] as usize));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+        let mut used = vec![false; n];
+        for f in &mesh.faces {
+            for &v in f.iter().filter(|&&v| v != sculpt_core::mesh::NO_VERT) {
+                used[v as usize] = true;
+            }
+        }
+        let mut size = std::collections::HashMap::new();
+        for i in (0..n).filter(|&i| used[i]) {
+            *size.entry(root(&mut parent, i)).or_insert(0usize) += 1;
+        }
+        size.into_values().collect()
+    }
+
+    /// Spiky vertices: farther from the mean of their neighbours than `k` times the mean edge to them, with where
+    /// they are.
+    fn spikes(mesh: &sculpt_core::mesh::PolyMesh, k: f32) -> Vec<Vec3> {
+        let n = mesh.positions.len();
+        let mut sum = vec![Vec3::ZERO; n];
+        let mut len = vec![0.0f32; n];
+        let mut cnt = vec![0u32; n];
+        for f in &mesh.faces {
+            let m = if f[3] == sculpt_core::mesh::NO_VERT { 3 } else { 4 };
+            for j in 0..m {
+                let (a, b) = (f[j] as usize, f[(j + 1) % m] as usize);
+                if a == b {
+                    continue;
+                }
+                let (pa, pb) = (mesh.positions[a], mesh.positions[b]);
+                sum[a] += pb;
+                sum[b] += pa;
+                len[a] += (pa - pb).length();
+                len[b] += (pa - pb).length();
+                cnt[a] += 1;
+                cnt[b] += 1;
+            }
+        }
+        (0..n).filter(|&i| cnt[i] > 0 && (mesh.positions[i] - sum[i] / cnt[i] as f32).length() > k * len[i] / cnt[i] as f32).map(|i| mesh.positions[i]).collect()
+    }
+
+    /// Volumes dumped from the review's frames (`SCULPT_DEMO_DUMP`), in the folder `SCULPT_DUMPS`: their surfaces'
+    /// spiky vertices, by the finest level where they are, and a few of them.
+    #[test]
+    #[ignore]
+    fn dumped_frames_spikes() {
+        let Ok(dir) = std::env::var("SCULPT_DUMPS") else { return };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "svol")).collect();
+        files.sort();
+        for f in files {
+            let vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(&f).unwrap()), LEVELS).unwrap();
+            let (mesh, _) = vol.surface(vol.levels() - 1);
+            let sp = spikes(&mesh, 0.6);
+            let lv: Vec<usize> = (0..LEVELS).map(|l| sp.iter().filter(|p| vol.level_of(**p) == l).count()).collect();
+            eprintln!("{}: {} vertices, {} spiky, by level {lv:?}; e.g. {:?}", f.file_name().unwrap().to_string_lossy(), mesh.positions.len(), sp.len(), &sp[..sp.len().min(4)]);
+        }
+    }
+
+    /// A shaded height map of `vol`'s surface over a square `half` across around `c` (seen along its normal), as a PGM.
+    fn height_map(vol: &LevelVolume, c: Vec3, half: f32, px: usize, path: &std::path::Path) {
+        use rayon::prelude::*;
+        let n = c.normalize();
+        let u = n.cross(Vec3::Y).normalize();
+        let v = n.cross(u);
+        let step = 2.0 * half / px as f32;
+        let hs: Vec<f32> = (0..px * px)
+            .into_par_iter()
+            .map(|k| {
+                let (i, j) = ((k % px) as f32, (k / px) as f32);
+                let q = c + u * (-half + step * i) + v * (-half + step * j);
+                vol.raycast(q + n * 0.3, -n, vol.levels() - 1, false).map_or(f32::NAN, |(hit, _)| (hit - c).dot(n))
+            })
+            .collect();
+        let at = |i: usize, j: usize| hs[j.min(px - 1) * px + i.min(px - 1)];
+        let light = Vec3::new(-0.5, 0.6, 0.6).normalize();
+        let mut img = format!("P5 {px} {px} 255
+").into_bytes();
+        for j in 0..px {
+            for i in 0..px {
+                let dx = (at(i + 1, j) - at(i.saturating_sub(1), j)) / (2.0 * step);
+                let dy = (at(i, j + 1) - at(i, j.saturating_sub(1))) / (2.0 * step);
+                let nn = Vec3::new(-dx, -dy, 1.0).normalize();
+                img.push((nn.dot(light).clamp(0.0, 1.0) * 255.0) as u8);
+            }
+        }
+        std::fs::write(path, img).unwrap();
+        // The finest level at each pixel, as grey.
+        let levels: Vec<u8> = (0..px * px)
+            .into_par_iter()
+            .map(|k| {
+                let (i, j) = (k % px, k / px);
+                let h = at(i, j);
+                if h.is_nan() {
+                    return 0;
+                }
+                let q = c + u * (-half + step * i as f32) + v * (-half + step * j as f32) + n * h;
+                (vol.level_of(q) * 50) as u8
+            })
+            .collect();
+        let mut lv = format!("P5 {px} {px} 255
+").into_bytes();
+        lv.extend(levels);
+        std::fs::write(path.with_extension("lvl.pgm"), lv).unwrap();
+        // Where the surface jumps between neighbouring pixels by more than four pixels' width: the levels and blocks
+        // on its two sides.
+        if std::env::var_os("SCULPT_REPLAY_JUMPS").is_some() {
+            let mut seen = std::collections::BTreeMap::new();
+            for j in 0..px - 1 {
+                for i in 0..px - 1 {
+                    for (a, b) in [((i, j), (i + 1, j)), ((i, j), (i, j + 1))] {
+                        let (ha, hb) = (at(a.0, a.1), at(b.0, b.1));
+                        if (ha - hb).abs() > 4.0 * step {
+                            let (hi, h) = if ha > hb { (a, ha) } else { (b, hb) };
+                            let q = c + u * (-half + step * hi.0 as f32) + v * (-half + step * hi.1 as f32) + n * h;
+                            let l = vol.level_of(q);
+                            let bc = ((q - vol.origin()) / (vol.voxel(l) * 8.0)).floor().as_ivec3();
+                            *seen.entry((l, bc.x, bc.y, bc.z)).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!("{}: jumps at the high side's finest level and block: {:?}", path.display(), seen.iter().take(12).collect::<Vec<_>>());
+        }
+    }
+
+    /// The level 0 field's slope at samples near the surface around `patch`, in quarters (0-0.25, ..., 1.75+).
+    fn slope(vol: &LevelVolume, patch: Vec3, half: f32) -> [usize; 8] {
+                let vx = vol.voxel(0);
+                let (lo, hi) = (((patch - Vec3::splat(half.max(0.1)) - vol.origin()) / vx).floor().as_ivec3(), ((patch + Vec3::splat(half.max(0.1)) - vol.origin()) / vx).ceil().as_ivec3());
+                let mut hist = [0usize; 8];
+                for z in lo.z..=hi.z {
+                    for y in lo.y..=hi.y {
+                        for x in lo.x..=hi.x {
+                            let i = glam::IVec3::new(x, y, z);
+                            let f = vol.sample(0, i, false);
+                            if f.abs() > 0.7 * vx {
+                                continue;
+                            }
+                            let g = glam::Vec3::new(
+                                vol.sample(0, i + glam::IVec3::X, false) - vol.sample(0, i - glam::IVec3::X, false),
+                                vol.sample(0, i + glam::IVec3::Y, false) - vol.sample(0, i - glam::IVec3::Y, false),
+                                vol.sample(0, i + glam::IVec3::Z, false) - vol.sample(0, i - glam::IVec3::Z, false),
+                            ).length() / (2.0 * vx);
+                            hist[((g / 0.25) as usize).min(7)] += 1;
+                        }
+                    }
+                }
+                hist
+    }
+
+    /// The review's big stroke replayed on the volume dumped just before it (`SCULPT_REPLAY_DIR` holds `dump_01604.svol`
+    /// and the session's dab log `dabs.txt`), drawn around the patch before and after its dabs.
+    #[test]
+    #[ignore]
+    fn replay_the_big_stroke() {
+        let Ok(dir) = std::env::var("SCULPT_REPLAY_DIR") else { return };
+        let dir = std::path::PathBuf::from(dir);
+        let vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(dir.join("dump_01604.svol")).unwrap()), LEVELS).unwrap();
+        let log = std::fs::read_to_string(dir.join("dabs.txt")).unwrap();
+        let last = log.rfind("BEGIN").unwrap();
+        let dabs: Vec<Vec<f32>> = log[last..].lines().filter(|l| l.starts_with("DAB")).map(|l| l.split_whitespace().skip(1).take(7).map(|x| x.parse().unwrap()).collect()).collect();
+        let carve: Vec<bool> = log[last..].lines().filter(|l| l.starts_with("DAB")).map(|l| l.ends_with("true")).collect();
+        let mut mode = VolumeMode::new(vol);
+        let patch = std::env::var("SCULPT_REPLAY_CENTER").ok().map(|c| {
+            let v: Vec<f32> = c.split(',').map(|x| x.parse().unwrap()).collect();
+            Vec3::new(v[0], v[1], v[2])
+        }).unwrap_or(Vec3::new(0.30, 0.34, 0.89));
+        let half: f32 = std::env::var("SCULPT_REPLAY_HALF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.12);
+        height_map(&mode.vol, patch, half, 700, &dir.join("map_0.pgm"));
+        mode.begin_stroke();
+        for (k, d) in dabs.iter().enumerate() {
+            mode.dab(Vec3::new(d[0], d[1], d[2]), d[3], d[4], d[5], d[6], carve[k]);
+            mode.tick();
+            height_map(&mode.vol, patch, half, 700, &dir.join(format!("map_{}.pgm", k + 1)));
+            eprintln!("after dab {}: level 0 slope near the surface, in quarters: {:?}", k + 1, slope(&mode.vol, patch, half));
+        }
+        mode.end_stroke();
+        mode.settle();
+        eprintln!("after the end: level 0 slope near the surface, in quarters: {:?}", slope(&mode.vol, patch, half));
+        height_map(&mode.vol, patch, half, 700, &dir.join("map_end.pgm"));
+    }
+
+    /// A big level 0 stroke over sculpted form and fine work, as the review's: what its surface looks like mid-stroke
+    /// (small loose pieces, open or tangled edges), dab by dab.
+    #[test]
+    #[ignore]
+    fn a_big_stroke_mid_stroke_surface() {
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, LEVELS));
+        let stroke = |mode: &mut VolumeMode, a: Vec3, b: Vec3, r: f32, px: f32, carve: bool, dabs: usize, watch: bool| {
+            mode.begin_stroke();
+            for k in 0..=dabs {
+                let d = a.lerp(b, k as f32 / dabs as f32).normalize();
+                if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
+                    mode.dab(hit, r, px, 1.0, 0.5, carve);
+                }
+                mode.tick();
+                if watch {
+                    let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
+                    let (open, nm) = sculpt_core::generator::levels::edge_counts(&mesh.faces);
+                    let mut sizes = pieces(&mesh);
+                    sizes.sort_unstable();
+                    let small = sizes.iter().filter(|&&s| s < sculpt_core::generator::level_volume::SPECK_VERTS).count();
+                    let sp = spikes(&mesh, 0.6);
+                    let lv: Vec<usize> = (0..LEVELS).map(|l| sp.iter().filter(|p| mode.vol.level_of(**p) == l).count()).collect();
+                    eprintln!("dab {k} at level {}: {} pieces ({small} small), open edges {open}, tangled {nm}; {} spiky vertices, by the finest level there {lv:?}", mode.level, sizes.len(), sp.len());
+                }
+            }
+            mode.end_stroke();
+            mode.settle();
+        };
+        // Broad form, then zoomed-in clay, then fine trims.
+        for (y, r) in [(0.05f32, 0.2f32), (-0.1, 0.18)] {
+            stroke(&mut mode, Vec3::new(-0.2, y, 1.0), Vec3::new(0.2, y, 1.0), r, 0.02, false, 12, false);
+        }
+        stroke(&mut mode, Vec3::new(0.0, 0.2, 1.0), Vec3::new(0.05, -0.15, 1.0), 0.1, 0.02, true, 10, false);
+        for y in [-0.02f32, 0.02] {
+            stroke(&mut mode, Vec3::new(-0.08, y, 1.0), Vec3::new(0.08, y, 1.0), 0.03, 0.0006, false, 16, false);
+        }
+        for k in 0..5 {
+            let y = -0.03 + 0.012 * k as f32;
+            stroke(&mut mode, Vec3::new(-0.05, y, 1.0), Vec3::new(0.05, y + 0.003, 1.0), 0.004, 0.0001, true, 12, false);
+        }
+        let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
+        eprintln!("before: {} pieces, {} spiky vertices; blocks per level {:?}", pieces(&mesh).len(), spikes(&mesh, 0.6).len(), mode.vol.memory().0);
+        stroke(&mut mode, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.1, 0.02, 1.0), 0.45, 0.02, false, 8, true);
+        let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
+        eprintln!("after the stroke ended: {} pieces, {} spiky vertices", pieces(&mesh).len(), spikes(&mesh, 0.6).len());
     }
 
     /// With a detail layer, a mask stroke hides the layer where it passes, and undo brings it back.

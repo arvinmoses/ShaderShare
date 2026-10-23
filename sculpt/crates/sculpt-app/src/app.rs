@@ -1150,6 +1150,21 @@ impl SculptApp {
         }
         let f = demo.step(rect, &self.camera);
         let shot = demo.current_frame() - 1;
+        // For looking into a frame: the volume as it is when that frame begins (`SCULPT_DEMO_DUMP=frame,frame,...`).
+        if let Ok(list) = std::env::var("SCULPT_DEMO_DUMP")
+            && list.split(',').any(|x| x.trim().parse::<u32>().ok() == Some(shot))
+            && let Some(m) = self.volume_mode.as_ref()
+            && let Ok(file) = std::fs::File::create(demo.dir.join(format!("dump_{shot:05}.svol")))
+        {
+            let _ = m.vol.write_to(&mut std::io::BufWriter::new(file));
+        }
+        // And a full rebuild of the GPU's copy at these frames (`SCULPT_DEMO_REBUILD=frame,...`).
+        if let Ok(list) = std::env::var("SCULPT_DEMO_REBUILD")
+            && list.split(',').any(|x| x.trim().parse::<u32>().ok() == Some(shot))
+            && let Some(m) = self.volume_mode.as_mut()
+        {
+            m.generation += 1;
+        }
         if let Some(c) = f.camera {
             self.camera = c;
         }
