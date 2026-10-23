@@ -278,6 +278,52 @@ struct Push {
     hard: f32,
 }
 
+/// The surface under a plane brush as it is now, as heights along the brush's normal `n` over its disc: a column every
+/// `step` across, each the first crossing of the dab's level's field along `n` from above the dab (NaN where the
+/// column meets no surface in reach). A sample that holds only a bound on its distance to the surface (see
+/// [`LevelVolume::plateau`]) reads its distance from here: its height over the column's surface, to the tangent plane
+/// there. Blended from a bound instead, a dab would put the new surface where the bound ran out and leave the field
+/// around it with the dab's weight for a slope, a lattice of facets along a big brush's rim.
+struct Ground {
+    on: Vec3,
+    n: Vec3,
+    t1: Vec3,
+    t2: Vec3,
+    step: f32,
+    /// Columns `-half..=half` along `t1` and `t2`.
+    half: i32,
+    h: Vec<f32>,
+}
+
+impl Ground {
+    fn size(&self) -> i32 {
+        2 * self.half + 1
+    }
+
+    /// The signed distance from `p` to the surface's tangent plane under it, when its column and the three around it
+    /// meet the surface.
+    fn distance(&self, p: Vec3) -> Option<f32> {
+        let q = p - self.on;
+        let s = q.dot(self.t1) / self.step + self.half as f32;
+        let t = q.dot(self.t2) / self.step + self.half as f32;
+        let (i, j) = (s.floor() as i32, t.floor() as i32);
+        if i < 0 || j < 0 || i + 1 >= self.size() || j + 1 >= self.size() {
+            return None;
+        }
+        let at = |a: i32, b: i32| self.h[(b * self.size() + a) as usize];
+        let (h00, h10, h01, h11) = (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1));
+        if h00.is_nan() || h10.is_nan() || h01.is_nan() || h11.is_nan() {
+            return None;
+        }
+        let (fs, ft) = (s - i as f32, t - j as f32);
+        let lerp = |a: f32, b: f32, x: f32| a + (b - a) * x;
+        let h = lerp(lerp(h00, h10, fs), lerp(h01, h11, fs), ft);
+        let hs = lerp(h10 - h00, h11 - h01, ft) / self.step;
+        let ht = lerp(h01 - h00, h11 - h10, fs) / self.step;
+        Some((q.dot(self.n) - h) / (1.0 + hs * hs + ht * ht).sqrt())
+    }
+}
+
 /// A block as it was before a stroke changed it.
 #[derive(Clone)]
 enum Was {
@@ -620,6 +666,18 @@ impl LevelVolume {
     /// as it moves the surface.
     pub fn band(&self, l: usize) -> f32 {
         if l == 0 { 16.0 * self.voxel0 } else { 2.5 * self.voxel(l) }
+    }
+
+    /// How many steps from the surface [`Self::redistance`] measures at a level with step `vx` and band `band`.
+    fn redistance_reach(vx: f32, band: f32) -> i32 {
+        ((band / vx).ceil() as i32 + 1).min(6)
+    }
+
+    /// How far from the surface level `l` holds distances: its band, or at level 0 the six steps [`Self::redistance`]
+    /// measures. A sample at or beyond this holds only a bound on its distance.
+    pub fn plateau(&self, l: usize) -> f32 {
+        let (vx, band) = (self.voxel(l), self.band(l));
+        band.min(Self::redistance_reach(vx, band) as f32 * vx)
     }
 
     /// Stored blocks per level, and the bytes their samples take at 16 bits.
@@ -1068,6 +1126,26 @@ impl LevelVolume {
                 }
             }
         }
+        // A plane brush's dab blends each sample part of the way, so it needs the samples' distances; at level 0,
+        // which holds them only six steps out, those holding only a bound read theirs from the surface under the
+        // brush. (A finer level holds distances to its band, and a sample at its band reads the levels below.)
+        let plateaus: Vec<f32> = (0..self.levels()).map(|k| self.plateau(k)).collect();
+        let plateau = plateaus[l];
+        let ground = if l > 0 { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band)) };
+        let ground = ground.as_ref();
+        // A sample's distance to the surface for the dab to blend from: its value, unless that is only a bound and the
+        // ground under the brush says how far the surface is (on the same side, and no nearer than the bound allows).
+        let from_ground = |p: Vec3, v: f32| -> f32 {
+            if let Some(g) = ground
+                && v.abs() >= 0.999 * plateau
+                && let Some(d) = g.distance(p)
+                && (d < 0.0) == (v < 0.0)
+                && d.abs() >= 0.9 * v.abs()
+            {
+                return d;
+            }
+            v
+        };
         // New samples for each candidate, worked out in parallel from the field as it is.
         let origin = self.origin;
         let me = &*self;
@@ -1087,13 +1165,19 @@ impl LevelVolume {
                         continue;
                     }
                     let blob = shape(p);
-                    let full = if carve { v.max(-blob) } else { v.min(blob) };
-                    let next = (*v + w * (full - *v)).clamp(-band, band);
+                    // Only a sample the dab changes, and blends (a full-weight dab takes the shape outright), needs
+                    // its distance.
+                    let changes = if carve { -blob > *v } else { blob < *v };
+                    let was = if changes && w < 1.0 { from_ground(p, *v) } else { *v };
+                    let full = if carve { was.max(-blob) } else { was.min(blob) };
+                    let next = (was + w * (full - was)).clamp(-band, band);
                     if next != *v {
                         if (next < 0.0) != (*v < 0.0) {
                             flips[i / 64] |= 1 << (i % 64);
                         }
-                        d[i] = next - *v;
+                        // The stroke's change of the distance here (what carrying detail reads as the surface's move),
+                        // not of the bound the sample held.
+                        d[i] = next - was;
                         *v = next;
                         any = true;
                     }
@@ -1137,10 +1221,11 @@ impl LevelVolume {
                             continue;
                         }
                         // A sample at its band holds only a bound; the levels below, on the same side and farther, say
-                        // how far: down to the first that holds the distance itself (within its own band), since the
-                        // next level down is often clamped too. Blended from a bound, the dab would reach it sooner here
-                        // than on the levels below, and clay would show at this level's blocks (a block at a time, as a
-                        // step) before it shows around them.
+                        // how far: down to the first that holds the distance itself (within its own plateau), since
+                        // the next level down is often clamped too, and when even level 0 holds only its bound, the
+                        // ground under the brush. Blended from a bound, the dab would reach it sooner here than on the
+                        // levels below, and clay would show at this level's blocks (a block at a time, as a step)
+                        // before it shows around them.
                         let blob = shape(p);
                         let mut was = *v;
                         if was.abs() >= 0.999 * fband {
@@ -1149,9 +1234,12 @@ impl LevelVolume {
                                 if (b < 0.0) == (was < 0.0) && b.abs() > was.abs() {
                                     was = b;
                                 }
-                                if b.abs() < 0.999 * me.band(k) {
+                                if b.abs() < 0.999 * plateaus[k] {
                                     break;
                                 }
+                            }
+                            if was.abs() >= 0.999 * plateaus[0] && w < 1.0 {
+                                was = from_ground(p, was);
                             }
                         }
                         let full = if carve { was.max(-blob) } else { was.min(blob) };
@@ -1907,6 +1995,52 @@ impl LevelVolume {
 
     // ------------------------------------------------------------------ plane brushes
 
+    /// The surface of level `l` as it is now under a plane brush at `on` with normal `n` and radius `r` (see
+    /// [`Ground`]): each column marched from `top` along `-n` (or up, where `top` is inside) to the field's first
+    /// crossing, no farther down than `bottom` (heights along `n` from `on`).
+    fn ground(&self, l: usize, on: Vec3, n: Vec3, r: f32, top: f32, bottom: f32) -> Ground {
+        let (vx, band) = (self.voxel(l), self.band(l));
+        let step = 2.0 * vx;
+        let half = (r / step).ceil() as i32 + 1;
+        let size = 2 * half + 1;
+        let (t1, t2) = n.any_orthonormal_pair();
+        let f = |a: i32, b: i32, u: f32| self.value_at(l, (on + t1 * ((a - half) as f32 * step) + t2 * ((b - half) as f32 * step) + n * u - self.origin) / vx, false);
+        let h: Vec<f32> = (0..size * size)
+            .into_par_iter()
+            .map(|k| {
+                let (a, b) = (k % size, k / size);
+                let (mut u, mut v) = (top, f(a, b, top));
+                if v == 0.0 {
+                    return u;
+                }
+                let dir = if v > 0.0 { -1.0 } else { 1.0 };
+                for _ in 0..64 {
+                    let next = u + v.abs().clamp(0.5 * vx, band) * dir;
+                    if next < bottom || next > top + 2.0 * band {
+                        return f32::NAN;
+                    }
+                    let nv = f(a, b, next);
+                    if (nv < 0.0) != (v < 0.0) {
+                        let (mut lo, mut hi) = (u, next);
+                        for _ in 0..10 {
+                            let m = 0.5 * (lo + hi);
+                            if (f(a, b, m) < 0.0) == (v < 0.0) {
+                                lo = m;
+                            } else {
+                                hi = m;
+                            }
+                        }
+                        return 0.5 * (lo + hi);
+                    }
+                    u = next;
+                    v = nv;
+                }
+                f32::NAN
+            })
+            .collect();
+        Ground { on, n, t1, t2, step, half, h }
+    }
+
     /// Where the line through `p` along `n` meets the surface of levels up to `l` (as it was when the stroke began,
     /// with `base`), within `limit` of `p`.
     fn along_onto(&self, l: usize, mut p: Vec3, n: Vec3, limit: f32, base: bool) -> Option<Vec3> {
@@ -2229,9 +2363,10 @@ impl LevelVolume {
                 continue;
             }
             let (vx, band) = (self.voxel(l), self.band(l));
-            // Crossings within a few steps: deeper samples get that far as a lower bound, which is all anything here
-            // reads them for (steps toward the surface), and the search stays small for level 0's wide band.
-            let reach = ((band / vx).ceil() as i32 + 1).min(6);
+            // Crossings within a few steps: deeper samples get that far as a lower bound (the plateau), which is all
+            // anything here reads them for (steps toward the surface; a plane dab reads the ground under the brush
+            // instead, see [`Ground`]), and the search stays small for level 0's wide band.
+            let reach = Self::redistance_reach(vx, band);
             let me = &*self;
             let fixed: Vec<(IVec3, Block)> = blocks
                 .par_iter()

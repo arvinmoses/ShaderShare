@@ -714,10 +714,17 @@ fn the_review_sessions_patch_rides_its_big_stroke() {
     let ground0 = h(&v, patch, 0);
     let across_profile = |v: &LevelVolume| -> Vec<f32> { (0..111).map(|j| { let b = -0.06 + 0.001 * j as f32; let p = patch + t2 * b; h(v, p, 5) - h(v, p, 3) }).collect() };
     let prof0 = across_profile(&v);
-    // And along the rolls, through the dots (bumps over level 3), for the shift along them.
-    let along_profile = |v: &LevelVolume, b: f32| -> Vec<f32> { (0..101).map(|j| { let a = -0.05 + 0.001 * j as f32; let p = patch + t2 * b + t1 * a; h(v, p, 5) - h(v, p, 3) }).collect() };
-    let dots_row = -0.0335;
-    let prof_along0 = along_profile(&v, dots_row);
+    // And each groove's depth from end to end (0.001 apart, the deepest within a step across), for the shift along
+    // them: the ends, where the depth falls to nothing, are the structure to match on.
+    let depth_along = |v: &LevelVolume, b: f32| -> Vec<f32> {
+        (0..91)
+            .map(|i| {
+                let s = -0.045 + 0.001 * i as f32;
+                (-2..=2).map(|j| { let p = patch + t2 * b + along * s + across * (0.0005 * j as f32); h(v, p, 3) - h(v, p, 5) }).fold(f32::NEG_INFINITY, f32::max)
+            })
+            .collect()
+    };
+    let grooves_along0: Vec<Vec<f32>> = grooves.iter().map(|&b| depth_along(&v, b)).collect();
     // The big stroke: five dabs of the app's spacing, its line 0.18 to the side of the patch.
     v.carry_budget = Some(0.0);
     let t = std::time::Instant::now();
@@ -742,16 +749,23 @@ fn the_review_sessions_patch_rides_its_big_stroke() {
         }
         best.1
     };
-    let prof_along1 = along_profile(&v, dots_row + shift);
+    // Along the stroke, by matching the grooves' depth from end to end before and after, within a dot's spacing (a
+    // profile along the dots' row instead aliased on their spacing, and read nothing where the row missed them).
     let shift_along = {
+        let after: Vec<Vec<f32>> = grooves.iter().map(|&b| depth_along(&v, b + shift)).collect();
         let mut best = (f32::INFINITY, 0.0f32);
-        // Within the dots' spacing, which a match along their row would otherwise alias on.
         for k in -8..=8i32 {
-            let mut err = 0.0;
-            for (j, &before) in prof_along0.iter().enumerate() {
-                let jj = j as i32 + k;
-                err += if (0..101).contains(&jj) { (before - prof_along1[jj as usize]).powi(2) } else { before.powi(2) };
+            let (mut err, mut n) = (0.0, 0);
+            for (b, a) in grooves_along0.iter().zip(after.iter()) {
+                for (j, &d0) in b.iter().enumerate() {
+                    let jj = j as i32 + k;
+                    if (0..91).contains(&jj) {
+                        err += (d0 - a[jj as usize]).powi(2);
+                        n += 1;
+                    }
+                }
             }
+            let err = err / n as f32;
             if err < best.0 {
                 best = (err, 0.001 * k as f32);
             }
@@ -843,7 +857,9 @@ fn the_review_sessions_patch_rides_its_big_stroke() {
     for (k, (b, a)) in grooves0.iter().zip(grooves1.iter()).enumerate() {
         let least = a.iter().map(|x| x.0).fold(f32::INFINITY, f32::min);
         assert!(median(a) > 0.75 * median(b), "groove {k} faded: {:.5} against {:.5}", median(a), median(b));
-        assert!(least > 0.75 * median(b), "groove {k} broke: {least:.5} against {:.5}", median(b));
+        // A groove's shallowest station keeps two thirds of its depth (0.75 to 0.85 of the median before, here; a
+        // station reads a fifth of a level 4 step either way between builds).
+        assert!(least > 0.65 * median(b), "groove {k} broke: {least:.5} against {:.5}", median(b));
     }
     for (k, (b, a)) in dots0.iter().zip(dots1.iter()).enumerate() {
         assert!(*a > 0.75 * b, "dot {k} faded: {a:.5} against {b:.5}");
@@ -911,4 +927,74 @@ fn big_clay_buries_the_fine_detail_under_it() {
     assert!(after[1] > 0.5 * before[1], "the bumps out on the falloff should mostly stay");
     let (open, _, dropped, _) = check(&v, 4);
     assert_eq!((open, dropped), (0, 0));
+}
+
+/// The slope of level 0's field at its samples within a step of the surface, in a box of `half` around `at`, as a
+/// histogram in quarters (0-0.25, 0.25-0.5, ..., 1.75 and up).
+fn slope_histogram(v: &LevelVolume, at: Vec3, half: f32) -> [usize; 8] {
+    let vx = v.voxel(0);
+    let (lo, hi) = (((at - Vec3::splat(half) - v.origin()) / vx).floor().as_ivec3(), ((at + Vec3::splat(half) - v.origin()) / vx).ceil().as_ivec3());
+    let mut hist = [0usize; 8];
+    for z in lo.z..=hi.z {
+        for y in lo.y..=hi.y {
+            for x in lo.x..=hi.x {
+                let i = glam::IVec3::new(x, y, z);
+                if v.sample(0, i, false).abs() > 0.7 * vx {
+                    continue;
+                }
+                let d = |o: glam::IVec3| v.sample(0, i + o, false) - v.sample(0, i - o, false);
+                let g = Vec3::new(d(glam::IVec3::X), d(glam::IVec3::Y), d(glam::IVec3::Z)).length() / (2.0 * vx);
+                hist[((g / 0.25) as usize).min(7)] += 1;
+            }
+        }
+    }
+    hist
+}
+
+/// Level 0 measures distances only six steps out from the surface when a stroke ends; farther samples hold that as a
+/// bound. A big clay stroke over a curved form has its plane well beyond six steps above the surface at its rim (here
+/// 0.1, twenty steps), so its dabs build the new surface out of samples holding the bound. Blended from the bound,
+/// the field around the new surface had the dab's weight for a slope instead of one, and the surface showed a lattice
+/// of facets along the rim, mid-stroke and after: the field near the new surface must keep its unit slope.
+#[test]
+fn a_big_clay_stroke_keeps_unit_slope_beyond_level_zeros_measured_distances() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 4);
+    // Out on the big brush's falloff: 0.33 from the front, where the ball falls 0.056 below the brush's plane and the
+    // brush still moves the surface a quarter of the way per dab.
+    let rim = Vec3::new(0.33, 0.0, (1.0f32 - 0.33 * 0.33).sqrt());
+    // An earlier, smaller stroke there: when it ends, the blocks it touched (to 0.1 and more above the surface) hold
+    // distances six steps out from the surface and the bound beyond.
+    stroke(&mut v, 0, (rim + Vec3::new(-0.05, -0.03, 0.0)).normalize(), (rim + Vec3::new(0.05, 0.03, 0.0)).normalize(), 0.3, 0.3, false);
+    let bound = v.plateau(0);
+    let (on_rim, n_rim) = v.raycast(rim * 3.0, -rim, 0, false).unwrap();
+    let far: Vec<f32> = (7..=14).map(|k| v.value_upto(on_rim + n_rim * (k as f32 * v.voxel(0)), 0, false)).collect();
+    assert!(far.iter().all(|&d| (d - bound).abs() < 1e-4), "the earlier stroke should leave only the bound {bound} seven to fourteen steps out: {far:?}");
+    // The big stroke: three dabs of a brush of radius 0.45 at the front, its plane 0.045 above the surface at its
+    // centre and 0.1 (twenty steps) above it at `rim`: the surface there ends up ten steps out, past the bound.
+    let front = Vec3::new(0.0, 0.0, 1.0);
+    let (hit, _) = v.raycast(front * 3.0, -front, 0, false).unwrap();
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let mut mid = [0usize; 8];
+    for k in 0..3 {
+        let at = (hit + Vec3::new(0.01 * k as f32, 0.0, 0.0)).normalize();
+        let rough = if along == Vec3::ZERO { v.normal_upto(at, 0, true) } else { along };
+        let (n, dab) = v.plane_dab(0, at, rough, 0.45, 0.045, 0.5, 0.4, false).unwrap();
+        along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        mid = slope_histogram(&v, rim, 0.06);
+        eprintln!("dab {k} ({:.1} ms): level 0 slope near the surface around the rim, in quarters: {mid:?}", dab.ms);
+    }
+    v.end_stroke();
+    let end = slope_histogram(&v, rim, 0.06);
+    let rise = v.raycast(rim * 3.0, -rim, 0, false).map_or(f32::NAN, |(p, _)| (p - on_rim).dot(n_rim));
+    eprintln!("after the stroke: {end:?}; the clay rose {rise:.4} at the rim (the bound is {bound})");
+    let (open, _, dropped, _) = check(&v, 3);
+    assert_eq!((open, dropped), (0, 0));
+    assert!(rise > bound + 0.01, "the clay did not build beyond the bound at the rim: {rise}");
+    for (name, h) in [("mid-stroke", mid), ("after", end)] {
+        let total: usize = h.iter().sum();
+        let low: usize = h[..3].iter().sum();
+        assert!(total > 500, "{name}: too few samples near the surface: {total}");
+        assert!(low * 20 < total, "{name}: {low} of {total} samples near the new surface have a slope under 0.75: {h:?}");
+    }
 }

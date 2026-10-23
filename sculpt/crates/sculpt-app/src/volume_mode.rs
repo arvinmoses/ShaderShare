@@ -804,18 +804,38 @@ mod tests {
             Vec3::new(v[0], v[1], v[2])
         }).unwrap_or(Vec3::new(0.30, 0.34, 0.89));
         let half: f32 = std::env::var("SCULPT_REPLAY_HALF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.12);
+        // Level 0's samples in a lattice box around the view's centre, as text, per stage.
+        let dump_box = |vol: &LevelVolume, name: &str| {
+            let Ok(r) = std::env::var("SCULPT_REPLAY_BOX") else { return };
+            let r: i32 = r.parse().unwrap();
+            let c = ((patch - vol.origin()) / vol.voxel(0)).round().as_ivec3();
+            let mut out = String::new();
+            for z in c.z - r..=c.z + r {
+                for y in c.y - r..=c.y + r {
+                    for x in c.x - r..=c.x + r {
+                        let i = glam::IVec3::new(x, y, z);
+                        out.push_str(&format!("{x} {y} {z} {} {}\n", vol.sample(0, i, false), vol.level_of(vol.origin() + i.as_vec3() * vol.voxel(0))));
+                    }
+                }
+            }
+            std::fs::write(dir.join(format!("box_{name}.txt")), out).unwrap();
+        };
         height_map(&mode.vol, patch, half, 700, &dir.join("map_0.pgm"));
+        dump_box(&mode.vol, "0");
         mode.begin_stroke();
         for (k, d) in dabs.iter().enumerate() {
             mode.dab(Vec3::new(d[0], d[1], d[2]), d[3], d[4], d[5], d[6], carve[k]);
             mode.tick();
             height_map(&mode.vol, patch, half, 700, &dir.join(format!("map_{}.pgm", k + 1)));
+            dump_box(&mode.vol, &format!("{}", k + 1));
             eprintln!("after dab {}: level 0 slope near the surface, in quarters: {:?}", k + 1, slope(&mode.vol, patch, half));
         }
+        eprintln!("{:.1} ms per dab", mode.last_ms / mode.last_dabs.max(1) as f64);
         mode.end_stroke();
         mode.settle();
         eprintln!("after the end: level 0 slope near the surface, in quarters: {:?}", slope(&mode.vol, patch, half));
         height_map(&mode.vol, patch, half, 700, &dir.join("map_end.pgm"));
+        dump_box(&mode.vol, "end");
     }
 
     /// A big level 0 stroke over sculpted form and fine work, as the review's: what its surface looks like mid-stroke
