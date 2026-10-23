@@ -294,7 +294,7 @@ fn picture_a_wide_blend() {
     let mut l = Layered::new(&mut s, 2);
     let spec = GeneratorSpec { count: 300, min_spacing: 0.13, size: 0.06, blend: 0.6, ..rocks() };
     l.add_generator(&mut s, "Rocks", 0, &spec);
-    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(".".into());
+    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(std::env::temp_dir().to_string_lossy().into_owned());
     let n = 500;
     for cap in [0usize, 3] {
         let mut img = vec![0u8; n * n];
@@ -322,7 +322,7 @@ fn picture_a_dump() {
     let path = std::env::var("SCULPT_GEN_DUMP").expect("SCULPT_GEN_DUMP");
     let v = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(path).unwrap()), 6).unwrap();
     let at: Vec<f32> = std::env::var("SCULPT_GEN_AT").unwrap_or("0.3,0.34,0.89".into()).split(',').map(|x| x.parse().unwrap()).collect();
-    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(".".into());
+    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(std::env::temp_dir().to_string_lossy().into_owned());
     let w = Vec3::new(at[0], at[1], at[2]).normalize();
     let u = w.any_orthonormal_vector();
     let t = w.cross(u);
@@ -547,7 +547,7 @@ fn live_against_afresh() {
 #[ignore]
 fn picture_layers_afresh() {
     let (v, _) = Layered::read_from(&mut std::io::BufReader::new(std::fs::File::open(std::env::var("SCULPT_GEN_LAYERS").unwrap()).unwrap()), 6).unwrap();
-    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(".".into());
+    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(std::env::temp_dir().to_string_lossy().into_owned());
     let w = Vec3::new(0.3, 0.34, 0.89).normalize();
     let u = w.any_orthonormal_vector();
     let t = w.cross(u);
