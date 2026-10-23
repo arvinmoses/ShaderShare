@@ -301,7 +301,16 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   and at its own level again when the drag ends, one undo step for all of it. At about the app's scale (a ball at a
   level 0 step of 0.007, twelve rocks): a drag step 6-8 ms at any level; on release 32 ms at level 2, 150 ms at
   level 3. The default size is 3% of the object, at the coarsest level giving a dozen steps a radius.
+* **A soft join reads the form alike everywhere.** A smooth minimum reads the form's distance out to its blend's
+  width, and level 0 holds distances only six steps out (past them, a block a stroke touched holds a bound, an
+  untouched one its band): a blend wider than that read different values on either side of a block's face, and
+  the review showed it as steps cut into the rocks (neighbouring samples 13.7 steps apart at a face). The form now
+  counts as six steps away wherever it is farther, the same in every block, and a fine level whose own distance is
+  near its clamp reads level 0's instead (1.2 steps apart at most). Test:
+  `a_blend_wider_than_the_form_holds_distances_leaves_no_steps`.
 * **Its mask** fades it, starting whole wherever it changes the field.
+* **Seen.** `volume/generator_layers.png` (from the review, 126-152 s): rocks added; 60 of them, larger, blended wider;
+  the same scatter cutting pits; the form sculpted under them; a rock masked away.
 * **Tests.** `tests/volume_gen.rs`: rocks stand on the form closed at every level, cutters dig pits, rocks ride a big
   stroke, an edit shows what building it afresh shows and undoes, a previewed drag ends as the edit made at once,
   saving and opening, the mask fading a rock away.
