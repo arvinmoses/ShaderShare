@@ -227,35 +227,10 @@ impl GeneratorCache {
                 None => scatter(&basis.sampler, None, base, &basis.normals, faces, spec),
             }),
         };
-        let seed = spec.seed;
         let mapper = Mapper::new(&spec.mapping, channels);
         let count = samples.len();
-        let instances = samples
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let i = i as u64;
-                // What the surface says about this instance (empty rows say nothing).
-                let m = mapper.map(s, i as usize, count, |stream, k| unit_random(seed ^ MAP_STREAM ^ stream as u64, k));
-                let spin = if spec.random_spin { unit_random(seed, i) * std::f32::consts::TAU } else { 0.0 };
-                // Each kind of variation draws from its own stream, so changing one never reshuffles another.
-                let size = spec.size * (1.0 + spec.size_var * signed_random(seed ^ SIZE_STREAM, i)).max(0.05) * m.size.max(0.05);
-                let mut axes = Vec3::new(
-                    1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i),
-                    1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 1),
-                    1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 2),
-                )
-                .max(Vec3::splat(0.05));
-                axes.y *= m.stretch.max(0.05);
-                let lift = spec.lift + spec.lift_var * signed_random(seed ^ LIFT_STREAM, i) + m.lift;
-                let max_tilt = (spec.tilt + m.tilt_degrees).clamp(0.0, 89.0).to_radians();
-                let up = lean(s.normal, max_tilt * unit_random(seed ^ TILT_STREAM, i), unit_random(seed ^ TILT_STREAM, i + (1 << 40)) * std::f32::consts::TAU);
-                Instance::new(spec.primitive, s.position + s.normal * (lift * size), frame_from_normal(up, spin), axes * size)
-            })
-            .collect();
-        // The largest an instance can grow, which bounds how far it can reach.
-        let mapped_growth: f32 = spec.mapping.iter().map(|r| r.max_factor()).product();
-        let biggest = spec.size * (1.0 + spec.size_var) * (1.0 + spec.stretch_var) * mapped_growth;
+        let instances = samples.iter().enumerate().map(|(i, s)| place_instance(spec, &mapper, s, i, count)).collect();
+        let biggest = biggest_instance(spec);
         let reach = if spec.op == BoolOp::Subtract { 0.0 } else { 0.25 * biggest };
         let set = InstanceSet::new(instances, reach);
         let boxes: Vec<Aabb> = (0..set.len()).filter(|&i| set.is_active(i)).map(|i| set.aabb(i)).collect();
@@ -308,11 +283,38 @@ impl GeneratorCache {
     }
 }
 
+/// Instance `i` of `count` for the surface point `s`, with the spec's variations (each drawn from its own stream, so
+/// changing one never reshuffles another) and what the surface says through `mapper`.
+pub(crate) fn place_instance(spec: &GeneratorSpec, mapper: &Mapper, s: &SurfaceSample, i: usize, count: usize) -> Instance {
+    let seed = spec.seed;
+    let m = mapper.map(s, i, count, |stream, k| unit_random(seed ^ MAP_STREAM ^ stream as u64, k));
+    let i = i as u64;
+    let spin = if spec.random_spin { unit_random(seed, i) * std::f32::consts::TAU } else { 0.0 };
+    let size = spec.size * (1.0 + spec.size_var * signed_random(seed ^ SIZE_STREAM, i)).max(0.05) * m.size.max(0.05);
+    let mut axes = Vec3::new(
+        1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i),
+        1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 1),
+        1.0 + spec.stretch_var * signed_random(seed ^ STRETCH_STREAM, 3 * i + 2),
+    )
+    .max(Vec3::splat(0.05));
+    axes.y *= m.stretch.max(0.05);
+    let lift = spec.lift + spec.lift_var * signed_random(seed ^ LIFT_STREAM, i) + m.lift;
+    let max_tilt = (spec.tilt + m.tilt_degrees).clamp(0.0, 89.0).to_radians();
+    let up = lean(s.normal, max_tilt * unit_random(seed ^ TILT_STREAM, i), unit_random(seed ^ TILT_STREAM, i + (1 << 40)) * std::f32::consts::TAU);
+    Instance::new(spec.primitive, s.position + s.normal * (lift * size), frame_from_normal(up, spin), axes * size)
+}
+
+/// The largest an instance of `spec` can grow (its size with every variation at its most), which bounds its reach.
+pub(crate) fn biggest_instance(spec: &GeneratorSpec) -> f32 {
+    let mapped_growth: f32 = spec.mapping.iter().map(|r| r.max_factor()).product();
+    spec.size * (1.0 + spec.size_var) * (1.0 + spec.stretch_var) * mapped_growth
+}
+
 const SIZE_STREAM: u64 = 0x5129_A1C3_0F7D_E001;
 const STRETCH_STREAM: u64 = 0x7C15_93B2_44D1_F002;
 const LIFT_STREAM: u64 = 0x3AF8_61E9_B2C4_D003;
 const TILT_STREAM: u64 = 0x96D2_0E47_58A3_C004;
-const ORDER_STREAM: u64 = 0xE410_7B6D_91F2_A005;
+pub(crate) const ORDER_STREAM: u64 = 0xE410_7B6D_91F2_A005;
 const MAP_STREAM: u64 = 0x1D8B_44F0_C6A7_E006;
 
 /// Deterministic value in `[-1, 1)`.
@@ -381,7 +383,7 @@ fn scatter(sampler: &SurfaceSampler, mask: Option<&[f32]>, base: &[Vec3], normal
 }
 
 /// Deterministic value in `[0, 1)` from a seed and an index (splitmix64).
-fn unit_random(seed: u64, i: u64) -> f32 {
+pub(crate) fn unit_random(seed: u64, i: u64) -> f32 {
     let mut z = seed.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

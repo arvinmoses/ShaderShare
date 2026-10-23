@@ -47,6 +47,7 @@ pub mod schedule;
 pub mod sdf;
 pub mod volume;
 pub mod voxel;
+pub mod volume_gen;
 
 use glam::Vec3;
 use rayon::prelude::*;

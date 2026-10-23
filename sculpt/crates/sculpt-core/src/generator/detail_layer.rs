@@ -24,7 +24,9 @@ use std::time::Instant;
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 
+use super::layer::GeneratorSpec;
 use super::level_volume::{EndDone, EndJob, HashMap, HashSet, Key, LevelDab, LevelVolume, Shared, Stored, StrokeEnd};
+use super::volume_gen::{Anchor, VolumeGen};
 
 const B: i32 = 8;
 const N: usize = 512;
@@ -59,7 +61,8 @@ fn corner_offset(q: i32) -> IVec3 {
     IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)
 }
 
-/// One layer: its name, level, whether it shows, and its samples (heights and mask) per block of its level.
+/// One layer: its name, level, whether it shows, and its samples (heights and mask) per block of its level; or, for a
+/// generator, what it scatters (its mask still per block of its level).
 #[derive(Clone)]
 struct Layer {
     name: String,
@@ -67,11 +70,49 @@ struct Layer {
     visible: bool,
     h: Shared<IVec3, Stored>,
     m: Shared<IVec3, Stored>,
+    scatter: Option<GenPart>,
+}
+
+/// A generator layer's scatter, and the blocks it changes at each level ([`VolumeGen::blocks`]).
+#[derive(Clone)]
+struct GenPart {
+    g: VolumeGen,
+    blocks: std::sync::Arc<Vec<HashSet<IVec3>>>,
+}
+
+impl GenPart {
+    fn new(form: &LevelVolume, g: VolumeGen, own: usize) -> GenPart {
+        let blocks = (0..form.levels()).map(|l| g.blocks(form, l, own)).collect();
+        GenPart { g, blocks: std::sync::Arc::new(blocks) }
+    }
 }
 
 impl Layer {
     fn new(name: &str, level: usize) -> Layer {
-        Layer { name: name.to_string(), level, visible: true, h: Shared::default(), m: Shared::default() }
+        Layer { name: name.to_string(), level, visible: true, h: Shared::default(), m: Shared::default(), scatter: None }
+    }
+
+    /// Whether the layer has block `bc` of level `l` (a generator, at any level it changes).
+    fn holds(&self, l: usize, bc: IVec3) -> bool {
+        match &self.scatter {
+            Some(g) => g.blocks.get(l).is_some_and(|b| b.contains(&bc)),
+            None => l == self.level && self.h.contains_key(&bc),
+        }
+    }
+
+    /// Every block the layer has, with its level.
+    fn all_keys(&self) -> Vec<(usize, IVec3)> {
+        match &self.scatter {
+            Some(g) => g.blocks.iter().enumerate().flat_map(|(l, b)| b.iter().map(move |bc| (l, *bc))).collect(),
+            None => self.h.keys().map(|bc| (self.level, *bc)).collect(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.scatter {
+            Some(g) => g.blocks.iter().map(|b| b.len()).sum(),
+            None => self.h.len(),
+        }
     }
 }
 
@@ -82,6 +123,8 @@ pub struct LayerInfo {
     pub level: usize,
     pub visible: bool,
     pub blocks: usize,
+    /// A generator layer (scattering a primitive) rather than heights.
+    pub generator: bool,
 }
 
 /// A layer map's samples over a box of lattice points, read once.
@@ -336,26 +379,22 @@ fn offsets(stack: &[Layer], l: usize, lo: IVec3, hi: IVec3, finer: bool, except:
 
 /// Whether block `bc` of level `l` is composed (a visible layer there has it).
 fn composed(stack: &[Layer], l: usize, bc: IVec3) -> bool {
-    stack.iter().any(|x| x.visible && x.level == l && x.h.contains_key(&bc))
+    stack.iter().any(|x| x.visible && x.holds(l, bc))
 }
 
 /// The shown blocks layer changes `changes` (level, block) reach: themselves, and the finer layers' blocks under them
 /// (which hold the coarser layers too).
 fn affected(stack: &[Layer], changes: &[(usize, IVec3)]) -> Vec<(usize, IVec3)> {
-    let top = stack.iter().map(|x| x.level).max().unwrap_or(0).max(changes.iter().map(|c| c.0).max().unwrap_or(0));
+    let top = stack.iter().map(|x| if x.scatter.is_some() { x.all_keys().iter().map(|k| k.0).max().unwrap_or(0) } else { x.level }).max().unwrap_or(0).max(changes.iter().map(|c| c.0).max().unwrap_or(0));
     let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); top + 1];
     for &(l, bc) in changes {
         per[l].insert(bc);
     }
     let mut out: HashSet<(usize, IVec3)> = changes.iter().copied().collect();
     for layer in stack.iter().filter(|x| x.visible) {
-        let lf = layer.level;
-        if (0..lf).all(|lk| per[lk].is_empty()) {
-            continue;
-        }
-        for bc in layer.h.keys() {
-            if (0..lf).any(|lk| !per[lk].is_empty() && per[lk].contains(&(*bc >> (lf - lk) as i32))) {
-                out.insert((lf, *bc));
+        for (lf, bc) in layer.all_keys() {
+            if (0..lf.min(top + 1)).any(|lk| !per[lk].is_empty() && per[lk].contains(&(bc >> (lf - lk) as i32))) {
+                out.insert((lf, bc));
             }
         }
     }
@@ -365,7 +404,9 @@ fn affected(stack: &[Layer], changes: &[(usize, IVec3)]) -> Vec<(usize, IVec3)> 
 /// What is shown at level `l` for blocks `keys`: the form pushed out by the layers at that level or coarser, or (`None`)
 /// nothing of its own where no visible layer at that level has the block.
 fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, keys: &[IVec3]) -> Vec<(IVec3, Option<Stored>)> {
-    let (v, band) = (form.voxel(l), form.band(l));
+    let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
+    // The generators shown, in the stack's order, each with its mask's lattice scale against this level's.
+    let gens: Vec<(&VolumeGen, &Shared<IVec3, Stored>, f32)> = stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref().map(|g| (&g.g, &x.m, 2f32.powi(x.level as i32 - l as i32)))).collect();
     keys.par_iter()
         .map(|&bc| {
             if !composed(stack, l, bc) {
@@ -389,18 +430,34 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
                 let f = g - i.as_vec3();
                 (0..8).map(|q| corner_weight(q, f) * pa(i + corner_offset(q))).sum::<f32>()
             };
+            // The generators' instances within reach of the block, and their masks.
+            let (wlo, whi) = (origin + lo.as_vec3() * v, origin + hi.as_vec3() * v);
+            let near: Vec<(&VolumeGen, Sparse, f32, Vec<u32>)> = gens
+                .iter()
+                .filter_map(|&(g, m, scale)| {
+                    let mut near = Vec::new();
+                    g.near(wlo, whi, g.blend() + v, &mut near);
+                    (!near.is_empty()).then(|| (g, Sparse::new(m, 1.0), scale, near))
+                })
+                .collect();
             let c: Vec<f32> = (0..n * n * n)
                 .map(|k| {
                     let i = lo + IVec3::new(k % n, (k / n) % n, k / (n * n));
                     let s = s[k as usize];
                     // Away from the surface the height moves nothing that shows.
-                    if s == 0.0 || pa(i).abs() > band + s.abs() + v {
-                        return pa(i);
+                    let mut c = if s == 0.0 || pa(i).abs() > band + s.abs() + v {
+                        pa(i)
+                    } else {
+                        // The form's field where this point would be with the height taken off, along the normal: zero
+                        // exactly the height out from the form's surface, however steep or shallow the field is.
+                        let g = Vec3::new(pa(i + IVec3::X) - pa(i - IVec3::X), pa(i + IVec3::Y) - pa(i - IVec3::Y), pa(i + IVec3::Z) - pa(i - IVec3::Z));
+                        tri(i.as_vec3() - g.normalize_or_zero() * (s / v))
+                    };
+                    // Then each generator on it, in order.
+                    for (g, mask, scale, near) in &near {
+                        c = g.apply(c, origin + i.as_vec3() * v, near, mask.linear(i.as_vec3() * *scale).clamp(0.0, 1.0));
                     }
-                    // The form's field where this point would be with the height taken off, along the normal: zero
-                    // exactly the height out from the form's surface, however steep or shallow the field is.
-                    let g = Vec3::new(pa(i + IVec3::X) - pa(i - IVec3::X), pa(i + IVec3::Y) - pa(i - IVec3::Y), pa(i + IVec3::Z) - pa(i - IVec3::Z));
-                    tri(i.as_vec3() - g.normalize_or_zero() * (s / v))
+                    c
                 })
                 .collect();
             let at = |x: i32, y: i32, z: i32| c[(x + n * (y + n * z)) as usize];
@@ -439,6 +496,19 @@ fn under(l: usize, region: &[Key], layer: &Layer) -> Vec<IVec3> {
         }
     }
     layer.h.keys().filter(|bc| (0..=l).any(|m| !per[m].is_empty() && per[m].contains(&(**bc >> (l - m) as i32)))).copied().collect()
+}
+
+/// Every block of `layer` (at any level) under any of the form's blocks `region`, with its level.
+fn under_all(region: &[Key], layer: &Layer) -> Vec<(usize, IVec3)> {
+    if layer.scatter.is_none() {
+        return under(layer.level, region, layer).into_iter().map(|bc| (layer.level, bc)).collect();
+    }
+    let top = region.iter().map(|k| k.0 as usize).max().unwrap_or(0);
+    let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); top + 1];
+    for &(m, bc) in region {
+        per[m as usize].insert(bc);
+    }
+    layer.all_keys().into_iter().filter(|&(l, bc)| (0..=l.min(top)).any(|m| !per[m].is_empty() && per[m].contains(&(bc >> (l - m) as i32)))).collect()
 }
 
 /// What a follow did.
@@ -521,6 +591,8 @@ pub struct FollowDone {
     region: Vec<Key>,
     end: bool,
     layers: Vec<(usize, LayerBlocks)>,
+    /// Generator layers as the follow left them (the stroke's last finds their anchors again on the form).
+    gens: Vec<(usize, GenPart)>,
     shown: Vec<(usize, IVec3, Option<Stored>)>,
     used: Vec<((usize, IVec3), Corners)>,
     stats: FollowStats,
@@ -547,7 +619,41 @@ impl FollowJob {
         let mut layers = Vec::with_capacity(self.stack.len());
         let mut used = Vec::new();
         let mut changes = Vec::new();
+        let mut gens = Vec::new();
         for k in 0..self.stack.len() {
+            if let Some(part) = self.stack[k].scatter.clone() {
+                let own = self.stack[k].level;
+                let part = if self.end {
+                    // The anchors found again on the form, and every block the layer changed or changes now.
+                    let reach = (16.0 * self.form.voxel(0)).max(2.0 * part.g.spec.size);
+                    let moved = GenPart::new(&self.form, part.g.follow(&self.form, reach), own);
+                    changes.extend(self.stack[k].all_keys());
+                    self.stack[k].scatter = Some(moved.clone());
+                    changes.extend(self.stack[k].all_keys());
+                    moved
+                } else {
+                    // Its blocks under the region, and form blocks the stroke made within its reach.
+                    let mut blocks = (*part.blocks).clone();
+                    for &(m, bc) in &self.region {
+                        let m = m as usize;
+                        if blocks[m].contains(&bc) {
+                            changes.push((m, bc));
+                        } else if self.form.exists(m, bc) {
+                            let (v, origin) = (self.form.voxel(m), self.form.origin());
+                            let lo = origin + (bc * B).as_vec3() * v;
+                            if part.g.touches(lo, lo + Vec3::splat(B as f32 * v), part.g.blend() + self.form.band(m) + v) {
+                                blocks[m].insert(bc);
+                                changes.push((m, bc));
+                            }
+                        }
+                    }
+                    let part = GenPart { g: part.g, blocks: std::sync::Arc::new(blocks) };
+                    self.stack[k].scatter = Some(part.clone());
+                    part
+                };
+                gens.push((k, part));
+                continue;
+            }
             let (built, u, s) = follow_heights(&self, k);
             stats.blocks += s.blocks;
             stats.points += s.points;
@@ -576,7 +682,7 @@ impl FollowJob {
         let shown = compose_all(&self.form, &self.stack, self.from - 1, &targets);
         stats.parts_ms[3] = t3.elapsed().as_secs_f64() * 1e3;
         stats.ms = t.elapsed().as_secs_f64() * 1e3;
-        FollowDone { form: self.form, region: self.region, end: self.end, layers, shown, used, stats }
+        FollowDone { form: self.form, region: self.region, end: self.end, layers, gens, shown, used, stats }
     }
 }
 
@@ -955,12 +1061,12 @@ impl Layered {
 
     /// The active layer's blocks.
     pub fn blocks(&self) -> usize {
-        self.stack.get(self.active).map_or(0, |x| x.h.len())
+        self.stack.get(self.active).map_or(0, |x| x.len())
     }
 
     /// The layers, bottom first.
     pub fn layers(&self) -> Vec<LayerInfo> {
-        self.stack.iter().map(|x| LayerInfo { name: x.name.clone(), level: x.level, visible: x.visible, blocks: x.h.len() }).collect()
+        self.stack.iter().map(|x| LayerInfo { name: x.name.clone(), level: x.level, visible: x.visible, blocks: x.len(), generator: x.scatter.is_some() }).collect()
     }
 
     /// The layer strokes on the layers (and mask strokes) work on.
@@ -984,6 +1090,49 @@ impl Layered {
         self.active
     }
 
+    /// A new generator layer on top, scattering `spec` over the form, made active. It changes the field at levels up to
+    /// `level` (any, coarse or fine: a generator's resolution is its own).
+    pub fn add_generator(&mut self, shown: &mut LevelVolume, name: &str, level: usize, spec: &GeneratorSpec) -> usize {
+        let level = level.min(self.form.levels() - 1);
+        self.history.push(Undo::Layers(self.stack.clone()));
+        self.redo.clear();
+        let mut layer = Layer::new(name, level);
+        layer.scatter = Some(GenPart::new(&self.form, VolumeGen::build(&self.form, spec, None), level));
+        let changes = layer.all_keys();
+        self.stack.push(layer);
+        self.active = self.stack.len() - 1;
+        self.compose(shown, &changes);
+        self.active
+    }
+
+    /// Generator layer `k`'s parameters.
+    pub fn generator(&self, k: usize) -> Option<&GeneratorSpec> {
+        self.stack.get(k)?.scatter.as_ref().map(|g| &g.g.spec)
+    }
+
+    /// Generator layer `k`'s instances as placed, for checks.
+    pub fn generator_instances(&self, k: usize) -> Vec<super::Instance> {
+        self.stack.get(k).and_then(|x| x.scatter.as_ref()).map_or(Vec::new(), |g| g.g.instances().to_vec())
+    }
+
+    /// Change generator layer `k`'s parameters (scattered again only if the count, seed or spacing changed). Within
+    /// an edit ([`Self::begin_edit`]) a run of changes undoes as one.
+    pub fn set_generator(&mut self, shown: &mut LevelVolume, k: usize, spec: &GeneratorSpec) {
+        let Some(old) = self.stack.get(k).and_then(|x| x.scatter.clone()) else { return };
+        if old.g.spec == *spec {
+            return;
+        }
+        if self.edit.is_none() {
+            self.history.push(Undo::Layers(self.stack.clone()));
+            self.redo.clear();
+        }
+        let own = self.stack[k].level;
+        let mut changes = self.stack[k].all_keys();
+        self.stack[k].scatter = Some(GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), own));
+        changes.extend(self.stack[k].all_keys());
+        self.compose(shown, &changes);
+    }
+
     /// Remove layer `k`.
     pub fn remove_layer(&mut self, shown: &mut LevelVolume, k: usize) {
         if k >= self.stack.len() {
@@ -993,7 +1142,7 @@ impl Layered {
         self.redo.clear();
         let gone = self.stack.remove(k);
         self.active = self.active.min(self.stack.len().saturating_sub(1));
-        let changes: Vec<(usize, IVec3)> = gone.h.keys().map(|bc| (gone.level, *bc)).collect();
+        let changes = gone.all_keys();
         self.compose(shown, &changes);
     }
 
@@ -1010,13 +1159,29 @@ impl Layered {
             return;
         }
         x.visible = on;
-        let changes: Vec<(usize, IVec3)> = x.h.keys().map(|bc| (x.level, *bc)).collect();
+        let changes = x.all_keys();
         self.compose(shown, &changes);
     }
 
     /// Hold layer `k` at another level: finer keeps its detail on a denser lattice; coarser keeps what that lattice
     /// can hold (averaged over each new step).
     pub fn set_level(&mut self, shown: &mut LevelVolume, k: usize, level: usize) {
+        if let Some(part) = self.stack.get(k).and_then(|x| x.scatter.clone()) {
+            // A generator: the same scatter, changing the field to another level.
+            let level = level.min(self.form.levels() - 1);
+            if self.stack[k].level == level {
+                return;
+            }
+            self.history.push(Undo::Layers(self.stack.clone()));
+            self.redo.clear();
+            let mut changes = self.stack[k].all_keys();
+            self.stack[k].level = level;
+            self.stack[k].m = Shared::default();
+            self.stack[k].scatter = Some(GenPart::new(&self.form, part.g, level));
+            changes.extend(self.stack[k].all_keys());
+            self.compose(shown, &changes);
+            return;
+        }
         let level = level.clamp(self.from, self.form.levels() - 1);
         let Some(old) = self.stack.get(k).cloned() else { return };
         if old.level == level {
@@ -1075,7 +1240,7 @@ impl Layered {
                 (bc, any.then(|| (Stored::from(h), Stored::from(m))))
             })
             .collect();
-        let mut layer = Layer { name: old.name.clone(), level, visible: old.visible, h: Shared::default(), m: Shared::default() };
+        let mut layer = Layer { name: old.name.clone(), level, visible: old.visible, h: Shared::default(), m: Shared::default(), scatter: None };
         for (bc, hm) in built {
             if let Some((h, m)) = hm {
                 layer.h.insert(bc, h);
@@ -1098,10 +1263,24 @@ impl Layered {
         self.follows = 0;
         self.covered = vec![HashSet::default(); self.form.levels()];
         for k in 0..self.stack.len() {
+            if self.stack[k].scatter.is_some() {
+                for (l, bc) in self.stack[k].all_keys() {
+                    self.cover(l, &[bc]);
+                }
+                continue;
+            }
             let keys: Vec<IVec3> = self.stack[k].h.keys().copied().collect();
             self.cover(self.stack[k].level, &keys);
         }
         self.form.begin_stroke();
+    }
+
+    /// Whether a generator shown reaches block `bc` of level `l` (a form block a stroke made there shows with it on).
+    fn generators_reach(&self, l: usize, bc: IVec3) -> bool {
+        let (v, origin) = (self.form.voxel(l), self.form.origin());
+        let lo = origin + (bc * B).as_vec3() * v;
+        let hi = lo + Vec3::splat(B as f32 * v);
+        self.stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref()).any(|g| g.g.touches(lo, hi, g.g.blend() + self.form.band(l) + v))
     }
 
     /// Mark the blocks over blocks `keys` of level `l`, at every level up to it.
@@ -1138,7 +1317,7 @@ impl Layered {
             for &k in &dirty {
                 shown.mirror(&self.form, k);
             }
-            let changes: Vec<(usize, IVec3)> = self.stack.iter().flat_map(|x| under(x.level, &dirty, x).into_iter().map(move |bc| (x.level, bc))).collect();
+            let changes: Vec<(usize, IVec3)> = self.stack.iter().flat_map(|x| under_all(&dirty, x)).collect();
             self.compose(shown, &changes);
             let stale = self.stale_under(shown, &dirty, &self.form);
             self.tidy(shown, stale, None);
@@ -1146,7 +1325,7 @@ impl Layered {
         }
         for k in dirty {
             let m = k.0 as usize;
-            if self.covered.get(m).is_some_and(|c| c.contains(&k.1)) {
+            if self.covered.get(m).is_some_and(|c| c.contains(&k.1)) || self.generators_reach(m, k.1) {
                 self.pending.insert(k);
             } else {
                 shown.mirror(&self.form, k);
@@ -1234,7 +1413,16 @@ impl Layered {
     pub fn follow_apply(&mut self, shown: &mut LevelVolume, done: FollowDone) {
         let t = Instant::now();
         self.running = false;
-        let FollowDone { form, region, end, layers, shown: blocks, used, mut stats } = done;
+        let FollowDone { form, region, end, layers, gens, shown: blocks, used, mut stats } = done;
+        for (k, part) in gens {
+            if let Some(x) = self.stack.get_mut(k).filter(|x| x.scatter.is_some()) {
+                x.scatter = Some(part);
+                let keys = x.all_keys();
+                for (l, bc) in keys {
+                    self.cover(l, &[bc]);
+                }
+            }
+        }
         let mut sorted = region.clone();
         sorted.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
         // (The layers' levels only where no layer is composed: their blocks there are composed below, or stay.)
@@ -1304,8 +1492,10 @@ impl Layered {
             for by in lo.y..=hi.y {
                 for bx in lo.x..=hi.x {
                     let bc = IVec3::new(bx, by, bz);
-                    let Some(m) = layer.m.get(&bc) else { continue };
-                    let mut m = Box::new(**m);
+                    // A generator's mask starts out whole wherever it changes the field.
+                    let start = if layer.scatter.as_ref().is_some_and(|g| g.blocks[level].contains(&bc)) { Some(Stored::from(Box::new([1.0f32; N]))) } else { None };
+                    let Some(m) = layer.m.get(&bc).cloned().or(start) else { continue };
+                    let mut m = Box::new(*m);
                     for (i, x) in m.iter_mut().enumerate() {
                         let d = (origin + (bc * B + cell(i)).as_vec3() * v - c).length() / r;
                         let t = (1.0 - d).clamp(0.0, 1.0);
@@ -1316,6 +1506,23 @@ impl Layered {
                     changed.push((level, bc));
                 }
             }
+        }
+        // A generator's mask reaches what it changes at every level: its blocks within the stroke.
+        if let Some(g) = layer.scatter.as_ref().filter(|_| !changed.is_empty()) {
+            changed = g
+                .blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(l, b)| {
+                    let s = self.form.voxel(l) * B as f32;
+                    b.iter()
+                        .filter(move |bc| {
+                            let lo = origin + bc.as_vec3() * s;
+                            (c.clamp(lo, lo + Vec3::splat(s)) - c).length() <= r + s
+                        })
+                        .map(move |bc| (l, *bc))
+                })
+                .collect();
         }
         if !changed.is_empty() {
             if self.edit.is_none() {
@@ -1375,6 +1582,17 @@ impl Layered {
         let same_shape = old.len() == self.stack.len() && old.iter().zip(&self.stack).all(|(a, b)| a.level == b.level && a.visible == b.visible);
         if same_shape {
             for (a, b) in old.iter().zip(&self.stack) {
+                if a.scatter.is_some() || b.scatter.is_some() {
+                    let same = match (&a.scatter, &b.scatter) {
+                        (Some(x), Some(y)) => std::sync::Arc::ptr_eq(&x.blocks, &y.blocks) && a.m.len() == b.m.len() && b.m.iter().all(|(bc, m)| a.m.get(bc).is_some_and(|o| std::sync::Arc::ptr_eq(o, m))),
+                        _ => false,
+                    };
+                    if !same {
+                        changes.extend(a.all_keys());
+                        changes.extend(b.all_keys());
+                    }
+                    continue;
+                }
                 for (bc, h) in b.h.iter() {
                     if a.h.get(bc).is_none_or(|o| !std::sync::Arc::ptr_eq(o, h)) || a.m.get(bc).zip(b.m.get(bc)).is_none_or(|(x, y)| !std::sync::Arc::ptr_eq(x, y)) {
                         changes.insert((b.level, *bc));
@@ -1388,11 +1606,11 @@ impl Layered {
             }
         } else {
             for x in old.iter().chain(&self.stack) {
-                changes.extend(x.h.keys().map(|bc| (x.level, *bc)));
+                changes.extend(x.all_keys());
             }
         }
         for x in &self.stack {
-            changes.extend(under(x.level, &region, x).into_iter().map(|bc| (x.level, bc)));
+            changes.extend(under_all(&region, x));
         }
         let changes: Vec<(usize, IVec3)> = changes.into_iter().collect();
         self.compose(shown, &changes);
@@ -1411,7 +1629,7 @@ impl Layered {
         }
         // Such blocks are parents of the layers' (read through their blocks, not every block shown).
         let mut out: HashSet<Key> = HashSet::default();
-        for x in &self.stack {
+        for x in self.stack.iter().filter(|x| x.scatter.is_none()) {
             let l = x.level;
             for &bc in x.h.keys() {
                 for m in 1..l {
@@ -1479,7 +1697,7 @@ impl Layered {
     pub fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
         self.form.write_to(w)?;
         w.write_all(b"SLAY")?;
-        for x in [1u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
+        for x in [2u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
             w.write_all(&x.to_le_bytes())?;
         }
         for layer in &self.stack {
@@ -1487,6 +1705,30 @@ impl Layered {
             w.write_all(layer.name.as_bytes())?;
             w.write_all(&(layer.level as u32).to_le_bytes())?;
             w.write_all(&[layer.visible as u8])?;
+            // What kind of layer (version 2): heights, or a generator (its parameters, anchors and mask).
+            w.write_all(&[layer.scatter.is_some() as u8])?;
+            if let Some(g) = &layer.scatter {
+                let spec = serde_json::to_vec(&g.g.spec).map_err(std::io::Error::other)?;
+                w.write_all(&(spec.len() as u32).to_le_bytes())?;
+                w.write_all(&spec)?;
+                w.write_all(&(g.g.anchors().len() as u32).to_le_bytes())?;
+                for a in g.g.anchors() {
+                    for x in a.p.to_array().into_iter().chain(a.n.to_array()) {
+                        w.write_all(&x.to_le_bytes())?;
+                    }
+                }
+                let mut keys: Vec<IVec3> = layer.m.keys().copied().collect();
+                keys.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+                w.write_all(&(keys.len() as u32).to_le_bytes())?;
+                for bc in keys {
+                    for x in bc.to_array() {
+                        w.write_all(&x.to_le_bytes())?;
+                    }
+                    let buf: Vec<u8> = layer.m[&bc].iter().flat_map(|v| v.to_le_bytes()).collect();
+                    w.write_all(&buf)?;
+                }
+                continue;
+            }
             let mut keys: Vec<IVec3> = layer.h.keys().copied().collect();
             keys.sort_unstable_by_key(|v| (v.z, v.y, v.x));
             w.write_all(&(keys.len() as u32).to_le_bytes())?;
@@ -1529,7 +1771,7 @@ impl Layered {
             Ok(u32::from_le_bytes(b))
         };
         let version = u32s(r)?;
-        if version != 1 {
+        if version != 1 && version != 2 {
             return Err(bad("unknown layer section version"));
         }
         let (from, count, active) = (u32s(r)? as usize, u32s(r)? as usize, u32s(r)? as usize);
@@ -1542,9 +1784,45 @@ impl Layered {
             let len = u32s(r)? as usize;
             let mut name = vec![0u8; len.min(4096)];
             r.read_exact(&mut name)?;
-            let level = (u32s(r)? as usize).clamp(from, top);
+            let level = u32s(r)? as usize;
             let mut vis = [0u8; 1];
             r.read_exact(&mut vis)?;
+            let mut kind = [0u8; 1];
+            if version >= 2 {
+                r.read_exact(&mut kind)?;
+            }
+            if kind[0] == 1 {
+                let mut layer = Layer::new(&String::from_utf8_lossy(&name), level.min(top));
+                layer.visible = vis[0] != 0;
+                let len = u32s(r)? as usize;
+                let mut spec = vec![0u8; len.min(1 << 20)];
+                r.read_exact(&mut spec)?;
+                let spec: GeneratorSpec = serde_json::from_slice(&spec).map_err(|e| bad(&format!("generator parameters: {e}")))?;
+                let n = u32s(r)? as usize;
+                let mut anchors = Vec::with_capacity(n.min(1 << 20));
+                for _ in 0..n {
+                    let mut f = [0f32; 6];
+                    for x in &mut f {
+                        *x = f32::from_bits(u32s(r)?);
+                    }
+                    anchors.push(Anchor { p: Vec3::new(f[0], f[1], f[2]), n: Vec3::new(f[3], f[4], f[5]) });
+                }
+                let masks = u32s(r)? as usize;
+                let mut buf = vec![0u8; N * 4];
+                for _ in 0..masks {
+                    let mut c = [0i32; 3];
+                    for x in &mut c {
+                        *x = u32s(r)? as i32;
+                    }
+                    r.read_exact(&mut buf)?;
+                    let m: Box<[f32; N]> = Box::new(std::array::from_fn(|i| f32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]])));
+                    layer.m.insert(IVec3::from_array(c), Stored::from(m));
+                }
+                layer.scatter = Some(GenPart::new(&form, VolumeGen::from_anchors(&spec, anchors), layer.level));
+                stack.push(layer);
+                continue;
+            }
+            let level = level.clamp(from, top);
             let mut layer = Layer::new(&String::from_utf8_lossy(&name), level);
             layer.visible = vis[0] != 0;
             let blocks = u32s(r)? as usize;
@@ -1568,7 +1846,7 @@ impl Layered {
         let mut shown = form.snapshot();
         let mut out = Layered::with_form(form, from, stack);
         out.active = active.min(out.stack.len().saturating_sub(1));
-        let changes: Vec<(usize, IVec3)> = out.stack.iter().flat_map(|x| x.h.keys().map(move |bc| (x.level, *bc))).collect();
+        let changes: Vec<(usize, IVec3)> = out.stack.iter().flat_map(|x| x.all_keys()).collect();
         out.compose(&mut shown, &changes);
         shown.clear_history();
         Ok((shown, Some(out)))
