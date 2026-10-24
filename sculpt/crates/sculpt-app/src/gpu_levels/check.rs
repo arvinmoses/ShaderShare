@@ -302,7 +302,7 @@ fn join_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
         let plan_ms = t.elapsed().as_secs_f64() * 1e3;
         let keys: Vec<Key> = plan.blocks.iter().map(|b| b.0).collect();
         gpu.sync(&mut vol);
-        let s = gpu.join(&vol, plan, &|k| layer.base_samples(k));
+        let s = gpu.join(plan, &|k| layer.base_samples(k));
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let status = read(device, queue, &gpu.buf.status);
         if status[3] != 0 {
@@ -353,6 +353,9 @@ pub fn run(args: &[String]) -> Res<()> {
     }
     if off > 1e-3 {
         return Err(format!("the shader's surface noise differs from the CPU's by {off} of its height").into());
+    }
+    if args.iter().any(|a| a == "--bench-join") {
+        return bench_join(&device, &queue);
     }
     if args.iter().any(|a| a == "--bench") {
         return bench(&device, &queue);
@@ -485,6 +488,52 @@ pub fn run(args: &[String]) -> Res<()> {
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     v.get(v.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// At the app's scale: a generator's edits joined on the GPU, timed (planning, joining, the GPU's work) against the
+/// CPU's job (`--bench-join`).
+fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
+    use sculpt_core::generator::detail_layer::Layered;
+    use sculpt_core::generator::layer::GeneratorSpec;
+    use sculpt_core::generator::{BoolOp, Primitive};
+    for level in [2usize, 3] {
+        let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, 0.007, 6);
+        let mut layer = Layered::new(&mut vol, 5);
+        let size = 0.028 * 2.5;
+        let spec = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 1, size, lift: 0.15, random_spin: true, min_spacing: 3.0 * size, size_var: 0.4, stretch_var: 0.35, tilt: 25.0, blend: 0.3, rough: 0.15, ..GeneratorSpec::default() };
+        let k = layer.add_generator(&mut vol, "Rocks", level, &spec);
+        let mut gpu = GpuLevels::new(device, queue, &vol, 5);
+        gpu.sync(&mut vol);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let mut rows = Vec::new();
+        for i in 1..=6 {
+            let next = GeneratorSpec { size: size * (1.0 + 0.04 * i as f32), ..spec.clone() };
+            let t = Instant::now();
+            let plan = layer.gpu_generator(&mut vol, k, &next).ok_or("no GPU join")?;
+            let plan_ms = t.elapsed().as_secs_f64() * 1e3;
+            let n = plan.blocks.len();
+            let ts = Instant::now();
+            gpu.sync(&mut vol);
+            let sync_ms = ts.elapsed().as_secs_f64() * 1e3;
+            let s = gpu.join(plan, &|k| layer.base_samples(k));
+            let tg = Instant::now();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
+            let tj = Instant::now();
+            while let Some(job) = layer.generator_take() {
+                layer.generator_apply(&mut vol, job.run());
+            }
+            let job_ms = tj.elapsed().as_secs_f64() * 1e3;
+            gpu.sync(&mut vol);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            rows.push(format!("{n} blocks: plan {plan_ms:.1}, sync {sync_ms:.1}, join {:.1} ms CPU, then the GPU {gpu_ms:.1} ms; the job {job_ms:.0} ms", s.cpu_ms));
+        }
+        println!("rocks at level {level}:");
+        for r in rows {
+            println!("  {r}");
+        }
+    }
+    Ok(())
 }
 
 fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {

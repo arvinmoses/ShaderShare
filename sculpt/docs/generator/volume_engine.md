@@ -309,8 +309,12 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   field, which also makes a distance of steep joins again (the GPU leaves that out). The shader's joining is
   `volume_gen.wgsl` (every primitive, both joins, roughness on the shared hash noise), within 1e-6 of the instances'
   size of the CPU's; an edit joined on the GPU against the job's field, near the surface: no sample on the other side
-  of it in about three million, the rest within 1.4 steps (`--gpu-levels-check`). On the check's ball, an edit costs
-  5-15 ms to plan and 8-26 ms to join on the CPU (the first 130 ms, reading every base), against the job's 40-68 ms.
+  of it in about three million, the rest within 1.4 steps (`--gpu-levels-check`). Only the blocks joined are rebuilt
+  (those around them read them only where the generators change nothing), and only above level 1: at level 1 or
+  coarser the CPU's preview is the layer at its own level already, and sooner. At about the app's scale (a ball at a
+  level 0 step of 0.007, twelve rough rocks at level 2, 52-80k blocks; `--gpu-levels-check --bench-join`): an edit
+  costs 30-43 ms to plan, about 30 to sync (putting the blocks it newly needs in place) and 27-48 to join on the CPU
+  (reading the bases it lacks), and 12-22 ms on the GPU; the job's exact field takes 400-620 ms.
 * **A soft join reads the form alike everywhere.** A smooth minimum reads the form's distance out to its blend's
   width, and level 0 holds distances only six steps out (past them, a block a stroke touched holds a bound, an
   untouched one its band): a blend wider than that read different values on either side of a block's face, and

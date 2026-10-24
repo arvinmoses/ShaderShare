@@ -10,7 +10,7 @@ use eframe::egui_wgpu::wgpu;
 use eframe::egui_wgpu::wgpu::util::DeviceExt;
 use rayon::prelude::*;
 use sculpt_core::generator::detail_layer::GpuPlan;
-use sculpt_core::generator::level_volume::{Key, LevelVolume};
+use sculpt_core::generator::level_volume::Key;
 
 use super::{GpuLevels, SAMPLE_WORDS, SyncStats, grid};
 
@@ -103,14 +103,14 @@ impl Join {
     }
 
     fn pool(device: &wgpu::Device, cap: u32) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels join bases"), size: cap as u64 * SAMPLE_WORDS * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+        device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels join bases"), size: cap as u64 * SAMPLE_WORDS * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false })
     }
 }
 
 impl GpuLevels {
     /// Join the generators to the blocks `plan` lists (those with a slot: shown), `base` giving a block's base field
     /// when the pool has none for it, and rebuild their surface and the blocks around them.
-    pub fn join(&mut self, vol: &LevelVolume, plan: GpuPlan, base: &(dyn Fn(Key) -> Box<[f32; 729]> + Sync)) -> SyncStats {
+    pub fn join(&mut self, plan: GpuPlan, base: &(dyn Fn(Key) -> Box<[f32; 729]> + Sync)) -> SyncStats {
         let t = std::time::Instant::now();
         let mut stats = SyncStats::default();
         let device = self.device.clone();
@@ -127,13 +127,14 @@ impl GpuLevels {
         // Bases the pool lacks: room for them (a larger pool starts afresh), then read and sent.
         let missing: Vec<Key> = blocks.iter().map(|b| b.0).filter(|k| !join.base_of.contains_key(k)).collect();
         if join.high as usize + missing.len() > join.cap as usize {
-            let need = (blocks.len() as u32).max(join.high + missing.len() as u32);
-            if need > join.cap {
-                join.cap = need.next_power_of_two();
-                join.base = Join::pool(&device, join.cap);
-            }
-            join.base_of.clear();
-            join.high = 0;
+            // A larger pool, the bases it held copied across.
+            let cap = (join.high + missing.len() as u32).next_power_of_two();
+            let pool = Join::pool(&device, cap);
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&join.base, 0, &pool, 0, join.high as u64 * SAMPLE_WORDS * 4);
+            self.queue.submit([enc.finish()]);
+            join.base = pool;
+            join.cap = cap;
         }
         let missing: Vec<Key> = blocks.iter().map(|b| b.0).filter(|k| !join.base_of.contains_key(k)).collect();
         let packed: Vec<(Key, Vec<u32>)> = missing
@@ -147,6 +148,7 @@ impl GpuLevels {
                 (k, w)
             })
             .collect();
+        let t_base = t.elapsed().as_secs_f64() * 1e3;
         let first = join.high;
         let mut all = Vec::with_capacity(packed.len() * SAMPLE_WORDS as usize);
         for (k, w) in packed {
@@ -208,11 +210,18 @@ impl GpuLevels {
         for (_, slot, _) in &blocks {
             self.sent[*slot as usize] = 0;
         }
+        let t_pass = t.elapsed().as_secs_f64() * 1e3;
+        // Rebuilt: the blocks joined (which blocks exist is the sync's, which went before). Those around them read
+        // them only where the generators change nothing.
         let keys: Vec<Key> = blocks.iter().map(|b| b.0).collect();
-        let extract = vol.extract_set_in(&keys, &self.show());
+        let extract = keys.clone();
+        let t_set = t.elapsed().as_secs_f64() * 1e3;
         self.extract(&extract, &[], &mut stats);
         stats.uploaded = keys.len();
         stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("SCULPT_JOIN_LOG").is_some() {
+            eprintln!("join: {} blocks ({} bases read): bases {t_base:.1}, lists and pass {:.1}, extract set {:.1} ({} blocks), extraction {:.1} ms", keys.len(), missing.len(), t_pass - t_base, t_set - t_pass, extract.len(), stats.cpu_ms - t_set);
+        }
         stats
     }
 }
