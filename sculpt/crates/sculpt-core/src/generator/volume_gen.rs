@@ -31,6 +31,28 @@ use crate::surface_noise::rough_sample;
 
 const B: i32 = 8;
 
+/// The shader's copy of the joining (`vg_apply`), with `surface_noise::WGSL` before it for the roughness.
+pub const WGSL: &str = include_str!("volume_gen.wgsl");
+
+/// An instance as the shader reads it (`GpuInstance` in [`WGSL`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuInstance {
+    pub m0: [f32; 4],
+    pub m1: [f32; 4],
+    pub m2: [f32; 4],
+    pub s: [f32; 4],
+    pub k: [u32; 4],
+}
+
+/// A generator's parameters as the shader reads them (`GpuGen`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuGen {
+    pub f: [f32; 4],
+    pub u: [u32; 4],
+}
+
 /// A point of the surface an instance hangs from, with the surface's outward normal there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Anchor {
@@ -289,6 +311,34 @@ impl VolumeGen {
     }
 
     /// The most the roughness moves an instance's surface, in world units.
+    /// Its instances as the shader reads them.
+    pub fn gpu_instances(&self) -> Vec<GpuInstance> {
+        self.set
+            .instances()
+            .iter()
+            .map(|i| {
+                let inv = glam::Mat3::from_quat(i.rotation).transpose();
+                let t = i.translation;
+                let ball = i.primitive == super::Primitive::Sphere && (i.scale.max_element() - i.scale.min_element()) <= 1e-6 * i.scale.max_element();
+                let prim = super::Primitive::ALL.iter().position(|p| *p == i.primitive).unwrap_or(1) as u32;
+                let inv_s = i.scale.recip();
+                GpuInstance {
+                    m0: [inv.x_axis.x, inv.x_axis.y, inv.x_axis.z, t.x],
+                    m1: [inv.y_axis.x, inv.y_axis.y, inv.y_axis.z, t.y],
+                    m2: [inv.z_axis.x, inv.z_axis.y, inv.z_axis.z, t.z],
+                    s: [inv_s.x, inv_s.y, inv_s.z, i.scale.min_element()],
+                    k: [prim, ball as u32, 0, 0],
+                }
+            })
+            .collect()
+    }
+
+    /// Its parameters as the shader reads them.
+    pub fn gpu_params(&self) -> GpuGen {
+        let r = self.rough.unwrap_or(Rough { kind: 0, freq: 0.0, octaves: 0, seed: 0 });
+        GpuGen { f: [self.blend(), self.roughness(), r.freq, if self.subtracts() { 1.0 } else { 0.0 }], u: [r.kind, r.octaves, r.seed, self.rough.is_some() as u32] }
+    }
+
     /// Its roughness noise, if it has any.
     pub fn rough(&self) -> Option<Rough> {
         self.rough

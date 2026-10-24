@@ -204,10 +204,93 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
     Ok(worst)
 }
 
+/// The shader's generator joining (`vg_apply`) against `VolumeGen::apply`, for every primitive, both joins and each
+/// roughness, at points about the instances. Returns the largest difference against the instances' size.
+fn generator_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<f32> {
+    use eframe::egui_wgpu::wgpu::util::DeviceExt;
+    use sculpt_core::generator::layer::GeneratorSpec;
+    use sculpt_core::generator::volume_gen::{Anchor, VolumeGen, WGSL as GEN_WGSL};
+    use sculpt_core::generator::{BoolOp, Primitive};
+    use sculpt_core::noise::NoiseKind;
+    let src = format!(
+        "{}
+{GEN_WGSL}
+@group(0) @binding(0) var<storage, read> vg_inst: array<GpuInstance>;
+@group(0) @binding(1) var<storage, read> vg_cand: array<u32>;
+@group(0) @binding(2) var<uniform> gen: GpuGen;
+@group(0) @binding(3) var<storage, read> pts: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    if (id.x >= arrayLength(&pts)) {{ return; }}
+    let p = pts[id.x];
+    out[id.x] = vg_apply(gen, p.w, p.xyz, 0u, arrayLength(&vg_cand));
+}}",
+        sculpt_core::surface_noise::WGSL
+    );
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("generator check"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+    let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+    let anchors: Vec<Anchor> = (0..6).map(|i| {
+        let t = i as f32;
+        let n = Vec3::new((t * 1.7).sin(), 0.4 + 0.3 * (t * 0.9).cos(), (t * 1.7).cos()).normalize();
+        Anchor { p: n, n }
+    }).collect();
+    let n = 4096usize;
+    let mut worst = 0.0f32;
+    for prim in Primitive::ALL {
+        for op in [BoolOp::Add, BoolOp::Subtract] {
+            for rough in [None, Some(NoiseKind::Fbm), Some(NoiseKind::Ridged), Some(NoiseKind::Cellular)] {
+                let spec = GeneratorSpec { primitive: prim, op, size: 0.2, lift: 0.3, blend: 0.3, stretch_var: 0.3, tilt: 20.0, random_spin: true, rough: if rough.is_some() { 0.25 } else { 0.0 }, rough_kind: rough.unwrap_or_default(), ..GeneratorSpec::default() };
+                let g = VolumeGen::from_anchors(&spec, anchors.clone()).fitted(0.005);
+                let pts: Vec<[f32; 4]> = (0..n)
+                    .map(|i| {
+                        let t = i as f32;
+                        let a = anchors[i % anchors.len()].p;
+                        let q = a * 1.1 + Vec3::new((t * 0.7548).sin(), (t * 0.5698).cos(), (t * 0.3165).sin()) * 0.3;
+                        [q.x, q.y, q.z, q.length() - 1.0]
+                    })
+                    .collect();
+                let inst = g.gpu_instances();
+                let cand: Vec<u32> = (0..inst.len() as u32).collect();
+                let params = g.gpu_params();
+                let bufs = [
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&inst), usage: wgpu::BufferUsages::STORAGE }),
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&cand), usage: wgpu::BufferUsages::STORAGE }),
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::bytes_of(&params), usage: wgpu::BufferUsages::UNIFORM }),
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&pts), usage: wgpu::BufferUsages::STORAGE }),
+                    device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
+                ];
+                let entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &entries });
+                let mut enc = device.create_command_encoder(&Default::default());
+                {
+                    let mut cp = enc.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&pipe);
+                    cp.set_bind_group(0, &group, &[]);
+                    cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
+                }
+                queue.submit([enc.finish()]);
+                let got: Vec<f32> = read(device, queue, &bufs[4]).into_iter().map(f32::from_bits).collect();
+                let off = pts.iter().zip(&got).map(|(p, gv)| (g.apply(p[3], Vec3::new(p[0], p[1], p[2]), &cand, 1.0) - gv).abs()).fold(0.0f32, f32::max) / spec.size;
+                if off > 1e-4 {
+                    println!("generator {prim:?} {op:?} roughness {rough:?}: GPU against CPU {off:.2e} of its size");
+                }
+                worst = worst.max(off);
+            }
+        }
+    }
+    println!("generator joining: GPU against CPU within {worst:.2e} of the instances' size, every primitive, join and roughness");
+    Ok(worst)
+}
+
 pub fn run(args: &[String]) -> Res<()> {
     let (device, queue, adapter) = device()?;
     println!("adapter: {adapter}");
     let off = surface_noise_check(&device, &queue)?;
+    let gen_off = generator_check(&device, &queue)?;
+    if gen_off > 1e-3 {
+        return Err(format!("the shader's generator joining differs from the CPU's by {gen_off} of the instances' size").into());
+    }
     if off > 1e-3 {
         return Err(format!("the shader's surface noise differs from the CPU's by {off} of its height").into());
     }
