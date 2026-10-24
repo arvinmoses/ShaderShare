@@ -2868,6 +2868,12 @@ impl LevelVolume {
 
     /// [`Self::extract_set`] in the view `v`: `changed` may also name blocks the view began or stopped showing.
     pub fn extract_set_in(&self, changed: &[Key], v: &Show) -> Vec<Key> {
+        self.extract_set_where(changed, v, &|_| true)
+    }
+
+    /// [`Self::extract_set_in`], listing only the blocks `keep` passes (those it fails are left out as they are found,
+    /// which costs less than taking them out after).
+    pub fn extract_set_where(&self, changed: &[Key], v: &Show, keep: &(dyn Fn(Key) -> bool + Sync)) -> Vec<Key> {
         let cap = v.cap.min(self.levels() - 1);
         // Per changed block, in parallel, then merged.
         let mut v: Vec<Key> = changed.par_iter().flat_map_iter(|&(l, bc)| {
@@ -2887,7 +2893,7 @@ impl LevelVolume {
                     for y in a.y..=b.y {
                         for x in a.x..=b.x {
                             let c = IVec3::new(x, y, z);
-                            if self.shows(v, m, c) {
+                            if self.shows(v, m, c) && keep((m as u8, c)) {
                                 out.push((m as u8, c));
                             }
                         }
@@ -2920,7 +2926,7 @@ impl LevelVolume {
                         if self.shows(v, m, c) {
                             // Only a block at the edge of its region (a neighbour missing) reads coarser samples or
                             // points its quads at coarser cells; one inside it is untouched by a coarser change.
-                            if (0..27).any(|q| q != 13 && !self.shows(v, m, c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1))) {
+                            if keep((m as u8, c)) && (0..27).any(|q| q != 13 && !self.shows(v, m, c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1))) {
                                 out.push((m as u8, c));
                             }
                             next.push(c);

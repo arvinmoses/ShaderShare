@@ -303,8 +303,8 @@ fn join_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
         let t = Instant::now();
         let plan = layer.gpu_generator(&mut vol, k, &spec).ok_or("the GPU cannot join this stack")?;
         let plan_ms = t.elapsed().as_secs_f64() * 1e3;
-        let keys: Vec<Key> = plan.blocks.iter().map(|b| b.0).collect();
-        gpu.sync(&mut vol);
+        let keys: Vec<Key> = plan.blocks.clone();
+        gpu.sync_for_join(&mut vol, &plan);
         let s = gpu.join(plan, &|k| layer.base_samples(k));
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let status = read(device, queue, &gpu.buf.status);
@@ -499,11 +499,12 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     use sculpt_core::generator::detail_layer::Layered;
     use sculpt_core::generator::layer::GeneratorSpec;
     use sculpt_core::generator::{BoolOp, Primitive};
-    for level in [2usize, 3] {
+    // Fewer rocks at level 3: twelve would take more slots than a 2 GB vertex buffer holds.
+    for (level, count) in [(2usize, 12u32), (3, 4)] {
         let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, 0.007, 6);
         let mut layer = Layered::new(&mut vol, 5);
         let size = 0.028 * 2.5;
-        let spec = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 1, size, lift: 0.15, random_spin: true, min_spacing: 3.0 * size, size_var: 0.4, stretch_var: 0.35, tilt: 25.0, blend: 0.3, rough: 0.15, ..GeneratorSpec::default() };
+        let spec = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count, seed: 1, size, lift: 0.15, random_spin: true, min_spacing: 3.0 * size, size_var: 0.4, stretch_var: 0.35, tilt: 25.0, blend: 0.3, rough: 0.15, ..GeneratorSpec::default() };
         let k = layer.add_generator(&mut vol, "Rocks", level, &spec);
         let mut gpu = GpuLevels::new(device, queue, &vol, 5);
         gpu.sync(&mut vol);
@@ -516,7 +517,7 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             let plan_ms = t.elapsed().as_secs_f64() * 1e3;
             let n = plan.blocks.len();
             let ts = Instant::now();
-            gpu.sync(&mut vol);
+            gpu.sync_for_join(&mut vol, &plan);
             let sync_ms = ts.elapsed().as_secs_f64() * 1e3;
             let s = gpu.join(plan, &|k| layer.base_samples(k));
             let tg = Instant::now();

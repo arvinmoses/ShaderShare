@@ -425,10 +425,15 @@ impl Viewport {
         v.gpu.view.tau_px = mode.level_px;
         v.gpu.view.budget = mode.budget_on.then(|| (mode.budget_m as f64 * 1e6) as u64);
         v.gpu.set_eye(eye, focal_px);
-        let s = v.gpu.sync(&mut mode.vol);
+        // A generator edit the GPU joins at its own level (the CPU's job brings the exact field after): the sync
+        // leaves the plan's blocks to the join.
+        let plan = mode.gpu_plan.take();
+        let s = match &plan {
+            Some(plan) => v.gpu.sync_for_join(&mut mode.vol, plan),
+            None => v.gpu.sync(&mut mode.vol),
+        };
         mode.view = v.gpu.view.stats;
-        // A generator edit the GPU joins at its own level (the CPU's job brings the exact field after).
-        if let (Some(plan), Some(layer)) = (mode.gpu_plan.take(), mode.layer.as_ref()) {
+        if let (Some(plan), Some(layer)) = (plan, mode.layer.as_ref()) {
             let j = v.gpu.join(plan, &|k| layer.base_samples(k));
             mode.join_ms = j.cpu_ms;
         }
