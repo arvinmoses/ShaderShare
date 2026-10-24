@@ -255,7 +255,11 @@ patch before the big stroke, under it as one volume (buried), and under it with 
 * **Painting on the layer**: a stroke with the layer selected works on what is shown, and when it ends the layer takes
   it in as heights (the form keeps none of it) and undoes it with its own history.
 * **Its mask** hides it where painted ("Mask: hide" and "Mask: show" in the Layers panel), and rides the form as the
-  heights do.
+  heights do. "Hide all" hides any layer everywhere (a detail layer's blocks, a generator's, or for surface noise the
+  surface's level 0 blocks, each with a ring of blocks round it, as the mask is read between lattice points) and picks
+  "Mask: show", to paint it in only where wanted; "Show all" clears the mask. One undo each. Surface grown later past
+  what was hidden shows the layer there. Tests: noise hidden, a patch painted in and baked holds only that patch; one
+  rock painted back of a hidden scatter; a detail layer hidden and shown again.
 * **Undo and redo** run over the stack: a form stroke brings back the form and the layer as they were; a layer stroke
   or mask stroke the layer alone.
 
@@ -398,8 +402,7 @@ and visibility like any layer, saved with the layers (section version 3). Files 
   millions of blocks (the panel shows an estimate first): mask it to where it is wanted.
 * `volume/surface_noise.png`: off; smooth; ridged; close up (`SCULPT_DEMO_SCRIPT=noise sculpt-app --demo-volume DIR`).
 
-Not done yet: a quick way to hide the mask everywhere and paint the noise in only where wanted (now it is painted
-away where not wanted), and baking off the frame.
+To bake a region only: "Hide all", paint the noise in there, bake. Not done yet: baking off the frame.
 
 
 ## The level by distance

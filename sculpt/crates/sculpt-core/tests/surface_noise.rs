@@ -101,3 +101,35 @@ fn baking_noise_puts_it_in_the_field_within_its_mask() {
     let back = (0..50).map(|i| out(&s, Vec3::new((i as f32).sin(), (i as f32 * 0.3).cos(), 0.5).normalize()).abs()).fold(0.0f32, f32::max);
     assert!(back < 1e-3, "undo left the noise in the field: {back}");
 }
+
+/// Hidden everywhere, then painted in over a patch: baking holds only that patch, and the noise is in the field there
+/// and nowhere else. Show all clears the mask; each is one undo.
+#[test]
+fn hide_all_then_paint_in_bakes_a_patch() {
+    let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 5);
+    let mut l = Layered::new(&mut s, 3);
+    let noise = SurfaceNoise { on: true, amplitude: 0.01, scale: 2.0, octaves: 4, kind: 0, seed: 7 };
+    let k = l.add_noise("Surface noise", noise);
+    let all = l.noise_blocks(k, 3).len();
+    l.fill_mask(&mut s, 0.0);
+    assert!(l.noise_blocks(k, 3).is_empty(), "hidden everywhere, yet blocks to bake");
+    l.paint_mask(&mut s, Vec3::new(0.0, 0.0, 1.0), 0.4, 1.0);
+    l.paint_mask(&mut s, Vec3::new(0.0, 0.0, 1.0), 0.4, 1.0);
+    let patch = l.noise_blocks(k, 3).len();
+    eprintln!("{all} blocks over the whole ball, {patch} in the patch");
+    assert!(patch > 0 && patch * 10 < all, "the patch holds {patch} of {all}");
+    l.bake_noise(&mut s, k, 3).expect("baked");
+    let octaves = noise.octaves_for(s.voxel(3), 4.0).max(1);
+    let out = |s: &LevelVolume, d: Vec3| s.raycast(d * 1.2, -d, s.levels() - 1, false).map_or(f32::NAN, |(q, _)| q.length() - 1.0);
+    let front = Vec3::new(0.05, 0.03, 1.0).normalize();
+    let got = out(&s, front);
+    assert!((got - noise.height(front, octaves)).abs() < 0.5 * s.voxel(3) + 0.001, "not baked in the patch: {got}");
+    let back = out(&s, -front);
+    assert!(back.abs() < 1e-3, "baked outside the patch: {back}");
+    // Show all on the (hidden) noise layer clears its mask; undo brings the mask back.
+    l.set_active(k);
+    l.fill_mask(&mut s, 1.0);
+    assert!(l.shown_noise().is_none() || l.shown_noise().unwrap().1.is_empty());
+    l.undo(&mut s);
+    assert_eq!(l.noise_blocks(k, 3).len(), patch);
+}

@@ -224,6 +224,16 @@ fn rides(levels: usize, from: usize) {
     assert!(masked[1] < 0.1 * after[1].0, "the mask did not hide the layer");
     assert!((masked[0] - after[0].0).abs() < 1e-5, "the mask reached the other row");
     assert_eq!(check(lv.shown(), 4), (0, 0, 0));
+
+    // Hide all takes the layer away on both rows; Show all brings both back whole, past the painted mask.
+    lv.l.fill_mask(&mut lv.s, 0.0);
+    let hidden: Vec<f32> = ROWS.iter().map(|&y| relief(&lv, y).0).collect();
+    eprintln!("hidden everywhere: {:.5} {:.5}", hidden[0], hidden[1]);
+    assert!(hidden.iter().zip(&after).all(|(h, a)| *h < 0.05 * a.0), "hide all left the layer showing");
+    lv.l.fill_mask(&mut lv.s, 1.0);
+    let back: Vec<f32> = ROWS.iter().map(|&y| relief(&lv, y).0).collect();
+    assert!(back.iter().zip(&after).all(|(b, a)| (b - a.0).abs() < 1e-5), "show all is not the layer unmasked");
+    assert_eq!(check(lv.shown(), 4), (0, 0, 0));
 }
 
 #[test]

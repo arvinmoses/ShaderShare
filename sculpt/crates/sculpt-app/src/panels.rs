@@ -503,6 +503,7 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                 let mut visible = None;
                 let mut level = None;
                 let mut remove = None;
+                let mut fill: Option<f32> = None;
                 for k in (0..layers.len()).rev() {
                     let info = &layers[k];
                     ui.horizontal(|ui| {
@@ -549,6 +550,15 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                                 m.target = Target::Mask { show: true };
                             }
                         });
+                        ui.horizontal(|ui| {
+                            ui.add_space(26.0);
+                            if ui.small_button("Hide all").on_hover_text("Hide this layer everywhere, then paint it in where wanted (Mask: show is picked). One undo.").clicked() {
+                                fill = Some(0.0);
+                            }
+                            if ui.small_button("Show all").on_hover_text("Clear this layer's mask: it shows everywhere again. One undo.").clicked() {
+                                fill = Some(1.0);
+                            }
+                        });
                     }
                 }
                 if ui.selectable_label(m.target == Target::Form, format!("Form  (levels 0 to {})", from - 1)).clicked() {
@@ -566,6 +576,13 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                 }
                 if let Some(k) = remove {
                     m.remove_layer(k);
+                }
+                if let Some(to) = fill {
+                    m.fill_mask(to);
+                    // Hidden everywhere: the next strokes paint it back in.
+                    if to < 1.0 {
+                        m.target = Target::Mask { show: true };
+                    }
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {

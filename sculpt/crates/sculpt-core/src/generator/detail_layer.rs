@@ -2113,6 +2113,52 @@ impl Layered {
         }
     }
 
+    /// Set the active layer's whole mask: 0 hides it everywhere (to paint it back in where wanted), 1 shows it
+    /// everywhere. One undo step. A hidden mask covers what the layer reaches now: a detail layer's blocks, a
+    /// generator's, or for surface noise the surface's level 0 blocks; surface grown later, past them, shows the layer.
+    pub fn fill_mask(&mut self, shown: &mut LevelVolume, to: f32) {
+        let Some(layer) = self.stack.get(self.active) else { return };
+        let level = layer.level;
+        let mut keys: Vec<IVec3> = layer.m.keys().copied().collect();
+        if to < 1.0 {
+            // With a block's ring round it: the mask is read between lattice points, so reaching into the next block.
+            let ring = |b: IVec3| (0..27).map(move |q| b + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1));
+            if let Some(g) = layer.scatter.as_ref() {
+                keys.extend(g.blocks[level].iter().flat_map(|b| ring(*b)));
+            } else if layer.noise.is_some() {
+                keys.extend(shown.level_keys(0).into_iter().flat_map(ring));
+            } else {
+                keys.extend(layer.h.keys().copied());
+            }
+            keys.sort_unstable_by_key(|k| (k.x, k.y, k.z));
+            keys.dedup();
+        }
+        if keys.is_empty() {
+            return;
+        }
+        self.history.push(Undo::Layers(self.stack.clone()));
+        self.redo.clear();
+        self.base_epoch += 1;
+        let layer = &mut self.stack[self.active];
+        if to >= 1.0 {
+            layer.m = Shared::default();
+        } else {
+            let fill = Stored::from(Box::new([to.max(0.0); N]));
+            for bc in &keys {
+                layer.m.insert(*bc, fill.clone());
+            }
+        }
+        if layer.noise.is_some() {
+            self.noise_epoch += 1;
+            return;
+        }
+        let changed: Vec<(usize, IVec3)> = match layer.scatter.as_ref() {
+            Some(g) => g.blocks.iter().enumerate().flat_map(|(l, b)| b.iter().map(move |bc| (l, *bc))).collect(),
+            None => keys.iter().map(|bc| (level, *bc)).collect(),
+        };
+        self.compose(shown, &changed);
+    }
+
     /// A new surface noise layer on top (drawn by the GPU over the whole surface, its mask at level 0's lattice), made
     /// active.
     pub fn add_noise(&mut self, name: &str, noise: crate::surface_noise::SurfaceNoise) -> usize {

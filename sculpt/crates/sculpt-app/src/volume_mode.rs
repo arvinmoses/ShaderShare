@@ -665,6 +665,14 @@ impl VolumeMode {
         }
     }
 
+    /// Hide the active layer everywhere (`to` 0, then paint it in with Mask: show) or show it everywhere (`to` 1).
+    pub fn fill_mask(&mut self, to: f32) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut() {
+            layer.fill_mask(&mut self.vol, to);
+        }
+    }
+
     /// Hold layer `k` at another level (its resolution).
     pub fn set_layer_level(&mut self, k: usize, level: usize) {
         self.settle();

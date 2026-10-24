@@ -223,6 +223,40 @@ fn the_mask_fades_a_rock_away() {
     let _ = Quat::IDENTITY;
 }
 
+/// Hide all takes every rock away, painting one back brings that rock
+/// alone, Show all brings them all; undo steps back through each.
+#[test]
+fn hide_all_then_paint_one_rock_in() {
+    let mut lv = Lv::ball();
+    let k = lv.add(2, &rocks());
+    let full = surface_key(&lv.s, 3);
+    let rocks_at = lv.l.generator_instances(k);
+    lv.l.fill_mask(&mut lv.s, 0.0);
+    let left: Vec<f32> = rocks_at.iter().map(|r| { let (p, n) = anchor(r, 0.2); out_at(&lv.s, p, n) }).collect();
+    // (Its finer blocks stay, so the bare ball is meshed finer: compared by how far each rock stands out.)
+    assert!(left.iter().all(|o| o.abs() < 1e-4), "hidden everywhere, yet rocks stand {left:?}");
+    let (p, n) = anchor(&rocks_at[0], 0.2);
+    lv.l.paint_mask(&mut lv.s, rocks_at[0].translation, 0.3, 1.0);
+    lv.l.paint_mask(&mut lv.s, rocks_at[0].translation, 0.3, 1.0);
+    let one = out_at(&lv.s, p, n);
+    let others: Vec<f32> = rocks_at[1..].iter().filter(|r| (r.translation - rocks_at[0].translation).length() > 0.6).map(|r| {
+        let (p, n) = anchor(r, 0.2);
+        out_at(&lv.s, p, n)
+    }).collect();
+    eprintln!("painted in: the rock stands {one:.4} out; the others {others:?}");
+    assert!(one > 0.11, "the painted rock stands only {one}");
+    assert!(others.iter().all(|o| o.abs() < 0.005), "rocks showed outside the stroke");
+    lv.l.fill_mask(&mut lv.s, 1.0);
+    assert!(surface_key(&lv.s, 3) == full, "show all differs from the layer unmasked");
+    let (open, _, dropped) = closed(&lv.s, 3);
+    assert_eq!((open, dropped), (0, 0));
+    lv.l.undo(&mut lv.s);
+    lv.l.undo(&mut lv.s);
+    lv.l.undo(&mut lv.s);
+    lv.l.undo(&mut lv.s);
+    assert!(surface_key(&lv.s, 3) == full, "undoing back to before hide all differs");
+}
+
 /// At the app's scale: adding a generator, dragging its size, a seed change (scattered again), and a big form stroke
 /// under it, timed.
 #[test]
