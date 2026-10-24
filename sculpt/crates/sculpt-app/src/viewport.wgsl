@@ -23,6 +23,8 @@ struct MeshOut {
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) overlay: f32,
+    // The surface point before surface noise moved it (where the noise is read).
+    @location(3) base: vec3<f32>,
 };
 
 fn decode(q: vec4<f32>) -> vec3<f32> {
@@ -38,6 +40,7 @@ fn vs_flat(@location(0) q: vec4<f32>) -> MeshOut {
     o.world = pos;
     o.normal = vec3<f32>(0.0, 1.0, 0.0);
     o.overlay = q.w;
+    o.base = pos;
     return o;
 }
 
@@ -49,6 +52,7 @@ fn vs_smooth(@location(0) q: vec4<f32>, @location(1) normal: vec3<f32>) -> MeshO
     o.world = pos;
     o.normal = normal;
     o.overlay = q.w;
+    o.base = pos;
     return o;
 }
 
@@ -149,7 +153,24 @@ struct LevelsU {
     origin: vec4<f32>,
     // x: level 0's step; y: tint by level when 1.
     misc: vec4<f32>,
+    // Surface noise: (amplitude, scale, -, -) and (octaves, kind, seed, on).
+    noise_f: vec4<f32>,
+    noise_i: vec4<u32>,
 };
+
+// The octaves a lattice of step `vx` holds: none shorter than four of its steps.
+fn sn_octaves_for(vx: f32) -> u32 {
+    var n = 0u;
+    var wave = 1.0 / max(SN_F.y, 1e-6);
+    for (var o = 0u; o < SN_I.x; o++) {
+        if (wave < 4.0 * vx) {
+            break;
+        }
+        n += 1u;
+        wave *= 0.5;
+    }
+    return n;
+}
 
 @group(1) @binding(0) var<uniform> L: LevelsU;
 @group(1) @binding(1) var<storage, read> lv_verts: array<vec2<u32>>;
@@ -183,11 +204,23 @@ fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
     let level = u32(max(m.w, 0));
     let vx = L.misc.x / f32(1u << level);
     let local = vec3<f32>(f32(v.x & 1023u), f32((v.x >> 10u) & 1023u), f32((v.x >> 20u) & 1023u)) / 1023.0 * 8.0;
-    let pos = L.origin.xyz + (vec3<f32>(m.xyz * 8) + local) * vx;
+    let base = L.origin.xyz + (vec3<f32>(m.xyz * 8) + local) * vx;
+    // The field's gradient points out of the solid.
+    let n = lv_oct_decode(v.y);
+    var pos = base;
+    SN_F = L.noise_f;
+    SN_I = L.noise_i;
+    if (SN_I.w != 0u) {
+        // Surface noise moves the vertex by the octaves this block's lattice holds; the rest only shade.
+        let k = sn_octaves_for(vx);
+        if (k > 0u) {
+            pos = base + n * sn_height(base, k);
+        }
+    }
     o.clip = u.view_proj * vec4<f32>(pos, 1.0);
     o.world = pos;
-    // The field's gradient points out of the solid.
-    o.normal = lv_oct_decode(v.y);
+    o.base = base;
+    o.normal = n;
     o.overlay = f32(level);
     return o;
 }
@@ -212,5 +245,16 @@ fn fs_levels(i: MeshOut) -> @location(0) vec4<f32> {
             base = vec3<f32>(0.70, 0.45, 0.85);
         }
     }
-    return lit(i, normalize(i.normal), base);
+    var n = normalize(i.normal);
+    SN_F = L.noise_f;
+    SN_I = L.noise_i;
+    if (SN_I.w != 0u) {
+        // Every octave shades: the normal tilted by the noise's slope along the surface (forward differences over an
+        // eighth of its finest wavelength).
+        let e = (1.0 / max(SN_F.y, 1e-6)) / f32(1u << min(SN_I.x, 16u)) * 0.125;
+        let h0 = sn_height(i.base, SN_I.x);
+        let g = vec3<f32>(sn_height(i.base + vec3<f32>(e, 0.0, 0.0), SN_I.x) - h0, sn_height(i.base + vec3<f32>(0.0, e, 0.0), SN_I.x) - h0, sn_height(i.base + vec3<f32>(0.0, 0.0, e), SN_I.x) - h0) / e;
+        n = normalize(n - (g - n * dot(n, g)));
+    }
+    return lit(i, n, base);
 }

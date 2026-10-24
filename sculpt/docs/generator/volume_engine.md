@@ -333,6 +333,25 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
 Not done yet: a noise layer over the whole surface (finer than level 0 it needs fine blocks everywhere: better done
 on the GPU, as the blocks are extracted), edge generators, density and painted placement, and intersect.
 
+## Surface noise, drawn by the GPU
+
+Noise over the whole surface along its normal, as ZBrush's surface noise is: not in the field (brushes work on the
+surface under it), drawn by the GPU as the surface is shown ("Surface noise" at the top of the Layers panel: height,
+bumps per unit, octaves, smooth or ridged, seed; saved with the volume after the layers, as an `SNOI` section).
+
+* **Vertices** move by the octaves their block's lattice holds (none shorter than four of its steps), so the
+  silhouette shows the coarse noise without aliasing the fine.
+* **Every pixel** is shaded by all of them: the normal tilted by the noise's slope along the surface (forward
+  differences over an eighth of its finest wavelength, read at the point before it moved), so octaves far finer than
+  any level show.
+* **The same noise on the CPU** (`sculpt_core::surface_noise`, gradient noise from an integer hash: no table for the
+  shader to hold), to bake it as seen. The GPU check (`--gpu-levels-check`) evaluates the shader's copy at 4,096 points
+  for each kind and some octave counts: within 0.001% of its height of the CPU's.
+* `volume/surface_noise.png`: off; smooth; ridged; close up (`SCULPT_DEMO_SCRIPT=noise sculpt-app --demo-volume DIR`).
+
+Not done yet: a mask for it, and baking it into a layer (over the whole surface at a fine level that is millions of
+blocks; within a mask it is not).
+
 ## The level by distance
 
 Each region of the view shows only the levels whose detail would show on screen from where the eye is ("Level by

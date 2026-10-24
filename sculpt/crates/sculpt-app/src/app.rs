@@ -1214,6 +1214,9 @@ impl SculptApp {
             if f.add_generator {
                 m.add_generator();
             }
+            if let Some(edit) = f.noise {
+                edit(&mut m.surface_noise);
+            }
             if let Some(edit) = f.generator
                 && let Some(layer) = m.layer.as_ref()
             {

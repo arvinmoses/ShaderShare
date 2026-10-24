@@ -59,6 +59,8 @@ enum Act {
     /// A new generator layer (rocks), and a change of its parameters (applied to the active generator's).
     AddGenerator,
     Generator(fn(&mut sculpt_core::generator::layer::GeneratorSpec)),
+    /// A change of the surface noise.
+    Noise(fn(&mut sculpt_core::surface_noise::SurfaceNoise)),
     /// Move the work at this level and finer into a detail layer.
     MakeLayer(usize),
     /// What strokes work on, with a detail layer.
@@ -96,6 +98,7 @@ pub struct Frame {
     pub cull: Option<bool>,
     pub by_distance: Option<bool>,
     pub add_generator: bool,
+    pub noise: Option<fn(&mut sculpt_core::surface_noise::SurfaceNoise)>,
     pub generator: Option<fn(&mut sculpt_core::generator::layer::GeneratorSpec)>,
     pub undo: bool,
     pub redo: bool,
@@ -248,7 +251,25 @@ impl VolumeDemo {
         at(152.0, 0.0, Target(crate::volume_mode::Target::Detail));
         at(153.0, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
         at(153.0, 3.0, Caption("Next: generators of other kinds (noise, edges), and the layers' work on the GPU"));
-        let end = 156.5;
+        let mut end = 156.5;
+        // `SCULPT_DEMO_SCRIPT=noise`: only the surface noise, on the plain ball (a quick look).
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("noise") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::whole(3.2, 0.3, 0.2)));
+            at(0.5, 0.0, Noise(|n| {
+                n.on = true;
+                n.amplitude = 0.02;
+                n.scale = 3.0;
+                n.octaves = 7;
+            }));
+            at(0.5, 3.0, Caption("Surface noise, drawn by the GPU: coarse octaves move the surface, every octave shades it"));
+            at(3.5, 0.0, Noise(|n| n.kind = 1));
+            at(3.5, 2.0, Caption("Ridged"));
+            at(5.5, 2.5, Camera(Pose::at(patch, 0.4)));
+            at(5.5, 3.0, Caption("Close up: octaves finer than any level, as shading"));
+            end = 9.0;
+        }
         let n = items.len();
         VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
     }
@@ -338,6 +359,7 @@ impl VolumeDemo {
                         Act::ByDistance(on) => f.by_distance = Some(on),
                         Act::AddGenerator => f.add_generator = true,
                         Act::Generator(edit) => f.generator = Some(edit),
+                        Act::Noise(edit) => f.noise = Some(edit),
                         Act::Undo => f.undo = true,
                         Act::Redo => f.redo = true,
                         _ => continue,

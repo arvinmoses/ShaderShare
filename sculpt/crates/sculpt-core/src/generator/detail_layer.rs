@@ -2132,6 +2132,10 @@ impl Layered {
             Err(e) => return Err(e),
         }
         let bad = |m: &str| Error::new(ErrorKind::InvalidData, m.to_string());
+        // A section after the volume that is not ours (the app's surface noise): no layers; the caller reads on.
+        if &magic == b"SNOI" {
+            return Ok((form, None));
+        }
         if &magic != b"SLAY" {
             return Err(bad("not a layer section"));
         }

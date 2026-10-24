@@ -137,9 +137,80 @@ fn compare(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, vol: &Le
     Ok((keys.len(), quads_total))
 }
 
+/// The shader's surface noise against `sculpt_core::surface_noise`, at points about the unit ball, for each kind and
+/// some octave counts. Returns the largest difference against the amplitude.
+fn surface_noise_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<f32> {
+    use sculpt_core::surface_noise::{SurfaceNoise, WGSL};
+    let src = format!(
+        "{WGSL}
+struct P {{ f: vec4<f32>, i: vec4<u32>, k: vec4<u32> }};
+@group(0) @binding(0) var<uniform> prm: P;
+@group(0) @binding(1) var<storage, read> pts: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    if (id.x >= arrayLength(&pts)) {{ return; }}
+    SN_F = prm.f;
+    SN_I = prm.i;
+    out[id.x] = sn_height(pts[id.x].xyz, prm.k.x);
+}}"
+    );
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("surface noise check"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+    let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+    let n = 4096usize;
+    let pts: Vec<[f32; 4]> = (0..n)
+        .map(|i| {
+            let t = i as f32;
+            let d = Vec3::new((t * 0.7548).sin(), (t * 0.5698).cos(), (t * 0.3165).sin()).normalize_or(Vec3::Z);
+            (d * (1.0 + 0.1 * (t * 0.137).sin())).extend(0.0).to_array()
+        })
+        .collect();
+    use eframe::egui_wgpu::wgpu::util::DeviceExt;
+    let pts_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&pts), usage: wgpu::BufferUsages::STORAGE });
+    let out = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (n * 4) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+    let mut worst = 0.0f32;
+    for kind in [0u32, 1] {
+        for octaves in [1u32, 4, 7] {
+            let sn = SurfaceNoise { on: true, amplitude: 0.02, scale: 9.0, octaves: 7, kind, seed: 3 };
+            let (f, i) = sn.uniform();
+            let mut prm = Vec::new();
+            prm.extend_from_slice(bytemuck::cast_slice(&f));
+            prm.extend_from_slice(bytemuck::cast_slice(&i));
+            prm.extend_from_slice(bytemuck::cast_slice(&[octaves, 0u32, 0, 0]));
+            let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &prm, usage: wgpu::BufferUsages::UNIFORM });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: pts_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+                ],
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&pipe);
+                cp.set_bind_group(0, &group, &[]);
+                cp.dispatch_workgroups((n as u32).div_ceil(64), 1, 1);
+            }
+            queue.submit([enc.finish()]);
+            let got: Vec<f32> = read(device, queue, &out).into_iter().map(f32::from_bits).collect();
+            let off = pts.iter().zip(&got).map(|(p, g)| (sn.height(Vec3::new(p[0], p[1], p[2]), octaves) - g).abs()).fold(0.0f32, f32::max);
+            println!("surface noise, kind {kind}, {octaves} octaves: GPU against CPU within {:.2e} of its height", off / sn.amplitude);
+            worst = worst.max(off / sn.amplitude);
+        }
+    }
+    Ok(worst)
+}
+
 pub fn run(args: &[String]) -> Res<()> {
     let (device, queue, adapter) = device()?;
     println!("adapter: {adapter}");
+    let off = surface_noise_check(&device, &queue)?;
+    if off > 1e-3 {
+        return Err(format!("the shader's surface noise differs from the CPU's by {off} of its height").into());
+    }
     if args.iter().any(|a| a == "--bench") {
         return bench(&device, &queue);
     }

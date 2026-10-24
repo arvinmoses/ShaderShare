@@ -466,6 +466,24 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
     let Some(m) = app.volume_mode.as_mut() else { return };
     ui.add_space(6.0);
     egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| {
+        // Surface noise: drawn by the GPU over everything, at any fineness.
+        let (lo, hi) = m.vol.bounds();
+        let extent = (hi - lo).max_element().max(1e-3);
+        let n = &mut m.surface_noise;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut n.on, "Surface noise").on_hover_text("Noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Brushes work on the surface under it.");
+        });
+        if n.on {
+            ui.add(egui::Slider::new(&mut n.amplitude, 0.0001 * extent..=0.05 * extent).logarithmic(true).max_decimals(4).text("Height"));
+            ui.add(egui::Slider::new(&mut n.scale, 0.5 / extent..=400.0 / extent).logarithmic(true).max_decimals(1).text("Bumps per unit"));
+            ui.add(egui::Slider::new(&mut n.octaves, 1..=8).text("Octaves"));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut n.kind, 0, "Smooth");
+                ui.selectable_value(&mut n.kind, 1, "Ridged");
+                ui.add(egui::DragValue::new(&mut n.seed).speed(0.2).prefix("seed "));
+            });
+        }
+        ui.add_space(6.0);
         match m.layer.as_ref().map(|_| ()) {
             None => {
                 ui.label("One volume: strokes work on all of it.");

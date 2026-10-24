@@ -15,6 +15,7 @@ use std::time::Instant;
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
 use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::surface_noise::SurfaceNoise;
 use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::generator::level_volume::{CarryDone, EndDone, LevelVolume};
 
@@ -60,6 +61,8 @@ pub struct VolumeMode {
     /// `level_px` pixels on screen.
     pub by_distance: bool,
     pub level_px: f32,
+    /// Noise over the whole surface, drawn by the GPU (not in the field until applied).
+    pub surface_noise: sculpt_core::surface_noise::SurfaceNoise,
     /// At most this many million triangles drawn (when on): past it, only the detail that shows most.
     pub budget_on: bool,
     pub budget_m: f32,
@@ -133,6 +136,7 @@ impl VolumeMode {
             cap,
             by_distance: true,
             level_px: 1.0,
+            surface_noise: sculpt_core::surface_noise::SurfaceNoise::default(),
             budget_on: true,
             budget_m: 6.0,
             generator_ms: 0.0,
@@ -623,18 +627,46 @@ impl VolumeMode {
     pub fn write_to(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         self.settle();
         match &self.layer {
-            Some(layer) => layer.write_to(w),
-            None => self.vol.write_to(w),
+            Some(layer) => layer.write_to(w)?,
+            None => self.vol.write_to(w)?,
         }
+        // Then the surface noise, when it has been set: "SNOI", a length, its settings as JSON.
+        if self.surface_noise != SurfaceNoise::default() {
+            let json = serde_json::to_vec(&self.surface_noise).map_err(std::io::Error::other)?;
+            w.write_all(b"SNOI")?;
+            w.write_all(&(json.len() as u32).to_le_bytes())?;
+            w.write_all(&json)?;
+        }
+        Ok(())
     }
 
-    /// A volume read from a `.svol` file, with its layers if it has any.
+    /// A volume read from a `.svol` file, with its layers and surface noise if it has them.
     pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<VolumeMode> {
-        let (vol, layer) = Layered::read_from(r, LEVELS)?;
+        let mut bytes = Vec::new();
+        r.read_to_end(&mut bytes)?;
+        let mut cur = std::io::Cursor::new(&bytes[..]);
+        let (vol, layer) = Layered::read_from(&mut cur, LEVELS)?;
+        let pos = cur.position() as usize;
         let mut mode = VolumeMode::new(vol);
         if let Some(mut layer) = layer {
             layer.deferred = true;
             mode.layer = Some(layer);
+        }
+        // The surface noise: after the layers, or in their place (its mark read already, then).
+        let at = if bytes[pos..].starts_with(b"SNOI") {
+            Some(pos + 4)
+        } else if mode.layer.is_none() && pos < bytes.len() && pos >= 4 && &bytes[pos - 4..pos] == b"SNOI" {
+            Some(pos)
+        } else {
+            None
+        };
+        if let Some(at) = at
+            && bytes.len() >= at + 4
+        {
+            let len = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+            if let Some(json) = bytes.get(at + 4..at + 4 + len) {
+                mode.surface_noise = serde_json::from_slice(json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            }
         }
         Ok(mode)
     }
@@ -1053,6 +1085,22 @@ mod tests {
         let layer = mode.layer.as_mut().unwrap();
         assert_eq!(layer.generator(k), Some(&spec));
         assert!(layer.generator_take().is_none(), "still shown as a preview");
+    }
+
+    #[test]
+    fn surface_noise_saves_with_the_volume_with_or_without_layers() {
+        for layers in [false, true] {
+            let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.05, 3));
+            if layers {
+                mode.make_layer(2);
+            }
+            mode.surface_noise = SurfaceNoise { on: true, amplitude: 0.02, scale: 7.0, octaves: 4, kind: 1, seed: 9 };
+            let mut buf = Vec::new();
+            mode.write_to(&mut buf).unwrap();
+            let back = VolumeMode::read_from(&mut &buf[..]).unwrap();
+            assert_eq!(back.surface_noise, mode.surface_noise, "layers {layers}");
+            assert_eq!(back.layer.is_some(), layers);
+        }
     }
 
     #[test]

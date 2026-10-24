@@ -20,6 +20,7 @@ pub mod pose;
 pub mod preview;
 pub mod primitives;
 pub mod subdiv;
+pub mod surface_noise;
 mod undo;
 
 pub use document::{DirtySet, Displacements, Document, PaintTarget, SurfaceHit};

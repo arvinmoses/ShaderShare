@@ -200,6 +200,8 @@ struct VolumeGpu {
 struct LevelsUniforms {
     origin: [f32; 4],
     misc: [f32; 4],
+    noise_f: [f32; 4],
+    noise_i: [u32; 4],
 }
 
 fn linear(c: egui::Color32) -> [f32; 4] {
@@ -212,7 +214,7 @@ impl Viewport {
         let device = &rs.device;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("viewport"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("viewport.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("viewport.wgsl"), sculpt_core::surface_noise::WGSL).into()),
         });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("viewport uniforms"),
@@ -390,7 +392,8 @@ impl Viewport {
             v.group = Self::levels_group(&rs.device, &self.levels_bgl, &v.uniforms, &v.gpu);
             v.buffers_made = v.gpu.buffers_made;
         }
-        let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc: [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, 0.0, 0.0] };
+        let (noise_f, noise_i) = mode.surface_noise.uniform();
+        let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc: [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, 0.0, 0.0], noise_f, noise_i };
         rs.queue.write_buffer(&v.uniforms, 0, bytemuck::bytes_of(&u));
         mode.blocks = v.gpu.slots();
         if s.uploaded > 0 || s.full {
