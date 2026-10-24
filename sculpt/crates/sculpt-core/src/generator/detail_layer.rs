@@ -2283,15 +2283,19 @@ impl Layered {
     }
 
     /// Blocks shown holds only as parents (neither the form's nor a layer's) under the form's blocks `region`: they read
-    /// the form as it was when made, whatever the layers do there.
+    /// the form as it was when made, whatever the layers do there. And the region's own blocks the form dropped:
+    /// mirrored coarsest first, each is kept as a parent while finer ones still hang from it, and those go right after.
     fn stale_under(&self, shown: &LevelVolume, region: &[Key], form: &LevelVolume) -> Vec<Key> {
         let top = self.form.levels() - 1;
         let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); top + 1];
+        let mut out: HashSet<Key> = HashSet::default();
         for &(m, bc) in region {
             per[m as usize].insert(bc);
+            if m > 0 && shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(&self.stack, m as usize, bc) {
+                out.insert((m, bc));
+            }
         }
         // Such blocks are parents of the layers' (read through their blocks, not every block shown).
-        let mut out: HashSet<Key> = HashSet::default();
         for x in self.stack.iter().filter(|x| x.scatter.is_none()) {
             let l = x.level;
             for &bc in x.h.keys() {
