@@ -2641,13 +2641,11 @@ impl Layered {
     /// below (coarsest first, so each reads the one below as it is now).
     fn tidy(&self, shown: &mut LevelVolume, keys: Vec<Key>, form: Option<&LevelVolume>) {
         let form = form.unwrap_or(&self.form);
-        let mut keys: Vec<Key> = keys
-            .into_iter()
-            .filter(|&(m, bc)| shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(&self.stack, m as usize, bc))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
+        // Each once (the blocks of a level name few parents between them), finest first.
+        let mut keys = keys;
         keys.sort_unstable_by_key(|k| (std::cmp::Reverse(k.0), k.1.z, k.1.y, k.1.x));
+        keys.dedup();
+        keys.retain(|&(m, bc)| shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(&self.stack, m as usize, bc));
         let mut kept = Vec::with_capacity(keys.len());
         for (m, bc) in keys {
             let mu = m as usize;
