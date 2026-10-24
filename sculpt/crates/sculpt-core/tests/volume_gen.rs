@@ -4,7 +4,9 @@
 
 use glam::{Quat, Vec3};
 use sculpt_core::generator::detail_layer::Layered;
-use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::density::Density;
+use sculpt_core::generator::layer::{EdgeSide, GeneratorSpec, PlaceOn};
+use sculpt_core::generator::volume_gen::VolumeGen;
 use sculpt_core::generator::level_volume::LevelVolume;
 use sculpt_core::generator::levels::edge_counts;
 use sculpt_core::generator::{BoolOp, Instance, Primitive};
@@ -799,4 +801,212 @@ fn an_edit_composed_off_the_frame_ends_as_one_made_at_once() {
     assert!(surface_key(&a.s, 3) == surface_key(&b.s, 3), "the newest edit's job differs");
     let (open, _, dropped) = closed(&a.s, 3);
     assert_eq!((open, dropped), (0, 0));
+}
+
+/// A box with edges rounded `round`, `half` each way.
+fn rounded_box(p: Vec3, half: Vec3, round: f32) -> f32 {
+    let q = p.abs() - (half - Vec3::splat(round));
+    q.max(Vec3::ZERO).length() + q.max_element().min(0.0) - round
+}
+
+/// A cube 1.2 across with its edges rounded 0.02, at a level 0 step of `voxel`.
+fn cube(voxel: f32, levels: usize) -> LevelVolume {
+    LevelVolume::from_field(&|p: Vec3| rounded_box(p, Vec3::splat(0.6), 0.02), 1.0, voxel, levels)
+}
+
+/// A pillar standing on a slab: ridges round the pillar's top and the slab's rim, a crease round the pillar's foot
+/// (at y -0.35, 0.25 out from the middle).
+fn pillar(voxel: f32, levels: usize) -> LevelVolume {
+    LevelVolume::from_field(
+        &|p: Vec3| rounded_box(p - Vec3::new(0.0, -0.5, 0.0), Vec3::new(0.9, 0.15, 0.9), 0.02).min(rounded_box(p, Vec3::new(0.25, 0.4, 0.25), 0.02)),
+        1.1,
+        voxel,
+        levels,
+    )
+}
+
+fn rubble() -> GeneratorSpec {
+    GeneratorSpec { count: 40, size: 0.04, min_spacing: 0.1, place_on: PlaceOn::default_edges(), ..rocks() }
+}
+
+/// How many of a point's coordinates lie at a face of the cube (within `tol`).
+fn at_faces(p: Vec3, tol: f32) -> usize {
+    p.to_array().iter().filter(|c| (c.abs() - 0.6).abs() < tol).count()
+}
+
+#[test]
+fn edge_placement_puts_rubble_along_the_edges_spaced_and_by_the_seed() {
+    let form = cube(0.03, 4);
+    let g = VolumeGen::build(&form, &rubble(), None);
+    let anchors = g.anchors();
+    eprintln!("{} anchors on the cube's edges", anchors.len());
+    assert_eq!(anchors.len(), 40, "count");
+    for (i, a) in anchors.iter().enumerate() {
+        // On an edge: at two faces at once (the rounding sets the bisector's point 0.006 in).
+        assert!(at_faces(a.p, 0.03) >= 2, "anchor {i} at {:?} is not on an edge", a.p);
+        for b in &anchors[i + 1..] {
+            assert!(a.p.distance(b.p) >= 0.1 - 1e-4, "too close");
+        }
+    }
+    // Each instance lies along its edge (the axis at no face) and stands on its bisector (at a corner, any way).
+    let mut corners = 0;
+    for (i, inst) in g.instances().iter().enumerate() {
+        let a = anchors[i];
+        let Some(free) = (0..3).find(|&k| (a.p[k].abs() - 0.6).abs() >= 0.03) else {
+            corners += 1;
+            continue;
+        };
+        let along = inst.rotation * Vec3::Z;
+        assert!(along[free].abs() > 0.95, "instance {i} at {:?} lies {along:?}, its edge along axis {free}", a.p);
+        let mut bisector = Vec3::ZERO;
+        for k in (0..3).filter(|&k| k != free) {
+            bisector[k] = a.p[k].signum();
+        }
+        let up = inst.rotation * Vec3::Y;
+        assert!(up.dot(bisector.normalize()) > 0.95, "instance {i} stands {up:?}");
+    }
+    eprintln!("{corners} at corners");
+    assert!(corners <= 8, "{corners} at corners");
+    // The same seed the same anchors; another seed others.
+    assert_eq!(VolumeGen::build(&form, &rubble(), None).anchors(), anchors);
+    assert_ne!(VolumeGen::build(&form, &GeneratorSpec { seed: 4, ..rubble() }, None).anchors(), anchors);
+    // A ball has no edges.
+    let ball = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+    assert!(VolumeGen::build(&ball, &rubble(), None).anchors().is_empty(), "edges on a ball");
+}
+
+#[test]
+fn ridges_and_creases_are_told_apart() {
+    let form = pillar(0.02, 3);
+    let crease = |p: Vec3| (p.y + 0.35).abs() < 0.03 && (p.x.abs().max(p.z.abs()) - 0.25).abs() < 0.03;
+    let creases = VolumeGen::build(&form, &GeneratorSpec { place_on: PlaceOn::Edges { angle: 40.0, side: EdgeSide::Creases }, ..rubble() }, None);    let ridges = VolumeGen::build(&form, &GeneratorSpec { place_on: PlaceOn::Edges { angle: 40.0, side: EdgeSide::Ridges }, ..rubble() }, None);
+    let both = VolumeGen::build(&form, &rubble(), None);
+    let n = |g: &VolumeGen| g.anchors().iter().filter(|a| crease(a.p)).count();
+    eprintln!("creases: {} of {} at the pillar's foot; ridges: {} of {}; both: {} of {}", n(&creases), creases.anchors().len(), n(&ridges), ridges.anchors().len(), n(&both), both.anchors().len());
+    // The crease round the pillar's foot is 2 long: room for about twenty, 0.1 apart (fewer are placed).
+    assert!(creases.anchors().len() >= 12, "creases found {}", creases.anchors().len());
+    assert_eq!(n(&creases), creases.anchors().len(), "a crease off the pillar's foot");
+    assert_eq!(n(&ridges), 0, "a ridge at the pillar's foot");
+    assert_eq!(ridges.anchors().len(), 40);
+    // Rubble in the crease stands out of it, between the wall and the ground.
+    for (a, i) in creases.anchors().iter().zip(creases.instances()) {
+        let up = i.rotation * Vec3::Y;
+        let out = Vec3::new(a.p.x, 0.0, a.p.z);
+        let out = if out.x.abs() > out.z.abs() { Vec3::X * out.x.signum() } else { Vec3::Z * out.z.signum() };
+        assert!(up.dot((out + Vec3::Y).normalize()) > 0.9, "rubble in the crease stands {up:?}");
+    }
+}
+
+#[test]
+fn edge_rubble_keeps_the_surface_closed_and_saves() {
+    let mut s = cube(0.03, 4);
+    let mut l = Layered::new(&mut s, 2);
+    // (Not lifted, so each instance's centre is its anchor.)
+    let spec = GeneratorSpec { size: 0.05, lift: 0.0, random_spin: true, rough: 0.2, stretch_var: 0.4, ..rubble() };
+    let k = l.add_generator(&mut s, "Rubble", 2, &spec);
+    assert_eq!(l.generator_instances(k).len(), 40);
+    for cap in 0..4 {
+        let (open, nm, dropped) = closed(&s, cap);
+        eprintln!("cap {cap}: open {open}, non-manifold {nm}, dropped {dropped}");
+        assert_eq!((open, dropped), (0, 0), "cap {cap}");
+    }
+    // Opened again, each instance lies along its edge as before (the edges are read from the form, not saved).
+    let mut buf = Vec::new();
+    l.write_to(&mut buf).unwrap();
+    let (_, opened) = Layered::read_from(&mut &buf[..], 4).unwrap();
+    let opened = opened.expect("layers");
+    let (a, b) = (l.generator_instances(k), opened.generator_instances(k));
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert!(x.translation.distance(y.translation) < 1e-5 && x.rotation.dot(y.rotation).abs() > 1.0 - 1e-5, "an instance moved on opening");
+    }
+    // An edit that keeps the count, seed, spacing, placement and density keeps the anchors.
+    let before: Vec<Vec3> = a.iter().map(|i| i.translation).collect();
+    l.set_generator(&mut s, k, &GeneratorSpec { size: 0.06, ..spec.clone() });
+    let after: Vec<Vec3> = l.generator_instances(k).iter().map(|i| i.translation).collect();
+    assert!(before.iter().zip(&after).all(|(p, q)| p.distance(*q) < 1e-5), "a size edit moved the anchors");
+    l.set_generator(&mut s, k, &GeneratorSpec { place_on: PlaceOn::Edges { angle: 60.0, side: EdgeSide::Both }, ..spec.clone() });
+    let moved: Vec<Vec3> = l.generator_instances(k).iter().map(|i| i.translation).collect();
+    assert!(moved != before, "a new angle kept the anchors");
+}
+
+#[test]
+fn facing_density_gathers_rubble_on_what_faces_the_axis() {
+    let ball = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+    let even = GeneratorSpec { count: 200, min_spacing: 0.0, ..rocks() };
+    let facing = GeneratorSpec { density: Density::Facing { axis: [0.0, 1.0, 0.0], sharpness: 2.0 }, ..even.clone() };
+    let share = |g: &VolumeGen| g.anchors().iter().filter(|a| a.n.y > 0.5).count() as f32 / g.anchors().len().max(1) as f32;
+    let (e, f) = (VolumeGen::build(&ball, &even, None), VolumeGen::build(&ball, &facing, None));
+    eprintln!("facing up past 60 degrees: even {:.2}, facing {:.2} ({} placed)", share(&e), share(&f), f.anchors().len());
+    assert_eq!(f.anchors().len(), 200, "count");
+    assert!(share(&e) < 0.35 && share(&f) > 0.65, "even {} facing {}", share(&e), share(&f));
+    assert!(f.anchors().iter().all(|a| a.n.y > 0.0), "an anchor facing away");
+    assert_eq!(VolumeGen::build(&ball, &facing, None).anchors(), f.anchors(), "not the same for a seed");
+    // Spaced too, the same.
+    let spaced = VolumeGen::build(&ball, &GeneratorSpec { min_spacing: 0.1, ..facing.clone() }, None);
+    assert!(share(&spaced) > 0.65, "spaced facing {}", share(&spaced));
+}
+
+#[test]
+fn clusters_gather_rubble_in_patches() {
+    let ball = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+    let clusters = Density::Clusters { scale: 2.0, coverage: 0.4, softness: 0.1, seed: 2 };
+    let d = clusters.at_points().unwrap();
+    let even = GeneratorSpec { count: 200, min_spacing: 0.0, ..rocks() };
+    let dense = |g: &VolumeGen| g.anchors().iter().filter(|a| d.at(a.p, a.n) > 0.0).count() as f32 / g.anchors().len().max(1) as f32;
+    let (e, c) = (VolumeGen::build(&ball, &even, None), VolumeGen::build(&ball, &GeneratorSpec { density: clusters.clone(), ..even.clone() }, None));
+    eprintln!("in the dense patches: even {:.2}, clustered {:.2} ({} placed)", dense(&e), dense(&c), c.anchors().len());
+    assert_eq!(c.anchors().len(), 200);
+    assert!(dense(&e) < 0.5 && dense(&c) > 0.9, "even {} clustered {}", dense(&e), dense(&c));
+    // Along edges too: the cube's edges, only in the patches.
+    let cube = cube(0.03, 4);
+    let g = VolumeGen::build(&cube, &GeneratorSpec { density: clusters, min_spacing: 0.05, ..rubble() }, None);
+    eprintln!("clustered along the cube's edges: {} placed, {:.2} dense", g.anchors().len(), dense(&g));
+    assert!(!g.anchors().is_empty() && dense(&g) > 0.9);
+    assert!(g.anchors().iter().all(|a| at_faces(a.p, 0.03) >= 2));
+}
+
+/// At the app's scale (a ball and a cube at a level 0 step of 0.007): scattering along edges and by a density, timed.
+#[test]
+#[ignore]
+fn placement_timing_at_app_scale() {
+    use std::time::Instant;
+    let ball = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, 0.007, 6);
+    let cube = LevelVolume::from_field(&|p: Vec3| rounded_box(p, Vec3::splat(0.6), 0.02), 1.0, 0.007, 6);
+    let size = 0.03;
+    let base = GeneratorSpec { count: 200, size, min_spacing: 2.0 * size, ..rocks() };
+    let cases: [(&str, &LevelVolume, GeneratorSpec); 6] = [
+        ("ball, surface", &ball, base.clone()),
+        ("ball, facing", &ball, GeneratorSpec { density: Density::default_facing(), ..base.clone() }),
+        ("ball, clusters", &ball, GeneratorSpec { density: Density::default_clusters(), ..base.clone() }),
+        ("ball, edges (none)", &ball, GeneratorSpec { place_on: PlaceOn::default_edges(), ..base.clone() }),
+        ("cube, edges", &cube, GeneratorSpec { place_on: PlaceOn::default_edges(), ..base.clone() }),
+        ("cube, edges, 1000", &cube, GeneratorSpec { place_on: PlaceOn::default_edges(), count: 1000, min_spacing: 0.0, ..base.clone() }),
+    ];
+    for (name, form, spec) in cases {
+        let t = Instant::now();
+        let g = VolumeGen::build(form, &spec, None);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let again = VolumeGen::build(form, &GeneratorSpec { size: size * 1.1, ..spec.clone() }, Some(&g));
+        let kept = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let _ = again.follow(form, 0.05);
+        let follow = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!("{name}: {} placed in {ms:.1} ms; a size edit (anchors kept) {kept:.2} ms; following {follow:.2} ms", g.anchors().len());
+    }
+}
+
+/// Rubble along a pillar's edges and in the crease at its foot, as a picture (when `SCULPT_GEN_PICTURE` names a
+/// folder).
+#[test]
+#[ignore]
+fn picture_edge_rubble() {
+    for (name, side) in [("edge_both", EdgeSide::Both), ("edge_ridges", EdgeSide::Ridges), ("edge_creases", EdgeSide::Creases)] {
+        let mut s = pillar(0.01, 4);
+        let mut l = Layered::new(&mut s, 2);
+        let spec = GeneratorSpec { count: 160, size: 0.035, min_spacing: 0.045, lift: 0.0, random_spin: true, size_var: 0.5, stretch_var: 0.4, rough: 0.25, blend: 0.3, place_on: PlaceOn::Edges { angle: 40.0, side }, ..rocks() };
+        l.add_generator(&mut s, "Rubble", 3, &spec);
+        picture(&s, Vec3::new(1.6, 1.4, 2.0), Vec3::new(1.6, 1.4, 2.0).normalize(), 0.85, name);
+    }
 }

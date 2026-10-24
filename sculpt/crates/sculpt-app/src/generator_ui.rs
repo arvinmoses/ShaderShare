@@ -12,7 +12,7 @@ use egui::{RichText, Ui};
 use sculpt_core::{Document, LayerId};
 use sculpt_core::generator::density::Density;
 use sculpt_core::bake::MeshAttribute;
-use sculpt_core::generator::layer::{GeneratorKind, GeneratorSpec};
+use sculpt_core::generator::layer::{EdgeSide, GeneratorKind, GeneratorSpec, PlaceOn};
 use sculpt_core::generator::mapping::{AttributeRow, AttributeSource, AttributeTarget};
 use sculpt_core::generator::{BoolOp, Primitive};
 
@@ -191,6 +191,7 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
     let Some(layer) = m.layer.as_ref() else { return };
     let k = layer.active();
     let Some(spec) = layer.generator(k).cloned() else { return };
+    let placed = layer.generator_instances(k).len();
     let (ms, full, join) = (m.generator_ms, m.generator_full_ms, m.join_ms);
     let on_gpu = m.layer.as_ref().is_some_and(|l| l.gpu_can_join());
     let mut next = spec.clone();
@@ -234,6 +235,74 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
         vslider(ui, "Lift jitter", egui::Slider::new(&mut next.lift_var, 0.0..=1.0).max_decimals(2), None, c, co, d);
         let r = prop(ui, "Spin", |ui| ui.checkbox(&mut next.random_spin, "Random"));
         note(&r, c, co);
+        ui.add_space(4.0);
+        // Where they go: the surface or its sharp edges, and a density that gathers them.
+        prop(ui, "Place on", |ui| {
+            let label = |p: &PlaceOn| if matches!(p, PlaceOn::Edges { .. }) { "Edges" } else { "Surface" };
+            egui::ComboBox::from_id_salt(("vgen_place", k))
+                .selected_text(label(&next.place_on))
+                .show_ui(ui, |ui| {
+                    for option in [PlaceOn::Surface, PlaceOn::default_edges()] {
+                        if ui.selectable_label(label(&next.place_on) == label(&option), label(&option)).clicked() && label(&next.place_on) != label(&option) {
+                            next.place_on = option;
+                            *c = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Anywhere on the surface, or along its sharp edges: chips off a ridge, rubble at the foot of a wall.")
+        });
+        if let PlaceOn::Edges { angle, side } = &mut next.place_on {
+            vslider(ui, "Edge angle", egui::Slider::new(angle, 10.0..=120.0).suffix(" deg").max_decimals(0), Some("How sharply the surface has to turn to count as an edge. Lower takes rounder ridges."), c, co, d);
+            prop(ui, "Edges", |ui| {
+                let name = |s: EdgeSide| match s {
+                    EdgeSide::Both => "Ridges and creases",
+                    EdgeSide::Ridges => "Ridges",
+                    EdgeSide::Creases => "Creases",
+                };
+                egui::ComboBox::from_id_salt(("vgen_side", k)).selected_text(name(*side)).show_ui(ui, |ui| {
+                    for s in [EdgeSide::Both, EdgeSide::Ridges, EdgeSide::Creases] {
+                        if ui.selectable_label(*side == s, name(s)).clicked() && *side != s {
+                            *side = s;
+                            *c = true;
+                        }
+                    }
+                })
+            });
+        }
+        prop(ui, "Density", |ui| {
+            egui::ComboBox::from_id_salt(("vgen_density", k))
+                .selected_text(next.density.label())
+                .show_ui(ui, |ui| {
+                    // (Painted needs a painted channel, which a volume does not have yet.)
+                    for (name, option) in [("Even", Density::Even), ("Clusters", Density::default_clusters()), ("Facing", Density::default_facing())] {
+                        if ui.selectable_label(next.density.label() == name, name).clicked() && next.density.label() != name {
+                            next.density = option;
+                            *c = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Where the instances gather. The count stays; the density decides where it goes.")
+        });
+        match &mut next.density {
+            Density::Clusters { scale, coverage, softness, seed } => {
+                vslider(ui, "Patch size", egui::Slider::new(scale, 0.5..=12.0).logarithmic(true).max_decimals(1), Some("Larger is bigger patches. Smaller is finer, more frequent clumps."), c, co, d);
+                vslider(ui, "Coverage", egui::Slider::new(coverage, 0.0..=1.0).max_decimals(2), Some("How much of the surface is dense."), c, co, d);
+                vslider(ui, "Softness", egui::Slider::new(softness, 0.02..=1.0).max_decimals(2), None, c, co, d);
+                let r = prop(ui, "Pattern seed", |ui| ui.add(egui::DragValue::new(seed).speed(0.2)));
+                *d |= r.dragged();
+                note(&r, c, co);
+            }
+            Density::Facing { axis, sharpness } => {
+                *c |= prop(ui, "Faces", |ui| axis_combo(ui, egui::Id::new(("vgen_facing", k)), axis));
+                vslider(ui, "Tightness", egui::Slider::new(sharpness, 0.3..=6.0).logarithmic(true).max_decimals(1), Some("Higher means the surface has to face that way more squarely."), c, co, d);
+            }
+            Density::Even | Density::Painted { .. } => {}
+        }
+        if placed < spec.count as usize {
+            ui.label(RichText::new(format!("{placed} of {} placed: the places that take them are full or few.", spec.count)).small().color(weak));
+        }
         ui.add_space(4.0);
         vslider(ui, "Roughness", egui::Slider::new(&mut next.rough, 0.0..=0.6).max_decimals(2), Some("Noise on each instance's surface, up to this fraction of its size: rocks become stones."), c, co, d);
         vslider(ui, "Bump size", egui::Slider::new(&mut next.rough_scale, 0.3..=8.0).logarithmic(true).max_decimals(1), Some("Bumps of the roughness across one instance."), c, co, d);

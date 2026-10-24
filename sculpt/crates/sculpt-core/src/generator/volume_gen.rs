@@ -5,7 +5,12 @@
 //!   0's surface by the lattice edges it crosses (so about evenly by area, with no surface to extract), apart by the
 //!   spec's spacing if it has one, and moved onto the finest surface the form has. When a stroke moves the form, each
 //!   anchor is found again on the new surface along its normal, so what was scattered rides the form. A spec edit
-//!   that does not change the count, seed or spacing keeps the anchors.
+//!   that does not change the count, seed, spacing, placement or density keeps the anchors.
+//! * **Along edges.** Placed on edges, a drawn point is kept where level 0's normals a few steps either side of it
+//!   differ by more than the angle ([`edge_at`]), moved across onto the edge's line, and an instance there lies along
+//!   the edge, upright on the bisector of its two sides. The edge is read from the form at the anchor (not saved).
+//! * **Density.** Clusters and facing keep each candidate as likely as the density is there (the count stays, the
+//!   candidates are drawn until it is met); a painted density scatters evenly, a volume having no painted channel.
 //! * **Instances** come from the anchors as on a mesh ([`super::layer`]): size, stretch, lift, tilt and spin varied by
 //!   the seed, and the mapping rows that read the surface's slope.
 //! * **Joining.** Instances join one another and the surface below with a polynomial smooth minimum over `blend` times
@@ -21,7 +26,7 @@ use std::sync::Arc;
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 
-use super::layer::{GeneratorSpec, ORDER_STREAM, biggest_instance, place_instance, unit_random};
+use super::layer::{EdgeSide, GeneratorSpec, ORDER_STREAM, PlaceOn, biggest_instance, place_instance, place_instance_along, unit_random};
 use super::level_volume::{HashSet, LevelVolume};
 use super::mapping::Mapper;
 use super::place::SurfaceSample;
@@ -64,6 +69,9 @@ pub struct Anchor {
 pub struct VolumeGen {
     pub spec: GeneratorSpec,
     anchors: Arc<Vec<Anchor>>,
+    /// Placed along edges: each anchor's edge (its direction, and the bisector the instance stands on), read from the
+    /// form at the anchor whenever the anchors are placed or move, so it needs no saving. Empty on the surface.
+    frames: Arc<Vec<(Vec3, Vec3)>>,
     set: Arc<InstanceSet>,
     /// The instances' roughness, when they have any.
     rough: Option<Rough>,
@@ -140,7 +148,98 @@ fn nearest_root(f: &dyn Fn(Vec3) -> f32, p: Vec3, d: Vec3, step: f32, reach: f32
     None
 }
 
-/// Points over the form's level 0 surface, `count` (or fewer when spaced and the surface is full), drawn by `seed`.
+/// How far either side of a point [`edge_at`] compares the surface's normals, in level 0 steps.
+const EDGE_REACH: f32 = 2.5;
+
+/// The form's sharp edge through a point of it, as [`edge_at`] measures it.
+#[derive(Clone, Copy, Debug)]
+struct Edge {
+    /// Along the edge (either way).
+    t: Vec3,
+    /// Across it, in the surface's plane at the point.
+    across: Vec3,
+    /// The bisector of the normals either side.
+    up: Vec3,
+    /// The normal a reach along `across`, and a reach back.
+    na: Vec3,
+    nb: Vec3,
+    /// The angle between them, in radians.
+    angle: f32,
+}
+
+impl Edge {
+    /// Convex (the surface falls away either side), as opposed to a crease.
+    fn ridge(&self) -> bool {
+        (self.na - self.nb).dot(self.across) > 0.0
+    }
+
+    fn takes(&self, angle: f32, side: EdgeSide) -> bool {
+        self.angle >= angle.to_radians()
+            && match side {
+                EdgeSide::Both => true,
+                EdgeSide::Ridges => self.ridge(),
+                EdgeSide::Creases => !self.ridge(),
+            }
+    }
+}
+
+/// The form's level 0 surface across `p` (on it, outward normal `n`): the normals a reach `r` either side, compared in
+/// four directions, give the direction the surface turns most (a fit of how the difference goes round), and the
+/// normals that way give the edge's angle and bisector. `None` where the field holds no distance to read a normal from.
+fn edge_at(form: &LevelVolume, p: Vec3, n: Vec3, r: f32) -> Option<Edge> {
+    let nrm = |q: Vec3| form.normal_upto(q, 0, false);
+    let n = n.normalize_or_zero();
+    if n == Vec3::ZERO {
+        return None;
+    }
+    let u = n.any_orthonormal_vector();
+    let v = n.cross(u);
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    let f = [u, (u + v) * h, v, (v - u) * h].map(|d| (nrm(p + d * r) - nrm(p - d * r)).length_squared());
+    // The difference goes round as A + B cos 2(theta - most): its largest at `most`.
+    let most = 0.5 * (0.5 * (f[1] - f[3])).atan2(0.5 * (f[0] - f[2]));
+    let across = u * most.cos() + v * most.sin();
+    let (na, nb) = (nrm(p + across * r), nrm(p - across * r));
+    if na == Vec3::ZERO || nb == Vec3::ZERO {
+        return None;
+    }
+    let up = (na + nb).normalize_or(n);
+    Some(Edge { t: up.cross(across).normalize_or(n.cross(across)), across, up, na, nb, angle: na.dot(nb).clamp(-1.0, 1.0).acos() })
+}
+
+/// `p` moved across edge `e` onto its line: where the normal turns half way between the two sides (found by halving,
+/// within a reach `r` either way), on the plane of `p`.
+fn onto_edge(form: &LevelVolume, p: Vec3, e: &Edge, r: f32) -> Vec3 {
+    let d = e.na - e.nb;
+    let g = |s: f32| form.normal_upto(p + e.across * s, 0, false).dot(d);
+    let (mut lo, mut hi) = (-r, r);
+    if g(lo) >= 0.0 || g(hi) <= 0.0 {
+        return p;
+    }
+    for _ in 0..7 {
+        let m = 0.5 * (lo + hi);
+        if g(m) < 0.0 { lo = m } else { hi = m }
+    }
+    p + e.across * (0.5 * (lo + hi))
+}
+
+/// Each anchor's edge frame (along the edge, and the bisector), for a spec placing along edges: empty otherwise.
+fn edge_frames(form: &LevelVolume, spec: &GeneratorSpec, anchors: &[Anchor]) -> Vec<(Vec3, Vec3)> {
+    if !matches!(spec.place_on, PlaceOn::Edges { .. }) {
+        return Vec::new();
+    }
+    let r = EDGE_REACH * form.voxel(0);
+    anchors
+        .par_iter()
+        .map(|a| match edge_at(form, a.p, a.n, r) {
+            Some(e) => (e.t, e.up),
+            None => (a.n.any_orthonormal_vector(), a.n),
+        })
+        .collect()
+}
+
+/// Points over the form's level 0 surface, `count` (or fewer when spaced and the surface is full, or when few places
+/// take them), drawn by `seed`: anywhere on it or along its edges, and as the spec's density has them.
 fn scatter(form: &LevelVolume, spec: &GeneratorSpec) -> Vec<Anchor> {
     let count = spec.count as usize;
     if count == 0 {
@@ -160,7 +259,8 @@ fn scatter(form: &LevelVolume, spec: &GeneratorSpec) -> Vec<Anchor> {
         return Vec::new();
     }
     let (v0, origin, top) = (form.voxel(0), form.origin(), form.levels() - 1);
-    let draw = |i: u64| -> Option<Anchor> {
+    // A point of level 0's surface, by area.
+    let draw0 = |i: u64| -> Option<Vec3> {
         let pick = ((unit_random(spec.seed, 2 * i) as f64 * total as f64) as u64).min(total - 1);
         let b = cdf.partition_point(|&c| c <= pick);
         let bc = keys[b];
@@ -182,27 +282,70 @@ fn scatter(form: &LevelVolume, spec: &GeneratorSpec) -> Vec<Anchor> {
         let (c, axis, t) = *edges.get(((unit_random(spec.seed, 2 * i + 1) * edges.len() as f32) as usize).min(edges.len().max(1) - 1))?;
         let mut q = (bc * B + c).as_vec3();
         q[axis] += t;
-        let p = origin + q * v0;
+        Some(origin + q * v0)
+    };
+    let draw = |i: u64| -> Option<Anchor> {
+        let p = draw0(i)?;
         snap(form, Anchor { p, n: form.normal_upto(p, top, false) }, 2.0 * v0)
     };
-    if spec.min_spacing <= 0.0 {
+    // Along edges: a point of the surface is kept where an edge runs through it, moved onto the edge's line and the
+    // finest surface, and measured again there (so what is kept is on an edge as its frame reads it).
+    let r = EDGE_REACH * v0;
+    let on_edge = |i: u64, angle: f32, side: EdgeSide| -> Option<Anchor> {
+        let p = draw0(i)?;
+        let e = edge_at(form, p, form.normal_upto(p, 0, false), r)?;
+        if !e.takes(angle, side) {
+            return None;
+        }
+        // Moved across twice: near a corner the first move may land between two edges, the second onto one.
+        let q = onto_edge(form, p, &e, r);
+        let q = match edge_at(form, q, e.up, r) {
+            Some(e) if e.takes(angle, side) => onto_edge(form, q, &e, r),
+            _ => q,
+        };
+        let a = snap(form, Anchor { p: q, n: e.up }, r + 2.0 * v0)?;
+        edge_at(form, a.p, a.n, r)?.takes(angle, side).then_some(a)
+    };
+    let density = spec.density.at_points();
+    let candidate = |i: u64| -> Option<Anchor> {
+        let a = match spec.place_on {
+            PlaceOn::Surface => draw(i)?,
+            PlaceOn::Edges { angle, side } => on_edge(i, angle, side)?,
+        };
+        // A density keeps a candidate as likely as it is dense there.
+        match &density {
+            Some(d) if unit_random(spec.seed ^ DENSITY_STREAM, i) >= d.at(a.p, a.n) => None,
+            _ => Some(a),
+        }
+    };
+    let filtered = density.is_some() || spec.place_on != PlaceOn::Surface;
+    if spec.min_spacing <= 0.0 && !filtered {
         return (0..count as u64).into_par_iter().filter_map(draw).collect();
     }
-    // Dart throwing, as on a mesh: candidates in a random order, kept when none kept is within the spacing.
-    let cell = spec.min_spacing;
+    // Candidates in batches. Spaced, as on a mesh, dart throwing: candidates in a random order, kept when none kept is
+    // within the spacing. Filtered (to edges or by a density), batches grow as fewer candidates pass, up to a limit.
+    let spaced = spec.min_spacing > 0.0;
+    let cell = spec.min_spacing.max(1e-6);
     let key = |p: Vec3| (p / cell).floor().as_ivec3();
     let mut grid: std::collections::HashMap<IVec3, Vec<u32>> = std::collections::HashMap::new();
     let mut kept: Vec<Anchor> = Vec::with_capacity(count);
-    let min2 = cell * cell;
+    let min2 = spec.min_spacing * spec.min_spacing;
     let mut dry = 0;
+    let (mut start, mut n) = (0u64, (count * 3).max(256) as u64);
     for batch in 0u64..24 {
-        let n = (count * 3).max(256) as u64;
-        let mut cands: Vec<(f32, Anchor)> = (0..n).into_par_iter().filter_map(|j| draw(batch * n + j).map(|a| (unit_random(spec.seed ^ ORDER_STREAM ^ batch, j), a))).collect();
-        cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut cands: Vec<(f32, Anchor)> = (0..n).into_par_iter().filter_map(|j| candidate(start + j).map(|a| (unit_random(spec.seed ^ ORDER_STREAM ^ batch, j), a))).collect();
+        let passed = cands.len();
+        if spaced {
+            cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
         let before = kept.len();
         for (_, a) in cands {
             if kept.len() >= count {
                 break;
+            }
+            if !spaced {
+                kept.push(a);
+                continue;
             }
             let k = key(a.p);
             let crowded = (0..27).any(|o| grid.get(&(k + IVec3::new(o % 3 - 1, (o / 3) % 3 - 1, o / 9 - 1))).is_some_and(|v| v.iter().any(|&j| kept[j as usize].p.distance_squared(a.p) < min2)));
@@ -218,9 +361,21 @@ fn scatter(form: &LevelVolume, spec: &GeneratorSpec) -> Vec<Anchor> {
         if dry >= 2 {
             break;
         }
+        start += n;
+        if filtered {
+            // Enough candidates next time for three times what is still wanted, at the share that passed.
+            let share = (passed as f64 / n as f64).max(1.0 / MOST_CANDIDATES as f64);
+            n = ((3.0 * (count - kept.len()) as f64 / share) as u64).clamp(256, MOST_CANDIDATES);
+        }
     }
     kept
 }
+
+/// The most candidates a batch of a filtered scatter draws.
+const MOST_CANDIDATES: u64 = 1 << 15;
+
+/// The stream deciding whether a density keeps a candidate.
+const DENSITY_STREAM: u64 = 0xA7D3_1E58_6C90_B007;
 
 /// `a` moved onto the form's finest surface along its normal (within `reach`), with the normal there.
 fn snap(form: &LevelVolume, a: Anchor, reach: f32) -> Option<Anchor> {
@@ -237,29 +392,49 @@ fn snap(form: &LevelVolume, a: Anchor, reach: f32) -> Option<Anchor> {
 }
 
 impl VolumeGen {
-    /// Scatter `spec` over `form`, keeping `previous`'s anchors where its count, seed and spacing are the same.
+    /// Scatter `spec` over `form`, keeping `previous`'s anchors where its count, seed, spacing, placement and density
+    /// are the same.
     pub fn build(form: &LevelVolume, spec: &GeneratorSpec, previous: Option<&VolumeGen>) -> VolumeGen {
-        let anchors = match previous {
-            Some(p) if p.spec.count == spec.count && p.spec.seed == spec.seed && p.spec.min_spacing == spec.min_spacing => p.anchors.clone(),
-            _ => Arc::new(scatter(form, spec)),
+        let (anchors, frames) = match previous {
+            Some(p)
+                if p.spec.count == spec.count
+                    && p.spec.seed == spec.seed
+                    && p.spec.min_spacing == spec.min_spacing
+                    && p.spec.place_on == spec.place_on
+                    && p.spec.density == spec.density =>
+            {
+                (p.anchors.clone(), p.frames.clone())
+            }
+            _ => {
+                let anchors = scatter(form, spec);
+                let frames = edge_frames(form, spec, &anchors);
+                (Arc::new(anchors), Arc::new(frames))
+            }
         };
-        Self::with_anchors(spec, anchors)
+        Self::with_anchors(spec, anchors, frames)
     }
 
-    fn with_anchors(spec: &GeneratorSpec, anchors: Arc<Vec<Anchor>>) -> VolumeGen {
+    fn with_anchors(spec: &GeneratorSpec, anchors: Arc<Vec<Anchor>>, frames: Arc<Vec<(Vec3, Vec3)>>) -> VolumeGen {
         let channels = std::collections::BTreeMap::new();
         let mapper = Mapper::new(&spec.mapping, &channels);
         let count = anchors.len();
         let instances = anchors
             .iter()
             .enumerate()
-            .map(|(i, a)| {
-                let s = SurfaceSample { position: a.p, normal: a.n, face: 0, verts: [0; 3], bary: [1.0, 0.0, 0.0] };
-                place_instance(spec, &mapper, &s, i, count)
+            .map(|(i, a)| match frames.get(i) {
+                // On an edge: standing on its bisector, lying along it.
+                Some(&(t, up)) => {
+                    let s = SurfaceSample { position: a.p, normal: up, face: 0, verts: [0; 3], bary: [1.0, 0.0, 0.0] };
+                    place_instance_along(spec, &mapper, &s, t, i, count)
+                }
+                None => {
+                    let s = SurfaceSample { position: a.p, normal: a.n, face: 0, verts: [0; 3], bary: [1.0, 0.0, 0.0] };
+                    place_instance(spec, &mapper, &s, i, count)
+                }
             })
             .collect();
         let rough = (spec.rough > 0.0).then(|| Rough { kind: rough_kind(spec.rough_kind), freq: spec.rough_scale.max(0.01) / spec.size.max(1e-6), octaves: 3, seed: spec.seed as u32 ^ 0x5eed });
-        let mut out = VolumeGen { spec: spec.clone(), anchors, set: Arc::new(InstanceSet::new(instances, 0.0)), rough };
+        let mut out = VolumeGen { spec: spec.clone(), anchors, frames, set: Arc::new(InstanceSet::new(instances, 0.0)), rough };
         // Instances are found as far out as they can reach: the blend and the roughness.
         let reach = out.pad();
         out.set = Arc::new(InstanceSet::new(out.set.instances().to_vec(), reach));
@@ -283,9 +458,16 @@ impl VolumeGen {
         self
     }
 
-    /// The same, with anchors as saved.
+    /// The same, with anchors as saved. Placed along edges, each instance stands on its anchor's normal; see
+    /// [`Self::from_anchors_on`] for their edges.
     pub fn from_anchors(spec: &GeneratorSpec, anchors: Vec<Anchor>) -> VolumeGen {
-        Self::with_anchors(spec, Arc::new(anchors))
+        Self::with_anchors(spec, Arc::new(anchors), Arc::new(Vec::new()))
+    }
+
+    /// The same, on `form`: placed along edges, each anchor's edge read from it, as when they were placed.
+    pub fn from_anchors_on(form: &LevelVolume, spec: &GeneratorSpec, anchors: Vec<Anchor>) -> VolumeGen {
+        let frames = edge_frames(form, spec, &anchors);
+        Self::with_anchors(spec, Arc::new(anchors), Arc::new(frames))
     }
 
     pub fn anchors(&self) -> &[Anchor] {
@@ -299,10 +481,12 @@ impl VolumeGen {
     /// Each anchor found again on `form` along its normal, as far as `reach`; one with no surface within it stays.
     pub fn follow(&self, form: &LevelVolume, reach: f32) -> VolumeGen {
         let moved: Vec<Anchor> = self.anchors.par_iter().map(|a| snap(form, *a, reach).unwrap_or(*a)).collect();
-        if moved == *self.anchors {
+        // Along edges, each edge read again: the form may have turned under an anchor that stayed.
+        let frames = edge_frames(form, &self.spec, &moved);
+        if moved == *self.anchors && frames == *self.frames {
             return self.clone();
         }
-        Self::with_anchors(&self.spec, Arc::new(moved))
+        Self::with_anchors(&self.spec, Arc::new(moved), Arc::new(frames))
     }
 
     /// The blend's width, in world units.

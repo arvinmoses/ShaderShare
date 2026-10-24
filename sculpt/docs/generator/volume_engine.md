@@ -296,8 +296,8 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   the stroke makes within its reach); at the stroke's end each anchor is found again on the new surface along its
   normal, an anchor whose surface did not move staying exactly. In the test the form rose 0.0440 under a rock and the
   rock moved 0.0440; rocks away from the stroke did not move at all.
-* **Editing.** A parameter change places the instances again (scattering again only for a new count, seed or
-  spacing) and composes the blocks it had and has. An edit shows at once held no finer than level 1, and at its own level
+* **Editing.** A parameter change places the instances again (scattering again only for a new count, seed,
+  spacing, placement or density) and composes the blocks it had and has. An edit shows at once held no finer than level 1, and at its own level
   from a job off the frame (a newer edit drops an older job's result), a drag one undo step for all of it. At about the app's scale (a ball at a
   level 0 step of 0.007, twelve rocks): a drag step 6-8 ms at any level; on release 32 ms at level 2, 150 ms at
   level 3. The default size is 3% of the object, at the coarsest level giving a dozen steps a radius.
@@ -337,6 +337,30 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   a big stroke on the form, the bumps after it exactly as tall where they were on it (0.1298 out of its centre,
   before and after). `volume/rock_detail_rides.png`: before and after; the faint plate round the bumps is shading
   where finer blocks begin (the surface there matches the coarser one to 0.00003).
+* **Along edges.** "Place on: Edges" scatters along the form's sharp edges instead: ridges (chips off a wall's
+  edge), creases (rubble at its foot), or both. There is no mesh to find edges on, and extracting level 0's surface
+  to reuse the mesh's edge finder would cost a whole surface (about a million triangles at the app's scale) for a few
+  hundred points, so each drawn point is tested where it is: level 0's normals 2.5 of its steps either side, in four
+  directions round the point, give the direction the surface turns most (a fit of the difference going round), and
+  the normals that way the edge's angle, its bisector, and ridge or crease (whether they part or meet). A point
+  turning more than the angle (40 degrees for a new layer) is moved across onto the edge's line (where the normal is
+  half way between the sides; twice, so a point near a corner lands on one edge), onto the finest surface, and tested
+  again there. Level 0 is read on purpose: fine detail and noise do not make edges, the form's shape does. An
+  instance on an edge lies along it (its local Z), upright on the bisector; a random spin turns it about the edge.
+  The edge is read again from the form at each anchor whenever the anchors are placed, follow a stroke or are opened,
+  so nothing new is saved. Candidates are drawn in batches until the count is met, a batch growing as fewer pass (to
+  32k at most), and a form with no edges places none. Tests: on a cube every anchor is at two faces (one of forty at
+  a corner), lies along its edge and stands on its bisector; on a pillar on a slab, creases only at the pillar's
+  foot, ridges never there; the surface closed at every level; opened again, every instance as it was.
+* **Density.** Clusters and facing work as on a mesh (painted does not: a volume has no painted channel, and the
+  layer's mask is its visibility, not where things gather): each candidate is kept as likely as the density is there,
+  the count still met. Tests: on a ball, anchors facing up past 60 degrees: 23% even, 93% with "facing up"; every
+  clustered anchor inside a patch (25% of an even scatter).
+* **What placing costs** at the app's scale (level 0 step 0.007, 200 rocks 0.03 across, spaced 0.06;
+  `placement_timing_at_app_scale`): on the surface 4.7 ms, facing 3.2 ms, clusters 2.9 ms; along a cube's edges 9.2
+  ms (149 placed: the edges are full at that spacing), 1000 unspaced 17.8 ms; a ball, finding no edges, 15.8 ms. An
+  edit keeping the anchors re-places them in 0.4-1.2 ms. Changing the placement or density scatters again, as a new
+  seed does.
 * **Its mask** fades it, starting whole wherever it changes the field.
 * **Seen.** `volume/generator_layers.png` (from the review, 126-152 s): rocks added; 60 of them, larger, blended wider;
   the same scatter cutting pits; the form sculpted under them; a rock masked away.
@@ -345,7 +369,8 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   saving and opening, the mask fading a rock away.
 
 Not done yet: a noise layer over the whole surface (finer than level 0 it needs fine blocks everywhere: better done
-on the GPU, as the blocks are extracted), edge generators, density and painted placement, and intersect.
+on the GPU, as the blocks are extracted), painted placement, and intersect. The mesh generator does not read the
+edge placement yet.
 
 ## Surface noise, drawn by the GPU
 

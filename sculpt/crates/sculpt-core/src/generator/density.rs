@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::place::SurfaceSampler;
 use crate::mask::{Levels, MaskLayer, MaskSource, MaskStack};
 use crate::mesh::Face;
-use crate::noise::NoiseParams;
+use crate::noise::{Noise, NoiseParams};
 
 /// How the instances are spread over the surface.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -35,11 +35,8 @@ impl Density {
         match self {
             Density::Even => None,
             Density::Clusters { scale, coverage, softness, seed } => {
-                let half = softness.clamp(0.02, 1.0) * 0.5;
-                let centre = 1.0 - coverage.clamp(0.0, 1.0);
-                let (lo, hi) = ((centre - half).clamp(0.0, 0.98), (centre + half).clamp(0.02, 1.0));
                 let noise = NoiseParams { scale: *scale, seed: *seed, ..Default::default() };
-                Some(MaskStack::new(0.0).with(MaskLayer::new("Clusters", MaskSource::Noise(noise)).levels(Levels::range(lo, hi.max(lo + 0.01)))))
+                Some(MaskStack::new(0.0).with(MaskLayer::new("Clusters", MaskSource::Noise(noise)).levels(cluster_levels(*coverage, *softness))))
             }
             Density::Facing { axis, sharpness } => {
                 let axis = Vec3::from_array(*axis).normalize_or(Vec3::NEG_Y);
@@ -69,6 +66,43 @@ impl Density {
 
     pub fn default_painted() -> Density {
         Density::Painted { channel: "paint.mask".into() }
+    }
+
+    /// This density read at single points, for a surface with no vertices to hold it (a volume's). `None` for an even
+    /// scatter, and for a painted one: a volume has no painted channel yet, so it scatters evenly.
+    pub fn at_points(&self) -> Option<PointDensity> {
+        match self {
+            Density::Even | Density::Painted { .. } => None,
+            Density::Clusters { scale, coverage, softness, seed } => {
+                Some(PointDensity::Clusters { noise: Noise::new(&NoiseParams { scale: *scale, seed: *seed, ..Default::default() }), levels: cluster_levels(*coverage, *softness) })
+            }
+            Density::Facing { axis, sharpness } => Some(PointDensity::Facing { axis: Vec3::from_array(*axis).normalize_or(Vec3::NEG_Y), sharpness: sharpness.max(0.05) }),
+        }
+    }
+}
+
+/// The clusters' noise remapped so `coverage` of it is dense, with a ramp `softness` wide at a clump's edge.
+fn cluster_levels(coverage: f32, softness: f32) -> Levels {
+    let half = softness.clamp(0.02, 1.0) * 0.5;
+    let centre = 1.0 - coverage.clamp(0.0, 1.0);
+    let (lo, hi) = ((centre - half).clamp(0.0, 0.98), (centre + half).clamp(0.02, 1.0));
+    Levels::range(lo, hi.max(lo + 0.01))
+}
+
+/// A density read at a point of a surface and its normal, the same as the mask stack [`Density::to_stack`] gives a
+/// mesh's vertices there.
+pub enum PointDensity {
+    Clusters { noise: Noise, levels: Levels },
+    Facing { axis: Vec3, sharpness: f32 },
+}
+
+impl PointDensity {
+    /// The density at `p`, where the surface's outward normal is `n`: 0 to 1.
+    pub fn at(&self, p: Vec3, n: Vec3) -> f32 {
+        match self {
+            PointDensity::Clusters { noise, levels } => levels.apply(noise.sample(p)).clamp(0.0, 1.0),
+            PointDensity::Facing { axis, sharpness } => n.dot(*axis).clamp(0.0, 1.0).powf(*sharpness),
+        }
     }
 }
 
