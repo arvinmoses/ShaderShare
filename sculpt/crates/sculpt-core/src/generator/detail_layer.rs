@@ -90,7 +90,7 @@ const PREVIEW: usize = 1;
 impl GenPart {
     fn new(form: &LevelVolume, g: VolumeGen, own: usize) -> GenPart {
         let g = g.fitted(form.voxel(own));
-        let blocks = (0..form.levels()).map(|l| g.blocks(form, l, own)).collect();
+        let blocks = (0..form.levels()).into_par_iter().map(|l| g.blocks(form, l, own)).collect();
         GenPart { g, blocks: std::sync::Arc::new(blocks), upto: own }
     }
 }
@@ -554,6 +554,39 @@ fn affected(stack: &[Layer], changes: &[(usize, IVec3)]) -> Vec<(usize, IVec3)> 
     out.into_iter().collect()
 }
 
+/// [`affected`] for generator layer `k` changing from `old` (its scatter before; `None` when the same) to what the
+/// stack holds now, without listing the layer's blocks twice: its blocks (old and new) are the changes, so only the
+/// other layers' blocks under them need finding. The layer's own blocks come first (how many is returned with the
+/// list), then the rest, with no repeats.
+fn affected_generator(stack: &[Layer], k: usize, old: Option<&GenPart>) -> (Vec<(usize, IVec3)>, usize) {
+    let Some(new) = stack[k].scatter.as_ref() else { return (Vec::new(), 0) };
+    let changed = |l: usize, bc: IVec3| new.blocks.get(l).is_some_and(|b| b.contains(&bc)) || old.is_some_and(|o| o.blocks.get(l).is_some_and(|b| b.contains(&bc)));
+    let mut out = stack[k].all_keys();
+    let own = out.len();
+    if let Some(old) = old {
+        let gone: Vec<(usize, IVec3)> = old
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(l, b)| b.par_iter().filter(move |bc| !new.blocks.get(l).is_some_and(|nb| nb.contains(bc))).map(move |bc| (l, *bc)).collect::<Vec<_>>())
+            .collect();
+        out.extend(gone);
+    }
+    let mut extra: HashSet<(usize, IVec3)> = HashSet::default();
+    for (j, layer) in stack.iter().enumerate() {
+        if j == k || !layer.visible || layer.len() == 0 {
+            continue;
+        }
+        for (lf, bc) in layer.all_keys() {
+            if !changed(lf, bc) && (0..lf).any(|lk| changed(lk, bc >> (lf - lk) as i32)) {
+                extra.insert((lf, bc));
+            }
+        }
+    }
+    out.extend(extra);
+    (out, own)
+}
+
 /// What is shown at level `l` for blocks `keys`: the form pushed out by the layers at that level or coarser, or (`None`)
 /// nothing of its own where no visible layer at that level has the block.
 fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, keys: &[IVec3]) -> Vec<(IVec3, Option<Stored>)> {
@@ -781,7 +814,8 @@ fn base_block(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, bc: I
     let (lo, hi) = (bc * B, bc * B + IVec3::splat(B));
     let s = offsets(stack, l, lo, hi, false, None);
     let most = s.iter().fold(0.0f32, |a, b| a.max(b.abs()));
-    let pad = (most / v).ceil() as i32 + 2;
+    // No heights: the samples are read where they are, so the field is needed over the block alone.
+    let pad = if most == 0.0 { 0 } else { (most / v).ceil() as i32 + 2 };
     let (plo, phi) = (lo - IVec3::splat(pad), hi + IVec3::splat(pad));
     let pn = phi - plo + IVec3::ONE;
     let field = unclamped(form, l, below, plo, phi);
@@ -838,13 +872,46 @@ pub struct GpuPlan {
     pub gens: Vec<GpuGen>,
     pub instances: Vec<GpuInstance>,
     pub cands: Vec<u32>,
-    /// Per block: its key, and per generator (as `gens`) the range of `cands` near it and its mask's samples there
-    /// (an index into `masks`, `u32::MAX` where the mask is whole).
-    pub blocks: Vec<(Key, Vec<[u32; 4]>)>,
-    /// Masks' 9x9x9 samples, block by block.
-    pub masks: Vec<Box<[f32; 729]>>,
+    /// The blocks to join.
+    pub blocks: Vec<Key>,
+    /// Per block (as `blocks`) and generator (as `gens`): the range of `cands` near it (first, count) and its mask's
+    /// samples there (an index into `masks`, `u32::MAX` where the mask is whole).
+    pub ranges: Vec<[u32; 4]>,
+    /// Masks' 9x9x9 samples, block by block, as 16-bit floats two to a word.
+    pub masks: Vec<[u32; 365]>,
+    /// Blocks new to the shown volume (among `blocks`), with their base field packed the same way: the GPU keeps
+    /// them, so they need no reading again.
+    pub fresh: Vec<Key>,
+    pub bases: Vec<[u32; 365]>,
     /// [`Layered::base_epoch`] when it was made.
     pub epoch: u64,
+}
+
+/// An f32 as an IEEE half (round to nearest; tiny values to zero, huge ones to the largest half).
+pub fn f16(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    if e <= 0 {
+        return sign;
+    }
+    if e >= 31 {
+        return sign | 0x7bff;
+    }
+    let m = b & 0x7f_ffff;
+    let h = ((e as u32) << 10) | (m >> 13);
+    // Round to nearest (half up: a carry into the exponent is right).
+    let h = h + ((m >> 12) & 1);
+    sign | (h.min(0x7bff) as u16)
+}
+
+/// A block's 9x9x9 samples as halves, two to a word (the first in the low half).
+pub fn pack_f16(s: &[f32; 729]) -> [u32; 365] {
+    let mut w = [0u32; 365];
+    for (i, v) in s.iter().enumerate() {
+        w[i / 2] |= (f16(*v) as u32) << (16 * (i % 2));
+    }
+    w
 }
 
 /// Compose the shown blocks `targets` (level, block), level by level.
@@ -1548,32 +1615,59 @@ impl Layered {
             self.history.push(Undo::Layers(self.stack.clone()));
             self.redo.clear();
         }
+        let log = std::env::var_os("SCULPT_JOIN_LOG").is_some();
+        let t0 = std::time::Instant::now();
+        let mut laps: Vec<(&str, f64)> = Vec::new();
+        let mut lap = |name: &'static str| {
+            if log {
+                laps.push((name, t0.elapsed().as_secs_f64() * 1e3));
+            }
+        };
         let own = self.stack[k].level;
-        let mut changes = self.stack[k].all_keys();
-        let mut part = GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), own);
+        let built = VolumeGen::build(&self.form, spec, Some(&old.g));
+        lap("build");
+        let mut part = GenPart::new(&self.form, built, own);
+        lap("part");
         // Shown by the GPU: the job brings the field at its own level.
         part.upto = usize::MAX;
         self.stack[k].scatter = Some(part);
-        changes.extend(self.stack[k].all_keys());
-        let targets = affected(&self.stack, &changes);
+        let (mut targets, own_n) = affected_generator(&self.stack, k, Some(&old));
+        lap("affected");
         // On the CPU: blocks no longer changed by any layer, the form's again; blocks new to the layer, their base.
-        let (gone, kept): (Vec<(usize, IVec3)>, Vec<(usize, IVec3)>) = targets.into_iter().partition(|&(l, bc)| !composed(&self.stack, l, bc));
-        let fresh: Vec<(usize, IVec3, Option<Stored>)> = kept
+        // The layer's own blocks are composed as long as it shows; the rest are looked up.
+        let stack = &self.stack;
+        let rest = targets.split_off(if self.stack[k].visible { own_n } else { 0 });
+        let (mut kept, gone): (Vec<(usize, IVec3)>, Vec<(usize, IVec3)>) = rest.into_par_iter().partition(|&(l, bc)| composed(stack, l, bc));
+        kept.extend(targets);
+        lap("partition");
+        let form = &self.form;
+        // Each new block's base, clamped for the shown volume and packed for the GPU (which keeps it).
+        let fresh: Vec<(usize, IVec3, Stored, [u32; 365])> = kept
             .par_iter()
             .filter(|&&(l, bc)| !shown.exists(l, bc))
             .map(|&(l, bc)| {
                 let b = self.base_samples((l as u8, bc));
+                let band = form.band(l);
                 let mut own = Box::new([0.0f32; N]);
                 for (i, o) in own.iter_mut().enumerate() {
                     let c = cell(i);
-                    *o = b[(c.x + 9 * c.y + 81 * c.z) as usize].clamp(-self.form.band(l), self.form.band(l));
+                    *o = b[(c.x + 9 * c.y + 81 * c.z) as usize].clamp(-band, band);
                 }
-                (l, bc, Some(Stored::from(own)))
+                (l, bc, Stored::from(own), pack_f16(&b))
             })
             .collect();
+        lap("fresh");
+        let (n_gone, n_fresh) = (gone.len(), fresh.len());
+        let mut fresh_keys = Vec::with_capacity(fresh.len());
+        let mut bases = Vec::with_capacity(fresh.len());
         let mut put: Vec<(usize, IVec3, Option<Stored>)> = gone.into_iter().map(|(l, bc)| (l, bc, None)).collect();
-        put.extend(fresh);
+        for (l, bc, s, w) in fresh {
+            fresh_keys.push((l as u8, bc));
+            bases.push(w);
+            put.push((l, bc, Some(s)));
+        }
         self.put_shown(shown, put, &self.form);
+        lap("put_shown");
         // The plan: the generators shown, and the instances near each block.
         let mut gens = Vec::new();
         let mut instances = Vec::new();
@@ -1586,18 +1680,24 @@ impl Layered {
             }
         }
         let origin = self.form.origin();
-        type Lists = Vec<(Vec<u32>, Option<Box<[f32; 729]>>)>;
-        let form = &self.form;
-        let per: Vec<(Key, Lists)> = kept
-            .par_iter()
-            .map(|&(l, bc)| {
-                let v = form.voxel(l);
-                let lo = origin + (bc * B).as_vec3() * v;
-                let hi = lo + Vec3::splat(B as f32 * v);
+        // The lists are built a chunk of blocks at a time, each chunk's own, then laid end to end.
+        struct Chunk {
+            keys: Vec<Key>,
+            cands: Vec<u32>,
+            ranges: Vec<[u32; 4]>,
+            masks: Vec<[u32; 365]>,
+        }
+        let chunks: Vec<Chunk> = kept
+            .par_chunks(512)
+            .map(|chunk| {
+                let mut c = Chunk { keys: Vec::with_capacity(chunk.len()), cands: Vec::new(), ranges: Vec::with_capacity(chunk.len() * parts.len()), masks: Vec::new() };
                 let mut near = Vec::new();
-                let lists = parts
-                    .iter()
-                    .map(|(g, first, m, gl)| {
+                for &(l, bc) in chunk {
+                    let v = form.voxel(l);
+                    let lo = origin + (bc * B).as_vec3() * v;
+                    let hi = lo + Vec3::splat(B as f32 * v);
+                    c.keys.push((l as u8, bc));
+                    for (g, first, m, gl) in &parts {
                         g.near(lo, hi, g.pad() + v, &mut near);
                         // The mask at the block's samples, where it is painted near (else whole): any of its blocks over
                         // the block's box, at the mask's lattice.
@@ -1607,45 +1707,52 @@ impl Layered {
                             let (a, z) = (a.div_euclid(IVec3::splat(B)), z.div_euclid(IVec3::splat(B)));
                             (a.z..=z.z).any(|bz| (a.y..=z.y).any(|by| (a.x..=z.x).any(|bx| m.contains_key(&IVec3::new(bx, by, bz)))))
                         };
-                        let mask = painted.then(|| {
-                            let mut out = Box::new([1.0f32; 729]);
+                        let mut mi = u32::MAX;
+                        if painted {
+                            let mut out = [1.0f32; 729];
                             for (k, o) in out.iter_mut().enumerate() {
                                 let i = bc * B + IVec3::new(k as i32 % 9, (k as i32 / 9) % 9, k as i32 / 81);
                                 *o = mask_at(form, m, *gl, origin + i.as_vec3() * v);
                             }
-                            out
-                        });
-                        let mask = mask.filter(|m| m.iter().any(|x| *x < 0.9999));
-                        (near.iter().map(|j| j + first).collect(), mask)
-                    })
-                    .collect();
-                ((l as u8, bc), lists)
-            })
-            .collect();
-        let mut cands = Vec::new();
-        let mut masks = Vec::new();
-        let blocks = per
-            .into_iter()
-            .map(|(key, lists)| {
-                let ranges = lists
-                    .into_iter()
-                    .map(|(c, mask)| {
-                        let first = cands.len() as u32;
-                        cands.extend(c);
-                        let mi = match mask {
-                            Some(m) => {
-                                masks.push(m);
-                                masks.len() as u32 - 1
+                            if out.iter().any(|x| *x < 0.9999) {
+                                mi = c.masks.len() as u32;
+                                c.masks.push(pack_f16(&out));
                             }
-                            None => u32::MAX,
-                        };
-                        [first, cands.len() as u32 - first, mi, 0]
-                    })
-                    .collect();
-                (key, ranges)
+                        }
+                        let at = c.cands.len() as u32;
+                        c.cands.extend(near.iter().map(|j| j + first));
+                        c.ranges.push([at, near.len() as u32, mi, 0]);
+                    }
+                }
+                c
             })
             .collect();
-        Some(GpuPlan { gens, instances, cands, blocks, masks, epoch: self.base_epoch })
+        lap("lists");
+        let mut blocks = Vec::with_capacity(kept.len());
+        let mut cands = Vec::with_capacity(chunks.iter().map(|c| c.cands.len()).sum());
+        let mut ranges = Vec::with_capacity(kept.len() * parts.len());
+        let mut masks = Vec::with_capacity(chunks.iter().map(|c| c.masks.len()).sum());
+        for c in chunks {
+            let (c0, m0) = (cands.len() as u32, masks.len() as u32);
+            blocks.extend(c.keys);
+            cands.extend(c.cands);
+            ranges.extend(c.ranges.into_iter().map(|r| [r[0] + c0, r[1], if r[2] == u32::MAX { u32::MAX } else { r[2] + m0 }, 0]));
+            masks.extend(c.masks);
+        }
+        lap("flatten");
+        if log {
+            let mut prev = 0.0;
+            let parts: Vec<String> = laps
+                .iter()
+                .map(|(n, t)| {
+                    let s = format!("{n} {:.1}", t - prev);
+                    prev = *t;
+                    s
+                })
+                .collect();
+            eprintln!("plan: {} kept, {n_gone} gone, {n_fresh} fresh: {}", kept.len(), parts.join(", "));
+        }
+        Some(GpuPlan { gens, instances, cands, blocks, ranges, masks, fresh: fresh_keys, bases, epoch: self.base_epoch })
     }
 
     /// Generator layer `k`'s parameters.
@@ -2258,12 +2365,19 @@ impl Layered {
         let k = (0..self.stack.len()).find(|&k| self.stack[k].scatter.as_ref().is_some_and(|p| p.upto != self.stack[k].level))?;
         let preview = self.stack[k].scatter.clone()?;
         let own = self.stack[k].level;
-        let part = GenPart::new(&self.form, preview.g.clone(), own);
         let mut stack = self.stack.clone();
-        let mut changes = stack[k].all_keys();
+        let (part, targets) = if preview.upto == usize::MAX {
+            // Shown by the GPU at its own level: its blocks are found already (see `gpu_generator`).
+            let part = GenPart { g: preview.g.clone(), blocks: preview.blocks.clone(), upto: own };
+            (part, affected_generator(&stack, k, None).0)
+        } else {
+            let part = GenPart::new(&self.form, preview.g.clone(), own);
+            let mut changes = stack[k].all_keys();
+            stack[k].scatter = Some(part.clone());
+            changes.extend(stack[k].all_keys());
+            (part, affected(&stack, &changes))
+        };
         stack[k].scatter = Some(part.clone());
-        changes.extend(stack[k].all_keys());
-        let targets = affected(&stack, &changes);
         Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets })
     }
 

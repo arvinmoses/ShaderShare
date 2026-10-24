@@ -598,25 +598,23 @@ impl VolumeGen {
                 self.touches(lo, lo + Vec3::splat(size), pad)
             }).collect::<Vec<_>>().into_iter().collect();
         }
-        let mut out: HashSet<IVec3> = HashSet::default();
-        for i in 0..self.set.len() {
-            if !self.set.is_active(i) {
-                continue;
-            }
-            let b = self.set.aabb(i);
-            let lo = ((b.min - Vec3::splat(pad) - origin) / size).floor().as_ivec3();
-            let hi = ((b.max + Vec3::splat(pad) - origin) / size).floor().as_ivec3();
-            for z in lo.z..=hi.z {
-                for y in lo.y..=hi.y {
-                    for x in lo.x..=hi.x {
-                        out.insert(IVec3::new(x, y, z));
-                    }
-                }
-            }
-        }
+        // The blocks of every instance's box, instance by instance in parallel, then made one set.
+        let mut boxes: Vec<IVec3> = (0..self.set.len())
+            .into_par_iter()
+            .filter(|&i| self.set.is_active(i))
+            .flat_map_iter(|i| {
+                let b = self.set.aabb(i);
+                let lo = ((b.min - Vec3::splat(pad) - origin) / size).floor().as_ivec3();
+                let hi = ((b.max + Vec3::splat(pad) - origin) / size).floor().as_ivec3();
+                (lo.z..=hi.z).flat_map(move |z| (lo.y..=hi.y).flat_map(move |y| (lo.x..=hi.x).map(move |x| IVec3::new(x, y, z))))
+            })
+            .collect();
+        boxes.par_sort_unstable_by_key(|c| (c.z, c.y, c.x));
+        boxes.dedup();
         if l == 0 {
-            return out;
+            return boxes.into_iter().collect();
         }
+        let out = boxes;
         let half = 0.5 * 3f32.sqrt() * size;
         let keep = |bc: &IVec3| -> bool {
             let lo = origin + (*bc * B).as_vec3() * v;

@@ -137,6 +137,9 @@ pub struct GpuLevels {
     eye: Option<(Vec3, f32)>,
     /// Generators joined on the GPU (made when first needed).
     join: Option<join::Join>,
+    /// An extraction a sync left for the join after it (slots to extract, slots to release): the blocks around a
+    /// join's read its vertices, so they are extracted with it.
+    deferred: Option<(Vec<u32>, Vec<u32>)>,
     /// Bumped whenever the buffers are made afresh, so whoever draws from them binds them again.
     pub buffers_made: u64,
 }
@@ -238,6 +241,7 @@ impl GpuLevels {
             view: LevelView::default(),
             eye: None,
             join: None,
+            deferred: None,
         };
         g.queue.write_buffer(&g.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         g
@@ -363,6 +367,9 @@ impl GpuLevels {
             self.sent.resize(s as usize + 1, 0);
         }
         self.sent[s as usize] = 0;
+        if let Some(j) = self.join.as_mut() {
+            j.slot_taken(s);
+        }
         self.slot_of.insert(k, s);
         Some(s)
     }
@@ -434,7 +441,7 @@ impl GpuLevels {
         self.queue.write_buffer(&self.buf.free_pages, 0, bytemuck::cast_slice(&free));
         self.queue.write_buffer(&self.buf.status, 0, bytemuck::cast_slice(&[self.buf.pages as i32, 0, 0, 0]));
         self.queue.write_buffer(&self.buf.slot_pages, 0, &vec![0u8; (self.buf.slots as u64 * SLOT_WORDS * 4) as usize]);
-        self.upload(vol, &blocks, stats);
+        self.upload(vol, &blocks, stats, None);
         self.send_meta(&blocks);
         self.extract(&blocks, &[], stats);
         stats.full = true;
@@ -464,29 +471,35 @@ impl GpuLevels {
     }
 
     fn send_meta(&self, keys: &[Key]) {
-        // Runs of consecutive slots in one write each: a write per slot costs far more than its 16 bytes.
-        let mut m: Vec<(u32, [i32; 4])> = keys.iter().filter_map(|k| Some((*self.slot_of.get(k)?, [k.1.x, k.1.y, k.1.z, k.0 as i32]))).collect();
-        m.sort_unstable_by_key(|e| e.0);
+        // Slots near one another in one write each (the slots between them as they are): a write per slot costs far
+        // more than its 16 bytes.
+        let mut m: Vec<u32> = keys.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
+        m.sort_unstable();
         let mut i = 0;
         while i < m.len() {
             let mut j = i + 1;
-            while j < m.len() && m[j].0 == m[j - 1].0 + 1 {
+            while j < m.len() && m[j] - m[j - 1] <= 32 {
                 j += 1;
             }
-            let data: Vec<[i32; 4]> = m[i..j].iter().map(|e| e.1).collect();
-            self.queue.write_buffer(&self.buf.meta, m[i].0 as u64 * 16, bytemuck::cast_slice(&data));
+            let (a, b) = (m[i], m[j - 1]);
+            let data: Vec<[i32; 4]> = (a..=b).map(|s| self.key_of[s as usize].map_or([0, 0, 0, -1], |k| [k.1.x, k.1.y, k.1.z, k.0 as i32])).collect();
+            self.queue.write_buffer(&self.buf.meta, a as u64 * 16, bytemuck::cast_slice(&data));
             i = j;
         }
     }
 
-    /// Send the samples of `keys` that differ from what their slots hold; returns those sent.
-    fn upload(&mut self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats) -> Vec<Key> {
+    /// Send the samples of `keys` that differ from what their slots hold; returns those sent. Those in `skip` are
+    /// neither read nor sent (a join writes their samples after), only marked as not held.
+    fn upload(&mut self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats, skip: Option<&KeySet<Key>>) -> Vec<Key> {
         let sent = &self.sent;
         let hidden = Some(self.view.hidden());
         let packed: Vec<(u32, Vec<u32>, u64, Key)> = keys
             .par_iter()
             .filter_map(|k| {
                 let s = *self.slot_of.get(k)?;
+                if skip.is_some_and(|x| x.contains(k)) {
+                    return Some((s, Vec::new(), 0, *k));
+                }
                 let data = packed_samples(vol, *k, hidden);
                 let h = sample_hash(&data);
                 (sent[s as usize] != h).then_some((s, data, h, *k))
@@ -495,9 +508,9 @@ impl GpuLevels {
         for p in &packed {
             self.sent[p.0 as usize] = p.2;
         }
-        let out: Vec<Key> = packed.iter().map(|p| p.3).collect();
+        let out: Vec<Key> = packed.iter().filter(|p| p.2 != 0).map(|p| p.3).collect();
         // Runs of consecutive slots go up in one write.
-        let mut sorted = packed;
+        let mut sorted: Vec<(u32, Vec<u32>)> = packed.into_iter().filter(|p| p.2 != 0).map(|p| (p.0, p.1)).collect();
         sorted.sort_unstable_by_key(|p| p.0);
         let mut i = 0;
         while i < sorted.len() {
@@ -514,10 +527,15 @@ impl GpuLevels {
         out
     }
 
-    /// Record and submit the passes for `extract` (slots re-extracted) and `released` (slots that only give pages back).
+    /// Record and submit the passes for `extract` (blocks re-extracted) and `released` (slots that only give pages back).
     fn extract(&mut self, extract: &[Key], released: &[u32], stats: &mut SyncStats) {
-        let mut work: Vec<u32> = released.to_vec();
         let ex: Vec<u32> = extract.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
+        self.extract_slots(ex, released, stats);
+    }
+
+    /// [`Self::extract`] by slot.
+    fn extract_slots(&mut self, ex: Vec<u32>, released: &[u32], stats: &mut SyncStats) {
+        let mut work: Vec<u32> = released.to_vec();
         work.extend_from_slice(&ex);
         if work.is_empty() {
             return;
@@ -617,10 +635,35 @@ impl GpuLevels {
 
     /// Bring the GPU's copy up to date with `vol`: upload what changed and re-extract around it.
     pub fn sync(&mut self, vol: &mut LevelVolume) -> SyncStats {
+        self.sync_in(vol, None)
+    }
+
+    /// [`Self::sync`] just before [`Self::join`] of `plan`: the plan's blocks are neither sent nor extracted here
+    /// (the join writes their samples and extracts them), only given slots.
+    pub fn sync_for_join(&mut self, vol: &mut LevelVolume, plan: &sculpt_core::generator::detail_layer::GpuPlan) -> SyncStats {
+        let skip: KeySet<Key> = plan.blocks.iter().copied().collect();
+        self.sync_in(vol, Some(&skip))
+    }
+
+    fn sync_in(&mut self, vol: &mut LevelVolume, skip: Option<&KeySet<Key>>) -> SyncStats {
         let t = Instant::now();
         let mut stats = SyncStats::default();
+        let log = std::env::var_os("SCULPT_JOIN_LOG").is_some();
+        let mut laps: Vec<(&str, f64)> = Vec::new();
+        let mut lap = |name: &'static str| {
+            if log {
+                laps.push((name, t.elapsed().as_secs_f64() * 1e3));
+            }
+        };
         self.read_status();
+        // An extraction left for a join that never came: the slots are as they were, so it still applies.
+        if let Some((ex, rel)) = self.deferred.take() {
+            self.extract_slots(ex, &rel, &mut stats);
+        }
+        lap("status");
         let mut dirty = vol.drain_dirty();
+        let n_dirty = dirty.len();
+        lap("dirty");
         let first = self.slot_of.is_empty() && self.high == 0;
         // The levels shown: blocks that changed are measured again (showing until they are), and those shown or
         // hidden since the last sync go up or come down as blocks that came or went do.
@@ -630,12 +673,15 @@ impl GpuLevels {
         } else {
             self.view.note(vol, &dirty);
         }
+        lap("note");
         self.view.refresh(vol, MEASURE_PER_SYNC);
+        lap("refresh");
         if let Some((eye, focal)) = self.eye {
             dirty.extend(self.view.choose(vol, eye, focal));
             dirty.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
             dirty.dedup();
         }
+        lap("choose");
         if first || self.grow_pages || self.cap_changed || vol.origin() != self.origin {
             self.cap_changed = false;
             self.origin = vol.origin();
@@ -662,7 +708,9 @@ impl GpuLevels {
         for k in &gone {
             self.hash_remove(*k);
         }
+        lap("gone");
         let uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
+        lap("upload_set");
         let mut out_of_slots = false;
         // Blocks given a slot now: only their slots' block coordinates need sending.
         let mut placed = Vec::new();
@@ -684,27 +732,63 @@ impl GpuLevels {
         // A slot freed here and handed straight to a new block is released with that block's extraction: listing it
         // twice would have two threads give its pages back at once, and two blocks would then share them.
         released.retain(|&s| self.key_of[s as usize].is_none());
+        lap("place");
         if self.hash_fit() {
             self.send_hash_whole();
+            lap("hash whole");
         } else {
+            // Changed entries near one another go up as one span (a write costs far more than a few entries).
             let mut dirty_h = std::mem::take(&mut self.hash_dirty);
             dirty_h.sort_unstable();
             dirty_h.dedup();
-            for h in dirty_h {
-                self.queue.write_buffer(&self.buf.hash, h as u64 * 16, bytemuck::cast_slice(&self.hash[h as usize]));
+            let mut i = 0;
+            while i < dirty_h.len() {
+                let mut j = i + 1;
+                while j < dirty_h.len() && dirty_h[j] - dirty_h[j - 1] <= 32 {
+                    j += 1;
+                }
+                let (a, b) = (dirty_h[i] as usize, dirty_h[j - 1] as usize);
+                self.queue.write_buffer(&self.buf.hash, a as u64 * 16, bytemuck::cast_slice(&self.hash[a..=b]));
+                i = j;
             }
+            lap("hash");
         }
         // Freed slots read as free.
         for &s in &released {
             self.queue.write_buffer(&self.buf.meta, s as u64 * 16, bytemuck::cast_slice(&[0i32, 0, 0, -1]));
         }
         self.send_meta(&placed);
-        let uploads = self.upload(vol, &uploads, &mut stats);
+        lap("slots");
+        let n_up = uploads.len();
+        let uploads = self.upload(vol, &uploads, &mut stats, skip);
+        lap("upload");
         let mut changed: Vec<Key> = uploads.clone();
         changed.extend(gone);
-        let extract = vol.extract_set_in(&changed, &self.view.show(self.cap));
-        self.extract(&extract, &released, &mut stats);
+        if let Some(skip) = skip {
+            // Of the join's blocks, those that came or went here changed for the blocks around them.
+            changed.extend(dirty.iter().filter(|k| skip.contains(k)));
+        }
+        let extract = match skip {
+            Some(skip) => vol.extract_set_where(&changed, &self.view.show(self.cap), &|k| !skip.contains(&k)),
+            None => vol.extract_set_in(&changed, &self.view.show(self.cap)),
+        };
+        lap("extract_set");
+        if skip.is_some() {
+            // The blocks around the join's read its vertices: extracted with it, after its samples are written.
+            let ex: Vec<u32> = extract.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
+            stats.extracted += ex.len();
+            stats.released += released.len();
+            self.deferred = Some((ex, released));
+        } else {
+            self.extract(&extract, &released, &mut stats);
+        }
+        lap("extract");
         stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        if log {
+            let mut prev = 0.0;
+            let parts: Vec<String> = laps.iter().map(|(n, tt)| { let s = format!("{n} {:.1}", tt - prev); prev = *tt; s }).collect();
+            eprintln!("sync: {n_dirty} dirty, {n_up} upload candidates, {} sent, {} extracted: {}", uploads.len(), extract.len(), parts.join(", "));
+        }
         stats
     }
 
