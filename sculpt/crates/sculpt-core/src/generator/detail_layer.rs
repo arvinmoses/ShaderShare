@@ -829,8 +829,11 @@ pub struct GpuPlan {
     pub gens: Vec<GpuGen>,
     pub instances: Vec<GpuInstance>,
     pub cands: Vec<u32>,
-    /// Per block: its key, and per generator (as `gens`) the range of `cands` near it.
-    pub blocks: Vec<(Key, Vec<[u32; 2]>)>,
+    /// Per block: its key, and per generator (as `gens`) the range of `cands` near it and its mask's samples there
+    /// (an index into `masks`, `u32::MAX` where the mask is whole).
+    pub blocks: Vec<(Key, Vec<[u32; 4]>)>,
+    /// Masks' 9x9x9 samples, block by block.
+    pub masks: Vec<Box<[f32; 729]>>,
     /// [`Layered::base_epoch`] when it was made.
     pub epoch: u64,
 }
@@ -1511,12 +1514,12 @@ impl Layered {
         base_block(&self.form, &self.stack, l, self.from - 1, bc, join)
     }
 
-    /// Whether the GPU can join the generators for an edit: none masked, and no detail layer shown above one (those
-    /// are composed in the stack's order, on the CPU).
+    /// Whether the GPU can join the generators for an edit: no detail layer shown above one (those are composed in the
+    /// stack's order, on the CPU).
     pub fn gpu_can_join(&self) -> bool {
         let first = self.stack.iter().position(|x| x.visible && x.scatter.is_some());
         let ordered = first.is_some_and(|g| self.stack[g + 1..].iter().any(|x| x.visible && x.scatter.is_none()));
-        !ordered && !self.stack.iter().any(|x| x.visible && x.scatter.is_some() && !x.m.is_empty())
+        !ordered
     }
 
     /// Change generator layer `k`'s parameters, the GPU to show it at its own level: the stack takes the new scatter
@@ -1562,48 +1565,75 @@ impl Layered {
         // The plan: the generators shown, and the instances near each block.
         let mut gens = Vec::new();
         let mut instances = Vec::new();
-        let mut parts: Vec<(&VolumeGen, u32)> = Vec::new();
+        let mut parts: Vec<(&VolumeGen, u32, &Shared<IVec3, Stored>, usize)> = Vec::new();
         for x in self.stack.iter().filter(|x| x.visible) {
             if let Some(g) = &x.scatter {
-                parts.push((&g.g, instances.len() as u32));
+                parts.push((&g.g, instances.len() as u32, &x.m, x.level));
                 gens.push(g.g.gpu_params());
                 instances.extend(g.g.gpu_instances());
             }
         }
         let origin = self.form.origin();
-        let per: Vec<(Key, Vec<Vec<u32>>)> = kept
+        type Lists = Vec<(Vec<u32>, Option<Box<[f32; 729]>>)>;
+        let form = &self.form;
+        let per: Vec<(Key, Lists)> = kept
             .par_iter()
             .map(|&(l, bc)| {
-                let v = self.form.voxel(l);
+                let v = form.voxel(l);
                 let lo = origin + (bc * B).as_vec3() * v;
                 let hi = lo + Vec3::splat(B as f32 * v);
                 let mut near = Vec::new();
                 let lists = parts
                     .iter()
-                    .map(|(g, first)| {
+                    .map(|(g, first, m, gl)| {
                         g.near(lo, hi, g.pad() + v, &mut near);
-                        near.iter().map(|j| j + first).collect()
+                        // The mask at the block's samples, where it is painted near (else whole): any of its blocks over
+                        // the block's box, at the mask's lattice.
+                        let painted = !near.is_empty() && !m.is_empty() && {
+                            let mv = form.voxel(*gl);
+                            let (a, z) = (((lo - origin) / mv).floor().as_ivec3() - IVec3::ONE, ((hi - origin) / mv).ceil().as_ivec3() + IVec3::ONE);
+                            let (a, z) = (a.div_euclid(IVec3::splat(B)), z.div_euclid(IVec3::splat(B)));
+                            (a.z..=z.z).any(|bz| (a.y..=z.y).any(|by| (a.x..=z.x).any(|bx| m.contains_key(&IVec3::new(bx, by, bz)))))
+                        };
+                        let mask = painted.then(|| {
+                            let mut out = Box::new([1.0f32; 729]);
+                            for (k, o) in out.iter_mut().enumerate() {
+                                let i = bc * B + IVec3::new(k as i32 % 9, (k as i32 / 9) % 9, k as i32 / 81);
+                                *o = mask_at(form, m, *gl, origin + i.as_vec3() * v);
+                            }
+                            out
+                        });
+                        let mask = mask.filter(|m| m.iter().any(|x| *x < 0.9999));
+                        (near.iter().map(|j| j + first).collect(), mask)
                     })
                     .collect();
                 ((l as u8, bc), lists)
             })
             .collect();
         let mut cands = Vec::new();
+        let mut masks = Vec::new();
         let blocks = per
             .into_iter()
             .map(|(key, lists)| {
                 let ranges = lists
                     .into_iter()
-                    .map(|c: Vec<u32>| {
+                    .map(|(c, mask)| {
                         let first = cands.len() as u32;
                         cands.extend(c);
-                        [first, cands.len() as u32 - first]
+                        let mi = match mask {
+                            Some(m) => {
+                                masks.push(m);
+                                masks.len() as u32 - 1
+                            }
+                            None => u32::MAX,
+                        };
+                        [first, cands.len() as u32 - first, mi, 0]
                     })
                     .collect();
                 (key, ranges)
             })
             .collect();
-        Some(GpuPlan { gens, instances, cands, blocks, epoch: self.base_epoch })
+        Some(GpuPlan { gens, instances, cands, blocks, masks, epoch: self.base_epoch })
     }
 
     /// Generator layer `k`'s parameters.

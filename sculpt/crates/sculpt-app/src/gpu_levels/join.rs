@@ -23,7 +23,9 @@ struct JoinP { origin: vec4<f32>, misc: vec4<f32> };
 @group(0) @binding(4) var<storage, read> vg_inst: array<GpuInstance>;
 @group(0) @binding(5) var<storage, read> vg_cand: array<u32>;
 @group(0) @binding(6) var<storage, read> gens: array<GpuGen>;
-@group(0) @binding(7) var<storage, read> ranges: array<vec2<u32>>;
+// Per block and generator: its first candidate, how many, its mask's samples (none: whole).
+@group(0) @binding(7) var<storage, read> ranges: array<vec4<u32>>;
+@group(0) @binding(9) var<storage, read> masks: array<u32>;
 // Per block: its slot, its first range, how many generators, its base's place in the pool.
 @group(0) @binding(8) var<storage, read> work: array<vec4<u32>>;
 
@@ -52,7 +54,13 @@ fn join(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
             var c = select(b.x, b.y, (i & 1u) == 1u);
             for (var g = 0u; g < item.z; g++) {
                 let r = ranges[item.y + g];
-                c = vg_apply(gens[g], c, p, r.x, r.y);
+                let joined = vg_apply(gens[g], c, p, r.x, r.y);
+                var m = 1.0;
+                if (r.z != 0xffffffffu) {
+                    let mv = unpack2x16float(masks[r.z * 365u + i / 2u]);
+                    m = clamp(select(mv.x, mv.y, (i & 1u) == 1u), 0.0, 1.0);
+                }
+                c = c + (joined - c) * m;
             }
             let e = clamp(c / band, -1.0, 1.0);
             var qv = i32(round(e * 32767.0));
@@ -120,7 +128,7 @@ impl GpuLevels {
             join.high = 0;
             join.epoch = plan.epoch;
         }
-        let blocks: Vec<(Key, u32, Vec<[u32; 2]>)> = plan.blocks.into_iter().filter_map(|(k, r)| self.slot_of.get(&k).map(|&s| (k, s, r))).collect();
+        let blocks: Vec<(Key, u32, Vec<[u32; 4]>)> = plan.blocks.into_iter().filter_map(|(k, r)| self.slot_of.get(&k).map(|&s| (k, s, r))).collect();
         if blocks.is_empty() {
             return stats;
         }
@@ -162,7 +170,7 @@ impl GpuLevels {
         }
         // The pass's lists.
         let ngens = plan.gens.len() as u32;
-        let mut ranges: Vec<[u32; 2]> = Vec::with_capacity(blocks.len() * ngens as usize);
+        let mut ranges: Vec<[u32; 4]> = Vec::with_capacity(blocks.len() * ngens as usize);
         let mut work: Vec<[u32; 4]> = Vec::with_capacity(blocks.len());
         for (k, slot, r) in &blocks {
             work.push([*slot, ranges.len() as u32, ngens, join.base_of[k]]);
@@ -184,6 +192,13 @@ impl GpuLevels {
             buf(bytemuck::cast_slice(&plan.gens).to_vec(), st),
             buf(bytemuck::cast_slice(&ranges).to_vec(), st),
             buf(bytemuck::cast_slice(&work).to_vec(), st),
+            buf(plan.masks.iter().flat_map(|m| {
+                let mut w = vec![0u32; SAMPLE_WORDS as usize];
+                for (i, v) in m.iter().enumerate() {
+                    w[i / 2] |= (f16(*v) as u32) << (16 * (i % 2));
+                }
+                w
+            }).flat_map(|w| w.to_le_bytes()).collect(), st),
         ];
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: bufs[0].as_entire_binding() },
@@ -195,6 +210,7 @@ impl GpuLevels {
             wgpu::BindGroupEntry { binding: 6, resource: bufs[3].as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: bufs[4].as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: bufs[5].as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: bufs[6].as_entire_binding() },
         ];
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("levels join"), layout: &join.pipe.get_bind_group_layout(0), entries: &entries });
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("levels join") });

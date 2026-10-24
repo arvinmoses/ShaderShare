@@ -301,7 +301,7 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   from a job off the frame (a newer edit drops an older job's result), a drag one undo step for all of it. At about the app's scale (a ball at a
   level 0 step of 0.007, twelve rocks): a drag step 6-8 ms at any level; on release 32 ms at level 2, 150 ms at
   level 3. The default size is 3% of the object, at the coarsest level giving a dozen steps a radius.
-* **Joined on the GPU.** Where the stack lets it (no generator masked, no detail layer above one), an edit is shown at
+* **Joined on the GPU.** Where the stack lets it (no detail layer above a generator; masks fade the join on the GPU as on the CPU), an edit is shown at
   its own level at once by the GPU: the stack takes the new scatter, the blocks it no longer changes get the form's
   field again and the blocks it newly changes their base (so every block that shows exists, as the extractor's rules
   need), and a pass joins the generators to each block's base field: the field composed without them, kept on the

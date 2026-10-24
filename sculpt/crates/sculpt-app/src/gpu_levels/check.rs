@@ -294,6 +294,9 @@ fn join_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     let mut layer = Layered::new(&mut vol, 2);
     let rocks = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 3, size: 0.12, lift: 0.2, min_spacing: 0.4, blend: 0.3, rough: 0.2, stretch_var: 0.3, tilt: 20.0, ..GeneratorSpec::default() };
     let k = layer.add_generator(&mut vol, "Rocks", 2, &rocks);
+    // Its mask painted away over the front, half way at its edge: the GPU fades the join as the CPU does.
+    layer.set_active(k);
+    layer.paint_mask(&mut vol, Vec3::new(0.0, 0.0, 1.0), 0.6, 0.0);
     let mut gpu = GpuLevels::new(device, queue, &vol, 3);
     gpu.sync(&mut vol);
     for (step, spec) in [GeneratorSpec { size: 0.15, ..rocks.clone() }, GeneratorSpec { blend: 0.6, ..rocks.clone() }, GeneratorSpec { op: BoolOp::Subtract, lift: 0.0, ..rocks.clone() }, GeneratorSpec { count: 20, ..rocks.clone() }].into_iter().enumerate() {
