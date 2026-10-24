@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::density::{Density, DensityField};
 use super::mapping::{AttributeRow, Mapper};
 use super::place::{SurfaceSample, SurfaceSampler};
-use super::{BoolOp, EvalParams, Instance, InstanceSet, Primitive, affected_leaves, eval_vertex, frame_from_normal};
+use super::{BoolOp, EvalParams, Instance, InstanceSet, Primitive, affected_leaves, eval_vertex, frame_from_edge, frame_from_normal};
 use crate::bvh::Bvh;
 use crate::geom::Aabb;
 use crate::mesh::{self, Face, Topology};
@@ -104,6 +104,10 @@ pub struct GeneratorSpec {
     /// Where on the surface the instances gather. The count stays fixed; a density redistributes it.
     #[serde(default)]
     pub density: Density,
+    /// Whether the instances hang anywhere on the surface or only along its sharp edges. Read on a volume; the mesh
+    /// layer scatters over the surface.
+    #[serde(default)]
+    pub place_on: PlaceOn,
     /// Rows that let the surface set each instance's size, height, lift and lean. See [`super::mapping`].
     #[serde(default)]
     pub mapping: Vec<AttributeRow>,
@@ -121,6 +125,36 @@ pub struct GeneratorSpec {
     /// The roughness's kind: smooth (fBm), ridged, or cellular (chunky facets).
     #[serde(default)]
     pub rough_kind: crate::noise::NoiseKind,
+}
+
+/// Where on the form a generator's instances hang.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlaceOn {
+    /// Anywhere on the surface, about evenly by area.
+    #[default]
+    Surface,
+    /// Along the form's sharp edges: where its surface turns by more than `angle` degrees across a few of level 0's
+    /// steps (or half an instance's size, if more). `side` picks ridges (convex: chips off an edge), creases (concave:
+    /// rubble at the foot of a wall) or both. Each instance lies along its edge, upright on the edge's bisector.
+    Edges { angle: f32, side: EdgeSide },
+}
+
+/// Which sharp edges [`PlaceOn::Edges`] takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeSide {
+    #[default]
+    Both,
+    Ridges,
+    Creases,
+}
+
+impl PlaceOn {
+    /// Edges at 40 degrees or sharper, of both kinds: a starting point for the panel's switch.
+    pub fn default_edges() -> PlaceOn {
+        PlaceOn::Edges { angle: 40.0, side: EdgeSide::Both }
+    }
 }
 
 fn default_blend() -> f32 {
@@ -149,6 +183,7 @@ impl Default for GeneratorSpec {
             tilt: 0.0,
             lift_var: 0.0,
             density: Density::Even,
+            place_on: PlaceOn::Surface,
             mapping: Vec::new(),
             blend: default_blend(),
             rough: 0.0,
@@ -303,6 +338,16 @@ impl GeneratorCache {
 /// Instance `i` of `count` for the surface point `s`, with the spec's variations (each drawn from its own stream, so
 /// changing one never reshuffles another) and what the surface says through `mapper`.
 pub(crate) fn place_instance(spec: &GeneratorSpec, mapper: &Mapper, s: &SurfaceSample, i: usize, count: usize) -> Instance {
+    place(spec, mapper, s, None, i, count)
+}
+
+/// The same for a point on an edge running along `tangent`, `s.normal` its bisector: the instance's local Z lies along
+/// the edge, and a random spin turns it about the edge instead of about the normal.
+pub(crate) fn place_instance_along(spec: &GeneratorSpec, mapper: &Mapper, s: &SurfaceSample, tangent: Vec3, i: usize, count: usize) -> Instance {
+    place(spec, mapper, s, Some(tangent), i, count)
+}
+
+fn place(spec: &GeneratorSpec, mapper: &Mapper, s: &SurfaceSample, tangent: Option<Vec3>, i: usize, count: usize) -> Instance {
     let seed = spec.seed;
     let m = mapper.map(s, i, count, |stream, k| unit_random(seed ^ MAP_STREAM ^ stream as u64, k));
     let i = i as u64;
@@ -318,7 +363,11 @@ pub(crate) fn place_instance(spec: &GeneratorSpec, mapper: &Mapper, s: &SurfaceS
     let lift = spec.lift + spec.lift_var * signed_random(seed ^ LIFT_STREAM, i) + m.lift;
     let max_tilt = (spec.tilt + m.tilt_degrees).clamp(0.0, 89.0).to_radians();
     let up = lean(s.normal, max_tilt * unit_random(seed ^ TILT_STREAM, i), unit_random(seed ^ TILT_STREAM, i + (1 << 40)) * std::f32::consts::TAU);
-    Instance::new(spec.primitive, s.position + s.normal * (lift * size), frame_from_normal(up, spin), axes * size)
+    let rotation = match tangent {
+        Some(t) => frame_from_edge(t, up) * glam::Quat::from_rotation_z(spin),
+        None => frame_from_normal(up, spin),
+    };
+    Instance::new(spec.primitive, s.position + s.normal * (lift * size), rotation, axes * size)
 }
 
 /// The largest an instance of `spec` can grow (its size with every variation at its most), which bounds its reach.

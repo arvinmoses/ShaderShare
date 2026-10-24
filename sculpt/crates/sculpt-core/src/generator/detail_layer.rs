@@ -2523,7 +2523,7 @@ impl Layered {
                     let m: Box<[f32; N]> = Box::new(std::array::from_fn(|i| f32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]])));
                     layer.m.insert(IVec3::from_array(c), Stored::from(m));
                 }
-                layer.scatter = Some(GenPart::new(&form, VolumeGen::from_anchors(&spec, anchors), layer.level));
+                layer.scatter = Some(GenPart::new(&form, VolumeGen::from_anchors_on(&form, &spec, anchors), layer.level));
                 stack.push(layer);
                 continue;
             }
