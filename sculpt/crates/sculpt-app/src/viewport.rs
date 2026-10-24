@@ -316,6 +316,7 @@ impl Viewport {
                 ro(3),
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                ro(6),
             ],
         });
         let levels_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("viewport levels"), bind_group_layouts: &[Some(&bgl), Some(&levels_bgl)], immediate_size: 0 });
@@ -472,7 +473,7 @@ impl Viewport {
     }
 
     fn levels_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, uniforms: &wgpu::Buffer, gpu: &crate::gpu_levels::GpuLevels, mask_hash: &wgpu::Buffer, mask_samples: &wgpu::Buffer) -> wgpu::BindGroup {
-        let (_, _, _, verts, cells) = gpu.buffers_for_draw();
+        let (_, _, _, verts, cells, slot_pages) = gpu.buffers_for_draw();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("volume levels"),
             layout,
@@ -483,6 +484,7 @@ impl Viewport {
                 wgpu::BindGroupEntry { binding: 3, resource: gpu.meta_buffer().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: mask_hash.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: mask_samples.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: slot_pages.as_entire_binding() },
             ],
         })
     }
@@ -690,7 +692,7 @@ impl Viewport {
             pass.set_pipeline(&self.bg_pipeline);
             pass.draw(0..3, 0..1);
             if let Some(v) = &self.volume {
-                let (pages, draws, status, _, _) = v.gpu.buffers_for_draw();
+                let (pages, draws, status, _, _, _) = v.gpu.buffers_for_draw();
                 pass.set_pipeline(&self.levels_pipeline);
                 pass.set_bind_group(1, &v.group, &[]);
                 pass.set_index_buffer(pages.slice(..), wgpu::IndexFormat::Uint32);

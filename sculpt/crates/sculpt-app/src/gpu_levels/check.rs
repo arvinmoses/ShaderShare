@@ -12,7 +12,7 @@ use eframe::egui_wgpu::wgpu;
 use glam::Vec3;
 use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
 
-use super::{GpuLevels, PAGE_INDICES, SLOT_WORDS, VSTRIDE, packed_samples};
+use super::{GpuLevels, PAGE_INDICES, SLOT_WORDS, packed_samples};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -92,7 +92,8 @@ fn compare(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, vol: &Le
         let vx = vol.voxel(k.0 as usize);
         let corner = vol.origin() + (k.1 * 8).as_vec3() * vx;
         for (i, p) in w.verts.iter().enumerate() {
-            let q = verts[(s * VSTRIDE as usize + i) * 2];
+            let page = slot_pages[s * SLOT_WORDS as usize + 27 + i / 64] as usize;
+            let q = verts[(page * 64 + i % 64) * 2];
             let local = Vec3::new((q & 1023) as f32, ((q >> 10) & 1023) as f32, ((q >> 20) & 1023) as f32) / 1023.0 * 8.0;
             let gp = corner + local * vx;
             let off = (gp - *p).length() / vx;
@@ -499,8 +500,7 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     use sculpt_core::generator::detail_layer::Layered;
     use sculpt_core::generator::layer::GeneratorSpec;
     use sculpt_core::generator::{BoolOp, Primitive};
-    // Fewer rocks at level 3: twelve would take more slots than a 2 GB vertex buffer holds.
-    for (level, count) in [(2usize, 12u32), (3, 4)] {
+    for (level, count) in [(2usize, 12u32), (3, 12)] {
         let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, 0.007, 6);
         let mut layer = Layered::new(&mut vol, 5);
         let size = 0.028 * 2.5;
@@ -536,6 +536,13 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
         for r in rows {
             println!("  {r}");
         }
+        gpu.sync(&mut vol);
+        let b = &gpu.buf;
+        let mb = |x: u64| x as f64 / 1e6;
+        println!(
+            "  pools: {} blocks in {} slots; quad pages {} used of {} ({:.0} MB); vertex pages {} used of {} ({:.0} MB)",
+            gpu.slots(), b.slots, b.pages as i64 - gpu.status[0] as i64, b.pages, mb(b.pages_buf.size()), b.vpages as i64 - gpu.status[4] as i64, b.vpages, mb(b.verts.size())
+        );
     }
     Ok(())
 }

@@ -15,8 +15,14 @@
 const VSTRIDE: u32 = 768u;
 const PAGE_QUADS: u32 = 64u;
 const PAGE_INDICES: u32 = 384u;
-const SLOT_WORDS: u32 = 32u;
+const SLOT_WORDS: u32 = 40u;
 const MAX_PAGES: u32 = 24u;
+// Vertices go in pages of 64 from a pool (a block holds what it has, not the most it could): per slot, after the quad
+// pages, how many vertex pages (word 26) and which (27..38).
+const VPAGE: u32 = 64u;
+const MAX_VPAGES: u32 = 12u;
+const VP_N: u32 = 26u;
+const VP_AT: u32 = 27u;
 const SAMPLE_WORDS: u32 = 365u;
 
 struct Params {
@@ -46,10 +52,12 @@ struct Params {
 // Per cell: first vertex (bits 0-9), pieces (10-12), inside corners (13-20), next to a finer cell (21).
 @group(0) @binding(6) var<storage, read_write> cells: array<u32>;
 @group(0) @binding(7) var<storage, read_write> pages: array<u32>;
-// Per slot: pages, quads, then the page numbers.
+// Per slot: pages, quads, then the page numbers; then its vertex pages (count, numbers).
 @group(0) @binding(8) var<storage, read_write> slot_pages: array<u32>;
+// The free quad pages, then (from `page_capacity` on) the free vertex pages.
 @group(0) @binding(9) var<storage, read_write> free_pages: array<u32>;
-// 0: free pages on the stack; 1: set when pages ran out; 2: draws written by `cull`; 3: quads dropped for want of pages.
+// 0: free pages on the stack; 1: set when pages ran out; 2: draws written by `cull`; 3: quads dropped for want of pages;
+// 4: free vertex pages; 5: set when vertex pages ran out.
 @group(0) @binding(10) var<storage, read_write> status: array<atomic<i32>>;
 // Per slot: bounds min (xyz, in steps inside the block), bounds max, normal cone (axis, cosine of its half-angle; w < -1
 // for none).
@@ -390,6 +398,14 @@ fn release(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
         return;
     }
     let s = work[i];
+    let nv = slot_pages[s * SLOT_WORDS + VP_N];
+    if (nv > 0u) {
+        let vbase = atomicAdd(&status[4], i32(nv));
+        for (var k = 0u; k < nv; k++) {
+            free_pages[P.page_capacity + u32(vbase) + k] = slot_pages[s * SLOT_WORDS + VP_AT + k];
+        }
+        slot_pages[s * SLOT_WORDS + VP_N] = 0u;
+    }
     let n = slot_pages[s * SLOT_WORDS];
     if (n == 0u) {
         return;
@@ -400,6 +416,11 @@ fn release(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
     }
     slot_pages[s * SLOT_WORDS] = 0u;
     slot_pages[s * SLOT_WORDS + 1u] = 0u;
+}
+
+// Where vertex `i` of the block being extracted goes: in the vertex pages its workgroup took (at W_PAGES).
+fn vat(i: u32) -> u32 {
+    return wget(W_PAGES + (i >> 6u)) * VPAGE + (i & 63u);
 }
 
 // ------------------------------------------------------------------------------ vertices
@@ -515,7 +536,7 @@ fn write_cell(l: u32, slot: u32, bc: vec3<i32>, ci: u32, head: u32, first: u32) 
     for (var k = 0u; k < n; k++) {
         let v = cell_vertex(l, slot, bc, ci, head, k);
         let q = vec3<u32>(round(clamp(v.pos / 8.0, vec3<f32>(0.0), vec3<f32>(1.0)) * 1023.0));
-        verts[slot * VSTRIDE + first + k] = vec2<u32>(q.x | (q.y << 10u) | (q.z << 20u), oct_encode(v.nrm));
+        verts[vat(first + k)] = vec2<u32>(q.x | (q.y << 10u) | (q.z << 20u), oct_encode(v.nrm));
         atomicMin(&wg[W_ATOM + 0], u32(clamp(v.pos.x / 8.0, 0.0, 1.0) * 65535.0));
         atomicMin(&wg[W_ATOM + 1], u32(clamp(v.pos.y / 8.0, 0.0, 1.0) * 65535.0));
         atomicMin(&wg[W_ATOM + 2], u32(clamp(v.pos.z / 8.0, 0.0, 1.0) * 65535.0));
@@ -530,7 +551,7 @@ fn write_cell(l: u32, slot: u32, bc: vec3<i32>, ci: u32, head: u32, first: u32) 
 fn cone_of(slot: u32, first: u32, n: u32, axis: vec3<f32>) -> f32 {
     var cmin = 1.0;
     for (var k = 0u; k < n; k++) {
-        cmin = min(cmin, dot(axis, oct_decode(verts[slot * VSTRIDE + first + k].y)));
+        cmin = min(cmin, dot(axis, oct_decode(verts[vat(first + k)].y)));
     }
     return cmin;
 }
@@ -557,11 +578,36 @@ fn vertices(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid:
     workgroupBarrier();
     let sc = scan_2(t, within);
     workgroupBarrier();
+    // The vertex pages for them (none if the pool ran out: the block shows nothing until the pool grows).
+    if (t == 0u) {
+        var got = 0u;
+        if (live) {
+            let want = (min(sc.y, VSTRIDE) + VPAGE - 1u) / VPAGE;
+            if (want > 0u) {
+                let old = atomicSub(&status[4], i32(want));
+                if (old < i32(want)) {
+                    atomicAdd(&status[4], i32(want));
+                    atomicStore(&status[5], 1);
+                } else {
+                    for (var k = 0u; k < want; k++) {
+                        let page = free_pages[P.page_capacity + u32(old) - 1u - k];
+                        wset(W_PAGES + k, page);
+                        slot_pages[slot * SLOT_WORDS + VP_AT + k] = page;
+                    }
+                    got = want;
+                }
+            }
+            slot_pages[slot * SLOT_WORDS + VP_N] = got;
+        }
+        wset(W_PAGES + MAX_VPAGES, got * VPAGE);
+    }
+    workgroupBarrier();
+    let room = wget(W_PAGES + MAX_VPAGES);
     let first_a = sc.x;
     let first_b = sc.x + ca;
     // Kept while they fit: the cells past the block's vertex budget get none (a prefix of cells is kept).
-    let keep_a = ca > 0u && first_a + ca <= VSTRIDE;
-    let keep_b = cb > 0u && first_b + cb <= VSTRIDE;
+    let keep_a = ca > 0u && first_a + ca <= room;
+    let keep_b = cb > 0u && first_b + cb <= room;
     if (live) {
         cells[slot * 512u + 2u * t] = select(0u, ha | first_a, keep_a);
         cells[slot * 512u + 2u * t + 1u] = select(0u, hb | first_b, keep_b);

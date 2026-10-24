@@ -21,16 +21,22 @@ use eframe::egui_wgpu::wgpu;
 use glam::{IVec3, Mat4, Vec3};
 use rayon::prelude::*;
 use sculpt_core::generator::level_view::LevelView;
-use sculpt_core::generator::level_volume::{HashSet as KeySet, Key, LevelVolume, Show, VERTS_PER_BLOCK, piece_table, quantize};
+use sculpt_core::generator::level_volume::{HashSet as KeySet, Key, LevelVolume, Show, piece_table, quantize};
 
 pub mod check;
 mod join;
 
 const SHADER: &str = include_str!("levels.wgsl");
 const PAGE_INDICES: u64 = 384;
-const SLOT_WORDS: u64 = 32;
+const SLOT_WORDS: u64 = 40;
+/// Vertices per vertex page.
+const VPAGE: u64 = 64;
+/// Slots per page to start with, for quads (64 a page) and vertices (64 a page), grown when they run out. Most blocks
+/// hold no surface (they are the band round it) and there are more slots than blocks: at app scale about 0.1 quad pages
+/// and 0.2 vertex pages are used per slot.
+const SLOTS_PER_QUAD_PAGE: u32 = 1;
+const SLOTS_PER_VERT_PAGE: u32 = 1;
 const SAMPLE_WORDS: u64 = 365;
-const VSTRIDE: u64 = VERTS_PER_BLOCK as u64;
 /// Blocks whose detail is measured again per sync, after they changed (for choosing the level by distance).
 const MEASURE_PER_SYNC: usize = 768;
 
@@ -67,6 +73,7 @@ pub struct SyncStats {
 struct Buffers {
     slots: u32,
     pages: u32,
+    vpages: u32,
     hash_len: u32,
     params: wgpu::Buffer,
     cull_params: wgpu::Buffer,
@@ -116,7 +123,7 @@ pub struct GpuLevels {
     /// Status read back from the GPU (free pages, ran out, draws, quads dropped).
     status_staging: wgpu::Buffer,
     status_state: Arc<AtomicU8>,
-    pub status: [i32; 4],
+    pub status: [i32; 8],
     /// Set when a cull pass recorded a status copy that the frame's submit has not mapped yet.
     status_copy: std::sync::atomic::AtomicBool,
     /// GPU timestamps around the extraction passes, when the device has them: the queries, where they resolve, a
@@ -130,6 +137,8 @@ pub struct GpuLevels {
     pub indirect_count: bool,
     /// Set when the pages ran out: the next sync grows them and rebuilds.
     grow_pages: bool,
+    /// Vertex pages ran out: twice as many on the next rebuild.
+    grow_vpages: bool,
     cap_changed: bool,
     /// Which blocks are shown, chosen by distance from the eye (a hidden block is not on the GPU at all, as if it
     /// were not stored), and the eye with its pixels per unit at distance one.
@@ -199,8 +208,8 @@ impl GpuLevels {
         let indirect_count = device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
         let blocks = vol.keys().len() as u32;
         let slots = (blocks * 2).max(4096);
-        let buf = Self::buffers(device, &layout, slots, slots * 4, 1024);
-        let status_staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels status staging"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let buf = Self::buffers(device, &layout, slots, slots / SLOTS_PER_QUAD_PAGE, slots / SLOTS_PER_VERT_PAGE, 1024);
+        let status_staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels status staging"), size: 32, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let g = GpuLevels {
             device: device.clone(),
             queue: queue.clone(),
@@ -224,7 +233,7 @@ impl GpuLevels {
             voxel0: vol.voxel0,
             status_staging,
             status_state: Arc::new(AtomicU8::new(0)),
-            status: [0; 4],
+            status: [0; 8],
             status_copy: std::sync::atomic::AtomicBool::new(false),
             timer: device.features().contains(wgpu::Features::TIMESTAMP_QUERY).then(|| {
                 let set = device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("levels timer"), ty: wgpu::QueryType::Timestamp, count: 2 });
@@ -236,6 +245,7 @@ impl GpuLevels {
             sent: Vec::new(),
             indirect_count,
             grow_pages: false,
+            grow_vpages: false,
             buffers_made: 1,
             cap_changed: false,
             view: LevelView::default(),
@@ -247,7 +257,7 @@ impl GpuLevels {
         g
     }
 
-    fn buffers(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, slots: u32, pages: u32, hash_len: u32) -> Buffers {
+    fn buffers(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, slots: u32, pages: u32, vpages: u32, hash_len: u32) -> Buffers {
         let make = |label: &str, size: u64, usage: wgpu::BufferUsages| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size.max(16), usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         let st = wgpu::BufferUsages::STORAGE;
         let s = slots as u64;
@@ -258,12 +268,12 @@ impl GpuLevels {
         let meta = make("levels meta", s * 16, st);
         let work_len = slots * 2;
         let work = make("levels work", work_len as u64 * 4, st);
-        let verts = make("levels verts", s * VSTRIDE * 8, st);
+        let verts = make("levels verts", vpages as u64 * VPAGE * 8, st);
         let cells = make("levels cells", s * 512 * 4, st);
         let pages_buf = make("levels pages", pages as u64 * PAGE_INDICES * 4, st | wgpu::BufferUsages::INDEX);
         let slot_pages = make("levels slot pages", s * SLOT_WORDS * 4, st);
-        let free_pages = make("levels free pages", pages as u64 * 4, st);
-        let status = make("levels status", 16, st | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC);
+        let free_pages = make("levels free pages", (pages as u64 + vpages as u64) * 4, st);
+        let status = make("levels status", 32, st | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC);
         let clusters = make("levels clusters", s * 48, st);
         let table = make("levels table", 256 * 4, st);
         let draws = make("levels draws", pages as u64 * 20, st | wgpu::BufferUsages::INDIRECT);
@@ -274,15 +284,15 @@ impl GpuLevels {
         };
         let group = group_with(&params);
         let cull_group = group_with(&cull_params);
-        Buffers { slots, pages, hash_len, params, cull_params, samples, hash, meta, work, work_len, verts, cells, pages_buf, slot_pages, free_pages, status, clusters, table, draws, group, cull_group }
+        Buffers { slots, pages, vpages, hash_len, params, cull_params, samples, hash, meta, work, work_len, verts, cells, pages_buf, slot_pages, free_pages, status, clusters, table, draws, group, cull_group }
     }
 
     pub fn page_capacity(&self) -> u32 {
         self.buf.pages
     }
 
-    pub fn buffers_for_draw(&self) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
-        (&self.buf.pages_buf, &self.buf.draws, &self.buf.status, &self.buf.verts, &self.buf.cells)
+    pub fn buffers_for_draw(&self) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
+        (&self.buf.pages_buf, &self.buf.draws, &self.buf.status, &self.buf.verts, &self.buf.cells, &self.buf.slot_pages)
     }
 
     pub fn meta_buffer(&self) -> &wgpu::Buffer {
@@ -416,13 +426,22 @@ impl GpuLevels {
     fn rebuild(&mut self, vol: &LevelVolume, stats: &mut SyncStats) {
         let blocks: Vec<Key> = vol.keys().into_iter().filter(|k| !self.view.hides(*k)).collect();
         let slots = ((blocks.len() as u32) * 2).max(self.buf.slots).max(4096);
-        let mut pages = self.buf.pages.max(slots * 4);
+        let mut pages = self.buf.pages.max(slots / SLOTS_PER_QUAD_PAGE);
+        let mut vpages = self.buf.vpages.max(slots / SLOTS_PER_VERT_PAGE);
         if self.grow_pages {
             pages *= 2;
             self.grow_pages = false;
         }
-        if slots != self.buf.slots || pages != self.buf.pages {
-            self.buf = Self::buffers(&self.device, &self.layout, slots, pages, 1024);
+        if self.grow_vpages {
+            vpages *= 2;
+            self.grow_vpages = false;
+        }
+        // No bigger than one binding may be.
+        let most = self.device.limits().max_storage_buffer_binding_size as u64;
+        let pages = pages.min((most / (PAGE_INDICES * 4)) as u32);
+        let vpages = vpages.min((most / (VPAGE * 8)) as u32);
+        if slots != self.buf.slots || pages != self.buf.pages || vpages != self.buf.vpages {
+            self.buf = Self::buffers(&self.device, &self.layout, slots, pages, vpages, 1024);
             self.buffers_made += 1;
             self.queue.write_buffer(&self.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         }
@@ -437,9 +456,9 @@ impl GpuLevels {
         self.hash_fit();
         self.send_hash_whole();
         // All pages free, every slot without pages.
-        let free: Vec<u32> = (0..self.buf.pages).rev().collect();
+        let free: Vec<u32> = (0..self.buf.pages).rev().chain((0..self.buf.vpages).rev()).collect();
         self.queue.write_buffer(&self.buf.free_pages, 0, bytemuck::cast_slice(&free));
-        self.queue.write_buffer(&self.buf.status, 0, bytemuck::cast_slice(&[self.buf.pages as i32, 0, 0, 0]));
+        self.queue.write_buffer(&self.buf.status, 0, bytemuck::cast_slice(&[self.buf.pages as i32, 0, 0, 0, self.buf.vpages as i32, 0, 0, 0]));
         self.queue.write_buffer(&self.buf.slot_pages, 0, &vec![0u8; (self.buf.slots as u64 * SLOT_WORDS * 4) as usize]);
         self.upload(vol, &blocks, stats, None);
         self.send_meta(&blocks);
@@ -451,9 +470,9 @@ impl GpuLevels {
         if self.hash.len() as u32 > self.buf.hash_len {
             // A bigger table needs a bigger buffer, and so a new bind group.
             let len = self.hash.len() as u32;
-            let pages = self.buf.pages;
+            let (pages, vpages) = (self.buf.pages, self.buf.vpages);
             let slots = self.buf.slots;
-            let old = std::mem::replace(&mut self.buf, Self::buffers(&self.device, &self.layout, slots, pages, len));
+            let old = std::mem::replace(&mut self.buf, Self::buffers(&self.device, &self.layout, slots, pages, vpages, len));
             self.buffers_made += 1;
             self.copy_contents(&old);
         }
@@ -581,7 +600,7 @@ impl GpuLevels {
         };
         // Read back the status (free pages, whether they ran out) when the GPU gets to it.
         if self.status_state.load(Ordering::Acquire) == 0 {
-            enc.copy_buffer_to_buffer(&self.buf.status, 0, &self.status_staging, 0, 16);
+            enc.copy_buffer_to_buffer(&self.buf.status, 0, &self.status_staging, 0, 32);
         }
         self.queue.submit([enc.finish()]);
         if self.status_state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -623,12 +642,19 @@ impl GpuLevels {
         if self.status_state.load(Ordering::Acquire) == 2 {
             {
                 let data = self.status_staging.slice(..).get_mapped_range().expect("mapped");
-                self.status.copy_from_slice(bytemuck::cast_slice(&data[..16]));
+                self.status.copy_from_slice(bytemuck::cast_slice(&data[..32]));
             }
             self.status_staging.unmap();
             self.status_state.store(0, Ordering::Release);
-            if self.status[1] != 0 {
+            // Ran out, or under a quarter free: grow before the next edit needs them, unless as big as a binding may be
+            // already (then what does not fit stays out).
+            let most = self.device.limits().max_storage_buffer_binding_size as u64;
+            let low = |free: i32, of: u32| free < (of / 4) as i32;
+            if (self.status[1] != 0 || low(self.status[0], self.buf.pages)) && (self.buf.pages as u64 * 2 * PAGE_INDICES * 4) <= most {
                 self.grow_pages = true;
+            }
+            if (self.status[5] != 0 || low(self.status[4], self.buf.vpages)) && (self.buf.vpages as u64 * 2 * VPAGE * 8) <= most {
+                self.grow_vpages = true;
             }
         }
     }
@@ -682,7 +708,7 @@ impl GpuLevels {
             dirty.dedup();
         }
         lap("choose");
-        if first || self.grow_pages || self.cap_changed || vol.origin() != self.origin {
+        if first || self.grow_pages || self.grow_vpages || self.cap_changed || vol.origin() != self.origin {
             self.cap_changed = false;
             self.origin = vol.origin();
             self.rebuild(vol, &mut stats);
@@ -818,7 +844,7 @@ impl GpuLevels {
         cp.dispatch_workgroups(x, y, 1);
         drop(cp);
         if self.status_state.load(Ordering::Acquire) == 0 {
-            enc.copy_buffer_to_buffer(&self.buf.status, 0, &self.status_staging, 0, 16);
+            enc.copy_buffer_to_buffer(&self.buf.status, 0, &self.status_staging, 0, 32);
             self.status_copy.store(true, Ordering::Release);
         }
     }

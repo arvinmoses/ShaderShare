@@ -180,6 +180,8 @@ fn sn_octaves_for(vx: f32) -> u32 {
 @group(1) @binding(3) var<storage, read> lv_meta: array<vec4<i32>>;
 @group(1) @binding(4) var<storage, read> lv_mask_hash: array<vec4<i32>>;
 @group(1) @binding(5) var<storage, read> lv_mask: array<f32>;
+// Per slot: its quad pages, then its vertex pages (count at word 26, numbers from 27), 40 words.
+@group(1) @binding(6) var<storage, read> lv_slot_pages: array<u32>;
 
 // The surface noise's mask at `p` (whole where none is painted): its block at level 0's lattice found by hash, then
 // trilinear in the block's samples.
@@ -238,7 +240,8 @@ fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
         o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
         return o;
     }
-    let v = lv_verts[slot * 768u + (info & 1023u) + min(piece, count - 1u)];
+    let vi = (info & 1023u) + min(piece, count - 1u);
+    let v = lv_verts[lv_slot_pages[slot * 40u + 27u + (vi >> 6u)] * 64u + (vi & 63u)];
     let m = lv_meta[slot];
     let level = u32(max(m.w, 0));
     let vx = L.misc.x / f32(1u << level);
