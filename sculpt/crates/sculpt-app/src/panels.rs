@@ -549,6 +549,18 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                                 m.target = Target::Mask { show: true };
                             }
                         });
+                        // Where a generator's rocks go, when its density is painted.
+                        if m.layer.as_ref().and_then(|l| l.generator(k)).is_some_and(|s| matches!(s.density, sculpt_core::generator::density::Density::Painted { .. })) {
+                            ui.horizontal(|ui| {
+                                ui.add_space(26.0);
+                                if ui.selectable_label(m.target == Target::Density { more: false }, "Density: less").on_hover_text("Paint where the rocks stay out. They scatter again when the stroke ends.").clicked() {
+                                    m.target = Target::Density { more: false };
+                                }
+                                if ui.selectable_label(m.target == Target::Density { more: true }, "Density: more").on_hover_text("Paint where the rocks may go.").clicked() {
+                                    m.target = Target::Density { more: true };
+                                }
+                            });
+                        }
                     }
                 }
                 if ui.selectable_label(m.target == Target::Form, format!("Form  (levels 0 to {})", from - 1)).clicked() {

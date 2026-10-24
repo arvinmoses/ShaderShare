@@ -73,6 +73,10 @@ struct Layer {
     scatter: Option<GenPart>,
     /// Surface noise: drawn by the GPU, not in the field (its mask at level 0's lattice).
     noise: Option<crate::surface_noise::SurfaceNoise>,
+    /// A generator's painted density, at level 0's lattice (absent block = fully dense), and its version (bumped by
+    /// each stroke; the scatter holds the version it was drawn with).
+    d: Shared<IVec3, Stored>,
+    d_ver: u64,
 }
 
 /// A generator layer's scatter, and the blocks it changes at each level ([`VolumeGen::blocks`]).
@@ -97,7 +101,7 @@ impl GenPart {
 
 impl Layer {
     fn new(name: &str, level: usize) -> Layer {
-        Layer { name: name.to_string(), level, visible: true, h: Shared::default(), m: Shared::default(), scatter: None, noise: None }
+        Layer { name: name.to_string(), level, visible: true, h: Shared::default(), m: Shared::default(), scatter: None, noise: None, d: Shared::default(), d_ver: 0 }
     }
 
     /// A detail layer (heights), rather than a generator or surface noise.
@@ -472,7 +476,7 @@ impl<'a> Below<'a> {
 }
 
 /// A mask of a layer at level `l` (absent: whole) at world point `p`, linearly.
-fn mask_at(form: &LevelVolume, m: &Shared<IVec3, Stored>, l: usize, p: Vec3) -> f32 {
+pub(super) fn mask_at(form: &LevelVolume, m: &Shared<IVec3, Stored>, l: usize, p: Vec3) -> f32 {
     if m.is_empty() {
         return 1.0;
     }
@@ -1809,7 +1813,7 @@ impl Layered {
                 (bc, any.then(|| (Stored::from(h), Stored::from(m))))
             })
             .collect();
-        let mut layer = Layer { name: old.name.clone(), level, visible: old.visible, h: Shared::default(), m: Shared::default(), scatter: None, noise: None };
+        let mut layer = Layer { name: old.name.clone(), level, visible: old.visible, h: Shared::default(), m: Shared::default(), scatter: None, noise: None, d: Shared::default(), d_ver: 0 };
         for (bc, hm) in built {
             if let Some((h, m)) = hm {
                 layer.h.insert(bc, h);
@@ -2111,6 +2115,77 @@ impl Layered {
             }
             self.compose(shown, &changed);
         }
+    }
+
+    /// Paint the active generator layer's density toward `to` (0 keeps rocks out, 1 lets them in) within `r` of `c`,
+    /// softly, on level 0's lattice. Only the channel changes: the rocks are scattered again when the stroke ends
+    /// ([`Self::end_density_stroke`]). Needs a generator whose density is painted; false if it is not.
+    pub fn paint_density(&mut self, c: Vec3, r: f32, to: f32) -> bool {
+        let k = self.active;
+        let painted = self.stack.get(k).and_then(|x| x.scatter.as_ref()).is_some_and(|g| matches!(g.g.spec.density, super::density::Density::Painted { .. }));
+        if !painted {
+            return false;
+        }
+        let (v, origin) = (self.form.voxel(0), self.form.origin());
+        // (A brush smaller than a lattice step still reaches the points around it.)
+        let r = r.max(v);
+        let lo = ((c - Vec3::splat(r) - origin) / (v * B as f32)).floor().as_ivec3();
+        let hi = ((c + Vec3::splat(r) - origin) / (v * B as f32)).floor().as_ivec3();
+        if self.edit.is_none() {
+            self.history.push(Undo::Layers(self.stack.clone()));
+            self.redo.clear();
+        }
+        let layer = &mut self.stack[k];
+        for bz in lo.z..=hi.z {
+            for by in lo.y..=hi.y {
+                for bx in lo.x..=hi.x {
+                    let bc = IVec3::new(bx, by, bz);
+                    let mut d = layer.d.get(&bc).map_or_else(|| Box::new([1.0f32; N]), |d| Box::new(**d));
+                    for (i, x) in d.iter_mut().enumerate() {
+                        let t = (1.0 - (origin + (bc * B + cell(i)).as_vec3() * v - c).length() / r).clamp(0.0, 1.0);
+                        *x += t * t * (3.0 - 2.0 * t) * (to - *x);
+                    }
+                    layer.d.insert(bc, Stored::from(d));
+                }
+            }
+        }
+        layer.d_ver += 1;
+        true
+    }
+
+    /// Generator layer `k`'s painted density: its blocks at level 0's lattice (none painted, fully dense).
+    pub fn density(&self, k: usize) -> Option<&Shared<IVec3, Stored>> {
+        self.stack.get(k).filter(|x| x.scatter.is_some()).map(|x| &x.d)
+    }
+
+    /// Scatter again the generators whose painted density changed since they were scattered, shown no finer than level 1
+    /// (see [`Self::generator_take`] for the rest). True if any was.
+    pub fn rescatter_painted(&mut self, shown: &mut LevelVolume) -> bool {
+        let mut any = false;
+        for k in 0..self.stack.len() {
+            let Some(old) = self.stack[k].scatter.clone() else { continue };
+            let stale = matches!(old.g.spec.density, super::density::Density::Painted { .. }) && old.g.painted_version().unwrap_or(0) != self.stack[k].d_ver;
+            if !stale {
+                continue;
+            }
+            any = true;
+            let upto = self.stack[k].level.min(PREVIEW);
+            let mut changes = self.stack[k].all_keys();
+            let painted = Some((self.stack[k].d_ver, self.stack[k].d.clone()));
+            let mut part = GenPart::new(&self.form, VolumeGen::build_with(&self.form, &old.g.spec, Some(&old.g), painted), upto);
+            part.upto = upto;
+            self.stack[k].scatter = Some(part);
+            changes.extend(self.stack[k].all_keys());
+            self.compose(shown, &changes);
+        }
+        any
+    }
+
+    /// A density stroke is over: the rocks are scattered again for what was painted, and the stroke ends as one undo step
+    /// (when [`Self::begin_edit`] began it).
+    pub fn end_density_stroke(&mut self, shown: &mut LevelVolume) {
+        self.rescatter_painted(shown);
+        self.end_edit();
     }
 
     /// A new surface noise layer on top (drawn by the GPU over the whole surface, its mask at level 0's lattice), made
@@ -2455,7 +2530,7 @@ impl Layered {
     pub fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
         self.form.write_to(w)?;
         w.write_all(b"SLAY")?;
-        for x in [3u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
+        for x in [4u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
             w.write_all(&x.to_le_bytes())?;
         }
         for layer in &self.stack {
@@ -2500,6 +2575,17 @@ impl Layered {
                         w.write_all(&x.to_le_bytes())?;
                     }
                     let buf: Vec<u8> = layer.m[&bc].iter().flat_map(|v| v.to_le_bytes()).collect();
+                    w.write_all(&buf)?;
+                }
+                // The painted density (version 4): its blocks, the same way.
+                let mut keys: Vec<IVec3> = layer.d.keys().copied().collect();
+                keys.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+                w.write_all(&(keys.len() as u32).to_le_bytes())?;
+                for bc in keys {
+                    for x in bc.to_array() {
+                        w.write_all(&x.to_le_bytes())?;
+                    }
+                    let buf: Vec<u8> = layer.d[&bc].iter().flat_map(|v| v.to_le_bytes()).collect();
                     w.write_all(&buf)?;
                 }
                 continue;
@@ -2550,7 +2636,7 @@ impl Layered {
             Ok(u32::from_le_bytes(b))
         };
         let version = u32s(r)?;
-        if !(1..=3).contains(&version) {
+        if !(1..=4).contains(&version) {
             return Err(bad("unknown layer section version"));
         }
         let (from, count, active) = (u32s(r)? as usize, u32s(r)? as usize, u32s(r)? as usize);
@@ -2618,7 +2704,23 @@ impl Layered {
                     let m: Box<[f32; N]> = Box::new(std::array::from_fn(|i| f32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]])));
                     layer.m.insert(IVec3::from_array(c), Stored::from(m));
                 }
-                layer.scatter = Some(GenPart::new(&form, VolumeGen::from_anchors_on(&form, &spec, anchors), layer.level));
+                if version >= 4 {
+                    let blocks = u32s(r)? as usize;
+                    for _ in 0..blocks {
+                        let mut c = [0i32; 3];
+                        for x in &mut c {
+                            *x = u32s(r)? as i32;
+                        }
+                        r.read_exact(&mut buf)?;
+                        let d: Box<[f32; N]> = Box::new(std::array::from_fn(|i| f32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]])));
+                        layer.d.insert(IVec3::from_array(c), Stored::from(d));
+                    }
+                }
+                let mut g = VolumeGen::from_anchors_on(&form, &spec, anchors);
+                if !layer.d.is_empty() {
+                    g = g.with_painted(0, layer.d.clone());
+                }
+                layer.scatter = Some(GenPart::new(&form, g, layer.level));
                 stack.push(layer);
                 continue;
             }

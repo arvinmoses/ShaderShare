@@ -37,6 +37,9 @@ pub enum Target {
     Detail,
     /// The layer's mask: hiding the layer where painted, or (`show`) showing it again.
     Mask { show: bool },
+    /// The generator layer's painted density: `more` lets rocks in, else keeps them out. The rocks are scattered again
+    /// when the stroke ends.
+    Density { more: bool },
 }
 
 pub struct VolumeMode {
@@ -197,6 +200,10 @@ impl VolumeMode {
         let target = self.layer.as_ref().map(|_| self.routed());
         if let (Some(Target::Mask { show }), Some(layer)) = (target, self.layer.as_mut()) {
             layer.paint_mask(&mut self.vol, at, radius, if show { 1.0 } else { 0.0 });
+            return;
+        }
+        if let (Some(Target::Density { more }), Some(layer)) = (target, self.layer.as_mut()) {
+            layer.paint_density(at, radius, if more { 1.0 } else { 0.0 });
             return;
         }
         if !self.chosen {
@@ -420,7 +427,7 @@ impl VolumeMode {
         let target = self.routed();
         match (self.layer.as_mut(), target) {
             (Some(layer), Target::Form) => layer.begin_stroke(),
-            (Some(layer), Target::Mask { .. }) => layer.begin_edit(),
+            (Some(layer), Target::Mask { .. } | Target::Density { .. }) => layer.begin_edit(),
             (layer, _) => {
                 self.on_layer = layer.is_some();
                 self.vol.begin_stroke();
@@ -450,6 +457,11 @@ impl VolumeMode {
                 }
             }
             (Some(layer), Target::Mask { .. }) => layer.end_edit(),
+            (Some(layer), Target::Density { .. }) => {
+                // The rocks scatter again for what was painted (a preview at once, its own level from a job).
+                layer.end_density_stroke(&mut self.vol);
+                self.start_generator_job();
+            }
             _ => {
                 if self.vol.in_stroke() {
                     self.ending = true;
