@@ -253,7 +253,7 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
             })
         });
         ui.add_space(4.0);
-        ui.label(RichText::new(format!("Last edit shown in {ms:.1} ms (while dragging, no finer than level 1; at its own level on release, {full:.0} ms). Sculpting the form carries it along; its mask (Layers panel) fades it.")).small().color(weak));
+        ui.label(RichText::new(format!("Last edit shown in {ms:.1} ms, no finer than level 1; at its own level {full:.0} ms later, composed off the frame. Sculpting the form carries it along; its mask (Layers panel) fades it.")).small().color(weak));
     });
     let Some(m) = app.volume_mode.as_mut() else { return };
     if changed && next != spec {

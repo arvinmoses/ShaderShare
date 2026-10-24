@@ -771,3 +771,32 @@ fn detail_on_a_rock_rides_the_rock() {
     let (open, _, dropped) = closed(&lv.s, 4);
     assert_eq!((open, dropped), (0, 0));
 }
+
+/// An edit shown at once as a preview, and at its own level from a job: it ends as the edit made at once; a job a
+/// newer edit overtook is dropped, and the newer one's job brings that.
+#[test]
+fn an_edit_composed_off_the_frame_ends_as_one_made_at_once() {
+    let mut a = Lv::ball();
+    let k = a.add(3, &rocks());
+    let bigger = GeneratorSpec { size: 0.12, ..rocks() };
+    a.l.preview_generator(&mut a.s, k, &bigger);
+    let job = a.l.generator_take().expect("a job for the preview");
+    assert!(a.l.generator_apply(&mut a.s, job.run()));
+    assert!(a.l.generator_take().is_none(), "nothing left to do");
+    let mut b = Lv::ball();
+    let kb = b.add(3, &rocks());
+    b.l.set_generator(&mut b.s, kb, &bigger);
+    assert!(surface_key(&a.s, 3) == surface_key(&b.s, 3), "the job's result differs");
+    // Overtaken: a job taken, then a newer edit before it is brought in.
+    let newest = GeneratorSpec { size: 0.14, ..rocks() };
+    a.l.preview_generator(&mut a.s, k, &GeneratorSpec { size: 0.13, ..rocks() });
+    let stale = a.l.generator_take().unwrap();
+    a.l.preview_generator(&mut a.s, k, &newest);
+    assert!(!a.l.generator_apply(&mut a.s, stale.run()), "a job overtaken was taken in");
+    let fresh = a.l.generator_take().unwrap();
+    assert!(a.l.generator_apply(&mut a.s, fresh.run()));
+    b.l.set_generator(&mut b.s, kb, &newest);
+    assert!(surface_key(&a.s, 3) == surface_key(&b.s, 3), "the newest edit's job differs");
+    let (open, _, dropped) = closed(&a.s, 3);
+    assert_eq!((open, dropped), (0, 0));
+}

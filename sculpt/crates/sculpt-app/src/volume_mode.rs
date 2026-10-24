@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
 use glam::Vec3;
-use sculpt_core::generator::detail_layer::{FollowDone, Layered};
+use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::generator::level_volume::{CarryDone, EndDone, LevelVolume};
@@ -70,6 +70,8 @@ pub struct VolumeMode {
     pub generator_ms: f64,
     pub generator_full_ms: f64,
     generator_edit: bool,
+    /// A generator being composed at its own level on another thread (its preview shown meanwhile).
+    gen_job: Option<Receiver<GenDone>>,
     /// Tint the surface by the level each part comes from.
     pub tint: bool,
     /// Timing of the last frame's dabs, for the status line.
@@ -136,6 +138,7 @@ impl VolumeMode {
             generator_ms: 0.0,
             generator_full_ms: 0.0,
             generator_edit: false,
+            gen_job: None,
             view: Default::default(),
             tint: false,
             last_ms: 0.0,
@@ -235,6 +238,7 @@ impl VolumeMode {
     /// Once a frame: bring in a carrying job that finished, and start the next on what is queued (see
     /// `LevelVolume::carry_take`).
     pub fn tick(&mut self) {
+        self.generator_jobs(false);
         let t = Instant::now();
         // The detail layer following the form: bring in a job that finished, start the next on what dabs queued.
         if let Some(layer) = self.layer.as_mut() {
@@ -346,6 +350,7 @@ impl VolumeMode {
     /// Finish a stroke whose end is still being worked out, now: before anything that needs the volume settled (a
     /// new stroke, undo, saving).
     pub fn settle(&mut self) {
+        self.generator_jobs(true);
         if let Some(layer) = self.layer.as_mut() {
             if let Some(rx) = self.form_end.take()
                 && let Ok(done) = rx.recv()
@@ -378,7 +383,7 @@ impl VolumeMode {
 
     /// Whether frames should keep coming to finish carrying or ending a stroke.
     pub fn busy(&self) -> bool {
-        self.ending || self.carrying() || self.follow_job.is_some() || self.form_end.is_some() || self.layer.as_ref().is_some_and(|l| l.busy())
+        self.ending || self.carrying() || self.follow_job.is_some() || self.form_end.is_some() || self.gen_job.is_some() || self.layer.as_ref().is_some_and(|l| l.busy())
     }
 
     /// The specks the last stroke to end left, removed, once.
@@ -500,16 +505,57 @@ impl VolumeMode {
             layer.begin_edit();
             self.generator_edit = true;
         }
-        // While dragging, shown no finer than level 1 (a few milliseconds); at its own level once the drag is over.
+        // Shown no finer than level 1 at once (a few milliseconds); at its own level from a job once the drag is over,
+        // the frames going on meanwhile.
         let t = Instant::now();
-        if dragging {
-            layer.preview_generator(&mut self.vol, k, spec);
-        } else {
-            layer.set_generator(&mut self.vol, k, spec);
-        }
+        layer.preview_generator(&mut self.vol, k, spec);
         self.generator_ms = t.elapsed().as_secs_f64() * 1e3;
         if !dragging {
             self.end_generator_edit();
+        }
+    }
+
+    /// Start composing a previewed generator at its own level on another thread, unless one is under way.
+    fn start_generator_job(&mut self) {
+        if self.gen_job.is_some() {
+            return;
+        }
+        let Some(job) = self.layer.as_mut().and_then(|l| l.generator_take()) else { return };
+        let (tx, rx) = channel();
+        let t = Instant::now();
+        rayon::spawn(move || {
+            let mut done = job.run();
+            done.ms = t.elapsed().as_secs_f64() * 1e3;
+            let _ = tx.send(done);
+        });
+        self.gen_job = Some(rx);
+    }
+
+    /// Take a generator job that finished (and start the next, if a newer edit wants one); with `wait`, the one under
+    /// way and every one still wanted, now.
+    fn generator_jobs(&mut self, wait: bool) {
+        loop {
+            self.start_generator_job();
+            let Some(rx) = self.gen_job.as_ref() else { return };
+            let done = if wait { rx.recv().ok() } else { rx.try_recv().ok() };
+            let Some(done) = done else {
+                if wait {
+                    self.gen_job = None;
+                }
+                return;
+            };
+            self.gen_job = None;
+            if let Some(layer) = self.layer.as_mut() {
+                let ms = done.ms;
+                if layer.generator_apply(&mut self.vol, done) {
+                    self.generator_full_ms = ms;
+                }
+            }
+            if !wait {
+                // The next, if any, starts on the next frame's tick.
+                self.start_generator_job();
+                return;
+            }
         }
     }
 
@@ -518,10 +564,9 @@ impl VolumeMode {
         if std::mem::take(&mut self.generator_edit)
             && let Some(layer) = self.layer.as_mut()
         {
-            let t = Instant::now();
-            layer.end_edit_in(&mut self.vol);
-            self.generator_full_ms = t.elapsed().as_secs_f64() * 1e3;
+            layer.end_edit();
         }
+        self.start_generator_job();
     }
 
     /// Move the work at levels `from` and finer into a detail layer over the rest (the form).
@@ -990,6 +1035,26 @@ mod tests {
     }
 
     /// With a detail layer, a mask stroke hides the layer where it passes, and undo brings it back.
+    #[test]
+    fn a_generator_edit_lands_at_its_own_level_off_the_frame() {
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5));
+        mode.add_generator();
+        let k = mode.layer.as_ref().unwrap().active();
+        let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+        spec.size *= 1.3;
+        mode.set_generator(k, &spec, false);
+        // Frames go on until the job is in.
+        let start = Instant::now();
+        while mode.busy() && start.elapsed().as_secs() < 20 {
+            mode.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!mode.busy(), "the job never came in");
+        let layer = mode.layer.as_mut().unwrap();
+        assert_eq!(layer.generator(k), Some(&spec));
+        assert!(layer.generator_take().is_none(), "still shown as a preview");
+    }
+
     #[test]
     fn a_mask_stroke_hides_the_detail_layer() {
         let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5));

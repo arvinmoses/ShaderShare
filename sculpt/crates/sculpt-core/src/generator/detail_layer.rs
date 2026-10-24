@@ -133,6 +133,36 @@ pub struct LayerInfo {
     pub generator: bool,
 }
 
+/// A generator previewed coarser, at its own level again: composed on another thread (see
+/// [`Layered::generator_take`]).
+pub struct GenJob {
+    form: LevelVolume,
+    stack: Vec<Layer>,
+    from: usize,
+    k: usize,
+    part: GenPart,
+    /// The preview it replaces: if the layer holds another by the time it is done, it is dropped.
+    preview: std::sync::Arc<Vec<HashSet<IVec3>>>,
+    targets: Vec<(usize, IVec3)>,
+}
+
+/// What a [`GenJob`] composed.
+pub struct GenDone {
+    k: usize,
+    part: GenPart,
+    preview: std::sync::Arc<Vec<HashSet<IVec3>>>,
+    blocks: Vec<(usize, IVec3, Option<Stored>)>,
+    pub ms: f64,
+}
+
+impl GenJob {
+    pub fn run(self) -> GenDone {
+        let t = Instant::now();
+        let blocks = compose_all(&self.form, &self.stack, self.from - 1, &self.targets);
+        GenDone { k: self.k, part: self.part, preview: self.preview, blocks, ms: t.elapsed().as_secs_f64() * 1e3 }
+    }
+}
+
 /// A layer map's samples over a box of lattice points, read once.
 struct Dense {
     lo: IVec3,
@@ -1838,6 +1868,33 @@ impl Layered {
     /// Begin an edit of a layer itself (a mask stroke): undone as one.
     pub fn begin_edit(&mut self) {
         self.edit = Some(self.stack.clone());
+    }
+
+    /// The next generator layer shown coarser than its own level (by a drag's preview) as a job composing it at its
+    /// own: [`GenJob::run`] on another thread, then [`Self::generator_apply`]. `None` when none is.
+    pub fn generator_take(&mut self) -> Option<GenJob> {
+        let k = (0..self.stack.len()).find(|&k| self.stack[k].scatter.as_ref().is_some_and(|p| p.upto != self.stack[k].level))?;
+        let preview = self.stack[k].scatter.clone()?;
+        let own = self.stack[k].level;
+        let part = GenPart::new(&self.form, preview.g.clone(), own);
+        let mut stack = self.stack.clone();
+        let mut changes = stack[k].all_keys();
+        stack[k].scatter = Some(part.clone());
+        changes.extend(stack[k].all_keys());
+        let targets = affected(&stack, &changes);
+        Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets })
+    }
+
+    /// Take what a [`GenJob`] composed, unless the layer changed meanwhile (then a later job brings it). True if taken.
+    pub fn generator_apply(&mut self, shown: &mut LevelVolume, done: GenDone) -> bool {
+        let GenDone { k, part, preview, blocks, .. } = done;
+        let Some(x) = self.stack.get_mut(k) else { return false };
+        if !x.scatter.as_ref().is_some_and(|p| std::sync::Arc::ptr_eq(&p.blocks, &preview)) {
+            return false;
+        }
+        x.scatter = Some(part);
+        self.put_shown(shown, blocks, &self.form);
+        true
     }
 
     pub fn end_edit_in(&mut self, shown: &mut LevelVolume) {

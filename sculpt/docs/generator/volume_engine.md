@@ -297,8 +297,8 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   normal, an anchor whose surface did not move staying exactly. In the test the form rose 0.0440 under a rock and the
   rock moved 0.0440; rocks away from the stroke did not move at all.
 * **Editing.** A parameter change places the instances again (scattering again only for a new count, seed or
-  spacing) and composes the blocks it had and has. While a slider is dragged the layer is held no finer than level 1,
-  and at its own level again when the drag ends, one undo step for all of it. At about the app's scale (a ball at a
+  spacing) and composes the blocks it had and has. An edit shows at once held no finer than level 1, and at its own level
+  from a job off the frame (a newer edit drops an older job's result), a drag one undo step for all of it. At about the app's scale (a ball at a
   level 0 step of 0.007, twelve rocks): a drag step 6-8 ms at any level; on release 32 ms at level 2, 150 ms at
   level 3. The default size is 3% of the object, at the coarsest level giving a dozen steps a radius.
 * **A soft join reads the form alike everywhere.** A smooth minimum reads the form's distance out to its blend's
