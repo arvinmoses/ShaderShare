@@ -191,7 +191,8 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
     let Some(layer) = m.layer.as_ref() else { return };
     let k = layer.active();
     let Some(spec) = layer.generator(k).cloned() else { return };
-    let (ms, full) = (m.generator_ms, m.generator_full_ms);
+    let (ms, full, join) = (m.generator_ms, m.generator_full_ms, m.join_ms);
+    let on_gpu = m.layer.as_ref().is_some_and(|l| l.gpu_can_join());
     let mut next = spec.clone();
     let (mut changed, mut coalesce, mut dragging) = (false, false, false);
     section(ui, fs, "volume_generator", "GENERATOR", |ui| {
@@ -253,7 +254,12 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
             })
         });
         ui.add_space(4.0);
-        ui.label(RichText::new(format!("Last edit shown in {ms:.1} ms, no finer than level 1; at its own level {full:.0} ms later, composed off the frame. Sculpting the form carries it along; its mask (Layers panel) fades it.")).small().color(weak));
+        let how = if on_gpu {
+            format!("Last edit shown at its own level by the GPU ({ms:.1} + {join:.1} ms on the CPU); the exact field {full:.0} ms later, composed off the frame.")
+        } else {
+            format!("Last edit shown in {ms:.1} ms, no finer than level 1; at its own level {full:.0} ms later, composed off the frame.")
+        };
+        ui.label(RichText::new(format!("{how} Sculpting the form carries it along; its mask (Layers panel) fades it.")).small().color(weak));
     });
     let Some(m) = app.volume_mode.as_mut() else { return };
     if changed && next != spec {

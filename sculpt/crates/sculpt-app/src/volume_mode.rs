@@ -75,6 +75,10 @@ pub struct VolumeMode {
     generator_edit: bool,
     /// A generator being composed at its own level on another thread (its preview shown meanwhile).
     gen_job: Option<Receiver<GenDone>>,
+    /// An edit for the GPU to join the generators for, on the next sync.
+    pub gpu_plan: Option<sculpt_core::generator::detail_layer::GpuPlan>,
+    /// How long the last join on the GPU took to start, on the CPU.
+    pub join_ms: f64,
     /// Tint the surface by the level each part comes from.
     pub tint: bool,
     /// Timing of the last frame's dabs, for the status line.
@@ -143,6 +147,8 @@ impl VolumeMode {
             generator_full_ms: 0.0,
             generator_edit: false,
             gen_job: None,
+            gpu_plan: None,
+            join_ms: 0.0,
             view: Default::default(),
             tint: false,
             last_ms: 0.0,
@@ -512,7 +518,11 @@ impl VolumeMode {
         // Shown no finer than level 1 at once (a few milliseconds); at its own level from a job once the drag is over,
         // the frames going on meanwhile.
         let t = Instant::now();
-        layer.preview_generator(&mut self.vol, k, spec);
+        // At its own level on the GPU where the stack lets it; else no finer than level 1 here.
+        match layer.gpu_generator(&mut self.vol, k, spec) {
+            Some(plan) => self.gpu_plan = Some(plan),
+            None => layer.preview_generator(&mut self.vol, k, spec),
+        }
         self.generator_ms = t.elapsed().as_secs_f64() * 1e3;
         if !dragging {
             self.end_generator_edit();

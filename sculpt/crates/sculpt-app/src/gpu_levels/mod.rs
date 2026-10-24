@@ -24,6 +24,7 @@ use sculpt_core::generator::level_view::LevelView;
 use sculpt_core::generator::level_volume::{HashSet as KeySet, Key, LevelVolume, Show, VERTS_PER_BLOCK, piece_table, quantize};
 
 pub mod check;
+mod join;
 
 const SHADER: &str = include_str!("levels.wgsl");
 const PAGE_INDICES: u64 = 384;
@@ -134,6 +135,8 @@ pub struct GpuLevels {
     /// were not stored), and the eye with its pixels per unit at distance one.
     pub view: LevelView,
     eye: Option<(Vec3, f32)>,
+    /// Generators joined on the GPU (made when first needed).
+    join: Option<join::Join>,
     /// Bumped whenever the buffers are made afresh, so whoever draws from them binds them again.
     pub buffers_made: u64,
 }
@@ -234,6 +237,7 @@ impl GpuLevels {
             cap_changed: false,
             view: LevelView::default(),
             eye: None,
+            join: None,
         };
         g.queue.write_buffer(&g.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         g

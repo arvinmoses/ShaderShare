@@ -301,6 +301,16 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   from a job off the frame (a newer edit drops an older job's result), a drag one undo step for all of it. At about the app's scale (a ball at a
   level 0 step of 0.007, twelve rocks): a drag step 6-8 ms at any level; on release 32 ms at level 2, 150 ms at
   level 3. The default size is 3% of the object, at the coarsest level giving a dozen steps a radius.
+* **Joined on the GPU.** Where the stack lets it (no generator masked, no detail layer above one), an edit is shown at
+  its own level at once by the GPU: the stack takes the new scatter, the blocks it no longer changes get the form's
+  field again and the blocks it newly changes their base (so every block that shows exists, as the extractor's rules
+  need), and a pass joins the generators to each block's base field: the field composed without them, kept on the
+  GPU (16-bit floats, in a pool) until what is under the generators changes. The CPU's job then brings the exact
+  field, which also makes a distance of steep joins again (the GPU leaves that out). The shader's joining is
+  `volume_gen.wgsl` (every primitive, both joins, roughness on the shared hash noise), within 1e-6 of the instances'
+  size of the CPU's; an edit joined on the GPU against the job's field, near the surface: no sample on the other side
+  of it in about three million, the rest within 1.4 steps (`--gpu-levels-check`). On the check's ball, an edit costs
+  5-15 ms to plan and 8-26 ms to join on the CPU (the first 130 ms, reading every base), against the job's 40-68 ms.
 * **A soft join reads the form alike everywhere.** A smooth minimum reads the form's distance out to its blend's
   width, and level 0 holds distances only six steps out (past them, a block a stroke touched holds a bound, an
   untouched one its band): a blend wider than that read different values on either side of a block's face, and

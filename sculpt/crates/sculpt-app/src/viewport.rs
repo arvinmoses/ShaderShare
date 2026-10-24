@@ -388,6 +388,11 @@ impl Viewport {
         v.gpu.set_eye(eye, focal_px);
         let s = v.gpu.sync(&mut mode.vol);
         mode.view = v.gpu.view.stats;
+        // A generator edit the GPU joins at its own level (the CPU's job brings the exact field after).
+        if let (Some(plan), Some(layer)) = (mode.gpu_plan.take(), mode.layer.as_ref()) {
+            let j = v.gpu.join(&mode.vol, plan, &|k| layer.base_samples(k));
+            mode.join_ms = j.cpu_ms;
+        }
         if v.gpu.buffers_made != v.buffers_made {
             v.group = Self::levels_group(&rs.device, &self.levels_bgl, &v.uniforms, &v.gpu);
             v.buffers_made = v.gpu.buffers_made;

@@ -270,6 +270,19 @@ impl VolumeDemo {
             at(5.5, 3.0, Caption("Close up: octaves finer than any level, as shading"));
             end = 9.0;
         }
+        // `SCULPT_DEMO_SCRIPT=gens`: only a generator and its edits, on the plain ball (a quick look).
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("gens") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::whole(3.0, 0.35, 0.25)));
+            at(0.5, 0.0, AddGenerator);
+            at(2.0, 0.0, Generator(|s| s.count = 40));
+            at(3.5, 0.0, Generator(|s| s.size *= 1.5));
+            at(5.0, 0.0, Generator(|s| s.blend = 0.6));
+            at(6.5, 0.0, Generator(|s| s.rough_kind = sculpt_core::noise::NoiseKind::Ridged));
+            at(8.0, 0.0, Generator(|s| s.op = sculpt_core::generator::BoolOp::Subtract));
+            end = 9.5;
+        }
         let n = items.len();
         VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
     }

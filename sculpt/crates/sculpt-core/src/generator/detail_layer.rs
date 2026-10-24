@@ -26,7 +26,7 @@ use rayon::prelude::*;
 
 use super::layer::GeneratorSpec;
 use super::level_volume::{EndDone, EndJob, HashMap, HashSet, Key, LevelDab, LevelVolume, Shared, Stored, StrokeEnd};
-use super::volume_gen::{Anchor, VolumeGen};
+use super::volume_gen::{Anchor, GpuGen, GpuInstance, VolumeGen};
 
 const B: i32 = 8;
 const N: usize = 512;
@@ -764,6 +764,77 @@ fn compose_ordered(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, 
     (0..n.x * n.y * n.z).map(|k| g[idx(lo + IVec3::new(k % n.x, (k / n.x) % n.y, k / (n.x * n.y)))]).collect()
 }
 
+/// Block `bc` of level `l`'s 9x9x9 samples (its own and the first layer past it) as composed without the generators:
+/// the form pushed out by the detail layers, read for a join (level 0's distance where this level's is near its clamp,
+/// and no farther than level 0 holds distances) where `join` (a generator reaches it). What the GPU joins them to.
+fn base_block(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, bc: IVec3, join: bool) -> Box<[f32; 729]> {
+    let (v, band) = (form.voxel(l), form.band(l));
+    let (lo, hi) = (bc * B, bc * B + IVec3::splat(B));
+    let s = offsets(stack, l, lo, hi, false, None);
+    let most = s.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+    let pad = (most / v).ceil() as i32 + 2;
+    let (plo, phi) = (lo - IVec3::splat(pad), hi + IVec3::splat(pad));
+    let pn = phi - plo + IVec3::ONE;
+    let field = unclamped(form, l, below, plo, phi);
+    let pa = |i: IVec3| {
+        let d = (i - plo).clamp(IVec3::ZERO, pn - IVec3::ONE);
+        field[((d.z * pn.y + d.y) * pn.x + d.x) as usize]
+    };
+    let tri = |g: Vec3| {
+        let i = g.floor().as_ivec3();
+        let f = g - i.as_vec3();
+        (0..8).map(|q| corner_weight(q, f) * pa(i + corner_offset(q))).sum::<f32>()
+    };
+    let sat = if l <= below { band } else { form.band(below) };
+    let reach = 0.95 * form.plateau(0);
+    let coarse = (l > 0 && join).then(|| {
+        let s = 1i32 << l;
+        let (clo, chi) = (lo.div_euclid(IVec3::splat(s)), hi.div_euclid(IVec3::splat(s)) + IVec3::ONE);
+        (clo, chi - clo + IVec3::ONE, form.samples(0, clo, chi), s as f32)
+    });
+    let far = |i: IVec3, c: f32| -> f32 {
+        let Some((clo, cn, g, s)) = &coarse else { return c };
+        let t = ((c.abs() - 0.5 * sat) / (0.4 * sat)).clamp(0.0, 1.0);
+        if t == 0.0 {
+            return c;
+        }
+        let q = i.as_vec3() / *s - clo.as_vec3();
+        let b = q.floor().as_ivec3().clamp(IVec3::ZERO, *cn - IVec3::splat(2));
+        let f = q - b.as_vec3();
+        let c0: f32 = (0..8).map(|k| {
+            let j = b + corner_offset(k);
+            corner_weight(k, f) * g[((j.z * cn.y + j.y) * cn.x + j.x) as usize]
+        }).sum();
+        let t = t * t * (3.0 - 2.0 * t);
+        c + (c0 - c) * t
+    };
+    let mut out = Box::new([0.0f32; 729]);
+    for (k, o) in out.iter_mut().enumerate() {
+        let i = lo + IVec3::new(k as i32 % 9, (k as i32 / 9) % 9, k as i32 / 81);
+        let s = s[k];
+        let c = if s == 0.0 || pa(i).abs() > band + s.abs() + v {
+            pa(i)
+        } else {
+            let g = Vec3::new(pa(i + IVec3::X) - pa(i - IVec3::X), pa(i + IVec3::Y) - pa(i - IVec3::Y), pa(i + IVec3::Z) - pa(i - IVec3::Z));
+            tri(i.as_vec3() - g.normalize_or_zero() * (s / v))
+        };
+        *o = if join { far(i, c).clamp(-reach, reach) } else { c };
+    }
+    out
+}
+
+/// What the GPU joins the generators to the field with, for an edit: the generators shown (in the stack's order) and
+/// their instances, and per block the instances near it of each. See [`Layered::gpu_generator`].
+pub struct GpuPlan {
+    pub gens: Vec<GpuGen>,
+    pub instances: Vec<GpuInstance>,
+    pub cands: Vec<u32>,
+    /// Per block: its key, and per generator (as `gens`) the range of `cands` near it.
+    pub blocks: Vec<(Key, Vec<[u32; 2]>)>,
+    /// [`Layered::base_epoch`] when it was made.
+    pub epoch: u64,
+}
+
 /// Compose the shown blocks `targets` (level, block), level by level.
 fn compose_all(form: &LevelVolume, stack: &[Layer], below: usize, targets: &[(usize, IVec3)]) -> Vec<(usize, IVec3, Option<Stored>)> {
     let mut per: HashMap<usize, Vec<IVec3>> = HashMap::default();
@@ -856,6 +927,9 @@ pub struct Layered {
     used: Used,
     /// Layer blocks follows changed this stroke: its last follow works them all out again.
     changed: HashSet<(usize, IVec3)>,
+    /// Bumped whenever what is under the generators may have changed (the form, the detail layers, which show): a
+    /// base field (see [`Self::base_samples`]) read before it is stale.
+    base_epoch: u64,
 }
 
 /// A follow to work out on another thread: copies of what it reads (see [`Layered::follow_take`]).
@@ -1232,6 +1306,7 @@ impl Layered {
             covered: Vec::new(),
             used: HashMap::default(),
             changed: HashSet::default(),
+            base_epoch: 0,
         }
     }
 
@@ -1332,6 +1407,7 @@ impl Layered {
     /// A stroke on what is shown (`shown`'s last stroke, on the active layer) has ended: take it into the layer's
     /// heights, to undo with the layers' history rather than with the stroke's own.
     pub fn take_detail(&mut self, shown: &mut LevelVolume) {
+        self.base_epoch += 1;
         let keys = shown.last_stroke_keys();
         shown.forget_last();
         if keys.is_empty() || self.stack.is_empty() {
@@ -1396,6 +1472,7 @@ impl Layered {
 
     /// A new empty layer at `level` (no coarser than the layers' first level) on top, made active.
     pub fn add_layer(&mut self, name: &str, level: usize) -> usize {
+        self.base_epoch += 1;
         let level = level.clamp(self.from, self.form.levels() - 1);
         self.history.push(Undo::Layers(self.stack.clone()));
         self.redo.clear();
@@ -1417,6 +1494,115 @@ impl Layered {
         self.active = self.stack.len() - 1;
         self.compose(shown, &changes);
         self.active
+    }
+
+    /// The base field's epoch (see `base_epoch`).
+    pub fn base_epoch(&self) -> u64 {
+        self.base_epoch
+    }
+
+    /// Block `key`'s 9x9x9 samples composed without the generators, as the GPU joins them to (see [`base_block`]).
+    pub fn base_samples(&self, key: Key) -> Box<[f32; 729]> {
+        let (l, bc) = (key.0 as usize, key.1);
+        let (v, origin) = (self.form.voxel(l), self.form.origin());
+        let lo = origin + (bc * B).as_vec3() * v;
+        let hi = lo + Vec3::splat(B as f32 * v);
+        let join = self.stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref()).any(|g| g.g.touches(lo, hi, g.g.pad() + v));
+        base_block(&self.form, &self.stack, l, self.from - 1, bc, join)
+    }
+
+    /// Whether the GPU can join the generators for an edit: none masked, and no detail layer shown above one (those
+    /// are composed in the stack's order, on the CPU).
+    pub fn gpu_can_join(&self) -> bool {
+        let first = self.stack.iter().position(|x| x.visible && x.scatter.is_some());
+        let ordered = first.is_some_and(|g| self.stack[g + 1..].iter().any(|x| x.visible && x.scatter.is_none()));
+        !ordered && !self.stack.iter().any(|x| x.visible && x.scatter.is_some() && !x.m.is_empty())
+    }
+
+    /// Change generator layer `k`'s parameters, the GPU to show it at its own level: the stack takes the new scatter
+    /// (and the blocks it no longer changes the form's again, and blocks it now changes their base, so they exist);
+    /// the GPU joins the generators to the blocks the plan lists. Its exact field comes from a job
+    /// ([`Self::generator_take`]), as after a preview. `None` (and nothing changed) where the GPU cannot.
+    pub fn gpu_generator(&mut self, shown: &mut LevelVolume, k: usize, spec: &GeneratorSpec) -> Option<GpuPlan> {
+        let old = self.stack.get(k).and_then(|x| x.scatter.clone())?;
+        if !self.gpu_can_join() {
+            return None;
+        }
+        if self.edit.is_none() && old.g.spec != *spec {
+            self.history.push(Undo::Layers(self.stack.clone()));
+            self.redo.clear();
+        }
+        let own = self.stack[k].level;
+        let mut changes = self.stack[k].all_keys();
+        let mut part = GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), own);
+        // Shown by the GPU: the job brings the field at its own level.
+        part.upto = usize::MAX;
+        self.stack[k].scatter = Some(part);
+        changes.extend(self.stack[k].all_keys());
+        let targets = affected(&self.stack, &changes);
+        // On the CPU: blocks no longer changed by any layer, the form's again; blocks new to the layer, their base.
+        let (gone, kept): (Vec<(usize, IVec3)>, Vec<(usize, IVec3)>) = targets.into_iter().partition(|&(l, bc)| !composed(&self.stack, l, bc));
+        let fresh: Vec<(usize, IVec3, Option<Stored>)> = kept
+            .par_iter()
+            .filter(|&&(l, bc)| !shown.exists(l, bc))
+            .map(|&(l, bc)| {
+                let b = self.base_samples((l as u8, bc));
+                let mut own = Box::new([0.0f32; N]);
+                for (i, o) in own.iter_mut().enumerate() {
+                    let c = cell(i);
+                    *o = b[(c.x + 9 * c.y + 81 * c.z) as usize].clamp(-self.form.band(l), self.form.band(l));
+                }
+                (l, bc, Some(Stored::from(own)))
+            })
+            .collect();
+        let mut put: Vec<(usize, IVec3, Option<Stored>)> = gone.into_iter().map(|(l, bc)| (l, bc, None)).collect();
+        put.extend(fresh);
+        self.put_shown(shown, put, &self.form);
+        // The plan: the generators shown, and the instances near each block.
+        let mut gens = Vec::new();
+        let mut instances = Vec::new();
+        let mut parts: Vec<(&VolumeGen, u32)> = Vec::new();
+        for x in self.stack.iter().filter(|x| x.visible) {
+            if let Some(g) = &x.scatter {
+                parts.push((&g.g, instances.len() as u32));
+                gens.push(g.g.gpu_params());
+                instances.extend(g.g.gpu_instances());
+            }
+        }
+        let origin = self.form.origin();
+        let per: Vec<(Key, Vec<Vec<u32>>)> = kept
+            .par_iter()
+            .map(|&(l, bc)| {
+                let v = self.form.voxel(l);
+                let lo = origin + (bc * B).as_vec3() * v;
+                let hi = lo + Vec3::splat(B as f32 * v);
+                let mut near = Vec::new();
+                let lists = parts
+                    .iter()
+                    .map(|(g, first)| {
+                        g.near(lo, hi, g.pad() + v, &mut near);
+                        near.iter().map(|j| j + first).collect()
+                    })
+                    .collect();
+                ((l as u8, bc), lists)
+            })
+            .collect();
+        let mut cands = Vec::new();
+        let blocks = per
+            .into_iter()
+            .map(|(key, lists)| {
+                let ranges = lists
+                    .into_iter()
+                    .map(|c: Vec<u32>| {
+                        let first = cands.len() as u32;
+                        cands.extend(c);
+                        [first, cands.len() as u32 - first]
+                    })
+                    .collect();
+                (key, ranges)
+            })
+            .collect();
+        Some(GpuPlan { gens, instances, cands, blocks, epoch: self.base_epoch })
     }
 
     /// Generator layer `k`'s parameters.
@@ -1467,6 +1653,7 @@ impl Layered {
 
     /// Remove layer `k`.
     pub fn remove_layer(&mut self, shown: &mut LevelVolume, k: usize) {
+        self.base_epoch += 1;
         if k >= self.stack.len() {
             return;
         }
@@ -1486,6 +1673,7 @@ impl Layered {
 
     /// Show or hide layer `k`.
     pub fn set_visible(&mut self, shown: &mut LevelVolume, k: usize, on: bool) {
+        self.base_epoch += 1;
         let Some(x) = self.stack.get_mut(k) else { return };
         if x.visible == on {
             return;
@@ -1498,6 +1686,7 @@ impl Layered {
     /// Hold layer `k` at another level: finer keeps its detail on a denser lattice; coarser keeps what that lattice
     /// can hold (averaged over each new step).
     pub fn set_level(&mut self, shown: &mut LevelVolume, k: usize, level: usize) {
+        self.base_epoch += 1;
         if let Some(part) = self.stack.get(k).and_then(|x| x.scatter.clone()) {
             // A generator: the same scatter, changing the field to another level.
             let level = level.min(self.form.levels() - 1);
@@ -1643,6 +1832,7 @@ impl Layered {
     /// After a dab on the form: what it changed away from the layers shows at once; over them, it waits for a follow
     /// (at once, unless deferred), which shows it with the layers on it.
     fn dabbed(&mut self, shown: &mut LevelVolume) {
+        self.base_epoch += 1;
         let dirty = self.form.drain_dirty();
         self.touched.extend(dirty.iter().copied());
         if self.start.is_none() {
@@ -1695,6 +1885,7 @@ impl Layered {
     }
 
     pub fn end_form_apply(&mut self, done: EndDone) -> StrokeEnd {
+        self.base_epoch += 1;
         let out = self.form.end_stroke_apply(done);
         let dirty = self.form.drain_dirty();
         self.touched.extend(dirty);
@@ -1743,6 +1934,7 @@ impl Layered {
     /// Take what a follow worked out: the layers' blocks, and what is shown over the blocks it covered (the form as the
     /// job read it, the layers on it).
     pub fn follow_apply(&mut self, shown: &mut LevelVolume, done: FollowDone) {
+        self.base_epoch += 1;
         let t = Instant::now();
         self.running = false;
         let FollowDone { form, region, end, layers, gens, shown: blocks, used, mut stats } = done;
@@ -1813,6 +2005,7 @@ impl Layered {
 
     /// Fade the active layer toward `to` (0 hides it, 1 shows it) within `r` of `c`, softly.
     pub fn paint_mask(&mut self, shown: &mut LevelVolume, c: Vec3, r: f32, to: f32) {
+        self.base_epoch += 1;
         let Some(level) = self.stack.get(self.active).map(|x| x.level) else { return };
         let (v, origin) = (self.form.voxel(level), self.form.origin());
         let lo = ((c - Vec3::splat(r) - origin) / (v * B as f32)).floor().as_ivec3();
@@ -1930,6 +2123,7 @@ impl Layered {
     }
 
     fn swap(&mut self, shown: &mut LevelVolume, entry: Undo, undo: bool) -> Undo {
+        self.base_epoch += 1;
         let (stack, form) = match entry {
             Undo::Form(s) => (s, true),
             Undo::Layers(s) => (s, false),

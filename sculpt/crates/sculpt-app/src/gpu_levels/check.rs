@@ -283,11 +283,71 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
     Ok(worst)
 }
 
+/// An edit of a generator joined on the GPU against the exact field the CPU's job brings after it: the samples near the
+/// surface agree but for the distance the CPU makes of steep joins again, and the surface built on the GPU drops
+/// nothing.
+fn join_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
+    use sculpt_core::generator::detail_layer::Layered;
+    use sculpt_core::generator::layer::GeneratorSpec;
+    use sculpt_core::generator::{BoolOp, Primitive};
+    let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
+    let mut layer = Layered::new(&mut vol, 2);
+    let rocks = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 3, size: 0.12, lift: 0.2, min_spacing: 0.4, blend: 0.3, rough: 0.2, stretch_var: 0.3, tilt: 20.0, ..GeneratorSpec::default() };
+    let k = layer.add_generator(&mut vol, "Rocks", 2, &rocks);
+    let mut gpu = GpuLevels::new(device, queue, &vol, 3);
+    gpu.sync(&mut vol);
+    for (step, spec) in [GeneratorSpec { size: 0.15, ..rocks.clone() }, GeneratorSpec { blend: 0.6, ..rocks.clone() }, GeneratorSpec { op: BoolOp::Subtract, lift: 0.0, ..rocks.clone() }, GeneratorSpec { count: 20, ..rocks.clone() }].into_iter().enumerate() {
+        let t = Instant::now();
+        let plan = layer.gpu_generator(&mut vol, k, &spec).ok_or("the GPU cannot join this stack")?;
+        let plan_ms = t.elapsed().as_secs_f64() * 1e3;
+        let keys: Vec<Key> = plan.blocks.iter().map(|b| b.0).collect();
+        gpu.sync(&mut vol);
+        let s = gpu.join(&vol, plan, &|k| layer.base_samples(k));
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let status = read(device, queue, &gpu.buf.status);
+        if status[3] != 0 {
+            return Err(format!("join step {step}: the GPU dropped {} quads", status[3]).into());
+        }
+        let samples = read(device, queue, &gpu.buf.samples);
+        let got: Vec<(Key, Vec<u32>)> = keys.iter().filter_map(|k| gpu.slot_of.get(k).map(|&sl| (*k, samples[sl as usize * 365..sl as usize * 365 + 365].to_vec()))).collect();
+        // The exact field.
+        let tj = Instant::now();
+        while let Some(job) = layer.generator_take() {
+            layer.generator_apply(&mut vol, job.run());
+        }
+        let job_ms = tj.elapsed().as_secs_f64() * 1e3;
+        let (mut flips, mut worst, mut near) = (0usize, 0.0f32, 0usize);
+        for (key, words) in &got {
+            let want = packed_samples(&vol, *key, Some(gpu.view.hidden()));
+            let (l, v) = (key.0 as usize, vol.voxel(key.0 as usize));
+            let band = vol.band(l);
+            for j in 0..729 {
+                let g = ((words[j / 2] >> (16 * (j % 2))) & 0xffff) as u16 as i16 as f32 / 32767.0 * band;
+                let w = ((want[j / 2] >> (16 * (j % 2))) & 0xffff) as u16 as i16 as f32 / 32767.0 * band;
+                if w.abs() < 2.0 * v {
+                    near += 1;
+                    worst = worst.max((g - w).abs() / v);
+                    if (g < 0.0) != (w < 0.0) && w.abs() > 0.25 * v {
+                        flips += 1;
+                    }
+                }
+            }
+        }
+        println!("join step {step}: {} blocks joined on the GPU (plan {plan_ms:.1} ms, join {:.1} ms CPU) against the CPU's job ({job_ms:.0} ms): near the surface ({near} samples) at most {worst:.2} steps apart, {flips} sides differ", got.len(), s.cpu_ms);
+        if flips > near / 1000 {
+            return Err(format!("join step {step}: {flips} samples on the other side").into());
+        }
+        gpu.sync(&mut vol);
+    }
+    Ok(())
+}
+
 pub fn run(args: &[String]) -> Res<()> {
     let (device, queue, adapter) = device()?;
     println!("adapter: {adapter}");
     let off = surface_noise_check(&device, &queue)?;
     let gen_off = generator_check(&device, &queue)?;
+    join_check(&device, &queue)?;
     if gen_off > 1e-3 {
         return Err(format!("the shader's generator joining differs from the CPU's by {gen_off} of the instances' size").into());
     }
