@@ -1215,7 +1215,17 @@ impl SculptApp {
                 m.add_generator();
             }
             if let Some(edit) = f.noise {
-                edit(&mut m.surface_noise);
+                // The topmost surface noise layer (made if there is none).
+                let find = |m: &crate::volume_mode::VolumeMode| m.layer.as_ref().and_then(|l| l.layers().iter().rposition(|x| x.noise));
+                if find(m).is_none() {
+                    m.add_noise();
+                }
+                if let Some(k) = find(m)
+                    && let Some(mut n) = m.layer.as_ref().and_then(|l| l.noise(k)).copied()
+                {
+                    edit(&mut n);
+                    m.set_noise(k, n, false);
+                }
             }
             if let Some(edit) = f.generator
                 && let Some(layer) = m.layer.as_ref()

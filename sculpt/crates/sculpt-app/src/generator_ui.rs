@@ -269,6 +269,44 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
     }
 }
 
+/// The Properties section for the volume's surface noise layer selected, if one is.
+pub(crate) fn volume_noise_props(app: &mut SculptApp, ui: &mut Ui) {
+    let fs = app.theme.metrics.font_size;
+    let weak = app.theme.weak_text();
+    let Some(m) = app.volume_mode.as_mut() else { return };
+    let Some(layer) = m.layer.as_ref() else { return };
+    let k = layer.active();
+    let Some(n0) = layer.noise(k).copied() else { return };
+    let (lo, hi) = m.vol.bounds();
+    let extent = (hi - lo).max_element().max(1e-3);
+    let mut n = n0;
+    let (mut changed, mut coalesce, mut dragging) = (false, false, false);
+    section(ui, fs, "volume_noise", "SURFACE NOISE", |ui| {
+        let (c, co, d) = (&mut changed, &mut coalesce, &mut dragging);
+        vslider(ui, "Height", egui::Slider::new(&mut n.amplitude, 0.0001 * extent..=0.05 * extent).logarithmic(true).max_decimals(4), Some("The most it moves the surface."), c, co, d);
+        vslider(ui, "Bumps per unit", egui::Slider::new(&mut n.scale, 0.5 / extent..=400.0 / extent).logarithmic(true).max_decimals(1), Some("Of its first octave; each next one is twice as fine."), c, co, d);
+        vslider(ui, "Octaves", egui::Slider::new(&mut n.octaves, 1..=8), None, c, co, d);
+        prop(ui, "Kind", |ui| {
+            ui.horizontal(|ui| {
+                *c |= ui.selectable_value(&mut n.kind, 0, "Smooth").changed();
+                *c |= ui.selectable_value(&mut n.kind, 1, "Ridged").changed();
+            })
+            .response
+        });
+        let r = prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut n.seed).speed(0.2)));
+        *d |= r.dragged();
+        note(&r, c, co);
+        ui.add_space(4.0);
+        ui.label(RichText::new("Drawn by the GPU over the whole surface, finer than any level; not in the field, so brushes work on the surface under it. Its mask (Layers panel) fades it.").small().color(weak));
+    });
+    let Some(m) = app.volume_mode.as_mut() else { return };
+    if changed && n != n0 {
+        m.set_noise(k, n, dragging || coalesce);
+    } else if !dragging {
+        m.set_noise(k, n0, false);
+    }
+}
+
 /// The Properties section for a generator layer.
 pub(crate) fn generator_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
     let Some(spec) = app.doc.as_ref().and_then(|d| d.layer(id)).and_then(|l| l.generator.clone()) else { return };

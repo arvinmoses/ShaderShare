@@ -460,30 +460,14 @@ fn falloff_tray(app: &mut SculptApp, ui: &mut Ui, tile: f32) {
 
 /// The volume's stack in the Layers panel: one volume, or the form with a detail layer (and its mask) over it, and
 /// which of them strokes work on.
+const NOISE_HOVER: &str = "A layer of noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Its mask fades it. Brushes work on the surface under it.";
+
 pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
     use crate::volume_mode::Target;
     let weak = app.theme.weak_text();
     let Some(m) = app.volume_mode.as_mut() else { return };
     ui.add_space(6.0);
     egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| {
-        // Surface noise: drawn by the GPU over everything, at any fineness.
-        let (lo, hi) = m.vol.bounds();
-        let extent = (hi - lo).max_element().max(1e-3);
-        let n = &mut m.surface_noise;
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut n.on, "Surface noise").on_hover_text("Noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Brushes work on the surface under it.");
-        });
-        if n.on {
-            ui.add(egui::Slider::new(&mut n.amplitude, 0.0001 * extent..=0.05 * extent).logarithmic(true).max_decimals(4).text("Height"));
-            ui.add(egui::Slider::new(&mut n.scale, 0.5 / extent..=400.0 / extent).logarithmic(true).max_decimals(1).text("Bumps per unit"));
-            ui.add(egui::Slider::new(&mut n.octaves, 1..=8).text("Octaves"));
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut n.kind, 0, "Smooth");
-                ui.selectable_value(&mut n.kind, 1, "Ridged");
-                ui.add(egui::DragValue::new(&mut n.seed).speed(0.2).prefix("seed "));
-            });
-        }
-        ui.add_space(6.0);
         match m.layer.as_ref().map(|_| ()) {
             None => {
                 ui.label("One volume: strokes work on all of it.");
@@ -495,6 +479,9 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                 ui.data_mut(|d| d.insert_temp(id, from));
                 if ui.button("New generator").on_hover_text("A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with.").clicked() {
                     m.add_generator();
+                }
+                if ui.button("New surface noise").on_hover_text(NOISE_HOVER).clicked() {
+                    m.add_noise();
                 }
                 if ui
                     .button("Move detail to a layer")
@@ -524,18 +511,27 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                             visible = Some((k, on));
                         }
                         let picked = m.target == Target::Detail && active == k;
-                        let label = if info.generator { format!("{}  (generator, {} blocks)", info.name, info.blocks) } else { format!("{}  ({} blocks)", info.name, info.blocks) };
+                        let label = if info.generator {
+                            format!("{}  (generator, {} blocks)", info.name, info.blocks)
+                        } else if info.noise {
+                            format!("{}  (drawn by the GPU)", info.name)
+                        } else {
+                            format!("{}  ({} blocks)", info.name, info.blocks)
+                        };
                         if ui.selectable_label(picked, label).clicked() {
                             select = Some(k);
                         }
                         let mut l = info.level;
-                        // A generator's resolution can be any level; a detail layer's, the layers' first or finer.
+                        // A generator's resolution can be any level; a detail layer's, the layers' first or finer;
+                        // surface noise has none (it is drawn at every fineness).
                         let first = if info.generator { 0 } else { from };
-                        egui::ComboBox::from_id_salt(("layer_level", k)).selected_text(format!("level {l}")).show_ui(ui, |ui| {
-                            for (c, t) in texts.iter().enumerate().skip(first) {
-                                ui.selectable_value(&mut l, c, t.as_str());
-                            }
-                        });
+                        if !info.noise {
+                            egui::ComboBox::from_id_salt(("layer_level", k)).selected_text(format!("level {l}")).show_ui(ui, |ui| {
+                                for (c, t) in texts.iter().enumerate().skip(first) {
+                                    ui.selectable_value(&mut l, c, t.as_str());
+                                }
+                            });
+                        }
                         if l != info.level {
                             level = Some((k, l));
                         }
@@ -591,6 +587,9 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                     .clicked()
                 {
                     m.add_generator();
+                }
+                if ui.button("New surface noise").on_hover_text(NOISE_HOVER).clicked() {
+                    m.add_noise();
                 }
                 if ui.button("Merge the layers into the form").clicked() {
                     m.merge_layer();
@@ -822,6 +821,7 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
             crate::generator_ui::volume_generator_props(app, ui);
+            crate::generator_ui::volume_noise_props(app, ui);
             match (app.selection, target) {
                 _ if app.layers.selection.len() > 1 => multi_props(app, ui),
                 (Selection::Effect(i), Some((id, false))) if active == Some(id) => effect_props(app, ui, i),

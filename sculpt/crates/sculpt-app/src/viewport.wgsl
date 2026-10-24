@@ -156,6 +156,8 @@ struct LevelsU {
     // Surface noise: (amplitude, scale, -, -) and (octaves, kind, seed, on).
     noise_f: vec4<f32>,
     noise_i: vec4<u32>,
+    // The noise mask's hash size less one, and whether there is a mask.
+    mask_i: vec4<u32>,
 };
 
 // The octaves a lattice of step `vx` holds: none shorter than four of its steps.
@@ -176,6 +178,43 @@ fn sn_octaves_for(vx: f32) -> u32 {
 @group(1) @binding(1) var<storage, read> lv_verts: array<vec2<u32>>;
 @group(1) @binding(2) var<storage, read> lv_cells: array<u32>;
 @group(1) @binding(3) var<storage, read> lv_meta: array<vec4<i32>>;
+@group(1) @binding(4) var<storage, read> lv_mask_hash: array<vec4<i32>>;
+@group(1) @binding(5) var<storage, read> lv_mask: array<f32>;
+
+// The surface noise's mask at `p` (whole where none is painted): its block at level 0's lattice found by hash, then
+// trilinear in the block's samples.
+fn noise_mask(p: vec3<f32>) -> f32 {
+    if (L.mask_i.y == 0u) {
+        return 1.0;
+    }
+    let g = (p - L.origin.xyz) / L.misc.x;
+    let b = vec3<i32>(floor(g / 8.0));
+    var h = ((bitcast<u32>(b.x) * 73856093u) ^ (bitcast<u32>(b.y) * 19349663u) ^ (bitcast<u32>(b.z) * 83492791u)) & L.mask_i.x;
+    var at = -1;
+    for (var probe = 0u; probe <= L.mask_i.x; probe++) {
+        let e = lv_mask_hash[h];
+        if (e.w < 0) {
+            break;
+        }
+        if (e.x == b.x && e.y == b.y && e.z == b.z) {
+            at = e.w;
+            break;
+        }
+        h = (h + 1u) & L.mask_i.x;
+    }
+    if (at < 0) {
+        return 1.0;
+    }
+    let q = clamp(g - vec3<f32>(b * 8), vec3<f32>(0.0), vec3<f32>(8.0));
+    let i = vec3<u32>(min(floor(q), vec3<f32>(7.0)));
+    let f = q - vec3<f32>(i);
+    let o = u32(at) * 729u + i.x + 9u * i.y + 81u * i.z;
+    let x00 = mix(lv_mask[o], lv_mask[o + 1u], f.x);
+    let x10 = mix(lv_mask[o + 9u], lv_mask[o + 10u], f.x);
+    let x01 = mix(lv_mask[o + 81u], lv_mask[o + 82u], f.x);
+    let x11 = mix(lv_mask[o + 90u], lv_mask[o + 91u], f.x);
+    return clamp(mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z), 0.0, 1.0);
+}
 
 fn lv_oct_decode(w: u32) -> vec3<f32> {
     let e = unpack2x16snorm(w);
@@ -214,7 +253,7 @@ fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
         // Surface noise moves the vertex by the octaves this block's lattice holds; the rest only shade.
         let k = sn_octaves_for(vx);
         if (k > 0u) {
-            pos = base + n * sn_height(base, k);
+            pos = base + n * sn_height(base, k) * noise_mask(base);
         }
     }
     o.clip = u.view_proj * vec4<f32>(pos, 1.0);
@@ -253,7 +292,7 @@ fn fs_levels(i: MeshOut) -> @location(0) vec4<f32> {
         // eighth of its finest wavelength).
         let e = (1.0 / max(SN_F.y, 1e-6)) / f32(1u << min(SN_I.x, 16u)) * 0.125;
         let h0 = sn_height(i.base, SN_I.x);
-        let g = vec3<f32>(sn_height(i.base + vec3<f32>(e, 0.0, 0.0), SN_I.x) - h0, sn_height(i.base + vec3<f32>(0.0, e, 0.0), SN_I.x) - h0, sn_height(i.base + vec3<f32>(0.0, 0.0, e), SN_I.x) - h0) / e;
+        let g = vec3<f32>(sn_height(i.base + vec3<f32>(e, 0.0, 0.0), SN_I.x) - h0, sn_height(i.base + vec3<f32>(0.0, e, 0.0), SN_I.x) - h0, sn_height(i.base + vec3<f32>(0.0, 0.0, e), SN_I.x) - h0) / e * noise_mask(i.base);
         n = normalize(n - (g - n * dot(n, g)));
     }
     return lit(i, n, base);

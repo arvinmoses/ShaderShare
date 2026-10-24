@@ -266,9 +266,12 @@ impl VolumeDemo {
             at(0.5, 3.0, Caption("Surface noise, drawn by the GPU: coarse octaves move the surface, every octave shades it"));
             at(3.5, 0.0, Noise(|n| n.kind = 1));
             at(3.5, 2.0, Caption("Ridged"));
-            at(5.5, 2.5, Camera(Pose::at(patch, 0.4)));
-            at(5.5, 3.0, Caption("Close up: octaves finer than any level, as shading"));
-            end = 9.0;
+            at(5.5, 0.0, Target(crate::volume_mode::Target::Mask { show: false }));
+            at(5.5, 3.0, Caption("Its mask fades it where painted"));
+            at(6.0, 2.0, Stroke { tool: Tool::ClayBuildup, size: 220.0, strength: 1.0, path: line((0.35, 0.45), (0.6, 0.5), 0.0, 10) });
+            at(8.5, 2.5, Camera(Pose::at(patch, 0.4)));
+            at(8.5, 3.0, Caption("Close up: octaves finer than any level, as shading"));
+            end = 12.0;
         }
         // `SCULPT_DEMO_SCRIPT=gens`: only a generator and its edits, on the plain ball (a quick look).
         if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("gens") {

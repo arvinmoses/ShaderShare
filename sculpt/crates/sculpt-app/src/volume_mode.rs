@@ -61,8 +61,6 @@ pub struct VolumeMode {
     /// `level_px` pixels on screen.
     pub by_distance: bool,
     pub level_px: f32,
-    /// Noise over the whole surface, drawn by the GPU (not in the field until applied).
-    pub surface_noise: sculpt_core::surface_noise::SurfaceNoise,
     /// At most this many million triangles drawn (when on): past it, only the detail that shows most.
     pub budget_on: bool,
     pub budget_m: f32,
@@ -140,7 +138,6 @@ impl VolumeMode {
             cap,
             by_distance: true,
             level_px: 1.0,
-            surface_noise: sculpt_core::surface_noise::SurfaceNoise::default(),
             budget_on: true,
             budget_m: 6.0,
             generator_ms: 0.0,
@@ -465,7 +462,7 @@ impl VolumeMode {
     /// no sculpting of its own).
     fn routed(&self) -> Target {
         match (self.target, self.layer.as_ref()) {
-            (Target::Detail, Some(layer)) if layer.generator(layer.active()).is_some() => Target::Form,
+            (Target::Detail, Some(layer)) if layer.generator(layer.active()).is_some() || layer.noise(layer.active()).is_some() => Target::Form,
             (t, _) => t,
         }
     }
@@ -505,6 +502,45 @@ impl VolumeMode {
         layer.add_generator(&mut self.vol, &format!("Generator {}", n + 1), level, &spec);
         self.generator_ms = t.elapsed().as_secs_f64() * 1e3;
         self.target = Target::Detail;
+    }
+
+    /// A new surface noise layer on top (drawn by the GPU over the whole surface), made active; with no layers yet,
+    /// the stack is made first.
+    pub fn add_noise(&mut self) {
+        let (lo, hi) = self.vol.bounds();
+        let extent = (hi - lo).max_element().max(1e-3);
+        self.add_noise_with(SurfaceNoise { on: true, amplitude: 0.006 * extent, scale: 6.0 / extent, octaves: 6, kind: 0, seed: 1 });
+    }
+
+    pub fn add_noise_with(&mut self, n: SurfaceNoise) {
+        self.settle();
+        if self.layer.is_none() {
+            self.make_layer(self.vol.levels() - 1);
+        }
+        if let Some(layer) = self.layer.as_mut() {
+            let count = layer.layers().iter().filter(|x| x.noise).count();
+            layer.add_noise(&format!("Surface noise {}", count + 1), n);
+            self.target = Target::Detail;
+        }
+    }
+
+    /// Change surface noise layer `k`'s settings; while `dragging`, the changes undo as one.
+    pub fn set_noise(&mut self, k: usize, n: SurfaceNoise, dragging: bool) {
+        let Some(layer) = self.layer.as_mut() else { return };
+        if dragging && !self.generator_edit {
+            layer.begin_edit();
+            self.generator_edit = true;
+        }
+        layer.set_noise(k, n);
+        if !dragging && std::mem::take(&mut self.generator_edit) {
+            layer.end_edit();
+        }
+    }
+
+    /// The surface noise shown, if any: its settings, its mask's blocks, and when either last changed.
+    pub fn shown_noise(&self) -> Option<(SurfaceNoise, &sculpt_core::generator::level_volume::Shared<glam::IVec3, sculpt_core::generator::level_volume::Stored>, u64)> {
+        let layer = self.layer.as_ref()?;
+        layer.shown_noise().map(|(n, m)| (n, m, layer.noise_epoch()))
     }
 
     /// Change generator layer `k`'s parameters. While `dragging`, the changes undo as one, until a change that is not.
@@ -640,13 +676,6 @@ impl VolumeMode {
             Some(layer) => layer.write_to(w)?,
             None => self.vol.write_to(w)?,
         }
-        // Then the surface noise, when it has been set: "SNOI", a length, its settings as JSON.
-        if self.surface_noise != SurfaceNoise::default() {
-            let json = serde_json::to_vec(&self.surface_noise).map_err(std::io::Error::other)?;
-            w.write_all(b"SNOI")?;
-            w.write_all(&(json.len() as u32).to_le_bytes())?;
-            w.write_all(&json)?;
-        }
         Ok(())
     }
 
@@ -662,7 +691,8 @@ impl VolumeMode {
             layer.deferred = true;
             mode.layer = Some(layer);
         }
-        // The surface noise: after the layers, or in their place (its mark read already, then).
+        // Surface noise as files before it was a layer kept it: after the layers, or in their place (its mark read
+        // already, then). It becomes a layer.
         let at = if bytes[pos..].starts_with(b"SNOI") {
             Some(pos + 4)
         } else if mode.layer.is_none() && pos < bytes.len() && pos >= 4 && &bytes[pos - 4..pos] == b"SNOI" {
@@ -675,7 +705,10 @@ impl VolumeMode {
         {
             let len = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
             if let Some(json) = bytes.get(at + 4..at + 4 + len) {
-                mode.surface_noise = serde_json::from_slice(json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                let n: SurfaceNoise = serde_json::from_slice(json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                if n.on {
+                    mode.add_noise_with(n);
+                }
             }
         }
         Ok(mode)
@@ -1098,19 +1131,24 @@ mod tests {
     }
 
     #[test]
-    fn surface_noise_saves_with_the_volume_with_or_without_layers() {
-        for layers in [false, true] {
-            let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.05, 3));
-            if layers {
-                mode.make_layer(2);
-            }
-            mode.surface_noise = SurfaceNoise { on: true, amplitude: 0.02, scale: 7.0, octaves: 4, kind: 1, seed: 9 };
-            let mut buf = Vec::new();
-            mode.write_to(&mut buf).unwrap();
-            let back = VolumeMode::read_from(&mut &buf[..]).unwrap();
-            assert_eq!(back.surface_noise, mode.surface_noise, "layers {layers}");
-            assert_eq!(back.layer.is_some(), layers);
-        }
+    fn surface_noise_saves_as_a_layer_and_older_files_open_with_it() {
+        let n = SurfaceNoise { on: true, amplitude: 0.02, scale: 7.0, octaves: 4, kind: 1, seed: 9 };
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.05, 3));
+        mode.add_noise_with(n);
+        let mut buf = Vec::new();
+        mode.write_to(&mut buf).unwrap();
+        let back = VolumeMode::read_from(&mut &buf[..]).unwrap();
+        assert_eq!(back.shown_noise().map(|s| s.0), Some(n));
+        // A file of one volume and its surface noise after it, as before noise was a layer.
+        let vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.05, 3);
+        let mut old = Vec::new();
+        vol.write_to(&mut old).unwrap();
+        let json = serde_json::to_vec(&n).unwrap();
+        old.extend_from_slice(b"SNOI");
+        old.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        old.extend_from_slice(&json);
+        let back = VolumeMode::read_from(&mut &old[..]).unwrap();
+        assert_eq!(back.shown_noise().map(|s| s.0), Some(n));
     }
 
     #[test]

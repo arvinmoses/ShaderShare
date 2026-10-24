@@ -71,6 +71,8 @@ struct Layer {
     h: Shared<IVec3, Stored>,
     m: Shared<IVec3, Stored>,
     scatter: Option<GenPart>,
+    /// Surface noise: drawn by the GPU, not in the field (its mask at level 0's lattice).
+    noise: Option<crate::surface_noise::SurfaceNoise>,
 }
 
 /// A generator layer's scatter, and the blocks it changes at each level ([`VolumeGen::blocks`]).
@@ -95,7 +97,12 @@ impl GenPart {
 
 impl Layer {
     fn new(name: &str, level: usize) -> Layer {
-        Layer { name: name.to_string(), level, visible: true, h: Shared::default(), m: Shared::default(), scatter: None }
+        Layer { name: name.to_string(), level, visible: true, h: Shared::default(), m: Shared::default(), scatter: None, noise: None }
+    }
+
+    /// A detail layer (heights), rather than a generator or surface noise.
+    fn is_detail(&self) -> bool {
+        self.scatter.is_none() && self.noise.is_none()
     }
 
     /// Whether the layer has block `bc` of level `l` (a generator, at any level it changes).
@@ -131,6 +138,8 @@ pub struct LayerInfo {
     pub blocks: usize,
     /// A generator layer (scattering a primitive) rather than heights.
     pub generator: bool,
+    /// Surface noise (drawn by the GPU) rather than heights.
+    pub noise: bool,
 }
 
 /// A generator previewed coarser, at its own level again: composed on another thread (see
@@ -553,7 +562,7 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
     let gens: Vec<(&VolumeGen, Option<&Shared<IVec3, Stored>>, f32)> =
         stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref().map(|g| (&g.g, (!x.m.is_empty()).then_some(&x.m), 2f32.powi(x.level as i32 - l as i32)))).collect();
     // Detail layers over a generator ride what is under them, generators included: composed in the stack's order.
-    let ordered = stack.iter().position(|x| x.visible && x.scatter.is_some()).is_some_and(|g| stack[g + 1..].iter().any(|x| x.visible && x.scatter.is_none() && x.level <= l));
+    let ordered = stack.iter().position(|x| x.visible && x.scatter.is_some()).is_some_and(|g| stack[g + 1..].iter().any(|x| x.visible && x.is_detail() && x.level <= l));
     keys.par_iter()
         .map(|&bc| {
             if !composed(stack, l, bc) {
@@ -930,6 +939,8 @@ pub struct Layered {
     used: Used,
     /// Layer blocks follows changed this stroke: its last follow works them all out again.
     changed: HashSet<(usize, IVec3)>,
+    /// Bumped whenever a surface noise layer changes (its settings, mask, visibility): the GPU's copy is stale.
+    noise_epoch: u64,
     /// Bumped whenever what is under the generators may have changed (the form, the detail layers, which show): a
     /// base field (see [`Self::base_samples`]) read before it is stale.
     base_epoch: u64,
@@ -1310,6 +1321,7 @@ impl Layered {
             used: HashMap::default(),
             changed: HashSet::default(),
             base_epoch: 0,
+            noise_epoch: 0,
         }
     }
 
@@ -1459,7 +1471,7 @@ impl Layered {
 
     /// The layers, bottom first.
     pub fn layers(&self) -> Vec<LayerInfo> {
-        self.stack.iter().map(|x| LayerInfo { name: x.name.clone(), level: x.level, visible: x.visible, blocks: x.len(), generator: x.scatter.is_some() }).collect()
+        self.stack.iter().map(|x| LayerInfo { name: x.name.clone(), level: x.level, visible: x.visible, blocks: if x.noise.is_some() { x.m.len() } else { x.len() }, generator: x.scatter.is_some(), noise: x.noise.is_some() }).collect()
     }
 
     /// The layer strokes on the layers (and mask strokes) work on.
@@ -1518,7 +1530,7 @@ impl Layered {
     /// stack's order, on the CPU).
     pub fn gpu_can_join(&self) -> bool {
         let first = self.stack.iter().position(|x| x.visible && x.scatter.is_some());
-        let ordered = first.is_some_and(|g| self.stack[g + 1..].iter().any(|x| x.visible && x.scatter.is_none()));
+        let ordered = first.is_some_and(|g| self.stack[g + 1..].iter().any(|x| x.visible && x.is_detail()));
         !ordered
     }
 
@@ -1684,6 +1696,7 @@ impl Layered {
 
     /// Remove layer `k`.
     pub fn remove_layer(&mut self, shown: &mut LevelVolume, k: usize) {
+        self.noise_epoch += 1;
         self.base_epoch += 1;
         if k >= self.stack.len() {
             return;
@@ -1704,6 +1717,7 @@ impl Layered {
 
     /// Show or hide layer `k`.
     pub fn set_visible(&mut self, shown: &mut LevelVolume, k: usize, on: bool) {
+        self.noise_epoch += 1;
         self.base_epoch += 1;
         let Some(x) = self.stack.get_mut(k) else { return };
         if x.visible == on {
@@ -1718,6 +1732,9 @@ impl Layered {
     /// can hold (averaged over each new step).
     pub fn set_level(&mut self, shown: &mut LevelVolume, k: usize, level: usize) {
         self.base_epoch += 1;
+        if self.stack.get(k).is_some_and(|x| x.noise.is_some()) {
+            return;
+        }
         if let Some(part) = self.stack.get(k).and_then(|x| x.scatter.clone()) {
             // A generator: the same scatter, changing the field to another level.
             let level = level.min(self.form.levels() - 1);
@@ -1792,7 +1809,7 @@ impl Layered {
                 (bc, any.then(|| (Stored::from(h), Stored::from(m))))
             })
             .collect();
-        let mut layer = Layer { name: old.name.clone(), level, visible: old.visible, h: Shared::default(), m: Shared::default(), scatter: None };
+        let mut layer = Layer { name: old.name.clone(), level, visible: old.visible, h: Shared::default(), m: Shared::default(), scatter: None, noise: None };
         for (bc, hm) in built {
             if let Some((h, m)) = hm {
                 layer.h.insert(bc, h);
@@ -2048,8 +2065,10 @@ impl Layered {
             for by in lo.y..=hi.y {
                 for bx in lo.x..=hi.x {
                     let bc = IVec3::new(bx, by, bz);
-                    // A generator's mask starts out whole wherever it changes the field.
-                    let start = if layer.scatter.as_ref().is_some_and(|g| g.blocks[level].contains(&bc)) { Some(Stored::from(Box::new([1.0f32; N]))) } else { None };
+                    // A generator's mask starts out whole wherever it changes the field; surface noise's wherever there is
+                    // surface (level 0's blocks shown).
+                    let whole = layer.scatter.as_ref().is_some_and(|g| g.blocks[level].contains(&bc)) || (layer.noise.is_some() && shown.exists(0, bc));
+                    let start = if whole { Some(Stored::from(Box::new([1.0f32; N]))) } else { None };
                     let Some(m) = layer.m.get(&bc).cloned().or(start) else { continue };
                     let mut m = Box::new(*m);
                     for (i, x) in m.iter_mut().enumerate() {
@@ -2085,8 +2104,56 @@ impl Layered {
                 self.history.push(Undo::Layers(was));
                 self.redo.clear();
             }
+            // Surface noise is not in the field: only the GPU's copy of its mask changes.
+            if self.stack[self.active].noise.is_some() {
+                self.noise_epoch += 1;
+                return;
+            }
             self.compose(shown, &changed);
         }
+    }
+
+    /// A new surface noise layer on top (drawn by the GPU over the whole surface, its mask at level 0's lattice), made
+    /// active.
+    pub fn add_noise(&mut self, name: &str, noise: crate::surface_noise::SurfaceNoise) -> usize {
+        self.history.push(Undo::Layers(self.stack.clone()));
+        self.redo.clear();
+        let mut layer = Layer::new(name, 0);
+        layer.noise = Some(noise);
+        self.stack.push(layer);
+        self.active = self.stack.len() - 1;
+        self.noise_epoch += 1;
+        self.active
+    }
+
+    /// Surface noise layer `k`'s settings.
+    pub fn noise(&self, k: usize) -> Option<&crate::surface_noise::SurfaceNoise> {
+        self.stack.get(k)?.noise.as_ref()
+    }
+
+    /// Change surface noise layer `k`'s settings (within an edit, a run of changes undoes as one).
+    pub fn set_noise(&mut self, k: usize, noise: crate::surface_noise::SurfaceNoise) {
+        let Some(x) = self.stack.get(k).filter(|x| x.noise.is_some()) else { return };
+        if x.noise == Some(noise) {
+            return;
+        }
+        if self.edit.is_none() {
+            self.history.push(Undo::Layers(self.stack.clone()));
+            self.redo.clear();
+        }
+        self.stack[k].noise = Some(noise);
+        self.noise_epoch += 1;
+    }
+
+    /// The surface noise shown (the topmost visible noise layer): its settings and its mask's blocks (at level 0's
+    /// lattice; none painted, whole).
+    pub fn shown_noise(&self) -> Option<(crate::surface_noise::SurfaceNoise, &Shared<IVec3, Stored>)> {
+        self.stack.iter().rev().filter(|x| x.visible).find_map(|x| x.noise.map(|n| (n, &x.m)))
+    }
+
+    /// Bumped whenever the surface noise shown may have changed.
+    pub fn noise_epoch(&self) -> u64 {
+        self.noise_epoch
     }
 
     /// Begin an edit of a layer itself (a mask stroke): undone as one.
@@ -2154,6 +2221,7 @@ impl Layered {
     }
 
     fn swap(&mut self, shown: &mut LevelVolume, entry: Undo, undo: bool) -> Undo {
+        self.noise_epoch += 1;
         self.base_epoch += 1;
         let (stack, form) = match entry {
             Undo::Form(s) => (s, true),
@@ -2292,7 +2360,7 @@ impl Layered {
     pub fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
         self.form.write_to(w)?;
         w.write_all(b"SLAY")?;
-        for x in [2u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
+        for x in [3u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
             w.write_all(&x.to_le_bytes())?;
         }
         for layer in &self.stack {
@@ -2300,8 +2368,25 @@ impl Layered {
             w.write_all(layer.name.as_bytes())?;
             w.write_all(&(layer.level as u32).to_le_bytes())?;
             w.write_all(&[layer.visible as u8])?;
-            // What kind of layer (version 2): heights, or a generator (its parameters, anchors and mask).
-            w.write_all(&[layer.scatter.is_some() as u8])?;
+            // What kind of layer (version 2): heights, a generator (its parameters, anchors and mask), or (version 3)
+            // surface noise (its settings and mask).
+            w.write_all(&[if layer.noise.is_some() { 2u8 } else { layer.scatter.is_some() as u8 }])?;
+            if let Some(n) = &layer.noise {
+                let json = serde_json::to_vec(n).map_err(std::io::Error::other)?;
+                w.write_all(&(json.len() as u32).to_le_bytes())?;
+                w.write_all(&json)?;
+                let mut keys: Vec<IVec3> = layer.m.keys().copied().collect();
+                keys.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+                w.write_all(&(keys.len() as u32).to_le_bytes())?;
+                for bc in keys {
+                    for x in bc.to_array() {
+                        w.write_all(&x.to_le_bytes())?;
+                    }
+                    let buf: Vec<u8> = layer.m[&bc].iter().flat_map(|v| v.to_le_bytes()).collect();
+                    w.write_all(&buf)?;
+                }
+                continue;
+            }
             if let Some(g) = &layer.scatter {
                 let spec = serde_json::to_vec(&g.g.spec).map_err(std::io::Error::other)?;
                 w.write_all(&(spec.len() as u32).to_le_bytes())?;
@@ -2370,7 +2455,7 @@ impl Layered {
             Ok(u32::from_le_bytes(b))
         };
         let version = u32s(r)?;
-        if version != 1 && version != 2 {
+        if !(1..=3).contains(&version) {
             return Err(bad("unknown layer section version"));
         }
         let (from, count, active) = (u32s(r)? as usize, u32s(r)? as usize, u32s(r)? as usize);
@@ -2389,6 +2474,27 @@ impl Layered {
             let mut kind = [0u8; 1];
             if version >= 2 {
                 r.read_exact(&mut kind)?;
+            }
+            if kind[0] == 2 {
+                let mut layer = Layer::new(&String::from_utf8_lossy(&name), 0);
+                layer.visible = vis[0] != 0;
+                let len = u32s(r)? as usize;
+                let mut json = vec![0u8; len.min(1 << 20)];
+                r.read_exact(&mut json)?;
+                layer.noise = Some(serde_json::from_slice(&json).map_err(|e| bad(&format!("surface noise: {e}")))?);
+                let masks = u32s(r)? as usize;
+                let mut buf = vec![0u8; N * 4];
+                for _ in 0..masks {
+                    let mut c = [0i32; 3];
+                    for x in &mut c {
+                        *x = u32s(r)? as i32;
+                    }
+                    r.read_exact(&mut buf)?;
+                    let m: Box<[f32; N]> = Box::new(std::array::from_fn(|i| f32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]])));
+                    layer.m.insert(IVec3::from_array(c), Stored::from(m));
+                }
+                stack.push(layer);
+                continue;
             }
             if kind[0] == 1 {
                 let mut layer = Layer::new(&String::from_utf8_lossy(&name), level.min(top));

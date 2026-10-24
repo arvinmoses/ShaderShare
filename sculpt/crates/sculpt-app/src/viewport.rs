@@ -190,6 +190,12 @@ struct VolumeGpu {
     gpu: crate::gpu_levels::GpuLevels,
     uniforms: wgpu::Buffer,
     group: wgpu::BindGroup,
+    /// The surface noise's mask: a hash of its blocks (at level 0's lattice: x, y, z, place or -1) and their 9x9x9
+    /// samples; the noise epoch they are of, and the hash's size less one (0: no mask).
+    mask_hash: wgpu::Buffer,
+    mask_samples: wgpu::Buffer,
+    mask_of: Option<u64>,
+    mask_bits: u32,
     /// The GPU buffers `group` binds, and the volume `gpu` copies.
     buffers_made: u64,
     generation: u64,
@@ -202,6 +208,35 @@ struct LevelsUniforms {
     misc: [f32; 4],
     noise_f: [f32; 4],
     noise_i: [u32; 4],
+    mask_i: [u32; 4],
+}
+
+/// The surface noise mask's blocks as the shader looks them up: an open-addressed hash of (x, y, z, place), and each
+/// block's 9x9x9 samples (its own and the first layer past it; whole where none is painted).
+fn noise_mask(m: &sculpt_core::generator::level_volume::Shared<glam::IVec3, sculpt_core::generator::level_volume::Stored>) -> (Vec<[i32; 4]>, Vec<f32>, u32) {
+    let keys: Vec<glam::IVec3> = m.keys().copied().collect();
+    let len = (keys.len() * 2).next_power_of_two().max(16);
+    let mut hash = vec![[0i32, 0, 0, -1]; len];
+    let mut samples = Vec::with_capacity(keys.len() * 729);
+    let at = |j: glam::IVec3| -> f32 {
+        let b = j.div_euclid(glam::IVec3::splat(8));
+        let l = j.rem_euclid(glam::IVec3::splat(8));
+        m.get(&b).map_or(1.0, |s| s[(l.x + 8 * l.y + 64 * l.z) as usize])
+    };
+    for (n, bc) in keys.iter().enumerate() {
+        let mut h = ((bc.x as u32).wrapping_mul(73856093) ^ (bc.y as u32).wrapping_mul(19349663) ^ (bc.z as u32).wrapping_mul(83492791)) as usize & (len - 1);
+        while hash[h][3] >= 0 {
+            h = (h + 1) & (len - 1);
+        }
+        hash[h] = [bc.x, bc.y, bc.z, n as i32];
+        for k in 0..729 {
+            samples.push(at(*bc * 8 + glam::IVec3::new(k % 9, (k / 9) % 9, k / 81)));
+        }
+    }
+    if samples.is_empty() {
+        samples.push(1.0);
+    }
+    (hash, samples, (len - 1) as u32)
 }
 
 fn linear(c: egui::Color32) -> [f32; 4] {
@@ -279,6 +314,8 @@ impl Viewport {
                 ro(1),
                 ro(2),
                 ro(3),
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
         let levels_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("viewport levels"), bind_group_layouts: &[Some(&bgl), Some(&levels_bgl)], immediate_size: 0 });
@@ -377,8 +414,10 @@ impl Viewport {
         if self.volume.as_ref().is_none_or(|v| v.generation != mode.generation) {
             let gpu = crate::gpu_levels::GpuLevels::new(&rs.device, &rs.queue, &mode.vol, mode.cap);
             let uniforms = rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some("volume levels uniforms"), size: std::mem::size_of::<LevelsUniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            let group = Self::levels_group(&rs.device, &self.levels_bgl, &uniforms, &gpu);
-            self.volume = Some(VolumeGpu { buffers_made: gpu.buffers_made, gpu, uniforms, group, generation: mode.generation });
+            let empty = |label| rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 256, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let (mask_hash, mask_samples) = (empty("noise mask hash"), empty("noise mask samples"));
+            let group = Self::levels_group(&rs.device, &self.levels_bgl, &uniforms, &gpu, &mask_hash, &mask_samples);
+            self.volume = Some(VolumeGpu { buffers_made: gpu.buffers_made, gpu, uniforms, group, mask_hash, mask_samples, mask_of: None, mask_bits: 0, generation: mode.generation });
         }
         let v = self.volume.as_mut().unwrap();
         v.gpu.set_cap(mode.cap);
@@ -393,12 +432,28 @@ impl Viewport {
             let j = v.gpu.join(plan, &|k| layer.base_samples(k));
             mode.join_ms = j.cpu_ms;
         }
-        if v.gpu.buffers_made != v.buffers_made {
-            v.group = Self::levels_group(&rs.device, &self.levels_bgl, &v.uniforms, &v.gpu);
+        // The surface noise shown, and its mask (sent again when the noise changed).
+        let noise = mode.shown_noise();
+        let mut regroup = v.gpu.buffers_made != v.buffers_made;
+        if let Some((_, m, epoch)) = &noise
+            && v.mask_of != Some(*epoch)
+        {
+            let (hash, samples, bits) = noise_mask(m);
+            use eframe::egui_wgpu::wgpu::util::DeviceExt;
+            let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+            v.mask_hash = rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("noise mask hash"), contents: bytemuck::cast_slice(&hash), usage: st });
+            v.mask_samples = rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("noise mask samples"), contents: bytemuck::cast_slice(&samples), usage: st });
+            v.mask_bits = if m.is_empty() { 0 } else { bits };
+            v.mask_of = Some(*epoch);
+            regroup = true;
+        }
+        if regroup {
+            v.group = Self::levels_group(&rs.device, &self.levels_bgl, &v.uniforms, &v.gpu, &v.mask_hash, &v.mask_samples);
             v.buffers_made = v.gpu.buffers_made;
         }
-        let (noise_f, noise_i) = mode.surface_noise.uniform();
-        let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc: [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, 0.0, 0.0], noise_f, noise_i };
+        let (noise_f, noise_i) = noise.as_ref().map_or(sculpt_core::surface_noise::SurfaceNoise { on: false, ..Default::default() }, |n| n.0).uniform();
+        let mask_i = [v.mask_bits, (v.mask_bits > 0 && noise.is_some()) as u32, 0, 0];
+        let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc: [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, 0.0, 0.0], noise_f, noise_i, mask_i };
         rs.queue.write_buffer(&v.uniforms, 0, bytemuck::bytes_of(&u));
         mode.blocks = v.gpu.slots();
         if s.uploaded > 0 || s.full {
@@ -411,7 +466,7 @@ impl Viewport {
         self.last_upload = UploadStats { bytes: s.bytes, ranges: s.uploaded, ms: t.elapsed().as_secs_f32() * 1e3 };
     }
 
-    fn levels_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, uniforms: &wgpu::Buffer, gpu: &crate::gpu_levels::GpuLevels) -> wgpu::BindGroup {
+    fn levels_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, uniforms: &wgpu::Buffer, gpu: &crate::gpu_levels::GpuLevels, mask_hash: &wgpu::Buffer, mask_samples: &wgpu::Buffer) -> wgpu::BindGroup {
         let (_, _, _, verts, cells) = gpu.buffers_for_draw();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("volume levels"),
@@ -421,6 +476,8 @@ impl Viewport {
                 wgpu::BindGroupEntry { binding: 1, resource: verts.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: cells.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: gpu.meta_buffer().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: mask_hash.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: mask_samples.as_entire_binding() },
             ],
         })
     }
