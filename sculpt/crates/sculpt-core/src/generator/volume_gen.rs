@@ -27,6 +27,7 @@ use super::mapping::Mapper;
 use super::place::SurfaceSample;
 use super::{BoolOp, InstanceSet};
 use crate::geom::Aabb;
+use crate::noise::{Noise, NoiseParams};
 
 const B: i32 = 8;
 
@@ -42,6 +43,21 @@ pub struct VolumeGen {
     pub spec: GeneratorSpec,
     anchors: Arc<Vec<Anchor>>,
     set: Arc<InstanceSet>,
+    /// The instances' roughness, when they have any.
+    rough: Option<Arc<Noise>>,
+}
+
+/// A noise sample (0 to 1) as a bump from -1 to 1: each kind spread over about that range (summed octaves crowd round
+/// the middle; ridges and cells sit low), and held to it.
+fn bump(kind: crate::noise::NoiseKind, n: f32) -> f32 {
+    use crate::noise::NoiseKind::*;
+    let b = match kind {
+        Fbm | Perlin => (n - 0.5) * 4.0,
+        Ridged | Turbulence => (n - 0.4) * 2.5,
+        // Cells pressed in, so their rims stand: craggy rather than a heap of balls.
+        Cellular => (0.4 - n) * 2.5,
+    };
+    b.clamp(-1.0, 1.0)
 }
 
 /// Polynomial smooth minimum over `k`.
@@ -201,8 +217,30 @@ impl VolumeGen {
                 place_instance(spec, &mapper, &s, i, count)
             })
             .collect();
-        let k = spec.blend.max(0.0) * spec.size;
-        VolumeGen { spec: spec.clone(), anchors, set: Arc::new(InstanceSet::new(instances, k)) }
+        let rough = (spec.rough > 0.0).then(|| {
+            Arc::new(Noise::new(&NoiseParams { kind: spec.rough_kind, scale: spec.rough_scale.max(0.01) / spec.size.max(1e-6), octaves: 3, gain: 0.45, seed: spec.seed as u32 ^ 0x5eed, ..Default::default() }))
+        });
+        let mut out = VolumeGen { spec: spec.clone(), anchors, set: Arc::new(InstanceSet::new(instances, 0.0)), rough };
+        // Instances are found as far out as they can reach: the blend and the roughness.
+        let reach = out.pad();
+        out.set = Arc::new(InstanceSet::new(out.set.instances().to_vec(), reach));
+        out
+    }
+
+    /// Its roughness held to what a lattice of step `voxel` shows: octaves no finer than four of its steps (finer ones
+    /// would only alias, as froth).
+    pub fn fitted(mut self, voxel: f32) -> VolumeGen {
+        if self.rough.is_none() {
+            return self;
+        }
+        let wave = self.spec.size.max(1e-6) / self.spec.rough_scale.max(0.01);
+        let mut octaves = 1u32;
+        while octaves < 3 && wave / (1u32 << octaves) as f32 >= 4.0 * voxel {
+            octaves += 1;
+        }
+        let spec = &self.spec;
+        self.rough = Some(Arc::new(Noise::new(&NoiseParams { kind: spec.rough_kind, scale: spec.rough_scale.max(0.01) / spec.size.max(1e-6), octaves, gain: 0.45, seed: spec.seed as u32 ^ 0x5eed, ..Default::default() })));
+        self
     }
 
     /// The same, with anchors as saved.
@@ -232,8 +270,23 @@ impl VolumeGen {
         self.spec.blend.max(0.0) * self.spec.size
     }
 
+    /// The most the roughness moves an instance's surface, in world units.
+    pub fn roughness(&self) -> f32 {
+        if self.rough.is_some() { self.spec.rough.max(0.0) * self.spec.size } else { 0.0 }
+    }
+
+    /// How far past its instances' own surfaces the layer can change the field: the blend and the roughness.
+    pub fn pad(&self) -> f32 {
+        self.blend() + self.roughness()
+    }
+
     fn subtracts(&self) -> bool {
         self.spec.op == BoolOp::Subtract
+    }
+
+    /// Instance `i`'s own field at `p`.
+    pub fn sdf(&self, i: u32, p: Vec3) -> f32 {
+        self.set.sdf(i, p)
     }
 
     /// Whether any instance's reach meets the box `lo..hi` grown by `pad`.
@@ -263,6 +316,11 @@ impl VolumeGen {
             return c;
         }
         let k = self.blend();
+        // Roughness, where it can change what shows: the instances' field displaced by noise (centred on zero).
+        let d = match &self.rough {
+            Some(n) if (if self.subtracts() { d < -c + k + self.roughness() } else { d < c + k + self.roughness() }) => d + self.roughness() * bump(self.spec.rough_kind, n.sample(p)),
+            _ => d,
+        };
         let out = if self.subtracts() { -smin(-c, d, k) } else { smin(c, d, k) };
         c + (out - c) * mask.min(1.0)
     }
@@ -271,7 +329,7 @@ impl VolumeGen {
     /// a shell around the instances' surface at levels up to `own`, and past it the form's own blocks within reach.
     pub fn blocks(&self, form: &LevelVolume, l: usize, own: usize) -> HashSet<IVec3> {
         let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
-        let k = self.blend();
+        let k = self.pad();
         // Level 0 keeps distances out to a wide band, but what shows is near the surface: two of its steps past the
         // blend are enough to place it (past them its distances are the form's, as a sculpted block's are past a dab).
         let pad = k + if l == 0 { 2.0 * v } else { band + v };
@@ -315,6 +373,6 @@ impl VolumeGen {
 
     /// How far it reaches past its instances' boxes, for the blocks to redo around an instance that moved.
     pub fn reach(&self) -> f32 {
-        biggest_instance(&self.spec) + self.blend()
+        biggest_instance(&self.spec) + self.pad()
     }
 }

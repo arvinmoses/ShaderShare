@@ -87,6 +87,7 @@ const PREVIEW: usize = 1;
 
 impl GenPart {
     fn new(form: &LevelVolume, g: VolumeGen, own: usize) -> GenPart {
+        let g = g.fitted(form.voxel(own));
         let blocks = (0..form.levels()).map(|l| g.blocks(form, l, own)).collect();
         GenPart { g, blocks: std::sync::Arc::new(blocks), upto: own }
     }
@@ -345,13 +346,121 @@ fn normal(form: &LevelVolume, p: Vec3, below: usize) -> Vec3 {
     form.normal_upto(p, 0, false)
 }
 
+/// The surface detail layer `k`'s heights stand on: the form, joined with the generators shown under the layer. Away
+/// from them it is the form exactly.
+struct Below<'a> {
+    form: &'a LevelVolume,
+    below: usize,
+    gens: Vec<(&'a VolumeGen, &'a Shared<IVec3, Stored>, usize)>,
+}
+
+impl<'a> Below<'a> {
+    fn of(form: &'a LevelVolume, stack: &'a [Layer], k: usize, below: usize) -> Below<'a> {
+        let gens = stack[..k.min(stack.len())].iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref().map(|g| (&g.g, &x.m, x.level))).collect();
+        Below { form, below, gens }
+    }
+
+    /// Whether a generator under the layer reaches `p`.
+    fn reached(&self, p: Vec3) -> bool {
+        self.gens.iter().any(|(g, ..)| g.touches(p, p, g.pad()))
+    }
+
+    /// The form's distance at `p` for a join: from the finest level whose band holds it, as far as level 0 holds
+    /// distances (as composing reads it).
+    fn distance(&self, p: Vec3) -> f32 {
+        let reach = 0.95 * self.form.plateau(0);
+        for l in (0..=self.below).rev() {
+            let v = self.form.value_upto(p, l, false);
+            if v.abs() < 0.8 * self.form.band(l) {
+                return v.clamp(-reach, reach);
+            }
+        }
+        self.form.value_upto(p, 0, false).clamp(-reach, reach)
+    }
+
+    /// Its field at `p`, the form read up to `level`.
+    fn value(&self, p: Vec3, level: usize) -> f32 {
+        let mut out: Option<f32> = None;
+        let mut near = Vec::new();
+        for (g, m, gl) in &self.gens {
+            g.near(p, p, g.pad(), &mut near);
+            if near.is_empty() {
+                continue;
+            }
+            let c = out.unwrap_or_else(|| self.distance(p));
+            out = Some(g.apply(c, p, &near, mask_at(self.form, m, *gl, p)));
+        }
+        out.unwrap_or_else(|| self.form.value_upto(p, level, false))
+    }
+
+    /// Where `p`, near what a generator under the layer scattered, was in `was` (the same generators as they were):
+    /// what they scatter moves whole, so a point on it came from the same place on it before. With how much that
+    /// holds: all where the instance is nearer than the form, none where the form is, easing across the join.
+    fn rigid(&self, was: &Below, p: Vec3) -> Option<(Vec3, f32)> {
+        if self.gens.len() != was.gens.len() {
+            return None;
+        }
+        let mut near = Vec::new();
+        let mut best: Option<(f32, Vec3, f32)> = None;
+        for ((g1, ..), (g0, ..)) in self.gens.iter().zip(&was.gens) {
+            if g1.instances().len() != g0.instances().len() {
+                continue;
+            }
+            g1.near(p, p, g1.pad(), &mut near);
+            let Some((j, d)) = near.iter().map(|&j| (j, g1.sdf(j, p))).min_by(|a, b| a.1.total_cmp(&b.1)) else { continue };
+            if best.is_some_and(|b| b.0 <= d) {
+                continue;
+            }
+            let (a, b) = (g1.instances()[j as usize], g0.instances()[j as usize]);
+            let local = (a.rotation.inverse() * (p - a.translation)) / a.scale;
+            best = Some((d, b.translation + b.rotation * (local * b.scale), g1.blend().max(1e-6)));
+        }
+        let (d, from, k) = best?;
+        let c = self.distance(p);
+        let t = ((c - d) / k + 0.5).clamp(0.0, 1.0);
+        (t > 0.0).then_some((from, t * t * (3.0 - 2.0 * t)))
+    }
+
+    /// Its outward normal at `p`.
+    fn normal(&self, p: Vec3) -> Vec3 {
+        if !self.reached(p) {
+            return normal(self.form, p, self.below);
+        }
+        let h = 0.5 * self.form.voxel(self.below);
+        let f = |q: Vec3| self.value(q, self.below);
+        Vec3::new(f(p + Vec3::X * h) - f(p - Vec3::X * h), f(p + Vec3::Y * h) - f(p - Vec3::Y * h), f(p + Vec3::Z * h) - f(p - Vec3::Z * h)).normalize_or_zero()
+    }
+}
+
+/// A mask of a layer at level `l` (absent: whole) at world point `p`, linearly.
+fn mask_at(form: &LevelVolume, m: &Shared<IVec3, Stored>, l: usize, p: Vec3) -> f32 {
+    if m.is_empty() {
+        return 1.0;
+    }
+    let g = (p - form.origin()) / form.voxel(l);
+    let i = g.floor().as_ivec3();
+    let f = g - i.as_vec3();
+    (0..8)
+        .map(|q| {
+            let j = i + corner_offset(q);
+            corner_weight(q, f) * m.get(&j.div_euclid(IVec3::splat(B))).map_or(1.0, |b| b[local(j)])
+        })
+        .sum::<f32>()
+        .clamp(0.0, 1.0)
+}
+
 /// The visible layers' masked heights summed, over the lattice box `lo..=hi` of level `l` (x fastest): the layers at
 /// level `l` or coarser (with `finer`, all of them), but for layer `except`.
 fn offsets(stack: &[Layer], l: usize, lo: IVec3, hi: IVec3, finer: bool, except: Option<usize>) -> Vec<f32> {
+    offsets_of(stack, l, lo, hi, &|k, layer| Some(k) != except && (finer || layer.level <= l))
+}
+
+/// [`offsets`] of the visible detail layers `which` picks.
+fn offsets_of(stack: &[Layer], l: usize, lo: IVec3, hi: IVec3, which: &dyn Fn(usize, &Layer) -> bool) -> Vec<f32> {
     let n = hi - lo + IVec3::ONE;
     let mut out = vec![0.0f32; (n.x * n.y * n.z) as usize];
     for (k, layer) in stack.iter().enumerate() {
-        if !layer.visible || Some(k) == except || (!finer && layer.level > l) {
+        if !layer.visible || layer.scatter.is_some() || !which(k, layer) {
             continue;
         }
         // The layer's lattice over the box: coarser, read linearly; finer, at the points it shares.
@@ -413,6 +522,8 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
     // The generators shown, in the stack's order, each with its mask's lattice scale against this level's.
     let gens: Vec<(&VolumeGen, Option<&Shared<IVec3, Stored>>, f32)> =
         stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref().map(|g| (&g.g, (!x.m.is_empty()).then_some(&x.m), 2f32.powi(x.level as i32 - l as i32)))).collect();
+    // Detail layers over a generator ride what is under them, generators included: composed in the stack's order.
+    let ordered = stack.iter().position(|x| x.visible && x.scatter.is_some()).is_some_and(|g| stack[g + 1..].iter().any(|x| x.visible && x.scatter.is_none() && x.level <= l));
     keys.par_iter()
         .map(|&bc| {
             if !composed(stack, l, bc) {
@@ -420,6 +531,10 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
             }
             let (lo, hi) = (bc * B - IVec3::ONE, bc * B + IVec3::splat(B));
             let n = 10;
+            if ordered {
+                let c = compose_ordered(form, stack, l, below, lo, hi);
+                return (bc, Some(finish(&c, n, v, band)));
+            }
             let s = offsets(stack, l, lo, hi, false, None);
             let most = s.iter().fold(0.0f32, |a, b| a.max(b.abs()));
             // The form's field around the block, as far out as the heights reach.
@@ -442,7 +557,7 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
                 .iter()
                 .filter_map(|&(g, m, scale)| {
                     let mut near = Vec::new();
-                    g.near(wlo, whi, g.blend() + v, &mut near);
+                    g.near(wlo, whi, g.pad() + v, &mut near);
                     (!near.is_empty()).then(|| (g, m.map(|m| Sparse::new(m, 1.0)), scale, near))
                 })
                 .collect();
@@ -499,18 +614,124 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
                     c
                 })
                 .collect();
-            let at = |x: i32, y: i32, z: i32| c[(x + n * (y + n * z)) as usize];
-            let mut out = Box::new([0.0f32; N]);
-            for (i, o) in out.iter_mut().enumerate() {
-                let q = cell(i) + IVec3::ONE;
-                let (x, y, z) = (q.x, q.y, q.z);
-                let g = Vec3::new(at(x + 1, y, z) - at(x - 1, y, z), at(x, y + 1, z) - at(x, y - 1, z), at(x, y, z + 1) - at(x, y, z - 1)) / (2.0 * v);
-                // Steeper than a distance on a groove's wall: made one again, so a crossing sits where it is.
-                *o = (at(x, y, z) / g.length().max(1.0)).clamp(-band, band);
-            }
-            (bc, Some(Stored::from(out)))
+            (bc, Some(finish(&c, n, v, band)))
         })
         .collect()
+}
+
+/// A block's samples from its composed field `c` (`n` per side, a sample past it all round): steeper than a distance on
+/// a groove's wall, made one again, so a crossing sits where it is; and held to the band.
+fn finish(c: &[f32], n: i32, v: f32, band: f32) -> Stored {
+    let at = |x: i32, y: i32, z: i32| c[(x + n * (y + n * z)) as usize];
+    let mut out = Box::new([0.0f32; N]);
+    for (i, o) in out.iter_mut().enumerate() {
+        let q = cell(i) + IVec3::ONE;
+        let (x, y, z) = (q.x, q.y, q.z);
+        let g = Vec3::new(at(x + 1, y, z) - at(x - 1, y, z), at(x, y + 1, z) - at(x, y - 1, z), at(x, y, z + 1) - at(x, y, z - 1)) / (2.0 * v);
+        *o = (at(x, y, z) / g.length().max(1.0)).clamp(-band, band);
+    }
+    Stored::from(out)
+}
+
+/// What is shown over the lattice box `lo..=hi` of level `l` (x fastest), composed in the stack's order: the form,
+/// then each run of detail layers pushing out what is under it (along its normal), and each generator joined to it.
+fn compose_ordered(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, lo: IVec3, hi: IVec3) -> Vec<f32> {
+    let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
+    let s_all = offsets(stack, l, lo, hi, false, None);
+    let most = s_all.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+    let pad = (most / v).ceil() as i32 + 2;
+    let (plo, phi) = (lo - IVec3::splat(pad), hi + IVec3::splat(pad));
+    let pn = phi - plo + IVec3::ONE;
+    let idx = |i: IVec3| {
+        let d = (i - plo).clamp(IVec3::ZERO, pn - IVec3::ONE);
+        ((d.z * pn.y + d.y) * pn.x + d.x) as usize
+    };
+    let points: Vec<IVec3> = (0..pn.x * pn.y * pn.z).map(|k| plo + IVec3::new(k % pn.x, (k / pn.x) % pn.y, k / (pn.x * pn.y))).collect();
+    let mut g = unclamped(form, l, below, plo, phi);
+    let sat = if l <= below { band } else { form.band(below) };
+    let reach = 0.95 * form.plateau(0);
+    // Level 0's distance over the box, for joins wider than this level holds one (see `compose_blocks`).
+    let coarse = (l > 0).then(|| {
+        let s = 1i32 << l;
+        let (clo, chi) = (plo.div_euclid(IVec3::splat(s)), phi.div_euclid(IVec3::splat(s)) + IVec3::ONE);
+        (clo, chi - clo + IVec3::ONE, form.samples(0, clo, chi), s as f32)
+    });
+    let far = |i: IVec3, c: f32| -> f32 {
+        let Some((clo, cn, g0, s)) = &coarse else { return c };
+        let t = ((c.abs() - 0.5 * sat) / (0.4 * sat)).clamp(0.0, 1.0);
+        if t == 0.0 {
+            return c;
+        }
+        let q = i.as_vec3() / *s - clo.as_vec3();
+        let b = q.floor().as_ivec3().clamp(IVec3::ZERO, *cn - IVec3::splat(2));
+        let f = q - b.as_vec3();
+        let c0: f32 = (0..8).map(|k| {
+            let j = b + corner_offset(k);
+            corner_weight(k, f) * g0[((j.z * cn.y + j.y) * cn.x + j.x) as usize]
+        }).sum();
+        let t = t * t * (3.0 - 2.0 * t);
+        c + (c0 - c) * t
+    };
+    // A run of detail layers (indices `run`) pushing out the field so far.
+    let push = |g: &Vec<f32>, run: &[usize]| -> Vec<f32> {
+        let s = offsets_of(stack, l, plo, phi, &|k, layer| layer.level <= l && run.contains(&k));
+        if s.iter().all(|x| *x == 0.0) {
+            return g.clone();
+        }
+        let pa = |i: IVec3| g[idx(i)];
+        let tri = |q: Vec3| {
+            let i = q.floor().as_ivec3();
+            let f = q - i.as_vec3();
+            (0..8).map(|c| corner_weight(c, f) * pa(i + corner_offset(c))).sum::<f32>()
+        };
+        points
+            .par_iter()
+            .enumerate()
+            .map(|(k, &i)| {
+                let s = s[k];
+                if s == 0.0 || pa(i).abs() > band + s.abs() + v {
+                    return pa(i);
+                }
+                let n = Vec3::new(pa(i + IVec3::X) - pa(i - IVec3::X), pa(i + IVec3::Y) - pa(i - IVec3::Y), pa(i + IVec3::Z) - pa(i - IVec3::Z));
+                tri(i.as_vec3() - n.normalize_or_zero() * (s / v))
+            })
+            .collect()
+    };
+    let mut run: Vec<usize> = Vec::new();
+    for (k, x) in stack.iter().enumerate() {
+        if !x.visible {
+            continue;
+        }
+        let Some(part) = x.scatter.as_ref() else {
+            run.push(k);
+            continue;
+        };
+        if !run.is_empty() {
+            g = push(&g, &run);
+            run.clear();
+        }
+        let gg = &part.g;
+        let mut near = Vec::new();
+        gg.near(origin + plo.as_vec3() * v, origin + phi.as_vec3() * v, gg.pad() + v, &mut near);
+        if near.is_empty() {
+            continue;
+        }
+        let scale = 2f32.powi(x.level as i32 - l as i32);
+        let mask = (!x.m.is_empty()).then(|| Sparse::new(&x.m, 1.0));
+        g = points
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| {
+                let m = mask.as_ref().map_or(1.0, |m| m.linear(i.as_vec3() * scale).clamp(0.0, 1.0));
+                gg.apply(far(i, g[k]).clamp(-reach, reach), origin + i.as_vec3() * v, &near, m)
+            })
+            .collect();
+    }
+    if !run.is_empty() {
+        g = push(&g, &run);
+    }
+    let n = hi - lo + IVec3::ONE;
+    (0..n.x * n.y * n.z).map(|k| g[idx(lo + IVec3::new(k % n.x, (k / n.x) % n.y, k / (n.x * n.y)))]).collect()
 }
 
 /// Compose the shown blocks `targets` (level, block), level by level.
@@ -680,7 +901,7 @@ impl FollowJob {
                         } else if self.form.exists(m, bc) {
                             let (v, origin) = (self.form.voxel(m), self.form.origin());
                             let lo = origin + (bc * B).as_vec3() * v;
-                            if part.g.touches(lo, lo + Vec3::splat(B as f32 * v), part.g.blend() + self.form.band(m) + v) {
+                            if part.g.touches(lo, lo + Vec3::splat(B as f32 * v), part.g.pad() + self.form.band(m) + v) {
                                 blocks[m].insert(bc);
                                 changes.push((m, bc));
                             }
@@ -737,8 +958,9 @@ fn follow_heights(job: &FollowJob, k: usize) -> (LayerBlocks, Vec<(IVec3, Corner
     let l = current.level;
     let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
     let (top, below) = (form.levels() - 1, job.from - 1);
-    let new = |p: Vec3| form.value_upto(p, top, false);
-    let old = |p: Vec3| form0.value_upto(p, top, false);
+    let (under1, under0) = (Below::of(form, &job.stack, k, below), Below::of(form0, &job.stack0, k, below));
+    let new = |p: Vec3| under1.value(p, top);
+    let old = |p: Vec3| under0.value(p, top);
     let reach = 64.0 * form.voxel(below.saturating_sub(2));
     // The longest step a search takes: the form's fields are distances out to its finest level's band, and only
     // signs are trusted, so a step may go that far.
@@ -746,7 +968,18 @@ fn follow_heights(job: &FollowJob, k: usize) -> (LayerBlocks, Vec<(IVec3, Corner
     // How far heights may stand out, and how far this layer's do (what decides which blocks hold any of it).
     let limit = MOST * form.voxel(job.from);
     let tall = tallest(layer0).max(tallest(current)).min(limit) + v;
-    let src = under(l, region, layer0);
+    let mut src = under(l, region, layer0);
+    // At the end, the layer's blocks over generators under it: what they scatter moved with the form wherever it
+    // hangs from, which is not where these blocks are.
+    if end && !(under0.gens.is_empty() && under1.gens.is_empty()) {
+        let size = v * B as f32;
+        let over = |bc: &IVec3| {
+            let lo = origin + (*bc * B).as_vec3() * v;
+            under0.gens.iter().chain(&under1.gens).any(|(g, ..)| g.touches(lo, lo + Vec3::splat(size), g.pad() + band))
+        };
+        let had: HashSet<IVec3> = src.iter().copied().collect();
+        src.extend(layer0.h.keys().filter(|bc| !had.contains(*bc) && over(bc)).copied().collect::<Vec<_>>());
+    }
     let mut dest: HashSet<IVec3> = src.iter().copied().collect();
     dest.extend(under(l, region, current));
     dest.extend(job.also.iter().filter(|a| a.0 == k).map(|a| a.1));
@@ -764,7 +997,7 @@ fn follow_heights(job: &FollowJob, k: usize) -> (LayerBlocks, Vec<(IVec3, Corner
                 .filter_map(|q| {
                     let g = if q == 8 { IVec3::splat(B / 2) } else { corner_offset(q) * B };
                     let c = origin + (bc * B + g).as_vec3() * v;
-                    let n0 = normal(form0, c, below);
+                    let n0 = under0.normal(c);
                     let y0 = root(&old, c, n0, 0.25 * v, far, reach)?;
                     let u = form.push_dir(y0, n0);
                     let y1 = root(&new, y0, u, 0.25 * v, far, reach)?;
@@ -784,20 +1017,31 @@ fn follow_heights(job: &FollowJob, k: usize) -> (LayerBlocks, Vec<(IVec3, Corner
     // out the fields hold only a bound).
     let measure = |i: IVec3| -> Option<(Vec3, f32)> {
         let p = origin + i.as_vec3() * v;
-        let n1 = normal(form, p, below);
+        let n1 = under1.normal(p);
         let o = root(&new, p, n1, 0.25 * v, far, reach).and_then(|y1| {
-            let n0 = normal(form0, y1, below);
+            let n0 = under0.normal(y1);
             let n0 = if n0 == Vec3::ZERO { n1 } else { n0 };
             let u = form.push_dir(y1, n0);
             // As far out from the surface the stroke began on, along its normal there, as `p` is out of the new one:
             // where the stroke tilted the surface, the same offset along the new normal would land beside the point it
             // came from.
             root(&old, y1, u, 0.25 * v, far, reach).map(|y0| {
-                let n = normal(form0, y0, below);
+                let n = under0.normal(y0);
                 let n = if n == Vec3::ZERO { n1 } else { n };
                 (y0 + n * (p - y1).dot(n1) - p, (p - y1).dot(n1))
             })
         });
+        // On what a generator scattered: where it was, moved whole (eased into the search across the join).
+        let o = match under1.rigid(&under0, p) {
+            Some((from, w)) => {
+                let d = o.map_or_else(|| under1.value(p, top), |o| o.1);
+                Some((match o {
+                    Some((m, _)) if w < 1.0 => m * (1.0 - w) + (from - p) * w,
+                    _ => from - p,
+                }, d))
+            }
+            None => o,
+        };
         o.map(|(o, d)| (o / v, d))
     };
     // The move, measured every `EVERY` steps: from each point to the new surface, and from there back to the surface
@@ -996,7 +1240,8 @@ impl Layered {
         let built: Vec<(IVec3, Option<Box<[f32; N]>>)> = keys
             .par_iter()
             .map(|&bc| {
-                let base = |p: Vec3| form.value_upto(p, below, false);
+                let under = Below::of(form, stack, k, below);
+                let base = |p: Vec3| under.value(p, below);
                 let top = |p: Vec3| detail.value_upto(p, detail.levels() - 1, false);
                 let others = offsets(stack, l, bc * B, bc * B + IVec3::splat(B - 1), true, Some(k));
                 let mask = stack[k].m.get(&bc).cloned();
@@ -1017,9 +1262,9 @@ impl Layered {
                         *out = 0.0;
                         continue;
                     }
-                    let n = normal(form, x, below);
+                    let n = under.normal(x);
                     let Some(foot) = root(&base, x, n, 0.25 * v, 2.0 * v, 8.0 * band) else { continue };
-                    let n = normal(form, foot, below);
+                    let n = under.normal(foot);
                     let Some(y) = root(&top, foot, n, 0.1 * v, 0.5 * v, limit + v) else { continue };
                     *out = (((y - foot).dot(n) - others[i]) / m).clamp(-limit, limit);
                     any |= out.abs() > 1e-4 * v;
@@ -1337,7 +1582,7 @@ impl Layered {
         let (v, origin) = (self.form.voxel(l), self.form.origin());
         let lo = origin + (bc * B).as_vec3() * v;
         let hi = lo + Vec3::splat(B as f32 * v);
-        self.stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref()).any(|g| g.g.touches(lo, hi, g.g.blend() + self.form.band(l) + v))
+        self.stack.iter().filter(|x| x.visible).filter_map(|x| x.scatter.as_ref()).any(|g| g.g.touches(lo, hi, g.g.pad() + self.form.band(l) + v))
     }
 
     /// Mark the blocks over blocks `keys` of level `l`, at every level up to it.

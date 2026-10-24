@@ -224,12 +224,16 @@ impl VolumeDemo {
         // A generator layer.
         at(124.0, 2.5, Camera(Pose::whole(3.0, 0.35, 0.25)));
         at(126.5, 0.0, AddGenerator);
-        at(126.5, 6.0, Caption("A generator layer in the same stack: rocks scattered over the form, joined to it softly, in the field (no overhang limit)"));
+        at(126.5, 6.0, Caption("A generator layer in the same stack: rough rocks scattered over the form, joined to it softly, in the field (no overhang limit)"));
         at(130.0, 0.0, Generator(|s| s.count = 30));
         at(131.0, 0.0, Generator(|s| s.count = 60));
         at(132.5, 0.0, Generator(|s| s.size *= 1.5));
         at(133.5, 0.0, Generator(|s| s.blend = 0.6));
         at(132.5, 4.0, Caption("Count, size, blend: each edit is shown at once (a drag previews it no finer than level 1)"));
+        at(134.8, 0.0, Generator(|s| s.rough_kind = sculpt_core::noise::NoiseKind::Ridged));
+        at(135.6, 0.0, Generator(|s| s.rough = 0.0));
+        at(134.8, 1.7, Caption("Roughness: ridged, then none"));
+        at(136.4, 0.0, Generator(|s| { s.rough = 0.15; s.rough_kind = sculpt_core::noise::NoiseKind::Fbm; }));
         at(136.5, 0.0, Generator(|s| s.op = sculpt_core::generator::BoolOp::Subtract));
         at(136.5, 3.0, Caption("Subtract: the same scatter cuts pits"));
         at(139.5, 0.0, Generator(|s| s.op = sculpt_core::generator::BoolOp::Add));

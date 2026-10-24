@@ -15,6 +15,12 @@ struct Lv {
 }
 
 impl Lv {
+    /// A ball at level 0 step `voxel`, with `levels`, layered from `from`.
+    fn with(voxel: f32, levels: usize, from: usize) -> Lv {
+        let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, levels);
+        let l = Layered::new(&mut s, from);
+        Lv { l, s }
+    }
     fn ball() -> Lv {
         let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
         let l = Layered::new(&mut s, 2);
@@ -50,6 +56,28 @@ fn anchor(i: &Instance, lift: f32) -> (Vec3, Vec3) {
 /// How far the surface stands out along `n` at `p` (negative: a pit).
 fn out_at(v: &LevelVolume, p: Vec3, n: Vec3) -> f32 {
     v.raycast(p + n * 0.5, -n, v.levels() - 1, false).map_or(f32::NAN, |(q, _)| (q - p).dot(n))
+}
+
+/// The surface seen from `eye` straight down `-w`, `half` wide each way, shaded, as a grey PGM at `path` (when
+/// `SCULPT_GEN_PICTURE` names a folder).
+fn picture(v: &LevelVolume, eye: Vec3, w: Vec3, half: f32, name: &str) {
+    let Ok(dir) = std::env::var("SCULPT_GEN_PICTURE") else { return };
+    let u = w.any_orthonormal_vector();
+    let t = w.cross(u);
+    let n = 400;
+    let mut img = vec![0u8; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let (a, b) = (-half + 2.0 * half * x as f32 / n as f32, half - 2.0 * half * y as f32 / n as f32);
+            if let Some((_, nrm)) = v.raycast(eye + u * a + t * b, -w, v.levels() - 1, false) {
+                img[y * n + x] = (35.0 + 220.0 * nrm.dot((w * 0.8 + u * -0.4 + t * 0.5).normalize()).max(0.0)) as u8;
+            }
+        }
+    }
+    let mut out = format!("P5 {n} {n} 255
+").into_bytes();
+    out.extend(img);
+    std::fs::write(format!("{dir}/{name}.pgm"), out).unwrap();
 }
 
 fn surface_key(v: &LevelVolume, cap: usize) -> Vec<[i64; 3]> {
@@ -202,7 +230,7 @@ fn timing_at_app_scale() {
     let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, 0.0035 * 2.0, 6);
     let mut l = Layered::new(&mut s, 5);
     let size = 4.0 * s.voxel(0);
-    let spec = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 1, size, lift: 0.15, random_spin: true, min_spacing: 3.0 * size, size_var: 0.4, stretch_var: 0.35, tilt: 25.0, blend: 0.3, ..GeneratorSpec::default() };
+    let spec = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 1, size, lift: 0.15, random_spin: true, min_spacing: 3.0 * size, size_var: 0.4, stretch_var: 0.35, tilt: 25.0, blend: 0.3, rough: if std::env::var_os("SMOOTH").is_some() { 0.0 } else { 0.25 }, ..GeneratorSpec::default() };
     for level in [1usize, 2, 3] {
         let t = Instant::now();
         let k = l.add_generator(&mut s, "Rocks", level, &spec);
@@ -614,4 +642,132 @@ fn a_blend_wider_than_the_form_holds_distances_leaves_no_steps() {
     }
     eprintln!("level 0 near the surface: neighbouring samples across block faces at most {worst:.2} steps apart (band {:.0} steps)", band / v0);
     assert!(worst < 1.6, "a step at a block's face: {worst} steps");
+}
+
+/// Rough rocks: their surface varies by about the roughness, within it, and stays closed at every level.
+#[test]
+fn rough_rocks_vary_within_their_roughness() {
+    for kind in [sculpt_core::noise::NoiseKind::Fbm, sculpt_core::noise::NoiseKind::Cellular] {
+        let mut lv = Lv::ball();
+        let spec = GeneratorSpec { rough: 0.25, rough_scale: 2.5, rough_kind: kind, lift: 0.4, ..rocks() };
+        let k = lv.add(2, &spec);
+        let amp = 0.25 * 0.1;
+        let (mut lo, mut hi, mut sum, mut sum2, mut n) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f32, 0.0f32, 0.0f32);
+        for i in lv.l.generator_instances(k) {
+            let up = i.rotation * Vec3::Y;
+            let (t1, t2) = (up.any_orthonormal_vector(), up.cross(up.any_orthonormal_vector()));
+            for a in 0..16 {
+                for e in 0..3 {
+                    let (th, ph) = (a as f32 * 0.3927, e as f32 * 0.35);
+                    let d = (up * ph.cos() + (t1 * th.cos() + t2 * th.sin()) * ph.sin()).normalize();
+                    // Along `d` from the centre: the radius of the rock there (a sphere of 0.1, stretched none here).
+                    let Some((q, _)) = lv.s.raycast(i.translation + d * 0.3, -d, 3, false) else { continue };
+                    let r = (q - i.translation).dot(d);
+                    lo = lo.min(r);
+                    hi = hi.max(r);
+                    sum += r;
+                    sum2 += r * r;
+                    n += 1.0;
+                }
+            }
+        }
+        let sd = (sum2 / n - (sum / n).powi(2)).max(0.0).sqrt();
+        eprintln!("{kind:?}: radius {lo:.4} to {hi:.4}, spread {sd:.4} (smooth 0.1, roughness up to {amp})");
+        assert!(sd > 0.2 * amp, "{kind:?}: hardly rough");
+        assert!(lo > 0.1 - amp - 0.01 && hi < 0.1 + amp + 0.01, "{kind:?}: rougher than its roughness");
+        for cap in 0..4 {
+            let (open, _, dropped) = closed(&lv.s, cap);
+            assert_eq!((open, dropped), (0, 0), "{kind:?} cap {cap}");
+        }
+    }
+}
+
+/// Rough rocks of each kind pictured from the front (`SCULPT_GEN_PICTURE`).
+#[test]
+#[ignore]
+fn picture_rough_rocks() {
+    let dir = std::env::var("SCULPT_GEN_PICTURE").unwrap_or(std::env::temp_dir().to_string_lossy().into_owned());
+    for (name, kind) in [("fbm", sculpt_core::noise::NoiseKind::Fbm), ("ridged", sculpt_core::noise::NoiseKind::Ridged), ("cellular", sculpt_core::noise::NoiseKind::Cellular)] {
+        let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
+        let mut l = Layered::new(&mut s, 3);
+        let spec = GeneratorSpec { count: 40, min_spacing: 0.3, size: 0.12, rough: 0.3, rough_scale: 1.5, rough_kind: kind, size_var: 0.4, stretch_var: 0.4, tilt: 25.0, random_spin: true, blend: 0.3, lift: 0.1, ..rocks() };
+        l.add_generator(&mut s, "Rocks", 3, &spec);
+        let n = 500;
+        let mut img = vec![0u8; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let (px, py) = (-0.6 + 1.2 * x as f32 / n as f32, 0.6 - 1.2 * y as f32 / n as f32);
+                if let Some((_, nrm)) = s.raycast(Vec3::new(px, py, 3.0), -Vec3::Z, 4, false) {
+                    img[y * n + x] = (35.0 + 220.0 * nrm.dot(Vec3::new(-0.4, 0.5, 0.8).normalize()).max(0.0)) as u8;
+                }
+            }
+        }
+        let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+        out.extend(img);
+        std::fs::write(format!("{dir}/rough_{name}.pgm"), out).unwrap();
+    }
+}
+
+/// Detail painted on a rock, in a layer over the generator: it stands on the rock, and when a stroke on the form
+/// carries the rock along, the detail goes with it.
+#[test]
+fn detail_on_a_rock_rides_the_rock() {
+    let mut lv = Lv::with(0.02, 5, 3);
+    let k = lv.add(1, &GeneratorSpec { size: 0.12, lift: 0.2, ..rocks() });
+    let top_layer = lv.l.add_layer("On the rocks", 4);
+    assert!(top_layer > k);
+    // The rock nearest the front, and bumps painted on its top (three, at level 4).
+    let inst = lv.l.generator_instances(k);
+    let (ri, rock) = inst.iter().enumerate().max_by(|a, b| a.1.translation.z.total_cmp(&b.1.translation.z)).map(|(i, r)| (i, *r)).unwrap();
+    let up = rock.rotation * Vec3::Y;
+    let side = up.any_orthonormal_vector();
+    let spots: Vec<Vec3> = (0..3).map(|j| (up * 0.12 + side * (0.03 * (j as f32 - 1.0))).normalize() * 0.12).collect();
+    let rock_out = |lv: &Lv, r: &Instance, d: Vec3| -> f32 {
+        // In the rock's own frame: turned as the rock turned since the bumps were painted.
+        let dir = (r.rotation * rock.rotation.inverse() * d).normalize();
+        // From close by: a ray from far off can step over a bump this thin.
+        lv.s.raycast(r.translation + dir * 0.2, -dir, 4, false).map_or(f32::NAN, |(q, _)| (q - r.translation).dot(dir))
+    };
+    let bare: Vec<f32> = spots.iter().map(|d| rock_out(&lv, &rock, *d)).collect();
+    for d in &spots {
+        lv.s.begin_stroke();
+        lv.s.ball_dab(4, rock.translation + d.normalize() * (bare[0] + 0.002), 0.008, 0.002, false);
+        lv.s.end_stroke();
+        lv.l.take_detail(&mut lv.s);
+    }
+    let painted: Vec<f32> = spots.iter().zip(&bare).map(|(d, b)| rock_out(&lv, &rock, *d) - b).collect();
+    eprintln!("bumps painted on the rock: {painted:.4?} out of it; layer blocks {}", lv.l.layers()[top_layer].blocks);
+    assert!(painted.iter().all(|h| *h > 0.004), "the bumps did not stand on the rock");
+    let (open, _, dropped) = closed(&lv.s, 4);
+    assert_eq!((open, dropped), (0, 0));
+    picture(&lv.s, rock.translation + up * 0.3, up, 0.2, "rock_detail_before");
+    // Composing it afresh (as opening the file does) shows the same.
+    {
+        let mut buf = Vec::new();
+        lv.l.write_to(&mut buf).unwrap();
+        let (fresh, _) = Layered::read_from(&mut &buf[..], 5).unwrap();
+        assert_eq!(lv.s.keys(), fresh.keys());
+        assert!(lv.s.keys().iter().all(|k| lv.s.block(*k).unwrap().iter().zip(fresh.block(*k).unwrap().iter()).all(|(x, y)| (x - y).abs() < 1e-4)));
+    }
+    // A big stroke on the form under the rock.
+    let p0 = rock.translation - up * (0.2 * 0.12);
+    lv.l.begin_stroke();
+    for s in 0..12 {
+        let dir = (p0 + Vec3::new(-0.12 + 0.02 * s as f32, 0.0, 0.0)).normalize();
+        let Some((hit, n)) = lv.l.form().raycast(dir * 3.0, -dir, 0, true) else { continue };
+        let _ = lv.l.plane_dab(&mut lv.s, 0, hit, n, 0.35, 0.035, 0.5, 0.4, false);
+    }
+    lv.l.end_stroke(&mut lv.s);
+    lv.l.settle(&mut lv.s);
+    let moved = lv.l.generator_instances(k)[ri];
+    let shift = (moved.translation - rock.translation).length();
+    let tops: Vec<f32> = spots.iter().map(|d| rock_out(&lv, &moved, *d)).collect();
+    eprintln!("the rock moved {shift:.4}; out of its centre now {tops:.4?} (bare {bare:.4?}, painted {:.4?})", spots.iter().zip(&bare).zip(&painted).map(|((_, b), p)| b + p).collect::<Vec<_>>());
+    assert!(shift > 0.01, "the rock did not move");
+    picture(&lv.s, moved.translation + up * 0.3, up, 0.2, "rock_detail_after");
+    for ((t, b), p) in tops.iter().zip(&bare).zip(&painted) {
+        assert!((t - (b + p)).abs() < 0.25 * p + 0.001, "a bump did not ride the rock: {t} against {}", b + p);
+    }
+    let (open, _, dropped) = closed(&lv.s, 4);
+    assert_eq!((open, dropped), (0, 0));
 }

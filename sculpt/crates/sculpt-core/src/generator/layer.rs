@@ -111,10 +111,24 @@ pub struct GeneratorSpec {
     /// `0` is a hard cut, around `0.25` rounds the join. The live displacement preview ignores it.
     #[serde(default = "default_blend")]
     pub blend: f32,
+    /// How rough each instance's surface is: noise displacing it by up to this fraction of its size (`0`: smooth).
+    /// On a volume, rocks come out as stones; the mesh preview ignores it.
+    #[serde(default)]
+    pub rough: f32,
+    /// Bumps of the roughness per instance size.
+    #[serde(default = "default_rough_scale")]
+    pub rough_scale: f32,
+    /// The roughness's kind: smooth (fBm), ridged, or cellular (chunky facets).
+    #[serde(default)]
+    pub rough_kind: crate::noise::NoiseKind,
 }
 
 fn default_blend() -> f32 {
     0.25
+}
+
+fn default_rough_scale() -> f32 {
+    1.5
 }
 
 impl Default for GeneratorSpec {
@@ -137,6 +151,9 @@ impl Default for GeneratorSpec {
             density: Density::Even,
             mapping: Vec::new(),
             blend: default_blend(),
+            rough: 0.0,
+            rough_scale: default_rough_scale(),
+            rough_kind: crate::noise::NoiseKind::Fbm,
         }
     }
 }

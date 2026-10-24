@@ -468,6 +468,7 @@ impl VolumeMode {
         // Rocks a few hundredths of the object across, at the coarsest level giving them about a dozen steps a radius.
         let (lo, hi) = self.vol.bounds();
         let size = 0.03 * (hi - lo).max_element();
+        // (Roughness keeps the octaves that level holds; a finer level shows more of it, at more cost.)
         let level = (0..=top).find(|&l| self.vol.voxel(l) <= size / 12.0).unwrap_or(top);
         let spec = GeneratorSpec {
             primitive: Primitive::Sphere,
@@ -482,6 +483,7 @@ impl VolumeMode {
             stretch_var: 0.35,
             tilt: 25.0,
             blend: 0.3,
+            rough: 0.15,
             ..GeneratorSpec::default()
         };
         let t = Instant::now();

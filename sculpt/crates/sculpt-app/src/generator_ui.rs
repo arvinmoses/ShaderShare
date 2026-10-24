@@ -234,6 +234,25 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
         let r = prop(ui, "Spin", |ui| ui.checkbox(&mut next.random_spin, "Random"));
         note(&r, c, co);
         ui.add_space(4.0);
+        vslider(ui, "Roughness", egui::Slider::new(&mut next.rough, 0.0..=0.6).max_decimals(2), Some("Noise on each instance's surface, up to this fraction of its size: rocks become stones."), c, co, d);
+        vslider(ui, "Bump size", egui::Slider::new(&mut next.rough_scale, 0.3..=8.0).logarithmic(true).max_decimals(1), Some("Bumps of the roughness across one instance."), c, co, d);
+        prop(ui, "Rough kind", |ui| {
+            use sculpt_core::noise::NoiseKind;
+            let name = |k: NoiseKind| match k {
+                NoiseKind::Ridged => "Ridged",
+                NoiseKind::Cellular => "Pitted",
+                _ => "Smooth",
+            };
+            egui::ComboBox::from_id_salt(("vgen_rough", k)).selected_text(name(next.rough_kind)).show_ui(ui, |ui| {
+                for kind in [NoiseKind::Fbm, NoiseKind::Ridged, NoiseKind::Cellular] {
+                    if ui.selectable_label(next.rough_kind == kind, name(kind)).clicked() {
+                        next.rough_kind = kind;
+                        *c = true;
+                    }
+                }
+            })
+        });
+        ui.add_space(4.0);
         ui.label(RichText::new(format!("Last edit shown in {ms:.1} ms (while dragging, no finer than level 1; at its own level on release, {full:.0} ms). Sculpting the form carries it along; its mask (Layers panel) fades it.")).small().color(weak));
     });
     let Some(m) = app.volume_mode.as_mut() else { return };

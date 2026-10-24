@@ -308,6 +308,21 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   counts as six steps away wherever it is farther, the same in every block, and a fine level whose own distance is
   near its clamp reads level 0's instead (1.2 steps apart at most). Test:
   `a_blend_wider_than_the_form_holds_distances_leaves_no_steps`.
+* **Rough rocks.** Roughness displaces each instance's own field by noise before the join, up to a fraction of its
+  size (0.15 for a new layer, 1.5 bumps an instance, in the octaves its level holds: none finer than four of its steps, which would only alias, as froth): smooth (fBm, 3 octaves), ridged, or pitted (cells pressed in). Each
+  kind's samples are spread to about -1 to 1 and held to it, so the setting is the most it moves the surface (test:
+  radius 0.0795 to 0.1204 for a roughness of 0.025 on a radius of 0.1). It costs about twice a smooth layer's edit
+  (more blocks, and the noise): a drag step 14-19 ms, on release 77 ms at level 2. `volume/rough_rocks.png`: smooth,
+  ridged, pitted.
+* **Detail over what a generator scattered.** The stack is composed in its order: the form, then each run of detail
+  layers pushing out what is under it, and each generator joined to it; so a detail layer above a generator stands on
+  its rocks (a stack without one composes as before). Painting reads heights off that surface, and following finds
+  each point's source on it: where an instance is nearer than the form, where the point was on that instance before
+  the stroke moved it (it moves whole, turning with the surface it hangs from), eased into the usual search across
+  the join. Test `detail_on_a_rock_rides_the_rock`: bumps 0.0100 tall painted on a rock, the rock carried 0.0435 by
+  a big stroke on the form, the bumps after it exactly as tall where they were on it (0.1298 out of its centre,
+  before and after). `volume/rock_detail_rides.png`: before and after; the faint plate round the bumps is shading
+  where finer blocks begin (the surface there matches the coarser one to 0.00003).
 * **Its mask** fades it, starting whole wherever it changes the field.
 * **Seen.** `volume/generator_layers.png` (from the review, 126-152 s): rocks added; 60 of them, larger, blended wider;
   the same scatter cutting pits; the form sculpted under them; a rock masked away.
@@ -315,9 +330,8 @@ layers, with a level, a mask and visibility of its own, and saves with them (lay
   stroke, an edit shows what building it afresh shows and undoes, a previewed drag ends as the edit made at once,
   saving and opening, the mask fading a rock away.
 
-Not done yet: noise and edge generators in the stack (the mesh's noise layer and edge cutters), density and painted
-placement, intersect, and generators over detail layers (detail painted on a rock rides the form under it, not the
-rock).
+Not done yet: a noise layer over the whole surface (finer than level 0 it needs fine blocks everywhere: better done
+on the GPU, as the blocks are extracted), edge generators, density and painted placement, and intersect.
 
 ## The level by distance
 

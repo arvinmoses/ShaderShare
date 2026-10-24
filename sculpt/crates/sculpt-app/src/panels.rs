@@ -579,7 +579,7 @@ pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
                 }
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Sculpting the form carries every layer along. Each layer has its own resolution: coarse ones cost little, and hold broad detail; fine ones hold the smallest. Layers add up, so their order does not matter. Saved with the volume.")
+                    RichText::new("Sculpting the form carries every layer along. Each layer has its own resolution: coarse ones cost little, and hold broad detail; fine ones hold the smallest. Detail layers add up; a detail layer above a generator stands on what it scattered, and rides it. Saved with the volume.")
                         .small()
                         .color(weak),
                 );
