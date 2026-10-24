@@ -2126,6 +2126,97 @@ impl Layered {
         self.active
     }
 
+    /// The blocks of `level` near the form's surface where surface noise layer `k` shows (its mask not wholly off):
+    /// what baking it there would hold.
+    pub fn noise_blocks(&self, k: usize, level: usize) -> Vec<IVec3> {
+        let Some(x) = self.stack.get(k).filter(|x| x.noise.is_some()) else { return Vec::new() };
+        let level = level.clamp(self.from, self.form.levels() - 1);
+        let (form, origin, below) = (&self.form, self.form.origin(), self.from - 1);
+        let (v, v0) = (form.voxel(level), form.voxel(0));
+        let reach = form.band(level) + x.noise.map_or(0.0, |n| n.amplitude) + 0.5 * 3f32.sqrt() * B as f32 * v;
+        let s = 1i32 << level;
+        let mut l0 = form.level_keys(0);
+        l0.retain(|bc| {
+            let c = origin + (bc.as_vec3() + Vec3::splat(0.5)) * B as f32 * v0;
+            form.value_upto(c, 0, false).abs() < 0.5 * 3f32.sqrt() * B as f32 * v0 + reach
+        });
+        l0.par_iter()
+            .flat_map_iter(|&b0| {
+                let m = &x.m;
+                (0..s * s * s).filter_map(move |q| {
+                    let bc = b0 * s + IVec3::new(q % s, (q / s) % s, q / (s * s));
+                    let c = origin + (bc.as_vec3() + Vec3::splat(0.5)) * B as f32 * v;
+                    let near = form.value_upto(c, below, false).abs() < reach;
+                    (near && mask_at(form, m, 0, c) > 1e-3).then_some(bc)
+                })
+            })
+            .collect()
+    }
+
+    /// About how many blocks [`Self::noise_blocks`] finds at `level` (level 0's blocks on the surface where the mask is
+    /// not wholly off, four times as many a level finer): cheap enough to show as the level is chosen.
+    pub fn noise_estimate(&self, k: usize, level: usize) -> usize {
+        let Some(x) = self.stack.get(k).filter(|x| x.noise.is_some()) else { return 0 };
+        let (form, origin) = (&self.form, self.form.origin());
+        let v0 = form.voxel(0);
+        let n = form
+            .level_keys(0)
+            .par_iter()
+            .filter(|bc| {
+                let c = origin + (bc.as_vec3() + Vec3::splat(0.5)) * B as f32 * v0;
+                form.value_upto(c, 0, false).abs() < 0.5 * B as f32 * v0 && mask_at(form, &x.m, 0, c) > 1e-3
+            })
+            .count();
+        n << (2 * level)
+    }
+
+    /// Bake surface noise layer `k` into a new detail layer at `level`: heights of the noise (in the octaves that level
+    /// holds) faded by its mask, over its blocks there ([`Self::noise_blocks`]). The noise layer is hidden, so it is not
+    /// drawn twice. One undo step. Returns the new layer.
+    pub fn bake_noise(&mut self, shown: &mut LevelVolume, k: usize, level: usize) -> Option<usize> {
+        let x = self.stack.get(k).filter(|x| x.noise.is_some())?.clone();
+        let noise = x.noise?;
+        let level = level.clamp(self.from, self.form.levels() - 1);
+        let keys = self.noise_blocks(k, level);
+        self.history.push(Undo::Layers(self.stack.clone()));
+        self.redo.clear();
+        self.base_epoch += 1;
+        self.noise_epoch += 1;
+        let (form, origin, below) = (&self.form, self.form.origin(), self.from - 1);
+        let v = form.voxel(level);
+        let octaves = noise.octaves_for(v, 4.0).max(1);
+        let limit = MOST * form.voxel(self.from);
+        let built: Vec<(IVec3, Box<[f32; N]>)> = keys
+            .par_iter()
+            .map(|&bc| {
+                let mut h = Box::new([0.0f32; N]);
+                for (i, o) in h.iter_mut().enumerate() {
+                    let p = origin + (bc * B + cell(i)).as_vec3() * v;
+                    // At the form's surface point nearest (along its normal), as the GPU reads it.
+                    let d = form.value_upto(p, below, false);
+                    let foot = p - normal(form, p, below) * d;
+                    *o = (noise.height(foot, octaves) * mask_at(form, &x.m, 0, foot)).clamp(-limit, limit);
+                }
+                (bc, h)
+            })
+            .collect();
+        let mut layer = Layer::new(&format!("{} (baked)", x.name), level);
+        for (bc, h) in built {
+            if h.iter().any(|v| v.abs() > 1e-6) {
+                layer.h.insert(bc, Stored::from(h));
+                layer.m.insert(bc, Stored::from(Box::new([1.0f32; N])));
+            }
+        }
+        let changes: Vec<(usize, IVec3)> = layer.h.keys().map(|bc| (level, *bc)).collect();
+        self.stack[k].visible = false;
+        // Under the generators, as noise on the form is (a detail layer above one would ride its rocks instead).
+        let at = self.stack.iter().position(|x| x.scatter.is_some()).unwrap_or(self.stack.len());
+        self.stack.insert(at, layer);
+        self.active = at;
+        self.compose(shown, &changes);
+        Some(at)
+    }
+
     /// Surface noise layer `k`'s settings.
     pub fn noise(&self, k: usize) -> Option<&crate::surface_noise::SurfaceNoise> {
         self.stack.get(k)?.noise.as_ref()

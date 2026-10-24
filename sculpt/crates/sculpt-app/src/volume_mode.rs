@@ -537,6 +537,17 @@ impl VolumeMode {
         }
     }
 
+    /// Bake surface noise layer `k` into a new detail layer at `level` (see `Layered::bake_noise`).
+    pub fn bake_noise(&mut self, k: usize, level: usize) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut()
+            && let Some(at) = layer.bake_noise(&mut self.vol, k, level)
+        {
+            layer.set_active(at);
+            self.target = Target::Detail;
+        }
+    }
+
     /// The surface noise shown, if any: its settings, its mask's blocks, and when either last changed.
     pub fn shown_noise(&self) -> Option<(SurfaceNoise, &sculpt_core::generator::level_volume::Shared<glam::IVec3, sculpt_core::generator::level_volume::Stored>, u64)> {
         let layer = self.layer.as_ref()?;

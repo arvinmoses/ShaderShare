@@ -368,7 +368,36 @@ pub(crate) fn volume_noise_props(app: &mut SculptApp, ui: &mut Ui) {
         ui.add_space(4.0);
         ui.label(RichText::new("Drawn by the GPU over the whole surface, finer than any level; not in the field, so brushes work on the surface under it. Its mask (Layers panel) fades it.").small().color(weak));
     });
+    // Baking it into a detail layer, where its mask lets it show, at a level chosen beside an estimate of the cost.
     let Some(m) = app.volume_mode.as_mut() else { return };
+    let Some(layer) = m.layer.as_ref() else { return };
+    let (from, top) = (layer.from(), m.vol.levels() - 1);
+    let id = ui.id().with(("bake_level", k));
+    let mut level = ui.data_mut(|d| *d.get_temp_mut_or(id, from)).clamp(from, top);
+    let est_id = ui.id().with(("bake_estimate", k, level, layer.noise_epoch()));
+    let estimate = match ui.data(|d| d.get_temp::<usize>(est_id)) {
+        Some(e) => e,
+        None => {
+            let e = layer.noise_estimate(k, level);
+            ui.data_mut(|d| d.insert_temp(est_id, e));
+            e
+        }
+    };
+    let mut bake = false;
+    ui.horizontal(|ui| {
+        bake = ui.button("Bake into a layer").on_hover_text("Puts the noise in the field as a detail layer at the level beside (the octaves it holds), where its mask lets it show, and hides this layer. One undo.").clicked();
+        egui::ComboBox::from_id_salt(("bake_level_combo", k)).selected_text(format!("level {level}")).show_ui(ui, |ui| {
+            for l in from..=top {
+                ui.selectable_value(&mut level, l, format!("level {l}"));
+            }
+        });
+    });
+    ui.data_mut(|d| d.insert_temp(id, level));
+    ui.label(RichText::new(format!("About {} blocks{}", estimate, if estimate > 200_000 { ": a lot; mask it to where it is wanted, or bake coarser" } else { "" })).small().color(weak));
+    if bake {
+        m.bake_noise(k, level);
+        return;
+    }
     if changed && n != n0 {
         m.set_noise(k, n, dragging || coalesce);
     } else if !dragging {

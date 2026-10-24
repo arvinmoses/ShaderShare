@@ -375,21 +375,32 @@ edge placement yet.
 ## Surface noise, drawn by the GPU
 
 Noise over the whole surface along its normal, as ZBrush's surface noise is: not in the field (brushes work on the
-surface under it), drawn by the GPU as the surface is shown ("Surface noise" at the top of the Layers panel: height,
-bumps per unit, octaves, smooth or ridged, seed; saved with the volume after the layers, as an `SNOI` section).
+surface under it), drawn by the GPU as the surface is shown. It is a layer in the stack ("New surface noise" in the
+Layers panel; its settings under Properties: height, bumps per unit, octaves, smooth or ridged, seed), with a mask
+and visibility like any layer, saved with the layers (section version 3). Files from before kept it after the volume
+(an `SNOI` section); they open with it as a layer.
 
 * **Vertices** move by the octaves their block's lattice holds (none shorter than four of its steps), so the
   silhouette shows the coarse noise without aliasing the fine.
 * **Every pixel** is shaded by all of them: the normal tilted by the noise's slope along the surface (forward
   differences over an eighth of its finest wavelength, read at the point before it moved), so octaves far finer than
   any level show.
+* **Its mask** lives at level 0's lattice, painted with "Mask: hide / show" as any layer's (whole where none is
+  painted, blocks made along the surface as it is painted). The GPU looks it up per vertex and per pixel: a small
+  hash of the painted level 0 blocks and their 9x9x9 samples, sent again only when the noise changes.
 * **The same noise on the CPU** (`sculpt_core::surface_noise`, gradient noise from an integer hash: no table for the
-  shader to hold), to bake it as seen. The GPU check (`--gpu-levels-check`) evaluates the shader's copy at 4,096 points
-  for each kind and some octave counts: within 0.001% of its height of the CPU's.
+  shader to hold). The GPU check (`--gpu-levels-check`) evaluates the shader's copy at 4,096 points for each kind and
+  some octave counts: within 0.001% of its height of the CPU's.
+* **Baking it** ("Bake into a layer" under its settings): a detail layer at a chosen level (the layers' first or
+  finer) holding the noise's heights in the octaves that level holds, faded by its mask, over level 0's blocks where
+  the mask is not wholly off; the noise layer is hidden; one undo. Test: the baked surface stands out of a ball by the
+  noise within 0.00024 (level 3 step 0.00375), none where masked away. Over a whole surface at a fine level that is
+  millions of blocks (the panel shows an estimate first): mask it to where it is wanted.
 * `volume/surface_noise.png`: off; smooth; ridged; close up (`SCULPT_DEMO_SCRIPT=noise sculpt-app --demo-volume DIR`).
 
-Not done yet: a mask for it, and baking it into a layer (over the whole surface at a fine level that is millions of
-blocks; within a mask it is not).
+Not done yet: a quick way to hide the mask everywhere and paint the noise in only where wanted (now it is painted
+away where not wanted), and baking off the frame.
+
 
 ## The level by distance
 
