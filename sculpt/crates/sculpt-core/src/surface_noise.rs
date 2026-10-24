@@ -68,6 +68,41 @@ pub fn gradient(p: Vec3, seed: u32) -> f32 {
     lerp(w, lerp(v, lerp(u, c(0, 0, 0), c(1, 0, 0)), lerp(u, c(0, 1, 0), c(1, 1, 0))), lerp(v, lerp(u, c(0, 0, 1), c(1, 0, 1)), lerp(u, c(0, 1, 1), c(1, 1, 1))))
 }
 
+/// Worley F1 at `q`: the distance to the nearest of one jittered point per unit cell.
+pub fn cellular(q: Vec3, seed: u32) -> f32 {
+    let c = q.floor();
+    let (x, y, z) = (c.x as i32, c.y as i32, c.z as i32);
+    let mut best = f32::INFINITY;
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let h = hash3(x + dx, y + dy, z + dz, seed);
+                let j = Vec3::new((h & 1023) as f32, ((h >> 10) & 1023) as f32, ((h >> 20) & 1023) as f32) / 1023.0;
+                let f = Vec3::new((x + dx) as f32, (y + dy) as f32, (z + dz) as f32) + j;
+                best = best.min((q - f).length_squared());
+            }
+        }
+    }
+    best.sqrt()
+}
+
+/// A generator's roughness noise at `q` (in its own bumps), 0 to 1: `kind` 0 smooth (fBm), 1 ridged, 2 cellular.
+pub fn rough_sample(kind: u32, q: Vec3, octaves: u32, seed: u32) -> f32 {
+    if kind == 2 {
+        return cellular(q, seed).min(1.0);
+    }
+    let (mut sum, mut amp, mut freq, mut norm) = (0.0f32, 1.0f32, 1.0f32, 0.0f32);
+    for o in 0..octaves.max(1) {
+        let g = gradient(q * freq + Vec3::splat(o as f32 * 17.13), seed.wrapping_add(o));
+        sum += amp * if kind == 1 { (1.0 - g.abs()) * (1.0 - g.abs()) } else { g };
+        norm += amp;
+        amp *= 0.45;
+        freq *= 2.0;
+    }
+    let s = sum / norm;
+    (if kind == 0 { s * 0.5 + 0.5 } else { s }).clamp(0.0, 1.0)
+}
+
 impl SurfaceNoise {
     /// How far it moves the surface at `p` along its normal, from its first `octaves` (at most its own).
     pub fn height(&self, p: Vec3, octaves: u32) -> f32 {

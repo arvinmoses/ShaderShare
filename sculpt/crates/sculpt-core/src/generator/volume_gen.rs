@@ -27,7 +27,7 @@ use super::mapping::Mapper;
 use super::place::SurfaceSample;
 use super::{BoolOp, InstanceSet};
 use crate::geom::Aabb;
-use crate::noise::{Noise, NoiseParams};
+use crate::surface_noise::rough_sample;
 
 const B: i32 = 8;
 
@@ -44,7 +44,26 @@ pub struct VolumeGen {
     anchors: Arc<Vec<Anchor>>,
     set: Arc<InstanceSet>,
     /// The instances' roughness, when they have any.
-    rough: Option<Arc<Noise>>,
+    rough: Option<Rough>,
+}
+
+/// A generator's roughness noise: its kind (0 smooth, 1 ridged, 2 cellular), bumps per world unit, octaves and seed
+/// (read by [`rough_sample`], the same on the GPU).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rough {
+    pub kind: u32,
+    pub freq: f32,
+    pub octaves: u32,
+    pub seed: u32,
+}
+
+fn rough_kind(k: crate::noise::NoiseKind) -> u32 {
+    use crate::noise::NoiseKind::*;
+    match k {
+        Fbm | Perlin => 0,
+        Ridged | Turbulence => 1,
+        Cellular => 2,
+    }
 }
 
 /// A noise sample (0 to 1) as a bump from -1 to 1: each kind spread over about that range (summed octaves crowd round
@@ -52,7 +71,7 @@ pub struct VolumeGen {
 fn bump(kind: crate::noise::NoiseKind, n: f32) -> f32 {
     use crate::noise::NoiseKind::*;
     let b = match kind {
-        Fbm | Perlin => (n - 0.5) * 4.0,
+        Fbm | Perlin => (n - 0.5) * 3.0,
         Ridged | Turbulence => (n - 0.4) * 2.5,
         // Cells pressed in, so their rims stand: craggy rather than a heap of balls.
         Cellular => (0.4 - n) * 2.5,
@@ -217,9 +236,7 @@ impl VolumeGen {
                 place_instance(spec, &mapper, &s, i, count)
             })
             .collect();
-        let rough = (spec.rough > 0.0).then(|| {
-            Arc::new(Noise::new(&NoiseParams { kind: spec.rough_kind, scale: spec.rough_scale.max(0.01) / spec.size.max(1e-6), octaves: 3, gain: 0.45, seed: spec.seed as u32 ^ 0x5eed, ..Default::default() }))
-        });
+        let rough = (spec.rough > 0.0).then(|| Rough { kind: rough_kind(spec.rough_kind), freq: spec.rough_scale.max(0.01) / spec.size.max(1e-6), octaves: 3, seed: spec.seed as u32 ^ 0x5eed });
         let mut out = VolumeGen { spec: spec.clone(), anchors, set: Arc::new(InstanceSet::new(instances, 0.0)), rough };
         // Instances are found as far out as they can reach: the blend and the roughness.
         let reach = out.pad();
@@ -238,8 +255,9 @@ impl VolumeGen {
         while octaves < 3 && wave / (1u32 << octaves) as f32 >= 4.0 * voxel {
             octaves += 1;
         }
-        let spec = &self.spec;
-        self.rough = Some(Arc::new(Noise::new(&NoiseParams { kind: spec.rough_kind, scale: spec.rough_scale.max(0.01) / spec.size.max(1e-6), octaves, gain: 0.45, seed: spec.seed as u32 ^ 0x5eed, ..Default::default() })));
+        if let Some(r) = self.rough.as_mut() {
+            r.octaves = octaves;
+        }
         self
     }
 
@@ -271,6 +289,11 @@ impl VolumeGen {
     }
 
     /// The most the roughness moves an instance's surface, in world units.
+    /// Its roughness noise, if it has any.
+    pub fn rough(&self) -> Option<Rough> {
+        self.rough
+    }
+
     pub fn roughness(&self) -> f32 {
         if self.rough.is_some() { self.spec.rough.max(0.0) * self.spec.size } else { 0.0 }
     }
@@ -318,7 +341,7 @@ impl VolumeGen {
         let k = self.blend();
         // Roughness, where it can change what shows: the instances' field displaced by noise (centred on zero).
         let d = match &self.rough {
-            Some(n) if (if self.subtracts() { d < -c + k + self.roughness() } else { d < c + k + self.roughness() }) => d + self.roughness() * bump(self.spec.rough_kind, n.sample(p)),
+            Some(n) if (if self.subtracts() { d < -c + k + self.roughness() } else { d < c + k + self.roughness() }) => d + self.roughness() * bump(self.spec.rough_kind, rough_sample(n.kind, p * n.freq, n.octaves, n.seed)),
             _ => d,
         };
         let out = if self.subtracts() { -smin(-c, d, k) } else { smin(c, d, k) };

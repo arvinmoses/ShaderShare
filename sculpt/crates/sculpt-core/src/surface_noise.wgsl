@@ -81,3 +81,48 @@ fn sn_height(p: vec3<f32>, octaves: u32) -> f32 {
     }
     return SN_F.x * clamp(b, -1.0, 1.0);
 }
+
+// Worley F1 at `q`.
+fn sn_cellular(q: vec3<f32>, seed: u32) -> f32 {
+    let c = vec3<i32>(floor(q));
+    var best = 1e30;
+    for (var dz = -1; dz <= 1; dz++) {
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let h = sn_hash3(c.x + dx, c.y + dy, c.z + dz, seed);
+                let j = vec3<f32>(f32(h & 1023u), f32((h >> 10u) & 1023u), f32((h >> 20u) & 1023u)) / 1023.0;
+                let f = vec3<f32>(c + vec3<i32>(dx, dy, dz)) + j;
+                let d = q - f;
+                best = min(best, dot(d, d));
+            }
+        }
+    }
+    return sqrt(best);
+}
+
+// A generator's roughness noise at `q`, 0 to 1 (`kind` 0 smooth, 1 ridged, 2 cellular).
+fn sn_rough(kind: u32, q: vec3<f32>, octaves: u32, seed: u32) -> f32 {
+    if (kind == 2u) {
+        return min(sn_cellular(q, seed), 1.0);
+    }
+    var sum = 0.0;
+    var amp = 1.0;
+    var freq = 1.0;
+    var norm = 0.0;
+    for (var o = 0u; o < max(octaves, 1u); o++) {
+        let g = sn_gradient(q * freq + vec3<f32>(f32(o) * 17.13), seed + o);
+        if (kind == 1u) {
+            sum += amp * (1.0 - abs(g)) * (1.0 - abs(g));
+        } else {
+            sum += amp * g;
+        }
+        norm += amp;
+        amp *= 0.45;
+        freq *= 2.0;
+    }
+    let s = sum / norm;
+    if (kind == 0u) {
+        return clamp(s * 0.5 + 0.5, 0.0, 1.0);
+    }
+    return clamp(s, 0.0, 1.0);
+}
