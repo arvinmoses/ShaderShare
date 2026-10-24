@@ -500,7 +500,9 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     use sculpt_core::generator::detail_layer::Layered;
     use sculpt_core::generator::layer::GeneratorSpec;
     use sculpt_core::generator::{BoolOp, Primitive};
-    for (level, count) in [(2usize, 12u32), (3, 12)] {
+    // `SCULPT_BENCH_LEVEL=2` for the one level.
+    let only: Option<usize> = std::env::var("SCULPT_BENCH_LEVEL").ok().and_then(|v| v.parse().ok());
+    for (level, count) in [(2usize, 12u32), (3, 12)].into_iter().filter(|(l, _)| only.is_none_or(|o| o == *l)) {
         let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, 0.007, 6);
         let mut layer = Layered::new(&mut vol, 5);
         let size = 0.028 * 2.5;
@@ -524,15 +526,26 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
             let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
             let tj = Instant::now();
+            let mut apply_ms = 0.0;
             while let Some(job) = layer.generator_take() {
-                layer.generator_apply(&mut vol, job.run());
+                let done = job.run();
+                let ta = Instant::now();
+                layer.generator_apply(&mut vol, done);
+                apply_ms += ta.elapsed().as_secs_f64() * 1e3;
             }
             let job_ms = tj.elapsed().as_secs_f64() * 1e3;
-            gpu.sync(&mut vol);
+            // The exact field landing: the sync after the job, as the app's next frame does it.
+            let tl = Instant::now();
+            let land = gpu.sync(&mut vol);
+            let land_cpu = tl.elapsed().as_secs_f64() * 1e3;
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            rows.push(format!("{n} blocks: plan {plan_ms:.1}, sync {sync_ms:.1}, join {:.1} ms CPU, then the GPU {gpu_ms:.1} ms; the job {job_ms:.0} ms", s.cpu_ms));
+            let land_ms = tl.elapsed().as_secs_f64() * 1e3;
+            rows.push(format!(
+                "{n} blocks: plan {plan_ms:.1}, sync {sync_ms:.1}, join {:.1} ms CPU, then the GPU {gpu_ms:.1} ms; the job {job_ms:.0} ms ({apply_ms:.1} taking it in); landing it: sync {land_cpu:.1} ms CPU ({} sent, {} extracted), GPU done at {land_ms:.1} ms",
+                s.cpu_ms, land.uploaded, land.extracted
+            ));
         }
-        println!("rocks at level {level}:");
+        println!("rocks at level {level} (blocks per level {:?}):", vol.memory().0);
         for r in rows {
             println!("  {r}");
         }

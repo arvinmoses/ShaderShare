@@ -11,7 +11,6 @@
 //! a vertex when drawn), its bounds and its normal cone. Every frame a cull pass writes the pages of the clusters in
 //! view and facing the eye as indirect draws, and the viewport draws them in one call.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
@@ -21,10 +20,11 @@ use eframe::egui_wgpu::wgpu;
 use glam::{IVec3, Mat4, Vec3};
 use rayon::prelude::*;
 use sculpt_core::generator::level_view::LevelView;
-use sculpt_core::generator::level_volume::{HashSet as KeySet, Key, LevelVolume, Show, piece_table, quantize};
+use sculpt_core::generator::level_volume::{HashMap as KeyMap, HashSet as KeySet, Key, LevelVolume, Show, piece_table, quantize};
 
 pub mod check;
 mod join;
+mod upload;
 
 const SHADER: &str = include_str!("levels.wgsl");
 const PAGE_INDICES: u64 = 384;
@@ -106,7 +106,7 @@ pub struct GpuLevels {
     cull: wgpu::ComputePipeline,
     buf: Buffers,
     /// Slot per stored block, and block per slot.
-    slot_of: HashMap<Key, u32>,
+    slot_of: KeyMap<Key, u32>,
     key_of: Vec<Option<Key>>,
     free: Vec<u32>,
     /// One past the highest slot in use.
@@ -151,6 +151,8 @@ pub struct GpuLevels {
     deferred: Option<(Vec<u32>, Vec<u32>)>,
     /// Bumped whenever the buffers are made afresh, so whoever draws from them binds them again.
     pub buffers_made: u64,
+    /// Samples sent in bulk (made when first needed).
+    scatter: Option<upload::Scatter>,
 }
 
 fn hash_of(c: IVec3, l: u32) -> u32 {
@@ -169,16 +171,31 @@ fn sample_hash(data: &[u32]) -> u64 {
 }
 
 pub(super) fn packed_samples(vol: &LevelVolume, k: Key, hidden: Option<&KeySet<Key>>) -> Vec<u32> {
+    let mut out = [0u32; SAMPLE_WORDS as usize];
+    pack_into(vol, k, hidden, &mut out);
+    out.to_vec()
+}
+
+fn pack_into(vol: &LevelVolume, k: Key, hidden: Option<&KeySet<Key>>, out: &mut [u32; SAMPLE_WORDS as usize]) {
     let (l, bc) = (k.0 as usize, k.1);
     let band = vol.band(l);
     let mut g = [0.0f32; 729];
     vol.gather9_hiding(l, bc, &mut g, hidden);
-    let mut out = vec![0u32; SAMPLE_WORDS as usize];
-    for (i, v) in g.iter().enumerate() {
-        let q = quantize(*v, band) as u16 as u32;
-        out[i / 2] |= q << (16 * (i % 2));
+    let mut q = [0u16; 730];
+    for (q, v) in q.iter_mut().zip(g.iter()) {
+        *q = quantize(*v, band) as u16;
     }
-    out
+    for (w, pair) in out.iter_mut().zip(q.chunks_exact(2)) {
+        *w = pair[0] as u32 | ((pair[1] as u32) << 16);
+    }
+}
+
+/// A block's samples as sent: its slot, their hash and the words.
+struct Packed {
+    slot: u32,
+    hash: u64,
+    key: Key,
+    data: [u32; SAMPLE_WORDS as usize],
 }
 
 impl GpuLevels {
@@ -219,7 +236,7 @@ impl GpuLevels {
             faces: pipe("faces"),
             cull: pipe("cull"),
             buf,
-            slot_of: HashMap::new(),
+            slot_of: KeyMap::default(),
             key_of: Vec::new(),
             free: Vec::new(),
             high: 0,
@@ -252,6 +269,7 @@ impl GpuLevels {
             eye: None,
             join: None,
             deferred: None,
+            scatter: None,
         };
         g.queue.write_buffer(&g.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         g
@@ -460,7 +478,10 @@ impl GpuLevels {
         self.queue.write_buffer(&self.buf.free_pages, 0, bytemuck::cast_slice(&free));
         self.queue.write_buffer(&self.buf.status, 0, bytemuck::cast_slice(&[self.buf.pages as i32, 0, 0, 0, self.buf.vpages as i32, 0, 0, 0]));
         self.queue.write_buffer(&self.buf.slot_pages, 0, &vec![0u8; (self.buf.slots as u64 * SLOT_WORDS * 4) as usize]);
-        self.upload(vol, &blocks, stats, None);
+        let (_, pending) = self.upload(vol, &blocks, stats, None);
+        if let Some(packed) = pending {
+            Self::send_packed(&mut self.scatter, &self.device, &self.queue, &self.buf.samples, packed);
+        }
         self.send_meta(&blocks);
         self.extract(&blocks, &[], stats);
         stats.full = true;
@@ -507,43 +528,82 @@ impl GpuLevels {
         }
     }
 
-    /// Send the samples of `keys` that differ from what their slots hold; returns those sent. Those in `skip` are
-    /// neither read nor sent (a join writes their samples after), only marked as not held.
-    fn upload(&mut self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats, skip: Option<&KeySet<Key>>) -> Vec<Key> {
+    /// Send the samples of `keys` that differ from what their slots hold; returns those sent, and, when they are many,
+    /// their samples packed for [`Self::send_packed`]. Those in `skip` are neither read nor sent (a join writes their
+    /// samples after), only marked as not held.
+    fn upload(&mut self, vol: &LevelVolume, keys: &[Key], stats: &mut SyncStats, skip: Option<&KeySet<Key>>) -> (Vec<Key>, Option<Vec<Option<Packed>>>) {
+        if let Some(skip) = skip {
+            for k in keys {
+                if skip.contains(k)
+                    && let Some(&s) = self.slot_of.get(k)
+                {
+                    self.sent[s as usize] = 0;
+                }
+            }
+        }
+        let t = Instant::now();
         let sent = &self.sent;
         let hidden = Some(self.view.hidden());
-        let packed: Vec<(u32, Vec<u32>, u64, Key)> = keys
+        let slot_of = &self.slot_of;
+        // Packed in place, a block per thread; a block whose slot holds the same is left out.
+        let packed: Vec<Option<Packed>> = keys
             .par_iter()
-            .filter_map(|k| {
-                let s = *self.slot_of.get(k)?;
+            .map(|k| {
                 if skip.is_some_and(|x| x.contains(k)) {
-                    return Some((s, Vec::new(), 0, *k));
+                    return None;
                 }
-                let data = packed_samples(vol, *k, hidden);
+                let s = *slot_of.get(k)?;
+                let mut data = [0u32; SAMPLE_WORDS as usize];
+                pack_into(vol, *k, hidden, &mut data);
                 let h = sample_hash(&data);
-                (sent[s as usize] != h).then_some((s, data, h, *k))
+                (sent[s as usize] != h).then_some(Packed { slot: s, hash: h, key: *k, data })
             })
             .collect();
-        for p in &packed {
-            self.sent[p.0 as usize] = p.2;
+        let t_pack = t.elapsed().as_secs_f64() * 1e3;
+        let mut out: Vec<Key> = Vec::new();
+        let mut blocks: Vec<(u32, &[u32; SAMPLE_WORDS as usize])> = Vec::new();
+        for p in packed.iter().flatten() {
+            self.sent[p.slot as usize] = p.hash;
+            out.push(p.key);
+            blocks.push((p.slot, &p.data));
         }
-        let out: Vec<Key> = packed.iter().filter(|p| p.2 != 0).map(|p| p.3).collect();
-        // Runs of consecutive slots go up in one write.
-        let mut sorted: Vec<(u32, Vec<u32>)> = packed.into_iter().filter(|p| p.2 != 0).map(|p| (p.0, p.1)).collect();
-        sorted.sort_unstable_by_key(|p| p.0);
+        stats.uploaded += blocks.len();
+        stats.bytes += blocks.len() * SAMPLE_WORDS as usize * 4;
+        if blocks.len() >= upload::IN_BULK {
+            // Many blocks: one write and a pass that scatters them to their slots, sent later.
+            if std::env::var_os("SCULPT_JOIN_LOG").is_some() && blocks.len() > 20000 {
+                eprintln!("upload: {} of {} blocks: pack {t_pack:.1}, list {:.1} ms", blocks.len(), keys.len(), t.elapsed().as_secs_f64() * 1e3 - t_pack);
+            }
+            drop(blocks);
+            return (out, Some(packed));
+        }
+        // A few: runs of consecutive slots go up in one write each.
+        blocks.sort_unstable_by_key(|p| p.0);
         let mut i = 0;
-        while i < sorted.len() {
+        while i < blocks.len() {
             let mut j = i + 1;
-            while j < sorted.len() && sorted[j].0 == sorted[j - 1].0 + 1 {
+            while j < blocks.len() && blocks[j].0 == blocks[j - 1].0 + 1 {
                 j += 1;
             }
-            let data: Vec<u32> = sorted[i..j].iter().flat_map(|p| p.1.iter().copied()).collect();
-            self.queue.write_buffer(&self.buf.samples, sorted[i].0 as u64 * SAMPLE_WORDS * 4, bytemuck::cast_slice(&data));
-            stats.bytes += data.len() * 4;
+            let data: Vec<u32> = blocks[i..j].iter().flat_map(|p| p.1.iter().copied()).collect();
+            self.queue.write_buffer(&self.buf.samples, blocks[i].0 as u64 * SAMPLE_WORDS * 4, bytemuck::cast_slice(&data));
             i = j;
         }
-        stats.uploaded += sorted.len();
-        out
+        (out, None)
+    }
+
+    /// Send what [`Self::upload`] packed: one write and a pass that scatters the blocks to their slots.
+    fn send_packed(scatter: &mut Option<upload::Scatter>, device: &wgpu::Device, queue: &wgpu::Queue, samples: &wgpu::Buffer, packed: Vec<Option<Packed>>) {
+        let t = Instant::now();
+        let blocks: Vec<(u32, &[u32; SAMPLE_WORDS as usize])> = packed.iter().flatten().map(|p| (p.slot, &p.data)).collect();
+        let sc = scatter.get_or_insert_with(|| upload::Scatter::new(device));
+        let laps = sc.send(device, queue, samples, &blocks);
+        if std::env::var_os("SCULPT_JOIN_LOG").is_some() && blocks.len() > 20000 {
+            eprintln!("send: {} blocks: list {:.1}, staging {:.1}, slots {:.1}, pass {:.1} ms", blocks.len(), t.elapsed().as_secs_f64() * 1e3 - laps[2], laps[0], laps[1] - laps[0], laps[2] - laps[1]);
+        }
+        // Freed off this thread (it is large).
+        drop(blocks);
+        rayon::spawn(move || drop(packed));
     }
 
     /// Record and submit the passes for `extract` (blocks re-extracted) and `released` (slots that only give pages back).
@@ -786,7 +846,7 @@ impl GpuLevels {
         self.send_meta(&placed);
         lap("slots");
         let n_up = uploads.len();
-        let uploads = self.upload(vol, &uploads, &mut stats, skip);
+        let (uploads, pending) = self.upload(vol, &uploads, &mut stats, skip);
         lap("upload");
         let mut changed: Vec<Key> = uploads.clone();
         changed.extend(gone);
@@ -794,6 +854,10 @@ impl GpuLevels {
             // Of the join's blocks, those that came or went here changed for the blocks around them.
             changed.extend(dirty.iter().filter(|k| skip.contains(k)));
         }
+        if let Some(packed) = pending {
+            Self::send_packed(&mut self.scatter, &self.device, &self.queue, &self.buf.samples, packed);
+        }
+        lap("send");
         let extract = match skip {
             Some(skip) => vol.extract_set_where(&changed, &self.view.show(self.cap), &|k| !skip.contains(&k)),
             None => vol.extract_set_in(&changed, &self.view.show(self.cap)),

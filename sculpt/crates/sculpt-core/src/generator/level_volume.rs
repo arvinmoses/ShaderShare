@@ -371,7 +371,10 @@ fn as_held(v: f32, band: f32) -> f32 {
 }
 
 pub fn quantize(v: f32, band: f32) -> i16 {
-    let q = (v / band * 32767.0).round().clamp(-32767.0, 32767.0) as i16;
+    let x = v / band * 32767.0;
+    // Rounded half away from zero as `f32::round` does, without its call (a library routine without SSE4): adding a
+    // half is exact at these sizes but for the one value just under a half, which rounds to 0 on its own.
+    let q = if x.abs() < 0.5 { 0 } else { ((x + 0.5f32.copysign(x)) as i32).clamp(-32767, 32767) as i16 };
     if v < 0.0 && q == 0 { -1 } else { q }
 }
 
@@ -501,6 +504,82 @@ pub struct ExtractStats {
     /// Quads dropped because a corner's cell had no vertex (a level 0 cell with no block, or a block over its vertex
     /// budget): holes, which should never happen.
     pub dropped: usize,
+}
+
+/// Which blocks of a level a list names: as bits over their box when that is small (a lookup is then a shift), else
+/// as a set.
+enum Named {
+    None,
+    Bits { lo: IVec3, n: IVec3, bits: Vec<u64> },
+    Set(HashSet<IVec3>),
+}
+
+impl Named {
+    /// Bits over a box of up to this many blocks (8 MB).
+    const MOST_BITS: i64 = 1 << 26;
+
+    fn of(keys: impl Iterator<Item = IVec3> + Clone) -> Named {
+        let (mut lo, mut hi, mut count) = (IVec3::MAX, IVec3::MIN, 0usize);
+        for c in keys.clone() {
+            lo = lo.min(c);
+            hi = hi.max(c);
+            count += 1;
+        }
+        if count == 0 {
+            return Named::None;
+        }
+        let n = hi - lo + IVec3::ONE;
+        if n.x as i64 * n.y as i64 * n.z as i64 <= Self::MOST_BITS {
+            let mut bits = vec![0u64; ((n.x as i64 * n.y as i64 * n.z as i64 + 63) / 64) as usize];
+            for c in keys {
+                let d = c - lo;
+                let i = ((d.z * n.y + d.y) * n.x + d.x) as usize;
+                bits[i >> 6] |= 1 << (i & 63);
+            }
+            Named::Bits { lo, n, bits }
+        } else {
+            let mut set: HashSet<IVec3> = HashSet::default();
+            set.reserve(count);
+            set.extend(keys);
+            Named::Set(set)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Named::None)
+    }
+
+    fn remove(&mut self, c: IVec3) {
+        match self {
+            Named::None => {}
+            Named::Bits { lo, n, bits } => {
+                let d = c - *lo;
+                if !(d.cmplt(IVec3::ZERO).any() || d.cmpge(*n).any()) {
+                    let i = ((d.z * n.y + d.y) * n.x + d.x) as usize;
+                    bits[i >> 6] &= !(1 << (i & 63));
+                }
+            }
+            Named::Set(s) => {
+                s.remove(&c);
+            }
+        }
+    }
+
+    #[inline]
+    fn contains(&self, c: IVec3) -> bool {
+        match self {
+            Named::None => false,
+            Named::Bits { lo, n, bits } => {
+                let d = c - *lo;
+                if d.cmplt(IVec3::ZERO).any() || d.cmpge(*n).any() {
+                    return false;
+                }
+                let i = ((d.z * n.y + d.y) * n.x + d.x) as usize;
+                bits[i >> 6] & (1 << (i & 63)) != 0
+            }
+            Named::Set(s) => s.contains(&c),
+        }
+    }
 }
 
 /// What a view draws: the stored blocks of levels up to `cap`, less those in `hidden`. A hidden block's stored finer
@@ -736,7 +815,7 @@ impl LevelVolume {
     /// Blocks whose samples or existence changed since the last call.
     pub fn drain_dirty(&mut self) -> Vec<Key> {
         let mut out: Vec<Key> = self.dirty.drain().collect();
-        out.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        out.par_sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
         out
     }
 
@@ -1044,12 +1123,15 @@ impl LevelVolume {
             self.blocks[l].get(&c).filter(|_| !hidden.is_some_and(|h| h.contains(&(l as u8, c))))
         });
         if nb.iter().all(|b| b.is_some()) {
+            let b: [&[f32; N]; 8] = std::array::from_fn(|q| &**nb[q].unwrap());
             for z in 0..9usize {
                 for y in 0..9usize {
-                    for x in 0..9usize {
-                        let q = (x >> 3) | ((y >> 3) << 1) | ((z >> 3) << 2);
-                        out[x + 9 * y + 81 * z] = nb[q].unwrap()[(x & 7) + 8 * (y & 7) + 64 * (z & 7)];
-                    }
+                    // A row of eight from the block holding it, and the one past it from the block along x.
+                    let q = ((y >> 3) << 1) | ((z >> 3) << 2);
+                    let row = 8 * (y & 7) + 64 * (z & 7);
+                    let o = 9 * y + 81 * z;
+                    out[o..o + 8].copy_from_slice(&b[q][row..row + 8]);
+                    out[o + 8] = b[q | 1][row];
                 }
             }
             return;
@@ -2808,7 +2890,368 @@ impl LevelVolume {
     /// [`Self::upload_set`] for a view `v` (whose samples are [`Self::gather9_hiding`] with its hidden blocks):
     /// `changed` may also name blocks it began or stopped showing. Only blocks it shows are listed.
     pub fn upload_set_in(&self, changed: &[Key], v: &Show) -> Vec<Key> {
-        // Per changed block, in parallel, then merged.
+        let levels = self.levels();
+        // At each changed block's level: it and the seven below it, named once however many changed blocks name them.
+        let span = |_l: usize, _m: usize, c: IVec3| (c - IVec3::ONE, c);
+        let near = Self::near(changed, levels - 1, false, &span, 8, |&(l8, bc), prev, out| {
+            if (l8 as usize) < levels {
+                // After the block just below along x: only the four it did not name.
+                let named = prev == Some(&(l8, bc - IVec3::X));
+                for o in 0..8 {
+                    if named && (o & 1) == 1 {
+                        continue;
+                    }
+                    out.push((l8, bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1)));
+                }
+            }
+        });
+        let mut out: Vec<Key> = near.par_iter().copied().filter(|&(l, c)| self.shows(v, l as usize, c)).collect();
+        // Finer blocks whose samples or first layer past them meet a changed block's box (grown by a sample for
+        // interpolation), found through the nesting. Only a block with a missing neighbour above it reads its first
+        // layer past it from coarser levels; one inside a finer region reads its neighbours, which this change leaves
+        // alone.
+        let finest = (0..levels).rev().find(|&m| self.level_len(m) > 0).unwrap_or(0);
+        let per = self.per_level(changed, finest);
+        let first = (0..finest).find(|&l| !per[l].is_empty());
+        let shown: Vec<std::sync::OnceLock<Option<Named>>> = (0..levels).map(|_| std::sync::OnceLock::new()).collect();
+        // A block among the eight below a changed block of its own level is listed above already.
+        let named = |m: usize, c: IVec3| Self::any_in(&per[m], c, c + IVec3::ONE);
+        for l in first.unwrap_or(finest)..finest {
+            if per[l].is_empty() {
+                continue;
+            }
+            // The box of changed block `bc`, in level `l` lattice units, is `bc*B-1 ..= bc*B+B+1`; a finer block `c`
+            // (lattice `c*B ..= c*B+B`, at `s` finer steps a step) meets it when some changed block lies in this range.
+            let meets = |c: IVec3, s: i32| {
+                let d = B * s;
+                let (lo, hi) = ((c * B - IVec3::splat(s + 1)).div_euclid(IVec3::splat(d)), (c * B + IVec3::splat(B + s)).div_euclid(IVec3::splat(d)));
+                Self::any_in(&per[l], lo, hi)
+            };
+            // Of the level's blocks named, those next to a changed block of the level itself.
+            let frontier: Vec<IVec3> = Self::at_level(&near, l as u8).par_iter().map(|k| k.1).filter(|c| meets(*c, 1)).collect();
+            let edge = |_m: usize, c: IVec3, shows: &dyn Fn(IVec3) -> bool| (1..8).any(|o| !shows(c + IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1)));
+            self.descend(v, levels - 1, l, frontier, &meets, &named, &edge, &shown, &mut out);
+        }
+        Self::unique(out)
+    }
+
+    /// The blocks to re-extract when the blocks `changed` changed (samples or existence), in a view capped at `cap`:
+    /// every stored block whose cells read those samples, whose cells a change in which blocks exist splits or joins,
+    /// or whose quads point at their vertices. That is, at every level, the stored blocks meeting a changed block's box
+    /// grown by two of its cells.
+    pub fn extract_set(&self, changed: &[Key], cap: usize) -> Vec<Key> {
+        self.extract_set_in(changed, &Show::upto(cap))
+    }
+
+    /// [`Self::extract_set`] in the view `v`: `changed` may also name blocks the view began or stopped showing.
+    pub fn extract_set_in(&self, changed: &[Key], v: &Show) -> Vec<Key> {
+        self.extract_set_where(changed, v, &|_| true)
+    }
+
+    /// [`Self::extract_set_in`], listing only the blocks `keep` passes (those it fails are left out as they are found,
+    /// which costs less than taking them out after).
+    pub fn extract_set_where(&self, changed: &[Key], v: &Show, keep: &(dyn Fn(Key) -> bool + Sync)) -> Vec<Key> {
+        let cap = v.cap.min(self.levels() - 1);
+        // At each changed block's level and the coarser ones: the few blocks meeting its box, named once however many
+        // changed blocks name them (neighbouring changed blocks name the same ones over and over).
+        // The blocks at level `m` meeting the box of level `l` block `c`.
+        let span = |l: usize, m: usize, c: IVec3| {
+            let s = 1i32 << (l - m);
+            let (lo, hi) = (c * B - IVec3::splat(2), c * B + IVec3::splat(B + 2));
+            (lo.div_euclid(IVec3::splat(s)).div_euclid(B3), (hi - IVec3::ONE).div_euclid(IVec3::splat(s)).div_euclid(B3))
+        };
+        let near = Self::near(changed, cap, true, &span, 36, |&(l8, bc), prev, out| {
+            let l = l8 as usize;
+            if l > cap {
+                return;
+            }
+            // After the block just below along x: only the blocks past what it named.
+            let after = (prev == Some(&(l8, bc - IVec3::X))).then_some(bc - IVec3::X);
+            for m in 0..=l {
+                let (a, b) = span(l, m, bc);
+                let x0 = after.map_or(a.x, |p| a.x.max(span(l, m, p).1.x + 1));
+                for z in a.z..=b.z {
+                    for y in a.y..=b.y {
+                        for x in x0..=b.x {
+                            out.push((m as u8, IVec3::new(x, y, z)));
+                        }
+                    }
+                }
+            }
+        });
+        let mut out: Vec<Key> = near.par_iter().copied().filter(|&(m, c)| self.shows(v, m as usize, c) && keep((m, c))).collect();
+        // Finer levels: shown descendants of the boxes, found through the nesting. Only a block at the edge of its
+        // region (a neighbour missing) reads coarser samples or points its quads at coarser cells; one inside it is
+        // untouched by a coarser change.
+        let finest = (0..=cap).rev().find(|&m| self.level_len(m) > 0).unwrap_or(0);
+        let per = self.per_level(changed, finest);
+        let first = (0..finest).find(|&l| !per[l].is_empty());
+        let shown: Vec<std::sync::OnceLock<Option<Named>>> = (0..=cap).map(|_| std::sync::OnceLock::new()).collect();
+        // A block next to a changed block of its own level is listed above already.
+        let named = |m: usize, c: IVec3| Self::any_in(&per[m], c - IVec3::ONE, c + IVec3::ONE);
+        for l in first.unwrap_or(finest)..finest {
+            if per[l].is_empty() {
+                continue;
+            }
+            // The box of changed block `bc`, in level `l` lattice units, is `bc*B-2 .. bc*B+B+2`; a finer block `c`
+            // (lattice `c*B .. c*B+B`, at `s` finer steps a step) meets it when some changed block lies in this range.
+            let meets = |c: IVec3, s: i32| {
+                let d = B * s;
+                let (lo, hi) = ((c * B - IVec3::splat((B + 2) * s)).div_euclid(IVec3::splat(d)) + IVec3::ONE, (c * B + IVec3::splat(B + 2 * s - 1)).div_euclid(IVec3::splat(d)));
+                Self::any_in(&per[l], lo, hi)
+            };
+            // Of the level's blocks named, those next to a changed block of the level itself.
+            let frontier: Vec<IVec3> = Self::at_level(&near, l as u8).par_iter().map(|k| k.1).filter(|c| meets(*c, 1)).collect();
+            let edge = |m: usize, c: IVec3, shows: &dyn Fn(IVec3) -> bool| keep((m as u8, c)) && (0..27).any(|q| q != 13 && !shows(c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)));
+            self.descend(v, cap, l, frontier, &meets, &named, &edge, &shown, &mut out);
+        }
+        Self::unique(out)
+    }
+
+    /// A key's place in the order (level, then z, y, x), as one number: quicker to compare than the tuple.
+    #[inline]
+    fn order(k: &Key) -> u128 {
+        let c = |v: i32| (v as u32 as u128) ^ (1 << 31);
+        ((k.0 as u128) << 96) | (c(k.1.z) << 64) | (c(k.1.y) << 32) | c(k.1.x)
+    }
+
+    /// `keys` in order, each once (sorted over the threads).
+    fn unique(mut keys: Vec<Key>) -> Vec<Key> {
+        keys.par_sort_unstable_by_key(Self::order);
+        keys.dedup();
+        keys
+    }
+
+    /// The blocks `span` (changed level, named level, changed block: the box of blocks named) names for the blocks of
+    /// `changed` up to `cap`, at their own level (and the coarser ones, with `coarser`), in order and each once. Where
+    /// a changed level's blocks lie in a box of fair size they are marked as bits over it, over the threads, and read
+    /// off in order; else what `each` names is gathered ([`Self::unique_chunked`]).
+    fn near(changed: &[Key], cap: usize, coarser: bool, span: &(dyn Fn(usize, usize, IVec3) -> (IVec3, IVec3) + Sync), per: usize, each: impl Fn(&Key, Option<&Key>, &mut Vec<Key>) + Sync) -> Vec<Key> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        #[derive(Clone, Copy)]
+        struct Grid {
+            lo: IVec3,
+            n: IVec3,
+        }
+        let index = |g: &Grid, c: IVec3| {
+            let d = c - g.lo;
+            ((d.z * g.n.y + d.y) * g.n.x + d.x) as usize
+        };
+        // The box of the changed blocks at each level.
+        let mut boxes: Vec<Option<(IVec3, IVec3)>> = vec![None; cap + 1];
+        for &(l, bc) in changed {
+            if (l as usize) <= cap {
+                let e = &mut boxes[l as usize];
+                *e = Some(e.map_or((bc, bc), |(a, b)| (a.min(bc), b.max(bc))));
+            }
+        }
+        let levels: Vec<usize> = (0..=cap).filter(|&l| boxes[l].is_some()).collect();
+        // Per changed level: bits over the box it names at its own level, marked by every thread (neighbouring blocks
+        // mostly fall to one thread), and at each coarser level, whose cells many blocks over the threads share, so
+        // each thread marks a copy of its own, joined after.
+        let mut same: Vec<Option<(Grid, Vec<AtomicU64>)>> = (0..=cap).map(|_| None).collect();
+        let mut coarse: Vec<(usize, usize, Grid)> = Vec::new();
+        let mut blank: Vec<Vec<u64>> = Vec::new();
+        for &l in &levels {
+            let (lo, hi) = boxes[l].unwrap();
+            for m in if coarser { 0..=l } else { l..=l } {
+                let (a, b) = (span(l, m, lo).0, span(l, m, hi).1);
+                let n = b - a + IVec3::ONE;
+                let cells = n.x as i64 * n.y as i64 * n.z as i64;
+                if cells > Named::MOST_BITS {
+                    return Self::unique_chunked(changed, per, each);
+                }
+                let words = ((cells + 63) / 64) as usize;
+                let g = Grid { lo: a, n };
+                if m == l {
+                    same[l] = Some((g, (0..words).map(|_| AtomicU64::new(0)).collect()));
+                } else {
+                    coarse.push((l, m, g));
+                    blank.push(vec![0u64; words]);
+                }
+            }
+        }
+        let mark = |mine: &mut Vec<Vec<u64>>, l: usize, bc: IVec3| {
+            if let Some((g, bits)) = &same[l] {
+                let (a, b) = span(l, l, bc);
+                for z in a.z..=b.z {
+                    for y in a.y..=b.y {
+                        for x in a.x..=b.x {
+                            let i = index(g, IVec3::new(x, y, z));
+                            let (w, bit) = (&bits[i >> 6], 1u64 << (i & 63));
+                            if w.load(Ordering::Relaxed) & bit == 0 {
+                                w.fetch_or(bit, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            for (ci, (cl, m, g)) in coarse.iter().enumerate() {
+                if *cl != l {
+                    continue;
+                }
+                let (a, b) = span(l, *m, bc);
+                for z in a.z..=b.z {
+                    for y in a.y..=b.y {
+                        for x in a.x..=b.x {
+                            let i = index(g, IVec3::new(x, y, z));
+                            mine[ci][i >> 6] |= 1 << (i & 63);
+                        }
+                    }
+                }
+            }
+        };
+        let merged: Vec<Vec<u64>> = changed
+            .par_chunks(4096)
+            .fold(
+                || blank.clone(),
+                |mut mine, chunk| {
+                    for &(l8, bc) in chunk {
+                        if (l8 as usize) <= cap {
+                            mark(&mut mine, l8 as usize, bc);
+                        }
+                    }
+                    mine
+                },
+            )
+            .reduce(
+                || blank.clone(),
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        for (p, q) in x.iter_mut().zip(y) {
+                            *p |= *q;
+                        }
+                    }
+                    a
+                },
+            );
+        // Read off level by level, each grid's bits in z, y, x order.
+        let read = |g: &Grid, words: &mut dyn Iterator<Item = u64>, m: usize, out: &mut Vec<Key>| {
+            for (w, mut bits) in words.enumerate() {
+                while bits != 0 {
+                    let i = w * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let (x, rest) = (i as i32 % g.n.x, i as i32 / g.n.x);
+                    out.push((m as u8, g.lo + IVec3::new(x, rest % g.n.y, rest / g.n.y)));
+                }
+            }
+        };
+        let mut out: Vec<Key> = Vec::new();
+        for m in 0..=cap {
+            for &l in &levels {
+                if m == l {
+                    if let Some((g, bits)) = &same[l] {
+                        read(g, &mut bits.iter().map(|w| w.load(Ordering::Relaxed)), m, &mut out);
+                    }
+                } else if let Some(ci) = coarse.iter().position(|(cl, cm, _)| *cl == l && *cm == m) {
+                    read(&coarse[ci].2, &mut merged[ci].iter().copied(), m, &mut out);
+                }
+            }
+        }
+        // Grids of one level from several changed levels may overlap.
+        if levels.len() > 1 { Self::unique(out) } else { out }
+    }
+
+    /// What `each` names for the keys of `changed` (about `per` a key), in order and each once: a chunk of keys at a
+    /// time on each thread, the repeats within a chunk dropped (as a set) before the chunks are merged.
+    fn unique_chunked(changed: &[Key], per: usize, each: impl Fn(&Key, Option<&Key>, &mut Vec<Key>) + Sync) -> Vec<Key> {
+        let chunks: Vec<Vec<Key>> = changed
+            .par_chunks(1024)
+            .map(|chunk| {
+                let mut out = Vec::with_capacity(per * 4);
+                let mut seen: HashSet<Key> = HashSet::default();
+                seen.reserve(chunk.len() * per / 4);
+                let mut prev: Option<&Key> = None;
+                for k in chunk {
+                    out.clear();
+                    each(k, prev, &mut out);
+                    seen.extend(out.iter().copied());
+                    prev = Some(k);
+                }
+                seen.into_iter().collect()
+            })
+            .collect();
+        Self::unique(chunks.concat())
+    }
+
+    /// The keys of `sorted` (as [`Self::unique`] orders them) at level `l`.
+    fn at_level(sorted: &[Key], l: u8) -> &[Key] {
+        let a = sorted.partition_point(|k| k.0 < l);
+        let b = a + sorted[a..].partition_point(|k| k.0 == l);
+        &sorted[a..b]
+    }
+
+    /// The blocks of `changed` at each level up to `cap`.
+    fn per_level(&self, changed: &[Key], cap: usize) -> Vec<Named> {
+        (0..=cap).map(|l| Named::of(changed.iter().filter(|k| k.0 as usize == l).map(|k| k.1))).collect()
+    }
+
+    /// Whether `set` holds a block in the box `lo..=hi`.
+    fn any_in(set: &Named, lo: IVec3, hi: IVec3) -> bool {
+        (lo.z..=hi.z).any(|z| (lo.y..=hi.y).any(|y| (lo.x..=hi.x).any(|x| set.contains(IVec3::new(x, y, z)))))
+    }
+
+    /// The shown blocks of the levels finer than `l` up to `cap` under the level `l` blocks `frontier` that `meets`
+    /// (a block, its steps per level `l` step) passes, level by level; those `edge` (given the level, the block and
+    /// whether a block of the level shows) passes are added to `out`, unless `named` (level, block) says the block
+    /// is listed already by its own level's changed blocks.
+    fn descend(&self, v: &Show, cap: usize, l: usize, mut frontier: Vec<IVec3>, meets: &(dyn Fn(IVec3, i32) -> bool + Sync), named: &(dyn Fn(usize, IVec3) -> bool + Sync), edge: &(dyn Fn(usize, IVec3, &dyn Fn(IVec3) -> bool) -> bool + Sync), shown: &[std::sync::OnceLock<Option<Named>>], out: &mut Vec<Key>) {
+        for m in l + 1..=cap {
+            // Every block has its parent, so a level without blocks has none finer.
+            if frontier.is_empty() || self.level_len(m) == 0 {
+                return;
+            }
+            let s = 1i32 << (m - l);
+            // The level's shown blocks as bits (made when the level is first reached): each block found looks up the
+            // many around it.
+            let bits = shown[m].get_or_init(|| self.shown_bits(m, v));
+            let shows_m = |c: IVec3| match bits {
+                Some(b) => b.contains(c),
+                None => self.shows(v, m, c),
+            };
+            // Children of distinct blocks are distinct: nothing to merge.
+            let next: Vec<(IVec3, bool)> = frontier
+                .par_iter()
+                .flat_map_iter(|p| {
+                    (0..8).filter_map(|q| {
+                        let c = *p * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
+                        (shows_m(c) && meets(c, s)).then(|| (c, !named(m, c) && edge(m, c, &shows_m)))
+                    })
+                })
+                .collect();
+            out.extend(next.iter().filter(|x| x.1).map(|x| (m as u8, x.0)));
+            frontier = next.into_iter().map(|x| x.0).collect();
+        }
+    }
+
+    /// Level `m`'s blocks the view shows, as bits over their box; none when that is too spread out.
+    fn shown_bits(&self, m: usize, v: &Show) -> Option<Named> {
+        let keys = self.level_keys(m);
+        let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+        for c in &keys {
+            lo = lo.min(*c);
+            hi = hi.max(*c);
+        }
+        let n = hi - lo + IVec3::ONE;
+        if keys.is_empty() || m > v.cap || n.x as i64 * n.y as i64 * n.z as i64 > Named::MOST_BITS {
+            return None;
+        }
+        // All of them, less the hidden ones (few, against looking each block up).
+        let mut named = Named::of(keys.iter().copied());
+        if let Some(hidden) = v.hidden {
+            for k in hidden {
+                if k.0 as usize == m {
+                    named.remove(k.1);
+                }
+            }
+        }
+        Some(named)
+    }
+
+    /// [`Self::upload_set_in`] a changed block at a time, as it was first written: the reference the chunked one is
+    /// tested against.
+    #[doc(hidden)]
+    pub fn upload_set_in_reference(&self, changed: &[Key], v: &Show) -> Vec<Key> {
         let mut v: Vec<Key> = changed.par_iter().flat_map_iter(|&(l8, bc)| {
             let mut out: Vec<Key> = Vec::new();
             let l = l8 as usize;
@@ -2821,8 +3264,6 @@ impl LevelVolume {
                     out.push((l8, n));
                 }
             }
-            // Finer blocks whose samples or first layer past them meet this block's box (grown by a sample for
-            // interpolation), found through the nesting.
             let (rlo, rhi) = (bc * B - IVec3::ONE, bc * B + IVec3::splat(B + 1));
             let mut frontier: Vec<IVec3> = (0..8).map(|o| bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1)).collect();
             for m in l + 1..self.levels() {
@@ -2836,8 +3277,6 @@ impl LevelVolume {
                         if chi.cmplt(flo).any() || clo.cmpgt(fhi).any() || !self.shows(v, m, c) {
                             continue;
                         }
-                        // Only a block with a missing neighbour above it reads its first layer past it from coarser
-                        // levels; one inside a finer region reads its neighbours, which this change leaves alone.
                         if (1..8).any(|o| !self.shows(v, m, c + IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1))) {
                             out.push((m as u8, c));
                         }
@@ -2858,34 +3297,19 @@ impl LevelVolume {
         v
     }
 
-    /// The blocks to re-extract when the blocks `changed` changed (samples or existence), in a view capped at `cap`:
-    /// every stored block whose cells read those samples, whose cells a change in which blocks exist splits or joins,
-    /// or whose quads point at their vertices. That is, at every level, the stored blocks meeting a changed block's box
-    /// grown by two of its cells.
-    pub fn extract_set(&self, changed: &[Key], cap: usize) -> Vec<Key> {
-        self.extract_set_in(changed, &Show::upto(cap))
-    }
-
-    /// [`Self::extract_set`] in the view `v`: `changed` may also name blocks the view began or stopped showing.
-    pub fn extract_set_in(&self, changed: &[Key], v: &Show) -> Vec<Key> {
-        self.extract_set_where(changed, v, &|_| true)
-    }
-
-    /// [`Self::extract_set_in`], listing only the blocks `keep` passes (those it fails are left out as they are found,
-    /// which costs less than taking them out after).
-    pub fn extract_set_where(&self, changed: &[Key], v: &Show, keep: &(dyn Fn(Key) -> bool + Sync)) -> Vec<Key> {
+    /// [`Self::extract_set_where`] a changed block at a time, as it was first written: the reference the chunked one
+    /// is tested against.
+    #[doc(hidden)]
+    pub fn extract_set_where_reference(&self, changed: &[Key], v: &Show, keep: &(dyn Fn(Key) -> bool + Sync)) -> Vec<Key> {
         let cap = v.cap.min(self.levels() - 1);
-        // Per changed block, in parallel, then merged.
         let mut v: Vec<Key> = changed.par_iter().flat_map_iter(|&(l, bc)| {
             let mut out: Vec<Key> = Vec::new();
             let l = l as usize;
             if l > cap {
                 return out;
             }
-            // The box in level `l` lattice units, grown by two cells.
             let lo = bc * B - IVec3::splat(2);
             let hi = bc * B + IVec3::splat(B + 2);
-            // Coarser levels and this one: the few blocks meeting the box.
             for m in 0..=l {
                 let s = 1i32 << (l - m);
                 let (a, b) = (lo.div_euclid(IVec3::splat(s)).div_euclid(B3), (hi - IVec3::ONE).div_euclid(IVec3::splat(s)).div_euclid(B3));
@@ -2900,7 +3324,6 @@ impl LevelVolume {
                     }
                 }
             }
-            // Finer levels: shown descendants of the box, found through the nesting.
             let mut frontier: Vec<IVec3> = Vec::new();
             {
                 let (a, b) = (lo.div_euclid(B3), (hi - IVec3::ONE).div_euclid(B3));
@@ -2924,8 +3347,6 @@ impl LevelVolume {
                             continue;
                         }
                         if self.shows(v, m, c) {
-                            // Only a block at the edge of its region (a neighbour missing) reads coarser samples or
-                            // points its quads at coarser cells; one inside it is untouched by a coarser change.
                             if keep((m as u8, c)) && (0..27).any(|q| q != 13 && !self.shows(v, m, c + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1))) {
                                 out.push((m as u8, c));
                             }

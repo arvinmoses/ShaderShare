@@ -111,42 +111,55 @@ impl LevelView {
         if dirty.is_empty() {
             return;
         }
-        // What each costs to draw, measured at once (a cheap count of sign changes).
-        let counted: Vec<(Key, u32)> = dirty.par_iter().map(|&k| (k, vol.surface_quads(k.0 as usize, k.1))).collect();
-        for (k, q) in counted {
-            let was = if q > 0 || vol.exists(k.0 as usize, k.1) { self.quads.insert(k, q) } else { self.quads.remove(&k) };
-            if k.0 == 0 {
-                self.base = self.base + q as u64 - was.unwrap_or(0) as u64;
-            }
-        }
-        let mut sorted: Vec<Key> = dirty.to_vec();
-        sorted.sort_unstable_by_key(|k| k.0);
+        // What each costs to draw, measured at once (a cheap count of sign changes), and whether it is still there.
+        let counted: Vec<(Key, u32, bool)> = dirty.par_iter().map(|&k| (k, vol.surface_quads(k.0 as usize, k.1), vol.exists(k.0 as usize, k.1))).collect();
+        // Level 0 always shows: its detail is never asked for. The rest coarsest first.
+        let mut sorted: Vec<(Key, bool)> = counted.iter().filter(|c| c.0.0 != 0).map(|c| (c.0, c.2)).collect();
+        sorted.sort_by_key(|k| k.0.0);
+        let syncs = self.syncs;
+        let LevelView { quads, base, own, stale, tree, hidden, .. } = self;
         let mut up: Vec<Key> = Vec::new();
-        for &k in &sorted {
-            let (l, bc) = (k.0 as usize, k.1);
-            // Level 0 always shows: its detail is never asked for.
-            if l == 0 {
-                continue;
-            }
-            if !vol.exists(l, bc) {
-                self.own.remove(&k);
-                self.stale.remove(&k);
-                self.hidden.remove(&k);
-                if self.tree.remove(&k).is_some() {
+        // Each table on a thread of its own: a generator's job changes tens of thousands of blocks at once.
+        rayon::scope(|sc| {
+            sc.spawn(|_| {
+                for &(k, q, exists) in &counted {
+                    let was = if q > 0 || exists { quads.insert(k, q) } else { quads.remove(&k) };
+                    if k.0 == 0 {
+                        *base = *base + q as u64 - was.unwrap_or(0) as u64;
+                    }
+                }
+            });
+            sc.spawn(|_| {
+                for (k, _) in &sorted {
+                    own.remove(k);
+                }
+            });
+            sc.spawn(|_| {
+                for &(k, exists) in &sorted {
+                    if exists {
+                        stale.insert(k, syncs);
+                    } else {
+                        stale.remove(&k);
+                    }
+                }
+            });
+            for &(k, exists) in &sorted {
+                if !exists {
+                    hidden.remove(&k);
+                    if tree.remove(&k).is_some() {
+                        up.push(k);
+                    }
+                    continue;
+                }
+                if hidden.contains(&(k.0 - 1, k.1.div_euclid(IVec3::splat(2)))) {
+                    hidden.insert(k);
+                }
+                // Already unbounded (still to be measured since an earlier change): so is everything above it.
+                if tree.get(&k) != Some(&f32::INFINITY) {
                     up.push(k);
                 }
-                continue;
             }
-            if self.hidden.contains(&(k.0 - 1, bc.div_euclid(IVec3::splat(2)))) {
-                self.hidden.insert(k);
-            }
-            self.own.remove(&k);
-            self.stale.insert(k, self.syncs);
-            // Already unbounded (still to be measured since an earlier change): so is everything above it.
-            if self.tree.get(&k) != Some(&f32::INFINITY) {
-                up.push(k);
-            }
-        }
+        });
         self.retree(vol, up);
         self.changed = true;
     }
@@ -184,8 +197,8 @@ impl LevelView {
                 let k = (l as u8, bc);
                 if vol.exists(l, bc) {
                     let own = self.own.get(&k).copied().unwrap_or(f32::INFINITY);
-                    let below = children(vol, k).map(|c| self.tree.get(&c).copied().unwrap_or(f32::INFINITY)).fold(0.0f32, f32::max);
-                    let t = own + below;
+                    // Unbounded (to be measured): so is the tree, whatever is below.
+                    let t = if own.is_infinite() { own } else { own + children(vol, k).map(|c| self.tree.get(&c).copied().unwrap_or(f32::INFINITY)).fold(0.0f32, f32::max) };
                     if self.tree.insert(k, t) == Some(t) {
                         continue;
                     }

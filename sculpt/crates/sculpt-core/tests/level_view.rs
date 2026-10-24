@@ -151,6 +151,42 @@ fn rebuilding_around_what_was_shown_or_hidden_matches_a_full_rebuild() {
 }
 
 #[test]
+fn the_upload_and_extract_sets_match_their_references() {
+    use sculpt_core::generator::level_volume::Show;
+    let mut v = worked();
+    let mut view = fresh_view(&v);
+    let cap = v.levels() - 1;
+    v.drain_dirty();
+    let eyes = [Vec3::new(0.0, 0.0, 1.3), Vec3::new(0.0, 0.0, 6.0), Vec3::new(2.0, 0.5, -1.5), Vec3::new(0.0, 0.0, 30.0), Vec3::new(0.2, 0.1, 1.15)];
+    let mut compared = 0;
+    for (i, eye) in eyes.iter().enumerate() {
+        let a = Vec3::new(-0.2 + 0.1 * i as f32, 0.0, 1.0);
+        stroke(&mut v, i % 4, a, a + Vec3::new(0.15, 0.05, 0.0), [0.3, 0.06, 0.03, 0.012][i % 4], i % 2 == 1);
+        let mut dirty = v.drain_dirty();
+        view.note(&v, &dirty);
+        view.refresh(&v, usize::MAX);
+        dirty.extend(view.choose(&v, *eye, FOCAL));
+        // Odd blocks left out, as a join's are.
+        let keep = |k: Key| (k.1.x + k.1.y + k.1.z) % 2 == 0;
+        for c in [cap, 2, 1, 0] {
+            let shows = [view.show(c), Show::upto(c)];
+            for show in &shows {
+                assert_eq!(v.upload_set_in(&dirty, show), v.upload_set_in_reference(&dirty, show), "eye {i}, cap {c}: upload set");
+                assert_eq!(v.extract_set_in(&dirty, show), v.extract_set_where_reference(&dirty, show, &|_| true), "eye {i}, cap {c}: extract set");
+                assert_eq!(v.extract_set_where(&dirty, show, &keep), v.extract_set_where_reference(&dirty, show, &keep), "eye {i}, cap {c}: extract set, kept");
+                compared += 1;
+            }
+        }
+        // Every block at once, as a generator landing names them.
+        let all = v.keys();
+        let show = view.show(cap);
+        assert_eq!(v.upload_set_in(&all, &show), v.upload_set_in_reference(&all, &show), "eye {i}: upload set of all");
+        assert_eq!(v.extract_set_in(&all, &show), v.extract_set_where_reference(&all, &show, &|_| true), "eye {i}: extract set of all");
+    }
+    assert!(compared >= 40);
+}
+
+#[test]
 fn a_block_being_sculpted_shows_until_its_detail_is_measured() {
     let mut v = worked();
     let mut view = fresh_view(&v);
