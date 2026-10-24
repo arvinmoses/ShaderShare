@@ -52,6 +52,9 @@ pub struct Options {
     pub zoom: f32,
     /// Run the scripted volume playground session, saving every frame into this folder (`volume_demo.rs`).
     pub demo_volume: Option<PathBuf>,
+    /// Open in the volume playground (a plain launch, or `--volume`); `--mesh` or any project, test or demo opens the
+    /// mesh sculptor.
+    pub start_volume: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +202,8 @@ pub struct SculptApp {
     pub volume_path: Option<String>,
     /// The scripted session being recorded, if any.
     volume_demo: Option<crate::volume_demo::VolumeDemo>,
+    /// Open the volume playground once the startup mesh is in (a plain launch).
+    start_volume: bool,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -298,6 +303,7 @@ impl SculptApp {
             volume_path: None,
             sweep: None,
             volume_demo: opts.demo_volume.map(crate::volume_demo::VolumeDemo::new),
+            start_volume: opts.start_volume,
         };
         app.layers.compact = settings["layers_compact"].as_bool().unwrap_or(false);
         app.view_detail = settings["view_detail"].as_str().and_then(ViewDetail::from_name).unwrap_or(ViewDetail::Balanced);
@@ -381,7 +387,8 @@ impl SculptApp {
                             self.sweep = Some(sweep);
                         }
                     }
-                    if let Some(m) = std::env::var("SCULPT_VOLUME").ok().and_then(|v| v.parse::<f32>().ok()).or(self.volume_demo.as_ref().map(|_| 1.0)) {
+                    let start = std::mem::take(&mut self.start_volume).then_some(1.0);
+                    if let Some(m) = std::env::var("SCULPT_VOLUME").ok().and_then(|v| v.parse::<f32>().ok()).or(self.volume_demo.as_ref().map(|_| 1.0)).or(start) {
                         self.open_volume(m * 1e6);
                     }
                     if std::env::var("SCULPT_DEMO_NOISE").is_ok() {

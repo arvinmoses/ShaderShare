@@ -199,7 +199,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let mut args = std::env::args().skip(1);
-    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, sweep_shots: None, bench_orbit: None, zoom: 1.0, demo_volume: None };
+    let mut opts = app::Options { project: None, level: 7, sphere_res: None, theme: None, test_frames: None, screenshot: None, demo_layers: false, demo_generator: None, demo_sweep: false, sweep_shots: None, bench_orbit: None, zoom: 1.0, demo_volume: None, start_volume: std::env::args().len() == 1 };
     let mut size = [1600.0f32, 1000.0];
     let (mut shots_dir, mut shot_times) = (None::<PathBuf>, Vec::<f32>::new());
     let mut demo_density = None::<sculpt_core::generator::density::Density>;
@@ -215,6 +215,8 @@ fn main() -> eframe::Result {
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-layers" => opts.demo_layers = true,
             "--demo-volume" => opts.demo_volume = args.next().map(PathBuf::from),
+            "--volume" => opts.start_volume = true,
+            "--mesh" => opts.start_volume = false,
             "--demo-sweep" => opts.demo_sweep = true,
             "--demo-map" => {
                 if let Some(row) = args.next().and_then(|v| parse_map_row(&v)) {
@@ -231,7 +233,8 @@ fn main() -> eframe::Result {
                 }
             }
             "-h" | "--help" => {
-                println!("sculpt-app [project.sculpt] [--level N] [--theme NAME] [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--demo-generator op:primitive:count:size:lift:seed] [--size WxH]");
+                println!("sculpt-app [project.sculpt] [--level N] [--theme NAME] [--test-strokes FRAMES] [--bench-orbit FRAMES] [--zoom F] [--screenshot out.png] [--demo-generator op:primitive:count:size:lift:seed] [--size WxH] [--volume | --mesh]
+(no arguments: the volume playground)");
                 return Ok(());
             }
             p => opts.project = Some(PathBuf::from(p)),
