@@ -1044,3 +1044,90 @@ fn picture_edge_rubble() {
         picture(&s, Vec3::new(1.6, 1.4, 2.0), Vec3::new(1.6, 1.4, 2.0).normalize(), 0.85, name);
     }
 }
+
+fn painted_rocks() -> GeneratorSpec {
+    GeneratorSpec { count: 100, min_spacing: 0.1, size: 0.05, density: Density::default_painted(), ..rocks() }
+}
+
+fn positions(l: &Layered, k: usize) -> Vec<Vec3> {
+    l.generator_instances(k).iter().map(|i| i.translation).collect()
+}
+
+/// A density stroke of `dabs` dabs at `c`, as the app makes one: an edit, dabs, then the scatter at its end (and the
+/// generator jobs it leaves).
+fn density_stroke(lv: &mut Lv, c: Vec3, r: f32, to: f32, dabs: usize) {
+    lv.l.begin_edit();
+    for _ in 0..dabs {
+        assert!(lv.l.paint_density(c, r, to));
+    }
+    lv.l.end_density_stroke(&mut lv.s);
+    while let Some(job) = lv.l.generator_take() {
+        let done = job.run();
+        lv.l.generator_apply(&mut lv.s, done);
+    }
+}
+
+#[test]
+fn painted_density_keeps_rocks_out_of_the_painted_region() {
+    let mut lv = Lv::ball();
+    let k = lv.add(2, &painted_rocks());
+    let c = Vec3::new(0.0, 0.0, 1.0);
+    let before = positions(&lv.l, k);
+    assert_eq!(before.len(), 100);
+    let inside = before.iter().filter(|p| p.distance(c) < 0.3).count();
+    assert!(inside > 0, "nothing there to take away");
+    density_stroke(&mut lv, c, 0.8, 0.0, 6);
+    let after = positions(&lv.l, k);
+    let still = after.iter().filter(|p| p.distance(c) < 0.3).count();
+    eprintln!("within 0.3 of the painted spot: {inside} before, {still} after; {} placed", after.len());
+    assert_eq!(still, 0, "rocks in the painted region");
+    assert_eq!(after.len(), 100, "the count is still met elsewhere");
+    let (open, _, dropped) = closed(&lv.s, 3);
+    assert_eq!((open, dropped), (0, 0));
+    // Painting it back lets them return.
+    density_stroke(&mut lv, c, 0.8, 1.0, 12);
+    assert!(positions(&lv.l, k).iter().filter(|p| p.distance(c) < 0.3).count() > 0, "none came back");
+}
+
+#[test]
+fn painted_density_undoes_in_one_step_and_saves() {
+    let mut lv = Lv::ball();
+    let k = lv.add(2, &painted_rocks());
+    let c = Vec3::new(0.0, 0.0, 1.0);
+    let before = positions(&lv.l, k);
+    density_stroke(&mut lv, c, 0.8, 0.0, 6);
+    let after = positions(&lv.l, k);
+    assert_ne!(before, after);
+    // Saved and opened: the same rocks and the same painted density.
+    let mut buf = Vec::new();
+    lv.l.write_to(&mut buf).unwrap();
+    let (_, opened) = Layered::read_from(&mut &buf[..], 4).unwrap();
+    let opened = opened.expect("layers");
+    assert_eq!(positions(&opened, k), after, "the rocks differ");
+    let (a, b) = (lv.l.density(k).unwrap(), opened.density(k).unwrap());
+    assert_eq!(a.len(), b.len());
+    assert!(a.keys().all(|bc| a[bc].iter().zip(b[bc].iter()).all(|(x, y)| x == y)), "the density differs");
+    // An older file (version 3, no density section) still opens.
+    let mut fresh = Lv::ball();
+    let j = fresh.add(2, &painted_rocks());
+    let mut old = Vec::new();
+    fresh.l.write_to(&mut old).unwrap();
+    let at = old.windows(4).position(|w| w == b"SLAY").unwrap();
+    old[at + 4..at + 8].copy_from_slice(&3u32.to_le_bytes());
+    old.truncate(old.len() - 4);
+    let (_, v3) = Layered::read_from(&mut &old[..], 4).unwrap();
+    assert_eq!(positions(&v3.expect("layers"), j), positions(&fresh.l, j));
+    // One undo takes the whole stroke back.
+    assert!(lv.l.undo(&mut lv.s));
+    assert_eq!(positions(&lv.l, k), before, "undo did not bring the rocks back");
+    assert!(lv.l.density(k).unwrap().is_empty(), "undo left paint");
+    assert!(lv.l.redo(&mut lv.s));
+    assert_eq!(positions(&lv.l, k), after);
+}
+
+#[test]
+fn painting_density_needs_a_painted_density() {
+    let mut lv = Lv::ball();
+    let _ = lv.add(2, &rocks());
+    assert!(!lv.l.paint_density(Vec3::Z, 0.3, 0.0));
+}

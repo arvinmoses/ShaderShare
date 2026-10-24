@@ -25,7 +25,8 @@ pub enum Density {
     /// More instances where the surface faces `axis` (for example rubble settles toward the ground with `axis` = -Y, or
     /// dust gathers on top with +Y). `sharpness` narrows how tightly it has to face that way.
     Facing { axis: [f32; 3], sharpness: f32 },
-    /// Painted by hand into a per-vertex channel (the mask paint tool writes `paint.mask`).
+    /// Painted by hand: into a per-vertex channel on a mesh (the mask paint tool writes `paint.mask`), or on a volume
+    /// layer, into its own density channel (`channel` is unused there).
     Painted { channel: String },
 }
 
@@ -69,7 +70,7 @@ impl Density {
     }
 
     /// This density read at single points, for a surface with no vertices to hold it (a volume's). `None` for an even
-    /// scatter, and for a painted one: a volume has no painted channel yet, so it scatters evenly.
+    /// scatter, and for a painted one (a volume layer reads its own painted channel instead).
     pub fn at_points(&self) -> Option<PointDensity> {
         match self {
             Density::Even | Density::Painted { .. } => None,

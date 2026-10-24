@@ -274,8 +274,7 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
             egui::ComboBox::from_id_salt(("vgen_density", k))
                 .selected_text(next.density.label())
                 .show_ui(ui, |ui| {
-                    // (Painted needs a painted channel, which a volume does not have yet.)
-                    for (name, option) in [("Even", Density::Even), ("Clusters", Density::default_clusters()), ("Facing", Density::default_facing())] {
+                    for (name, option) in [("Even", Density::Even), ("Clusters", Density::default_clusters()), ("Facing", Density::default_facing()), ("Painted", Density::default_painted())] {
                         if ui.selectable_label(next.density.label() == name, name).clicked() && next.density.label() != name {
                             next.density = option;
                             *c = true;
@@ -298,7 +297,10 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
                 *c |= prop(ui, "Faces", |ui| axis_combo(ui, egui::Id::new(("vgen_facing", k)), axis));
                 vslider(ui, "Tightness", egui::Slider::new(sharpness, 0.3..=6.0).logarithmic(true).max_decimals(1), Some("Higher means the surface has to face that way more squarely."), c, co, d);
             }
-            Density::Even | Density::Painted { .. } => {}
+            Density::Painted { .. } => {
+                ui.label(RichText::new("Paint it: pick Density: less / more under this layer in the Layers panel, then drag on the object. The rocks scatter again when the stroke ends.").small().color(weak));
+            }
+            Density::Even => {}
         }
         if placed < spec.count as usize {
             ui.label(RichText::new(format!("{placed} of {} placed: the places that take them are full or few.", spec.count)).small().color(weak));

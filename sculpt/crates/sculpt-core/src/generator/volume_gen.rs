@@ -10,7 +10,8 @@
 //!   differ by more than the angle ([`edge_at`]), moved across onto the edge's line, and an instance there lies along
 //!   the edge, upright on the bisector of its two sides. The edge is read from the form at the anchor (not saved).
 //! * **Density.** Clusters and facing keep each candidate as likely as the density is there (the count stays, the
-//!   candidates are drawn until it is met); a painted density scatters evenly, a volume having no painted channel.
+//!   candidates are drawn until it is met). A painted density reads the layer's painted channel (level 0's lattice,
+//!   absent = fully dense) the same way; with nothing painted it scatters evenly.
 //! * **Instances** come from the anchors as on a mesh ([`super::layer`]): size, stretch, lift, tilt and spin varied by
 //!   the seed, and the mapping rows that read the surface's slope.
 //! * **Joining.** Instances join one another and the surface below with a polynomial smooth minimum over `blend` times
@@ -27,7 +28,9 @@ use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 
 use super::layer::{EdgeSide, GeneratorSpec, ORDER_STREAM, PlaceOn, biggest_instance, place_instance, place_instance_along, unit_random};
-use super::level_volume::{HashSet, LevelVolume};
+use super::density::Density;
+use super::detail_layer::mask_at;
+use super::level_volume::{HashSet, LevelVolume, Shared, Stored};
 use super::mapping::Mapper;
 use super::place::SurfaceSample;
 use super::{BoolOp, InstanceSet};
@@ -75,6 +78,8 @@ pub struct VolumeGen {
     set: Arc<InstanceSet>,
     /// The instances' roughness, when they have any.
     rough: Option<Rough>,
+    /// The painted density the anchors were drawn with (its layer's version of it, and the map).
+    painted: Option<(u64, Shared<IVec3, Stored>)>,
 }
 
 /// A generator's roughness noise: its kind (0 smooth, 1 ridged, 2 cellular), bumps per world unit, octaves and seed
@@ -240,7 +245,7 @@ fn edge_frames(form: &LevelVolume, spec: &GeneratorSpec, anchors: &[Anchor]) -> 
 
 /// Points over the form's level 0 surface, `count` (or fewer when spaced and the surface is full, or when few places
 /// take them), drawn by `seed`: anywhere on it or along its edges, and as the spec's density has them.
-fn scatter(form: &LevelVolume, spec: &GeneratorSpec) -> Vec<Anchor> {
+fn scatter(form: &LevelVolume, spec: &GeneratorSpec, painted: Option<&Shared<IVec3, Stored>>) -> Vec<Anchor> {
     let count = spec.count as usize;
     if count == 0 {
         return Vec::new();
@@ -307,18 +312,22 @@ fn scatter(form: &LevelVolume, spec: &GeneratorSpec) -> Vec<Anchor> {
         edge_at(form, a.p, a.n, r)?.takes(angle, side).then_some(a)
     };
     let density = spec.density.at_points();
+    // A painted density is the layer's channel, when anything is painted.
+    let painted = painted.filter(|m| matches!(spec.density, Density::Painted { .. }) && !m.is_empty());
     let candidate = |i: u64| -> Option<Anchor> {
         let a = match spec.place_on {
             PlaceOn::Surface => draw(i)?,
             PlaceOn::Edges { angle, side } => on_edge(i, angle, side)?,
         };
         // A density keeps a candidate as likely as it is dense there.
-        match &density {
-            Some(d) if unit_random(spec.seed ^ DENSITY_STREAM, i) >= d.at(a.p, a.n) => None,
-            _ => Some(a),
-        }
+        let d = match (&density, painted) {
+            (Some(d), _) => d.at(a.p, a.n),
+            (None, Some(m)) => mask_at(form, m, 0, a.p),
+            _ => 1.0,
+        };
+        (unit_random(spec.seed ^ DENSITY_STREAM, i) < d).then_some(a)
     };
-    let filtered = density.is_some() || spec.place_on != PlaceOn::Surface;
+    let filtered = density.is_some() || painted.is_some() || spec.place_on != PlaceOn::Surface;
     if spec.min_spacing <= 0.0 && !filtered {
         return (0..count as u64).into_par_iter().filter_map(draw).collect();
     }
@@ -395,23 +404,44 @@ impl VolumeGen {
     /// Scatter `spec` over `form`, keeping `previous`'s anchors where its count, seed, spacing, placement and density
     /// are the same.
     pub fn build(form: &LevelVolume, spec: &GeneratorSpec, previous: Option<&VolumeGen>) -> VolumeGen {
+        Self::build_with(form, spec, previous, previous.and_then(|p| p.painted.clone()))
+    }
+
+    /// [`Self::build`], with a painted density (its version, and the map). The anchors are kept only if it is the one
+    /// `previous` was drawn with.
+    pub fn build_with(form: &LevelVolume, spec: &GeneratorSpec, previous: Option<&VolumeGen>, painted: Option<(u64, Shared<IVec3, Stored>)>) -> VolumeGen {
+        let same_paint = |p: &VolumeGen| p.painted.as_ref().map(|x| x.0) == painted.as_ref().map(|x| x.0);
         let (anchors, frames) = match previous {
             Some(p)
                 if p.spec.count == spec.count
                     && p.spec.seed == spec.seed
                     && p.spec.min_spacing == spec.min_spacing
                     && p.spec.place_on == spec.place_on
-                    && p.spec.density == spec.density =>
+                    && p.spec.density == spec.density
+                    && (!matches!(spec.density, Density::Painted { .. }) || same_paint(p)) =>
             {
                 (p.anchors.clone(), p.frames.clone())
             }
             _ => {
-                let anchors = scatter(form, spec);
+                let anchors = scatter(form, spec, painted.as_ref().map(|x| &x.1));
                 let frames = edge_frames(form, spec, &anchors);
                 (Arc::new(anchors), Arc::new(frames))
             }
         };
-        Self::with_anchors(spec, anchors, frames)
+        let mut out = Self::with_anchors(spec, anchors, frames);
+        out.painted = painted;
+        out
+    }
+
+    /// The version of the painted density the anchors were drawn with (none: not painted).
+    pub fn painted_version(&self) -> Option<u64> {
+        self.painted.as_ref().map(|x| x.0)
+    }
+
+    /// Note the painted density the saved anchors were drawn with.
+    pub fn with_painted(mut self, version: u64, map: Shared<IVec3, Stored>) -> VolumeGen {
+        self.painted = Some((version, map));
+        self
     }
 
     fn with_anchors(spec: &GeneratorSpec, anchors: Arc<Vec<Anchor>>, frames: Arc<Vec<(Vec3, Vec3)>>) -> VolumeGen {
@@ -434,7 +464,7 @@ impl VolumeGen {
             })
             .collect();
         let rough = (spec.rough > 0.0).then(|| Rough { kind: rough_kind(spec.rough_kind), freq: spec.rough_scale.max(0.01) / spec.size.max(1e-6), octaves: 3, seed: spec.seed as u32 ^ 0x5eed });
-        let mut out = VolumeGen { spec: spec.clone(), anchors, frames, set: Arc::new(InstanceSet::new(instances, 0.0)), rough };
+        let mut out = VolumeGen { spec: spec.clone(), anchors, frames, set: Arc::new(InstanceSet::new(instances, 0.0)), rough, painted: None };
         // Instances are found as far out as they can reach: the blend and the roughness.
         let reach = out.pad();
         out.set = Arc::new(InstanceSet::new(out.set.instances().to_vec(), reach));
