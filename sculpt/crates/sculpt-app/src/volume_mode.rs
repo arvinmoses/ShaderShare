@@ -658,7 +658,7 @@ impl VolumeMode {
         self.settle();
         if let Some(layer) = self.layer.as_mut() {
             let n = layer.layers().len();
-            layer.add_layer(&format!("Layer {}", n + 1), level);
+            layer.add_layer(&mut self.vol, &format!("Layer {}", n + 1), level);
             self.target = Target::Detail;
         }
     }

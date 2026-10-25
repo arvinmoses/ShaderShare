@@ -127,7 +127,7 @@ fn every_operation_leaves_shown_as_composed_afresh() {
     check("mask hidden", &s, &l);
     l.paint_mask(&mut s, at, 0.05, 1.0);
     check("mask shown", &s, &l);
-    l.add_layer("Layer 2", 5);
+    l.add_layer(&mut s, "Layer 2", 5);
     for k in 0..4 {
         let d = Vec3::new(-0.02 + 0.012 * k as f32, -0.03, 1.0).normalize();
         let (hit, _) = s.raycast(d * 3.0, -d, 5, false).unwrap();

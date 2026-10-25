@@ -750,7 +750,7 @@ fn picture_rough_rocks() {
 fn detail_on_a_rock_rides_the_rock() {
     let mut lv = Lv::with(0.02, 5, 3);
     let k = lv.add(1, &GeneratorSpec { size: 0.12, lift: 0.2, ..rocks() });
-    let top_layer = lv.l.add_layer("On the rocks", 4);
+    let top_layer = lv.l.add_layer(&mut lv.s, "On the rocks", 4);
     assert!(top_layer > k);
     // The rock nearest the front, and bumps painted on its top (three, at level 4).
     let inst = lv.l.generator_instances(k);
