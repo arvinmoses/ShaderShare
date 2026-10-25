@@ -113,9 +113,10 @@ each until the detail is all in (0.9 s, about 50 frames). Then the stroke ends a
 moved down, specks: 0.32 s on the shared threads, about 16 frames), and taking its result costs the main thread
 1.5 ms, plus one frame's sync of about 25 ms for the blocks it changed.
 
-Ending a stroke in a job works on a copy of the volume while nothing else may change it: the next stroke, an undo
-or a save waits for it, and its result is then the copy's maps, taken as they are. A test checks that a stroke ended
-this way is byte for byte the stroke ended at once, and undoes the same.
+Ending a stroke in a job works on a copy of the volume while nothing else may change it: an undo or a save waits for
+it, and its result is then the copy's maps, taken as they are. A test checks that a stroke ended this way is byte for
+byte the stroke ended at once, and undoes the same. The next stroke does not wait: it runs ahead (see "A new stroke
+never waits").
 
 The dabs now cost about what the same dabs over bare clay do: a radius of 0.3 is 85 level 0 steps and changes about
 2400 blocks a dab.
@@ -244,7 +245,9 @@ patch before the big stroke, under it as one volume (buried), and under it with 
   what is; a job on a quarter of the cores (the carrying threads) follows the queue with the form as it was when the
   job began, and the frame takes its result in, the form there with the layer on it. When the pen lifts, the form's
   end and then the stroke's last follow (exact, over all the stroke touched and every layer block it changed) run on
-  all the cores. At the demo's scale (a brush of radius 0.5 over a layer of 2400 blocks, a ball of 1M triangles):
+  the same threads (on all the cores they slowed the next stroke's dabs several times over and finished hardly
+  sooner; a last follow with generators in the stack, which composes all their blocks again, runs on all of them below
+  the frame's priority). At the demo's scale (a brush of radius 0.5 over a layer of 2400 blocks, a ball of 1M triangles):
   10.6 ms a frame with the layer against 11.4 without, pen up 0.2 ms, the layer caught up 0.7 s after
   (`big_form_strokes_under_a_layer_stay_cheap_a_frame`). Following in jobs ends exactly as following at once does
   (`following_in_jobs_ends_as_following_at_once`). On the way there: a block whose corners all lie farther from the
@@ -448,6 +451,71 @@ Seen, not fixed: a saddle in a cell next to a finer one is an edge shared by fou
 whatever its pieces: the extractor's rule, the same on the GPU), a pinch at level boundaries a few times per
 million faces; the test reports them and fails only on any away from a finer cell.
 
+## A new stroke never waits
+
+A stroke used to begin by waiting for all the work still landing: the last stroke's carrying, its end, the layers'
+last follow, a generator's job. Now its first dab shows on the next frame, and the stroke ends exactly as it would
+have after waiting (`volume_mode.rs`, `Ahead`):
+
+* **Running ahead.** A stroke begun while work it must come after is still landing is drawn at once on a copy of
+  what is shown (and of the layers: `LevelVolume::preview_copy`, `Layered::preview_copy`, made in a moment, their
+  maps sharing shards). Its begin, dabs and end are kept as given; the real state goes on taking its work in, frame
+  by frame, and once nothing the stroke must come after is left, does the stroke for real, dab for dab, up to 24 ms
+  of it a frame. Once it has caught up, the real state is drawn again: every block the copy or the real state
+  changed meanwhile is sent to the GPU. Strokes begun while one is still running ahead queue behind it; undo, saving
+  and any edit of the layers do everything still to do first. The copy's dabs only queue carrying and following
+  (nothing runs them), so meanwhile detail under a form stroke shows as it does mid-stroke, trailing.
+* **A form stroke takes a previewed generator from its job** (`Layered::adopt_generators`): the generator is held at
+  its own level (the part the job was given, kept when it was taken) and the job's blocks are composed by the
+  stroke's last follow, which composes every generator block again anyway; the job is stopped (`GenJob::canceller`,
+  it checks between batches of 4096 blocks) and its result, if it lands, is dropped. So a form stroke right after a
+  generator edit neither waits nor runs ahead.
+* **Threads.** Pen-up work (the rest of the carrying in one job, the stroke's end, the last follow) runs on the
+  carrying threads, a quarter of the cores: on all of them, beside the next stroke's dabs, it made those dabs 5-20
+  times slower and finished hardly sooner. Generator jobs, and a last follow with generators in the stack, run on all
+  the cores below the frame's priority.
+* **Covering the layers** at a stroke's begin is done a level at a time in parallel, and a follow covers only a
+  generator's new blocks: a follow under a level 2 generator (100k blocks) took 450 ms on the main thread, now 2 ms.
+
+The wait from a stroke's begin to its first dab, at the app's scale (a ball of 1M triangles, a stroke begun a frame
+after the last one's pen up, a dab a frame; `waits_before_a_new_stroke`):
+
+| after | before | now | the stroke done for real from |
+|---|---|---|---|
+| a big form stroke over a detail layer (radius 0.5, 3300 layer blocks) | 880 ms | 8-10 ms | 1.6 s, caught up 0.2 s later |
+| a generator edit at level 2 (100k blocks) | 1.8 s | 8-24 ms | at once (taken from the job) |
+| a generator edit at level 3 (1M blocks) | 17.6 s | 27-28 ms | at once |
+| a big plain stroke carrying detail (radius 0.3) | 720 ms | 6-7 ms | 1.3 s, caught up 0.2 s later |
+
+Frames during such a stroke stay at 6-12 ms, but for the one that takes in the last stroke's last follow (85 ms after
+the form stroke, as before when it was part of the wait). The rest at level 3 is covering a million blocks at the
+begin.
+
+Tests (`volume_mode.rs`): strokes run ahead after plain strokes, form strokes over layers (form, detail and mask
+strokes after them), and generator edits (form strokes taking the generator, detail strokes running ahead until its
+job is in) end exactly as waiting, undo and redo step for step the same, and what the GPU was sent adds up to what
+is shown at every frame. `tests/stress.rs`: form strokes over a generator's job (previewed or joined on the GPU, the
+stale job landing mid-stroke or after), strokes drawn ahead on copies while an end or a follow is still to land
+(drawing on the copies leaves the real state exactly as it was), in the seeded session with its checks, and
+`orderings_land_as_waiting` (two sessions from one seed, one waiting: exactly the same after every step, undo and
+redo).
+
+Found on the way: composing a layer block reads the form two of a level's steps past its box (interpolated and
+differenced), but only blocks whose box itself overlapped a changed form block were composed again; a form stroke
+next to a layer left blocks off by a few ulps (`reading`).
+
+Left: carrying under a big stroke ("Big brushes keep finer detail") ends as its jobs happened to land, so as the
+frames fell, whoever waits: two sessions that both wait, one dab a frame and three, differ in a few in-between
+blocks and by up to a few tenths of a level 0 step after a third stroke over them, and running ahead differs just
+as much (`carrying_ends_as_its_jobs_land_whoever_waits`). Mask and density strokes running ahead show on the copy
+like any other. A stroke's raycasts while running ahead hit the copy's surface (the stroke it ran ahead of not yet
+ended there), so its dabs land where the pen saw them, a little off where waiting would have put them. The last
+follow after a form stroke over a big generator takes its blocks in on the main thread (0.4 s at level 2, 3.5 s at
+level 3), before and now. Long sessions (`SCULPT_STRESS_VOXEL=0.12`, 30-40 steps): seeds 1 and 3 pass; seed 2 stops
+at a generator edit leaving a non-manifold edge away from any finer cell, seed 5 at a generator edit pushing three
+undo steps, seeds 4, 6 and 8 at a file opened differing from what was live (past the tolerance, or a level 1 block
+only live). The code before this work stops at each of them the same way, with the same numbers.
+
 ## The level by distance
 
 Each region of the view shows only the levels whose detail would show on screen from where the eye is ("Level by
@@ -558,8 +626,6 @@ one array of atomics at fixed places. The exact check runs on both backends.
 ## Known gaps
 
 * **No occlusion culling yet**, only view and facing.
-* **Starting a stroke right after a big one waits** for the last one's end (up to about 0.3 s after a big stroke
-  over detail, if the pen comes down at once).
 * **Very big brushes on a fine level 0 cost about 7 ms a dab** (2400 blocks changed); a frame with several such dabs
   runs at 30-40 fps, detail or not.
 * Carrying in jobs leaves a few empty in-between blocks that carrying all at once drops (up to 10 a level in the

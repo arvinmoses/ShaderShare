@@ -244,6 +244,52 @@ fn plane_stroke(dab: &mut dyn FnMut(usize, Vec3, Vec3, f32, bool, usize), hit: &
     }
 }
 
+/// A stroke on the form: its level, radius, clay or trim, where, followed in jobs, ended in a job.
+#[derive(Clone, Copy)]
+struct FormStroke {
+    level: usize,
+    r: f32,
+    trim: bool,
+    d: Vec3,
+    jobs: bool,
+    end_job: bool,
+}
+
+/// The stroke's begin and dabs on `l`'s form (and follows in jobs, landing a few dabs late), up to its end. A
+/// generator still previewed is taken at its own level first, as the app does.
+fn form_dabs(l: &mut Layered, s: &mut LevelVolume, f: &FormStroke) {
+    let FormStroke { level, r, trim, d, jobs, .. } = *f;
+    let span = (r * 1.5).min(0.5);
+    let side = d.any_orthonormal_vector();
+    l.deferred = jobs;
+    let hits: Vec<Option<(Vec3, Vec3)>> = (0..=6).map(|k| l.form().raycast((d + side * span * (-1.0 + k as f32 / 3.0)).normalize() * 3.0, -(d + side * span * (-1.0 + k as f32 / 3.0)).normalize(), level, true)).collect();
+    l.adopt_generators();
+    l.begin_stroke();
+    let mut along = Vec3::ZERO;
+    for (k, h) in hits.into_iter().enumerate() {
+        let Some((at, n)) = h else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = l.plane_dab(s, level, at, rough, r, r * 0.095, 0.5, 0.4, trim) {
+            along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
+        }
+        if jobs && k % 3 == 2 && let Some(job) = l.follow_take() {
+            l.follow_apply(s, job.run());
+        }
+    }
+}
+
+/// End a form stroke (in a job, or at once) and land everything after it.
+fn form_end(l: &mut Layered, s: &mut LevelVolume, f: &FormStroke) {
+    if f.end_job {
+        if let Some(job) = l.end_form_take() {
+            l.end_form_apply(job.run());
+        }
+    } else {
+        l.end_stroke(s);
+    }
+    l.settle(s);
+}
+
 impl World {
     fn new(seed: u64, voxel: f32) -> World {
         let s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, LEVELS);
@@ -527,9 +573,8 @@ impl World {
         self.check(&format!("plain {} stroke at level {level} r {r:.4} (carry jobs {jobs}, end job {end_job}, keep {})", if trim { "trim" } else { "clay" }, self.s.keep_detail));
     }
 
-    /// A stroke on the form under the layers, followed in jobs that land late or at once, ended in a job or at once,
-    /// and settled (or, now and then, checked before the last follow lands).
-    fn form_stroke(&mut self) {
+    /// A form stroke's parameters, drawn.
+    fn draw_form_stroke(&mut self) -> FormStroke {
         let from = self.from();
         let level = self.rng.below(from);
         let r = self.radius(level);
@@ -537,23 +582,16 @@ impl World {
         let d = self.rng.dir();
         let jobs = self.rng.chance(0.6);
         let end_job = self.rng.chance(0.5);
-        let span = (r * 1.5).min(0.5);
-        let side = d.any_orthonormal_vector();
+        FormStroke { level, r, trim, d, jobs, end_job }
+    }
+
+    /// A stroke on the form under the layers, followed in jobs that land late or at once, ended in a job or at once,
+    /// and settled (or, now and then, checked before the last follow lands).
+    fn form_stroke(&mut self) {
+        let f = self.draw_form_stroke();
+        let FormStroke { level, r, trim, jobs, end_job, .. } = f;
+        form_dabs(self.l.as_mut().unwrap(), &mut self.s, &f);
         let l = self.l.as_mut().unwrap();
-        l.deferred = jobs;
-        let hits: Vec<Option<(Vec3, Vec3)>> = (0..=6).map(|k| l.form().raycast((d + side * span * (-1.0 + k as f32 / 3.0)).normalize() * 3.0, -(d + side * span * (-1.0 + k as f32 / 3.0)).normalize(), level, true)).collect();
-        l.begin_stroke();
-        let mut along = Vec3::ZERO;
-        for (k, h) in hits.into_iter().enumerate() {
-            let Some((at, n)) = h else { continue };
-            let rough = if along == Vec3::ZERO { n } else { along };
-            if let Some((n, _)) = l.plane_dab(&mut self.s, level, at, rough, r, r * 0.095, 0.5, 0.4, trim) {
-                along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
-            }
-            if jobs && k % 3 == 2 && let Some(job) = l.follow_take() {
-                l.follow_apply(&mut self.s, job.run());
-            }
-        }
         if end_job {
             match l.end_form_take() {
                 Some(job) => {
@@ -570,6 +608,143 @@ impl World {
         }
         self.l.as_mut().unwrap().settle(&mut self.s);
         self.check(&format!("form {} stroke at level {level} r {r:.4} (follow jobs {jobs}, end job {end_job})", if trim { "trim" } else { "clay" }));
+    }
+
+    /// A generator edited (previewed coarser, or joined on the GPU), and a form stroke begun before its job lands:
+    /// the stroke takes the generator at its own level (`Layered::adopt_generators`), and the job's result, landing
+    /// mid-stroke or after it, is dropped. With `wait`, the job lands first instead, as before.
+    fn form_stroke_over_a_generator_job(&mut self, wait: bool) {
+        let gens = self.generators();
+        if gens.is_empty() {
+            return self.add_generator();
+        }
+        let k = gens[self.rng.below(gens.len())];
+        let gpu = self.rng.chance(0.5);
+        let late = self.rng.chance(0.5);
+        let scale = self.rng.range(0.7, 1.4);
+        let f = self.draw_form_stroke();
+        let l = self.l.as_mut().unwrap();
+        // (Only a generator finer than the preview's level is previewed: one at level 1 or coarser is moved to 2.)
+        if l.layers()[k].level < 2 {
+            l.set_level(&mut self.s, k, 2);
+        }
+        let mut spec = l.generator(k).unwrap().clone();
+        spec.size *= scale;
+        if !(gpu && l.gpu_generator(&mut self.s, k, &spec).is_some()) {
+            l.preview_generator(&mut self.s, k, &spec);
+        }
+        assert!(l.previewing(), "the edit was not previewed");
+        let job = l.generator_take();
+        let mut stale = None;
+        if wait {
+            if let Some(job) = job {
+                assert!(l.generator_apply(&mut self.s, job.run()));
+            }
+        } else {
+            stale = job;
+        }
+        form_dabs(l, &mut self.s, &f);
+        assert!(!l.previewing());
+        if !late && let Some(job) = stale.take() {
+            assert!(!l.generator_apply(&mut self.s, job.run()), "a generator job a form stroke made stale was taken");
+        }
+        form_end(l, &mut self.s, &f);
+        if let Some(job) = stale.take() {
+            assert!(!l.generator_apply(&mut self.s, job.run()), "a generator job a form stroke made stale was taken");
+        }
+        self.check(&format!("form stroke at level {} r {:.4} over generator {k}'s job (wait {wait}, on the GPU {gpu}, landing late {late})", f.level, f.r));
+    }
+
+    /// A form stroke ended in a job, and the next stroke (on the form, or on what is shown, taken into the active
+    /// detail layer) drawn ahead on copies while that end and the last follow are still to land; then they land and
+    /// the next stroke is done for real. Drawing on the copies leaves the real state exactly as it was. With `wait`,
+    /// nothing is drawn ahead.
+    fn stroke_drawn_ahead(&mut self, wait: bool) {
+        let first = self.draw_form_stroke();
+        let next = self.draw_form_stroke();
+        let detail = self.rng.chance(0.4) && self.l.as_ref().is_some_and(|l| l.layers().get(l.active()).is_some_and(|x| !x.generator && !x.noise));
+        let level = self.l.as_ref().map_or(0, |l| l.layers().get(l.active()).map_or(l.from(), |x| x.level));
+        let r = self.s.voxel(level) * 6.0;
+        let l = self.l.as_mut().unwrap();
+        form_dabs(l, &mut self.s, &first);
+        let end = if first.end_job { l.end_form_take() } else { None };
+        if !first.end_job {
+            l.end_stroke(&mut self.s);
+        }
+        if !wait {
+            let before = fingerprint(&self.s, Some(&*l));
+            let (mut cl, mut cs) = (l.preview_copy(), self.s.preview_copy());
+            if detail {
+                cs.begin_stroke();
+                let d = next.d;
+                if let Some((at, n)) = cs.raycast(d * 3.0, -d, level, true) {
+                    cs.plane_dab(level, at, n, r, r * 0.095, 0.5, 0.4, next.trim);
+                }
+            } else {
+                form_dabs(&mut cl, &mut cs, &next);
+            }
+            let after = fingerprint(&self.s, Some(&*l));
+            if let Err(why) = same_state(&before, &after) {
+                panic!("drawing on copies changed the real state: {why}");
+            }
+        }
+        if let Some(job) = end {
+            l.end_form_apply(job.run());
+        }
+        l.settle(&mut self.s);
+        if detail {
+            self.s.begin_stroke();
+            let d = next.d;
+            if let Some((at, n)) = self.s.raycast(d * 3.0, -d, level, true) {
+                self.s.plane_dab(level, at, n, r, r * 0.095, 0.5, 0.4, next.trim);
+            }
+            self.s.end_stroke();
+            self.l.as_mut().unwrap().take_detail(&mut self.s);
+        } else {
+            let l = self.l.as_mut().unwrap();
+            form_dabs(l, &mut self.s, &next);
+            form_end(l, &mut self.s, &next);
+        }
+        self.check(&format!("{} stroke after a form stroke at level {}, drawn ahead {}", if detail { "detail" } else { "form" }, first.level, !wait));
+    }
+
+    /// A stroke ended in a job (its carrying in jobs too), and the next drawn ahead on a copy before the end lands;
+    /// then it lands and the next is done for real. The copy leaves the real volume exactly as it was.
+    fn plain_drawn_ahead(&mut self, wait: bool) {
+        let level = self.rng.below(LEVELS);
+        let r = self.radius(level);
+        let d = self.rng.dir();
+        let next = self.rng.dir();
+        self.s.keep_detail = self.rng.chance(0.4);
+        self.s.carry_budget = Some(0.0);
+        let s = &mut self.s;
+        s.begin_stroke();
+        if let Some((at, n)) = s.raycast(d * 3.0, -d, level, true) {
+            s.plane_dab(level, at, n, r, r * 0.095, 0.5, 0.4, false);
+        }
+        while let Some(job) = s.carry_take(64) {
+            s.carry_apply(job.run());
+        }
+        let end = s.end_stroke_take();
+        if !wait {
+            let before = samples(s, None);
+            let mut copy = s.preview_copy();
+            copy.begin_stroke();
+            if let Some((at, n)) = copy.raycast(next * 3.0, -next, level, true) {
+                copy.plane_dab(level, at, n, r, r * 0.095, 0.5, 0.4, true);
+            }
+            assert!(before == samples(s, None), "drawing on a copy changed the real volume");
+        }
+        if let Some(job) = end {
+            s.end_stroke_apply(job.run());
+        }
+        s.carry_budget = None;
+        s.begin_stroke();
+        if let Some((at, n)) = s.raycast(next * 3.0, -next, level, true) {
+            s.plane_dab(level, at, n, r, r * 0.095, 0.5, 0.4, true);
+        }
+        s.end_stroke();
+        self.check(&format!("plain stroke at level {level} r {r:.4} after one ending in a job, drawn ahead {}", !wait));
     }
 
     /// A stroke on what is shown, taken into the active detail layer when it ends (as the app does).
@@ -998,6 +1173,8 @@ impl World {
         if self.l.is_none() {
             if self.rng.chance(0.25) {
                 self.make_layer();
+            } else if self.rng.chance(0.2) {
+                self.plain_drawn_ahead(false);
             } else {
                 self.plain_stroke();
             }
@@ -1005,7 +1182,9 @@ impl World {
         }
         let roll = self.rng.below(100);
         match roll {
-            0..=17 => self.form_stroke(),
+            0..=13 => self.form_stroke(),
+            14..=15 => self.form_stroke_over_a_generator_job(false),
+            16..=17 => self.stroke_drawn_ahead(false),
             18..=35 => self.layer_stroke(),
             36..=40 => self.add_generator(),
             41..=50 => self.edit_generator(),
@@ -1057,6 +1236,58 @@ fn run(seed: u64, steps: usize, voxel: f32) {
 #[test]
 fn a_short_mixed_session_stays_closed_exact_and_undoable() {
     run(1, 14, 0.12);
+}
+
+/// Two sessions from one seed, one waiting for every job before the next stroke and one not (a form stroke taking a
+/// generator from its job, strokes drawn ahead on copies while an end or a follow is still to land): after each such
+/// step they hold exactly the same, and undo and redo the same.
+#[test]
+fn orderings_land_as_waiting() {
+    let mut a = World::new(5, 0.12);
+    let mut b = World::new(5, 0.12);
+    let compare = |a: &mut World, b: &mut World, what: &str| {
+        let (fa, fb) = (fingerprint(&a.s, a.l.as_ref()), fingerprint(&b.s, b.l.as_ref()));
+        if let Err(why) = same_state(&fa, &fb) {
+            panic!("after {what}, waiting and not waiting differ: {why}");
+        }
+    };
+    for _ in 0..3 {
+        a.plain_drawn_ahead(true);
+        b.plain_drawn_ahead(false);
+        compare(&mut a, &mut b, "a plain stroke drawn ahead");
+    }
+    a.make_layer();
+    b.make_layer();
+    a.add_generator();
+    b.add_generator();
+    for round in 0..4 {
+        a.form_stroke_over_a_generator_job(true);
+        b.form_stroke_over_a_generator_job(false);
+        compare(&mut a, &mut b, &format!("a form stroke over a generator's job (round {round})"));
+        a.stroke_drawn_ahead(true);
+        b.stroke_drawn_ahead(false);
+        compare(&mut a, &mut b, &format!("a stroke drawn ahead (round {round})"));
+        if round == 1 {
+            a.add_layer();
+            b.add_layer();
+        }
+    }
+    // Undo all the way and redo, step by step the same.
+    let mut n = 0;
+    loop {
+        let (x, y) = (a.l.as_mut().unwrap().undo(&mut a.s), b.l.as_mut().unwrap().undo(&mut b.s));
+        assert_eq!(x, y);
+        if !x {
+            break;
+        }
+        n += 1;
+        compare(&mut a, &mut b, &format!("{n} undos"));
+    }
+    for k in 1..=n {
+        assert!(a.l.as_mut().unwrap().redo(&mut a.s) && b.l.as_mut().unwrap().redo(&mut b.s));
+        compare(&mut a, &mut b, &format!("{k} redos"));
+    }
+    eprintln!("the same after every one of {n} undos and redos");
 }
 
 #[test]
