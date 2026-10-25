@@ -504,7 +504,48 @@ distance" in the Mesh menu, on by default, with the pixels it takes):
   cell (seen only when the levels are chosen from far but drawn from near), the coarser cell can hold no surface
   there, and the hand-over still steps a little when the block goes.
 
-Not done yet: choosing by occlusion.
+* **At half a million blocks.** The view keeps its blocks as a tree in flat arrays (a node per stored block, parent
+  and children by index), and a choice walks it level by level over the arrays in parallel; within a budget the
+  threshold is found from a histogram of the blocks' detail on screen, and only its bin is sorted. Choosing takes
+  3-12 ms with 270k blocks (it took 10-60 ms, and 150 ms in the app with 416k shown), and nothing when nothing
+  changed. Blocks that changed are measured for a time (2 ms a sync, batches of 2048) rather than 768 a sync, so a
+  bake's 315k blocks are measured in a few frames rather than hundreds; and blocks still to be measured are left out
+  of the budget's sum (they show as work under way must), where before a big unmeasured change could push the
+  threshold to infinity and hide everything shown. In the stress demo after the bake: 15-47 ms a frame against
+  0.8-1.4 s.
+
+## Big changes land region by region
+
+A generator's exact field landing after its preview, a bake, an undo of either: hundreds of thousands of blocks
+change in one frame, and sending them all cost 330-540 ms in that frame (twelve rocks at level 3, 480k blocks). Now a
+sync takes only part of such a change, and the rest waits:
+
+* **Regions.** The changed blocks are ordered by their level 0 block along a space-filling curve and taken from one
+  end, a few thousand to tens of thousands a sync (adjusted to what a sync costs, aiming at 25 ms), to the end of a
+  region; blocks that went from the volume all go at once (their neighbours' quads point at their cells).
+* **Nothing opens between what has landed and what has not.** A block the GPU holds as it was (its samples not yet
+  given) stays as it is, and a neighbour sent next to it takes its first layer of samples past the shared face from
+  that block's slot, in the pass that scatters the samples to their slots: both sides agree. A block the GPU does
+  not hold yet counts as hidden (as if not stored) for everything sent in the meantime, so the coarser level is drawn
+  there until it lands, as under a hidden block. A block the view shows or hides, or a block below one that lands
+  (whose first layer past it changed), goes with it whether or not its turn had come.
+* **Measured as it lands.** A big change is measured as it is noted, so what would not show from here is never sent
+  (a bake seen from afar sends a tenth of its blocks); a stroke's blocks still show until they settle.
+* **Pools grow in place.** Slots, quad pages and vertex pages run out mid-landing; the buffers are now remade bigger
+  with what the GPU built copied across and the new pages put on the free stacks by a pass, instead of a full rebuild.
+  A rebuild remains for pages that actually ran out (quads were dropped).
+* **Checked.** `--gpu-levels-check` lands every change a few hundred blocks a sync, and after each sync on the way
+  reads the samples back and checks that every pair of neighbouring blocks agrees on their shared face, edge or
+  corner and that no quad was dropped, before the final comparison with the reference.
+* **Numbers** (`--gpu-levels-check --bench-join`, each sync's GPU work waited for as a frame would): twelve rocks at
+  level 3, 300-483k blocks, land over 27-73 syncs, the longest 41-53 ms CPU (45-56 with its GPU work), 0.7-1.8 s CPU
+  in all (the boundaries of regions are sent again, and each sync pays for working out its sets); at level 2,
+  52-80k blocks over 3-5 syncs, the longest 27-30 ms. A sync that takes a region costs about: taking it 1 ms, noting
+  and measuring 2-4, choosing 4-8, the upload set 5-8, packing 3, the extract set 5-8.
+
+Not done yet: choosing by occlusion; a file opened still uploads everything in one sync (the rebuild); the surface
+noise a bake replaces vanishes when the bake begins rather than when its layer has landed; under heavy load from
+other processes the parallel parts of a sync (the sets, packing) can take several times as long.
 
 ## Driver workarounds (Vulkan, this AMD driver)
 

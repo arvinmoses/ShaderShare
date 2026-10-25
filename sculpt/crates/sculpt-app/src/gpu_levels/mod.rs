@@ -37,8 +37,17 @@ const VPAGE: u64 = 64;
 const SLOTS_PER_QUAD_PAGE: u32 = 1;
 const SLOTS_PER_VERT_PAGE: u32 = 1;
 const SAMPLE_WORDS: u64 = 365;
-/// Blocks whose detail is measured again per sync, after they changed (for choosing the level by distance).
-const MEASURE_PER_SYNC: usize = 768;
+/// Milliseconds a sync spends measuring the detail of blocks that changed (for choosing the level by distance).
+const MEASURE_MS: f64 = 2.0;
+/// Changed blocks a sync takes at most, to begin with: a bigger change (a generator's exact field landing, a bake)
+/// goes up over several syncs, region by region, the rest shown as it was meanwhile. Adjusted to what a sync costs.
+const LAND_FIRST: usize = 12_000;
+const LAND_LEAST: usize = 6_000;
+const LAND_MOST: usize = 160_000;
+/// What a sync that lands part of a change should cost, in milliseconds.
+const LAND_MS: f64 = 25.0;
+/// No slot.
+const NO_SLOT: u32 = u32::MAX;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -68,6 +77,8 @@ pub struct SyncStats {
     pub bytes: usize,
     /// Everything was rebuilt (first sync, a cap change, or buffers that had to grow).
     pub full: bool,
+    /// Changed blocks left for later syncs.
+    pub pending: usize,
 }
 
 struct Buffers {
@@ -138,11 +149,27 @@ pub struct GpuLevels {
     /// GPU time of the last extraction read back, in milliseconds.
     pub gpu_ms: f64,
     pub indirect_count: bool,
-    /// Set when the pages ran out: the next sync grows them and rebuilds.
+    /// Set when the pages are running low: the next sync grows them in place.
     grow_pages: bool,
-    /// Vertex pages ran out: twice as many on the next rebuild.
     grow_vpages: bool,
+    /// Set when the pages ran out (quads were dropped): the next sync grows them and rebuilds.
+    out_of_pages: bool,
+    out_of_vpages: bool,
     cap_changed: bool,
+    /// Changed blocks left for later syncs (see `LAND_FIRST`): the set of them, and the same in the order they are
+    /// taken in (the next last), each with its region's place in that order; a block taken or sent before its turn
+    /// leaves the set and is skipped when its turn comes. And how many a sync takes now (adjusted to what a sync
+    /// costs; `land_limit` fixes it).
+    pending_set: KeySet<Key>,
+    pending: Vec<(u64, Key)>,
+    land_now: usize,
+    pub land_limit: Option<usize>,
+    /// Buffers grown in place and the stacks of free pages extended (made when first needed), and what the pools
+    /// grew by while a status read was under way (which will not count it).
+    grow: Option<upload::Grow>,
+    pool_fix: Option<(i32, i32)>,
+    /// The blocks the last sync sent (for checks).
+    pub last_sent: Vec<Key>,
     /// Which blocks are shown, chosen by distance from the eye (a hidden block is not on the GPU at all, as if it
     /// were not stored), and the eye with its pixels per unit at distance one.
     pub view: LevelView,
@@ -193,12 +220,20 @@ fn pack_into(vol: &LevelVolume, k: Key, hidden: Option<&KeySet<Key>>, out: &mut 
     }
 }
 
-/// A block's samples as sent: its slot, their hash and the words.
+/// A block's samples as sent: its slot, their hash and the words; and per neighbour past it (by octant, 1 to 7) the
+/// slot of that neighbour where the GPU still holds it as it was (its samples not yet given to it), whose samples the
+/// first layer past the block must agree with (`NO_SLOT`: none).
 struct Packed {
     slot: u32,
     hash: u64,
     key: Key,
+    nb: [u32; 7],
     data: [u32; SAMPLE_WORDS as usize],
+}
+
+/// A key's slot in `pending_set` with a slot: the GPU holds the block as it was.
+fn held_as_was(pending: &KeySet<Key>, slot_of: &KeyMap<Key, u32>, k: Key) -> u32 {
+    if pending.contains(&k) { slot_of.get(&k).copied().unwrap_or(NO_SLOT) } else { NO_SLOT }
 }
 
 impl GpuLevels {
@@ -266,8 +301,17 @@ impl GpuLevels {
             indirect_count,
             grow_pages: false,
             grow_vpages: false,
+            out_of_pages: false,
+            out_of_vpages: false,
             buffers_made: 1,
             cap_changed: false,
+            pending: Vec::new(),
+            pending_set: KeySet::default(),
+            land_now: LAND_FIRST,
+            land_limit: None,
+            grow: None,
+            pool_fix: None,
+            last_sent: Vec::new(),
             view: LevelView::default(),
             eye: None,
             join: None,
@@ -474,22 +518,25 @@ impl GpuLevels {
 
     /// Everything from scratch: buffers sized for the volume, every block shown uploaded and extracted.
     fn rebuild(&mut self, vol: &LevelVolume, stats: &mut SyncStats) {
+        // Everything goes up: nothing is left for later.
+        self.pending.clear();
+        self.pending_set.clear();
         let blocks: Vec<Key> = vol.keys().into_iter().filter(|k| !self.view.hides(*k)).collect();
         let slots = ((blocks.len() as u32) * 2).max(self.buf.slots).max(4096);
         let mut pages = self.buf.pages.max(slots / SLOTS_PER_QUAD_PAGE);
         let mut vpages = self.buf.vpages.max(slots / SLOTS_PER_VERT_PAGE);
-        if self.grow_pages {
+        if self.grow_pages || self.out_of_pages {
             pages *= 2;
             self.grow_pages = false;
+            self.out_of_pages = false;
         }
-        if self.grow_vpages {
+        if self.grow_vpages || self.out_of_vpages {
             vpages *= 2;
             self.grow_vpages = false;
+            self.out_of_vpages = false;
         }
         // No bigger than one binding may be.
-        let most = self.device.limits().max_storage_buffer_binding_size as u64;
-        let pages = pages.min((most / (PAGE_INDICES * 4)) as u32);
-        let vpages = vpages.min((most / (VPAGE * 8)) as u32);
+        let (pages, vpages) = self.fit_pools(pages, vpages);
         if slots != self.buf.slots || pages != self.buf.pages || vpages != self.buf.vpages {
             self.buf = Self::buffers(&self.device, &self.layout, slots, pages, vpages, 1024);
             self.buffers_made += 1;
@@ -508,14 +555,15 @@ impl GpuLevels {
         // All pages free, every slot without pages.
         let free: Vec<u32> = (0..self.buf.pages).rev().chain((0..self.buf.vpages).rev()).collect();
         self.queue.write_buffer(&self.buf.free_pages, 0, bytemuck::cast_slice(&free));
-        self.queue.write_buffer(&self.buf.status, 0, bytemuck::cast_slice(&[self.buf.pages as i32, 0, 0, 0, self.buf.vpages as i32, 0, 0, 0]));
+        self.status = [self.buf.pages as i32, 0, 0, 0, self.buf.vpages as i32, 0, 0, 0];
+        self.queue.write_buffer(&self.buf.status, 0, bytemuck::cast_slice(&self.status));
         self.queue.write_buffer(&self.buf.slot_pages, 0, &vec![0u8; (self.buf.slots as u64 * SLOT_WORDS * 4) as usize]);
         let (_, pending) = self.upload(vol, &blocks, stats, None);
         if let Some(packed) = pending {
             Self::send_packed(&mut self.scatter, &self.device, &self.queue, &self.buf.samples, packed);
         }
-        self.send_meta(&blocks);
         let mut all: Vec<u32> = (0..self.high).collect();
+        self.send_meta(&mut all);
         self.send_fades(&mut all);
         self.extract(&blocks, &[], stats);
         stats.full = true;
@@ -524,31 +572,86 @@ impl GpuLevels {
     fn send_hash_whole(&mut self) {
         if self.hash.len() as u32 > self.buf.hash_len {
             // A bigger table needs a bigger buffer, and so a new bind group.
-            let len = self.hash.len() as u32;
-            let (pages, vpages) = (self.buf.pages, self.buf.vpages);
-            let slots = self.buf.slots;
-            let old = std::mem::replace(&mut self.buf, Self::buffers(&self.device, &self.layout, slots, pages, vpages, len));
-            self.buffers_made += 1;
-            self.copy_contents(&old);
+            let (slots, pages, vpages) = (self.buf.slots, self.buf.pages, self.buf.vpages);
+            self.remake(slots, pages, vpages, self.hash.len() as u32);
         }
         self.queue.write_buffer(&self.buf.hash, 0, bytemuck::cast_slice(&self.hash));
         self.hash_dirty.clear();
     }
 
-    /// Copy what the GPU built into freshly made buffers of the same slot and page counts.
-    fn copy_contents(&self, old: &Buffers) {
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        for (a, b) in [(&old.samples, &self.buf.samples), (&old.meta, &self.buf.meta), (&old.verts, &self.buf.verts), (&old.cells, &self.buf.cells), (&old.pages_buf, &self.buf.pages_buf), (&old.slot_pages, &self.buf.slot_pages), (&old.free_pages, &self.buf.free_pages), (&old.status, &self.buf.status), (&old.clusters, &self.buf.clusters), (&old.table, &self.buf.table), (&old.morph, &self.buf.morph)] {
-            enc.copy_buffer_to_buffer(a, 0, b, 0, a.size().min(b.size()));
-        }
-        self.queue.submit([enc.finish()]);
+    /// Page counts no bigger than one binding may be.
+    fn fit_pools(&self, pages: u32, vpages: u32) -> (u32, u32) {
+        let most = self.device.limits().max_storage_buffer_binding_size as u64;
+        (pages.min((most / (PAGE_INDICES * 4)) as u32), vpages.min((most / (VPAGE * 8)) as u32))
     }
 
-    fn send_meta(&self, keys: &[Key]) {
+    /// Buffers of these sizes (no smaller than now) holding what the GPU built: a slot keeps its number and its
+    /// pages, new pages go onto the free stacks, and whoever draws binds the buffers again. Nothing is rebuilt.
+    fn remake(&mut self, slots: u32, pages: u32, vpages: u32, hash_len: u32) {
+        let (slots, pages, vpages, hash_len) = (slots.max(self.buf.slots), pages.max(self.buf.pages), vpages.max(self.buf.vpages), hash_len.max(self.buf.hash_len));
+        if (slots, pages, vpages, hash_len) == (self.buf.slots, self.buf.pages, self.buf.vpages, self.buf.hash_len) {
+            return;
+        }
+        let t = Instant::now();
+        let old = std::mem::replace(&mut self.buf, Self::buffers(&self.device, &self.layout, slots, pages, vpages, hash_len));
+        self.buffers_made += 1;
+        let new = &self.buf;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("levels grow") });
+        for (a, b) in [(&old.samples, &new.samples), (&old.meta, &new.meta), (&old.verts, &new.verts), (&old.cells, &new.cells), (&old.pages_buf, &new.pages_buf), (&old.slot_pages, &new.slot_pages), (&old.status, &new.status), (&old.clusters, &new.clusters), (&old.table, &new.table), (&old.morph, &new.morph)] {
+            enc.copy_buffer_to_buffer(a, 0, b, 0, a.size().min(b.size()));
+        }
+        // The free quad pages, then from `pages` on the free vertex pages: each stack where it now begins.
+        enc.copy_buffer_to_buffer(&old.free_pages, 0, &new.free_pages, 0, old.pages as u64 * 4);
+        enc.copy_buffer_to_buffer(&old.free_pages, old.pages as u64 * 4, &new.free_pages, pages as u64 * 4, old.vpages as u64 * 4);
+        self.queue.submit([enc.finish()]);
+        if pages > old.pages || vpages > old.vpages {
+            let g = self.grow.get_or_insert_with(|| upload::Grow::new(&self.device));
+            g.extend(&self.device, &self.queue, &new.free_pages, &new.status, [old.pages, pages, old.vpages, vpages]);
+            // As the status will read once it comes back (a read under way now will not count the new pages).
+            let d = ((pages - old.pages) as i32, (vpages - old.vpages) as i32);
+            self.status[0] += d.0;
+            self.status[4] += d.1;
+            if self.status_state.load(Ordering::Acquire) != 0 {
+                let was = self.pool_fix.unwrap_or((0, 0));
+                self.pool_fix = Some((was.0 + d.0, was.1 + d.1));
+            }
+        }
+        self.queue.write_buffer(&self.buf.hash, 0, bytemuck::cast_slice(&self.hash));
+        self.hash_dirty.clear();
+        if std::env::var_os("SCULPT_JOIN_LOG").is_some() {
+            eprintln!("grow: slots {} -> {slots}, pages {} -> {pages}, vertex pages {} -> {vpages}, slot table {} -> {hash_len}: {:.1} ms", old.slots, old.pages, old.vpages, old.hash_len, t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
+    /// Room for `blocks` more blocks with slots and pages to spare, grown in place if there is not.
+    fn make_room(&mut self, blocks: usize) {
+        let spare = self.free.len() + (self.buf.slots - self.high) as usize;
+        let mut slots = self.buf.slots;
+        if blocks > spare {
+            slots = ((self.slot_of.len() + blocks) as u32 * 2).max(slots * 2);
+        }
+        // Pages: as the status last read them, a block taking about one of each at most.
+        let (mut pages, mut vpages) = (self.buf.pages, self.buf.vpages);
+        let need = blocks as i32 + 4096;
+        if self.grow_pages || self.status[0] < need {
+            pages = (pages * 2).max(pages + need as u32);
+            self.grow_pages = false;
+        }
+        if self.grow_vpages || self.status[4] < need {
+            vpages = (vpages * 2).max(vpages + need as u32);
+            self.grow_vpages = false;
+        }
+        let (pages, vpages) = self.fit_pools(pages, vpages);
+        self.remake(slots, pages, vpages, self.buf.hash_len);
+    }
+
+    /// Send the block coordinates of `slots` (a free slot reads as free).
+    fn send_meta(&self, slots: &mut Vec<u32>) {
         // Slots near one another in one write each (the slots between them as they are): a write per slot costs far
         // more than its 16 bytes.
-        let mut m: Vec<u32> = keys.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
+        let m = slots;
         m.sort_unstable();
+        m.dedup();
         let mut i = 0;
         while i < m.len() {
             let mut j = i + 1;
@@ -579,6 +682,7 @@ impl GpuLevels {
         let sent = &self.sent;
         let hidden = Some(self.view.hidden());
         let slot_of = &self.slot_of;
+        let pending = &self.pending_set;
         // Packed in place, a block per thread; a block whose slot holds the same is left out.
         let packed: Vec<Option<Packed>> = keys
             .par_iter()
@@ -590,20 +694,30 @@ impl GpuLevels {
                 let mut data = [0u32; SAMPLE_WORDS as usize];
                 pack_into(vol, *k, hidden, &mut data);
                 let h = sample_hash(&data);
-                (sent[s as usize] != h).then_some(Packed { slot: s, hash: h, key: *k, data })
+                if sent[s as usize] == h {
+                    return None;
+                }
+                // Neighbours past it the GPU still holds as they were: the first layer past the block is taken from
+                // their slots when it is scattered, so both sides of each face agree.
+                let nb: [u32; 7] = if pending.is_empty() { [NO_SLOT; 7] } else { std::array::from_fn(|i| held_as_was(pending, slot_of, (k.0, k.1 + IVec3::new((i as i32 + 1) & 1, ((i as i32 + 1) >> 1) & 1, (i as i32 + 1) >> 2)))) };
+                Some(Packed { slot: s, hash: h, key: *k, nb, data })
             })
             .collect();
         let t_pack = t.elapsed().as_secs_f64() * 1e3;
         let mut out: Vec<Key> = Vec::new();
-        let mut blocks: Vec<(u32, &[u32; SAMPLE_WORDS as usize])> = Vec::new();
+        let mut blocks: Vec<(u32, [u32; 7], &[u32; SAMPLE_WORDS as usize])> = Vec::new();
+        let mut patched = false;
         for p in packed.iter().flatten() {
-            self.sent[p.slot as usize] = p.hash;
+            // A slot patched from its neighbours holds something other than what was packed: sent again next time.
+            let patch = p.nb != [NO_SLOT; 7];
+            patched |= patch;
+            self.sent[p.slot as usize] = if patch { 0 } else { p.hash };
             out.push(p.key);
-            blocks.push((p.slot, &p.data));
+            blocks.push((p.slot, p.nb, &p.data));
         }
         stats.uploaded += blocks.len();
         stats.bytes += blocks.len() * SAMPLE_WORDS as usize * 4;
-        if blocks.len() >= upload::IN_BULK {
+        if blocks.len() >= upload::IN_BULK || patched {
             // Many blocks: one write and a pass that scatters them to their slots, sent later.
             if std::env::var_os("SCULPT_JOIN_LOG").is_some() && blocks.len() > 20000 {
                 eprintln!("upload: {} of {} blocks: pack {t_pack:.1}, list {:.1} ms", blocks.len(), keys.len(), t.elapsed().as_secs_f64() * 1e3 - t_pack);
@@ -619,7 +733,7 @@ impl GpuLevels {
             while j < blocks.len() && blocks[j].0 == blocks[j - 1].0 + 1 {
                 j += 1;
             }
-            let data: Vec<u32> = blocks[i..j].iter().flat_map(|p| p.1.iter().copied()).collect();
+            let data: Vec<u32> = blocks[i..j].iter().flat_map(|p| p.2.iter().copied()).collect();
             self.queue.write_buffer(&self.buf.samples, blocks[i].0 as u64 * SAMPLE_WORDS * 4, bytemuck::cast_slice(&data));
             i = j;
         }
@@ -629,7 +743,7 @@ impl GpuLevels {
     /// Send what [`Self::upload`] packed: one write and a pass that scatters the blocks to their slots.
     fn send_packed(scatter: &mut Option<upload::Scatter>, device: &wgpu::Device, queue: &wgpu::Queue, samples: &wgpu::Buffer, packed: Vec<Option<Packed>>) {
         let t = Instant::now();
-        let blocks: Vec<(u32, &[u32; SAMPLE_WORDS as usize])> = packed.iter().flatten().map(|p| (p.slot, &p.data)).collect();
+        let blocks: Vec<(u32, [u32; 7], &[u32; SAMPLE_WORDS as usize])> = packed.iter().flatten().map(|p| (p.slot, p.nb, &p.data)).collect();
         let sc = scatter.get_or_insert_with(|| upload::Scatter::new(device));
         let laps = sc.send(device, queue, samples, &blocks);
         if std::env::var_os("SCULPT_JOIN_LOG").is_some() && blocks.len() > 20000 {
@@ -740,17 +854,91 @@ impl GpuLevels {
             }
             self.status_staging.unmap();
             self.status_state.store(0, Ordering::Release);
-            // Ran out, or under a quarter free: grow before the next edit needs them, unless as big as a binding may be
-            // already (then what does not fit stays out).
+            if let Some((p, v)) = self.pool_fix.take() {
+                self.status[0] += p;
+                self.status[4] += v;
+            }
+            // Ran out (quads were dropped: grown and rebuilt), or under a quarter free (grown in place before the
+            // next edit needs them), unless as big as a binding may be already (then what does not fit stays out).
             let most = self.device.limits().max_storage_buffer_binding_size as u64;
             let low = |free: i32, of: u32| free < (of / 4) as i32;
-            if (self.status[1] != 0 || low(self.status[0], self.buf.pages)) && (self.buf.pages as u64 * 2 * PAGE_INDICES * 4) <= most {
-                self.grow_pages = true;
+            if (self.buf.pages as u64 * 2 * PAGE_INDICES * 4) <= most {
+                self.out_of_pages |= self.status[1] != 0;
+                self.grow_pages |= low(self.status[0], self.buf.pages);
             }
-            if (self.status[5] != 0 || low(self.status[4], self.buf.vpages)) && (self.buf.vpages as u64 * 2 * VPAGE * 8) <= most {
-                self.grow_vpages = true;
+            if (self.buf.vpages as u64 * 2 * VPAGE * 8) <= most {
+                self.out_of_vpages |= self.status[5] != 0;
+                self.grow_vpages |= low(self.status[4], self.buf.vpages);
             }
         }
+    }
+
+    /// Changed blocks not yet given to the GPU (a big change lands over several syncs).
+    pub fn pending(&self) -> usize {
+        self.pending_set.len()
+    }
+
+    /// Of the blocks that changed (`drained` now, and those left from earlier syncs), the ones this sync takes: all
+    /// of them, or when `all` is not asked and they are more than a sync should take, those that went from the volume
+    /// (cheap, and their neighbours' quads would point at their cells) and then whole regions in a space-filling
+    /// order up to about the limit, the rest left for later syncs.
+    fn take_region(&mut self, vol: &LevelVolume, drained: Vec<Key>, all: bool) -> Vec<Key> {
+        let limit = self.land_limit.unwrap_or(self.land_now);
+        if all || (self.pending_set.is_empty() && drained.len() <= limit) {
+            let set = std::mem::take(&mut self.pending_set);
+            let mut now: Vec<Key> = self.pending.drain(..).map(|p| p.1).filter(|k| set.contains(k)).collect();
+            now.extend(drained);
+            return now;
+        }
+        // Each block's region: its level 0 block, in Morton order (descending: the next to take is last). Blocks that
+        // went all go now (the GPU would hold them while their neighbours read them as gone).
+        let order = |k: &Key| -> u64 {
+            let c = k.1.div_euclid(IVec3::splat(1 << k.0)) + IVec3::splat(1 << 19);
+            let mut m: u64 = 0;
+            for b in 0..20 {
+                m |= (((c.x >> b) & 1) as u64) << (3 * b) | (((c.y >> b) & 1) as u64) << (3 * b + 1) | (((c.z >> b) & 1) as u64) << (3 * b + 2);
+            }
+            !m
+        };
+        let (mut now, there): (Vec<Key>, Vec<Key>) = drained.into_par_iter().partition(|k| vol.block(*k).is_none());
+        if !there.is_empty() {
+            let mut fresh: Vec<(u64, Key)> = there.par_iter().map(|k| (order(k), *k)).collect();
+            fresh.par_sort_unstable_by_key(|o| o.0);
+            self.pending_set.extend(fresh.iter().map(|o| o.1));
+            if self.pending.is_empty() {
+                self.pending = fresh;
+            } else {
+                // Merged in, the order kept.
+                let old = std::mem::take(&mut self.pending);
+                let mut merged = Vec::with_capacity(old.len() + fresh.len());
+                let (mut a, mut b) = (old.into_iter().peekable(), fresh.into_iter().peekable());
+                loop {
+                    match (a.peek(), b.peek()) {
+                        (Some(x), Some(y)) => merged.push(if x.0 <= y.0 { a.next().unwrap() } else { b.next().unwrap() }),
+                        (Some(_), None) => merged.push(a.next().unwrap()),
+                        (None, Some(_)) => merged.push(b.next().unwrap()),
+                        (None, None) => break,
+                    }
+                }
+                self.pending = merged;
+            }
+        }
+        // From the end: up to the limit of blocks still pending, then to the end of that region (within reason).
+        let (mut taken, mut cut) = (0, self.pending.len());
+        while cut > 0 && taken < limit {
+            cut -= 1;
+            taken += self.pending_set.contains(&self.pending[cut].1) as usize;
+        }
+        while cut > 0 && taken < limit + limit / 2 && self.pending[cut - 1].0 == self.pending[cut].0 {
+            cut -= 1;
+            taken += self.pending_set.contains(&self.pending[cut].1) as usize;
+        }
+        for (_, k) in self.pending.drain(cut..).rev() {
+            if self.pending_set.remove(&k) {
+                now.push(k);
+            }
+        }
+        now
     }
 
     /// Bring the GPU's copy up to date with `vol`: upload what changed and re-extract around it.
@@ -781,30 +969,44 @@ impl GpuLevels {
             self.extract_slots(ex, &rel, &mut stats);
         }
         lap("status");
-        let mut dirty = vol.drain_dirty();
-        let n_dirty = dirty.len();
-        lap("dirty");
         let first = self.slot_of.is_empty() && self.high == 0;
+        let full = first || self.out_of_pages || self.out_of_vpages || self.cap_changed || vol.origin() != self.origin;
+        // The blocks that changed: those left from earlier syncs first. A big change goes up region by region over
+        // several syncs, the rest shown as it was meanwhile; a join (whose blocks the GPU writes) takes everything.
+        let drained = vol.drain_dirty();
+        let n_dirty = drained.len() + self.pending_set.len();
+        let mut dirty = self.take_region(vol, drained, full || skip.is_some());
+        let spread = !self.pending_set.is_empty();
+        lap("dirty");
         // The levels shown: blocks that changed are measured again (showing until they are), and those shown or
         // hidden since the last sync go up or come down as blocks that came or went do.
-        if first || vol.origin() != self.origin {
+        if full {
             self.view.clear();
             self.view.note(vol, &vol.keys());
         } else {
-            self.view.note(vol, &dirty);
+            // A big change (a field landing, a bake, an undo) is measured as it is noted, so what would not show
+            // from here is never sent; a stroke's blocks are left to show until they settle.
+            self.view.note_at(vol, &dirty, dirty.len() >= LAND_LEAST);
         }
         lap("note");
-        self.view.refresh(vol, MEASURE_PER_SYNC);
+        self.view.refresh_within(vol, MEASURE_MS);
         lap("refresh");
         if let Some((eye, focal)) = self.eye {
-            dirty.extend(self.view.choose(vol, eye, focal));
+            let flips = self.view.choose(vol, eye, focal);
+            if spread {
+                // A block shown or hidden goes now, whether or not its change was left for later.
+                for k in &flips {
+                    self.pending_set.remove(k);
+                }
+            }
+            dirty.extend(flips);
             dirty.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
             dirty.dedup();
         }
         lap("choose");
         // Blocks whose fade began, turned or ended: those keeping their slots are sent now, the rest with their slots.
         let faded = self.view.take_fade_changes();
-        if first || self.grow_pages || self.grow_vpages || self.cap_changed || vol.origin() != self.origin {
+        if full {
             self.cap_changed = false;
             self.origin = vol.origin();
             self.rebuild(vol, &mut stats);
@@ -814,8 +1016,14 @@ impl GpuLevels {
         let mut fade_slots: Vec<u32> = faded.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
         if dirty.is_empty() {
             self.send_fades(&mut fade_slots);
+            stats.pending = self.pending_set.len();
             return stats;
         }
+        // Blocks left for later that the GPU does not hold count as hidden for now (as if not stored), so what is
+        // sent next to them reads them as the GPU does; those it holds stay as they are, their neighbours' first layer
+        // past them taken from their slots.
+        let held_back: Vec<Key> = if spread { self.pending_set.iter().copied().filter(|k| !self.slot_of.contains_key(k)).collect() } else { Vec::new() };
+        let hid_now = self.view.hide_for_now(&held_back);
         // Blocks that went, and blocks that came.
         let mut released = Vec::new();
         let mut gone = Vec::new();
@@ -834,30 +1042,30 @@ impl GpuLevels {
         }
         lap("gone");
         let uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
-        lap("upload_set");
-        let mut out_of_slots = false;
-        // Blocks given a slot now: only their slots' block coordinates need sending.
-        let mut placed = Vec::new();
-        for k in &uploads {
-            if !self.slot_of.contains_key(k) {
-                if let Some(s) = self.take_slot(*k) {
-                    self.hash_insert(*k, s);
-                    placed.push(*k);
-                } else {
-                    out_of_slots = true;
-                }
+        if spread {
+            // Blocks sent now have landed, whether or not their own change was left for later.
+            for k in &uploads {
+                self.pending_set.remove(k);
             }
         }
-        if out_of_slots {
-            self.rebuild(vol, &mut stats);
-            stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
-            return stats;
+        lap("upload_set");
+        // Blocks given a slot now: only their slots' block coordinates need sending.
+        let coming = uploads.iter().filter(|k| !self.slot_of.contains_key(k)).count();
+        self.make_room(coming);
+        let mut placed = Vec::with_capacity(coming);
+        for k in &uploads {
+            if !self.slot_of.contains_key(k) {
+                let s = self.take_slot(*k).expect("room was made");
+                self.hash_insert(*k, s);
+                placed.push(*k);
+            }
         }
         // A slot freed here and handed straight to a new block is released with that block's extraction: listing it
         // twice would have two threads give its pages back at once, and two blocks would then share them.
         released.retain(|&s| self.key_of[s as usize].is_none());
         lap("place");
-        if self.hash_fit() {
+        // Many changed entries (thousands of blocks that came or went) go up as the whole table: far fewer writes.
+        if self.hash_fit() || self.hash_dirty.len() > 2048 {
             self.send_hash_whole();
             lap("hash whole");
         } else {
@@ -877,17 +1085,15 @@ impl GpuLevels {
             }
             lap("hash");
         }
-        // Freed slots read as free.
-        for &s in &released {
-            self.queue.write_buffer(&self.buf.meta, s as u64 * 16, bytemuck::cast_slice(&[0i32, 0, 0, -1]));
-        }
-        self.send_meta(&placed);
-        fade_slots.extend(placed.iter().filter_map(|k| self.slot_of.get(k).copied()));
-        fade_slots.extend_from_slice(&released);
+        // Slots given a block, and freed slots (which read as free).
+        let mut meta_slots: Vec<u32> = placed.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
+        meta_slots.extend_from_slice(&released);
+        self.send_meta(&mut meta_slots);
+        fade_slots.extend_from_slice(&meta_slots);
         self.send_fades(&mut fade_slots);
         lap("slots");
         let n_up = uploads.len();
-        let (uploads, pending) = self.upload(vol, &uploads, &mut stats, skip);
+        let (uploads, packed) = self.upload(vol, &uploads, &mut stats, skip);
         lap("upload");
         let mut changed: Vec<Key> = uploads.clone();
         changed.extend(gone);
@@ -895,7 +1101,7 @@ impl GpuLevels {
             // Of the join's blocks, those that came or went here changed for the blocks around them.
             changed.extend(dirty.iter().filter(|k| skip.contains(k)));
         }
-        if let Some(packed) = pending {
+        if let Some(packed) = packed {
             Self::send_packed(&mut self.scatter, &self.device, &self.queue, &self.buf.samples, packed);
         }
         lap("send");
@@ -914,11 +1120,19 @@ impl GpuLevels {
             self.extract(&extract, &released, &mut stats);
         }
         lap("extract");
+        self.view.unhide(&hid_now);
+        self.last_sent = uploads.clone();
         stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        stats.pending = self.pending_set.len();
+        if spread {
+            // The next sync takes about as many blocks as fit the time this one was meant to cost.
+            let per_ms = dirty.len() as f64 / stats.cpu_ms.max(0.5);
+            self.land_now = ((per_ms * LAND_MS) as usize).clamp(LAND_LEAST, LAND_MOST);
+        }
         if log {
             let mut prev = 0.0;
             let parts: Vec<String> = laps.iter().map(|(n, tt)| { let s = format!("{n} {:.1}", tt - prev); prev = *tt; s }).collect();
-            eprintln!("sync: {n_dirty} dirty, {n_up} upload candidates, {} sent, {} extracted: {}", uploads.len(), extract.len(), parts.join(", "));
+            eprintln!("sync: {n_dirty} dirty ({} taken, {} left), {n_up} upload candidates, {} sent, {} extracted: {}", dirty.len(), self.pending_set.len(), uploads.len(), extract.len(), parts.join(", "));
         }
         stats
     }

@@ -67,6 +67,65 @@ fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, m
     v.end_stroke();
 }
 
+/// Sync until nothing is left for later (a big change lands over several syncs), checking after each sync on the
+/// way that the surface is whole: every pair of neighbouring blocks on the GPU agrees on the samples of their shared
+/// face, and no quad was dropped. Returns the last sync's stats.
+fn sync_all(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &mut GpuLevels, vol: &mut LevelVolume, when: &str, landed_only: bool) -> Res<super::SyncStats> {
+    let mut s = gpu.sync(vol);
+    let mut syncs = 1;
+    let mut landed: std::collections::HashSet<Key> = std::collections::HashSet::new();
+    while gpu.pending() > 0 {
+        landed.extend(gpu.last_sent.iter().copied());
+        faces_agree(device, queue, gpu, &format!("{when}, after sync {syncs} with {} blocks left to land", gpu.pending()), landed_only.then_some(&landed))?;
+        s = gpu.sync(vol);
+        syncs += 1;
+    }
+    if syncs > 1 {
+        println!("{when}: landed over {syncs} syncs");
+    }
+    Ok(s)
+}
+
+/// Every pair of neighbouring blocks the GPU holds agrees on the samples of the face, edge or corner they share (a
+/// block's first layer past it is the neighbour's own first layer), and no quad was dropped. With `landed`, only
+/// pairs with a block among them (the rest may be a join's preview, which the exact field differs a little from).
+fn faces_agree(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, when: &str, landed: Option<&std::collections::HashSet<Key>>) -> Res<()> {
+    let samples = read(device, queue, &gpu.buf.samples);
+    let status = read(device, queue, &gpu.buf.status);
+    let at = |s: usize, i: usize| (samples[s * 365 + i / 2] >> (16 * (i % 2))) & 0xffff;
+    let mut pairs = 0;
+    for (k, &s) in &gpu.slot_of {
+        for q in 1..8usize {
+            let o = glam::IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, (q >> 2) as i32);
+            let d = (k.0, k.1 + o);
+            let Some(&t) = gpu.slot_of.get(&d) else { continue };
+            if landed.is_some_and(|l| !l.contains(k) && !l.contains(&d)) {
+                continue;
+            }
+            pairs += 1;
+            for z in 0..9usize {
+                for y in 0..9usize {
+                    for x in 0..9usize {
+                        if (x == 8) as usize | (((y == 8) as usize) << 1) | (((z == 8) as usize) << 2) != q {
+                            continue;
+                        }
+                        let i = x + 9 * y + 81 * z;
+                        let j = (x - 8 * o.x as usize) + 9 * (y - 8 * o.y as usize) + 81 * (z - 8 * o.z as usize);
+                        if at(s as usize, i) != at(t as usize, j) {
+                            return Err(format!("{when}: block {k:?} and the block {o} past it disagree at its sample ({x},{y},{z}): {} against {}", at(s as usize, i) as u16 as i16, at(t as usize, j) as u16 as i16).into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if status[3] != 0 {
+        return Err(format!("{when}: the GPU dropped {} quads with a corner missing", status[3]).into());
+    }
+    println!("{when}: {pairs} pairs of neighbouring blocks agree on their shared samples");
+    Ok(())
+}
+
 /// Compare the GPU's surface with the reference, block by block. Returns (blocks, quads) compared.
 fn compare(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, vol: &LevelVolume, when: &str) -> Res<(usize, usize)> {
     let show = gpu.show();
@@ -341,7 +400,10 @@ fn join_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
         if flips > near / 1000 {
             return Err(format!("join step {step}: {flips} samples on the other side").into());
         }
-        gpu.sync(&mut vol);
+        // The exact field landing, region by region.
+        gpu.land_limit = Some(4000);
+        sync_all(device, queue, &mut gpu, &mut vol, &format!("join step {step}, the exact field"), true)?;
+        gpu.land_limit = None;
     }
     Ok(())
 }
@@ -391,6 +453,9 @@ pub fn run(args: &[String]) -> Res<()> {
         // The first pass buries finer detail under coarse strokes (the default); the second keeps it, carried in jobs.
         vol.keep_detail = jobs;
         let mut gpu = GpuLevels::new(&device, &queue, &vol, 3);
+        // Changes land a few hundred blocks a sync, so a stroke's dabs land over several syncs, as a big change does
+        // in the app.
+        gpu.land_limit = Some(200);
         gpu.sync(&mut vol);
         compare(&device, &queue, &gpu, &vol, &format!("{pass}fresh ball"))?;
         let plan: [(usize, Vec3, Vec3, f32, bool); 7] = [
@@ -420,7 +485,13 @@ pub fn run(args: &[String]) -> Res<()> {
                 } else {
                     v.carry_pending(Some(0.5));
                 }
-                let s = gpu.sync(v);
+                let s = match sync_all(&device, &queue, &mut gpu, v, &format!("{pass}stroke {} dab {}", i + 1, dab + 1), false) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        failed.get_or_insert(e.to_string());
+                        return;
+                    }
+                };
                 dab += 1;
                 if every && failed.is_none() && let Err(e) = compare(&device, &queue, &gpu, v, &format!("{pass}stroke {} dab {dab} (full {}, released {}, uploaded {})", i + 1, s.full, s.released, s.uploaded)) {
                     failed = Some(e.to_string());
@@ -442,16 +513,16 @@ pub fn run(args: &[String]) -> Res<()> {
             if let Some(e) = failed {
                 return Err(e.into());
             }
-            gpu.sync(&mut vol);
+            sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}stroke {}", i + 1), false)?;
             compare(&device, &queue, &gpu, &vol, &format!("{pass}stroke {} (level {l}, {})", i + 1, if *trim { "trim" } else { "clay" }))?;
         }
         for i in 0..4 {
             vol.undo();
-            gpu.sync(&mut vol);
+            sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}undo {}", i + 1), false)?;
             compare(&device, &queue, &gpu, &vol, &format!("{pass}undo {}", i + 1))?;
         }
         vol.redo();
-        gpu.sync(&mut vol);
+        sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}redo"), false)?;
         compare(&device, &queue, &gpu, &vol, &format!("{pass}redo"))?;
         for cap in [0, 1, 2, 3] {
             gpu.set_cap(cap);
@@ -467,9 +538,9 @@ pub fn run(args: &[String]) -> Res<()> {
                 stroke(&mut vol, 1 + i % 3, a, a + Vec3::new(0.15, 0.05, 0.0), [0.06, 0.03, 0.012][i % 3], false, |v| { v.carry_pending(None); }, |_| {});
             }
             gpu.set_eye(*eye, 1000.0);
-            gpu.sync(&mut vol);
+            sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}seen from {eye}"), false)?;
             while gpu.view.stats.stale > 0 {
-                gpu.sync(&mut vol);
+                sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}seen from {eye}, measured"), false)?;
             }
             let st = gpu.view.stats;
             compare(&device, &queue, &gpu, &vol, &format!("{pass}seen from {eye} ({} blocks shown, {} hidden)", st.shown, st.hidden))?;
@@ -477,12 +548,12 @@ pub fn run(args: &[String]) -> Res<()> {
         // A tight triangle budget, near: only the detail that shows most.
         gpu.view.budget = Some(gpu.view.stats.triangles * 9 / 10);
         gpu.set_eye(Vec3::new(0.0, 0.0, 1.3), 1000.0);
-        gpu.sync(&mut vol);
+        sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}within a budget"), false)?;
         let st = gpu.view.stats;
         compare(&device, &queue, &gpu, &vol, &format!("{pass}within a budget ({} triangles, detail down to {:.1} px)", st.triangles, st.tau_used))?;
         gpu.view.budget = None;
         gpu.view.on = false;
-        gpu.sync(&mut vol);
+        sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}every level again"), false)?;
         compare(&device, &queue, &gpu, &vol, &format!("{pass}every level again"))?;
     }
     println!("the GPU surface matches the reference at every step");
@@ -534,15 +605,29 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
                 apply_ms += ta.elapsed().as_secs_f64() * 1e3;
             }
             let job_ms = tj.elapsed().as_secs_f64() * 1e3;
-            // The exact field landing: the sync after the job, as the app's next frame does it.
+            // The exact field landing: the syncs after the job, as the app's next frames do it, region by region,
+            // each frame's GPU work done before the next (as presenting a frame has it).
             let tl = Instant::now();
-            let land = gpu.sync(&mut vol);
-            let land_cpu = tl.elapsed().as_secs_f64() * 1e3;
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let (mut syncs, mut worst, mut worst_frame, mut cpu, mut sent, mut extracted) = (0, 0.0f64, 0.0f64, 0.0f64, 0, 0);
+            loop {
+                let tf = Instant::now();
+                let land = gpu.sync(&mut vol);
+                let ms = tf.elapsed().as_secs_f64() * 1e3;
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                worst = worst.max(ms);
+                worst_frame = worst_frame.max(tf.elapsed().as_secs_f64() * 1e3);
+                cpu += ms;
+                sent += land.uploaded;
+                extracted += land.extracted;
+                syncs += 1;
+                if gpu.pending() == 0 {
+                    break;
+                }
+            }
             let land_ms = tl.elapsed().as_secs_f64() * 1e3;
             rows.push(format!(
-                "{n} blocks: plan {plan_ms:.1}, sync {sync_ms:.1}, join {:.1} ms CPU, then the GPU {gpu_ms:.1} ms; the job {job_ms:.0} ms ({apply_ms:.1} taking it in); landing it: sync {land_cpu:.1} ms CPU ({} sent, {} extracted), GPU done at {land_ms:.1} ms",
-                s.cpu_ms, land.uploaded, land.extracted
+                "{n} blocks: plan {plan_ms:.1}, sync {sync_ms:.1}, join {:.1} ms CPU, then the GPU {gpu_ms:.1} ms; the job {job_ms:.0} ms ({apply_ms:.1} taking it in); landing it: {syncs} syncs, the longest {worst:.1} ms CPU ({worst_frame:.1} with its GPU work), {cpu:.1} ms CPU in all ({sent} sent, {extracted} extracted), all done at {land_ms:.1} ms",
+                s.cpu_ms
             ));
         }
         println!("rocks at level {level} (blocks per level {:?}):", vol.memory().0);
@@ -733,7 +818,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     }
     let (counts, bytes) = vol.memory();
     println!("blocks per level {counts:?}, {:.1} MB of samples", bytes as f64 / 1e6);
-    while gpu.view.stats.stale > 0 {
+    while gpu.view.stats.stale > 0 || gpu.pending() > 0 {
         gpu.sync(&mut vol);
     }
     for eye in [Vec3::new(0.0, 0.0, 2.6), Vec3::new(0.0, 0.0, 1.15), Vec3::new(0.0, 0.0, 8.0), Vec3::new(3.0, 0.0, 0.0)] {

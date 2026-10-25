@@ -414,7 +414,8 @@ impl Viewport {
 
     /// Bring the volume playground's surface up to date: send the blocks that changed and rebuild the surface around them
     /// on the GPU (everything, for a new volume or a new level cap). `clock` is the time in seconds (the wall clock if
-    /// none). True while levels are still fading as they hand over (more frames are wanted).
+    /// none). True while levels are still fading as they hand over, or a big change is still landing region by region
+    /// (more frames are wanted).
     pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode, eye: glam::Vec3, focal_px: f32, clock: Option<f64>) -> bool {
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let now = clock.unwrap_or_else(|| START.get_or_init(Instant::now).elapsed().as_secs_f64());
@@ -477,7 +478,10 @@ impl Viewport {
         mode.blocks = v.gpu.slots();
         if s.uploaded > 0 || s.full {
             mode.sync = s;
+        } else if mode.sync.pending > 0 {
+            mode.sync.pending = s.pending;
         }
+        let fading = fading || s.pending > 0;
         self.volume_draws = v.gpu.status[2].max(0) as u32;
         mode.pages_drawn = self.volume_draws;
         mode.gpu_ms = v.gpu.gpu_ms;

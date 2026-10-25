@@ -1316,6 +1316,8 @@ impl SculptApp {
                 let mut enc = png::Encoder::new(std::io::BufWriter::new(file), image.size[0] as u32, image.size[1] as u32);
                 enc.set_color(png::ColorType::Rgba);
                 enc.set_depth(png::BitDepth::Eight);
+                // Encoded on the frame: the fast setting keeps the frame's own work readable in its readout.
+                enc.set_compression(png::Compression::Fast);
                 enc.write_header().and_then(|mut w| w.write_image_data(&rgba)).map_err(|e| e.to_string())
             });
             if let Err(e) = r {
@@ -1403,7 +1405,14 @@ impl SculptApp {
                     "Level by distance off: every level shown".to_string()
                 },
                 format!("Last stroke at level {} (step {:.5})  ·  {:.2} ms a dab on the CPU", m.stroke_level, m.vol.voxel(m.stroke_level), m.dab_ms),
-                format!("Surface rebuilt on the GPU: {} blocks in {:.2} ms ({} blocks sent, {:.2} ms CPU)", fmt_count(m.sync.extracted), m.gpu_ms, fmt_count(m.sync.uploaded), m.sync.cpu_ms),
+                format!(
+                    "Surface rebuilt on the GPU: {} blocks in {:.2} ms ({} blocks sent, {:.2} ms CPU{})",
+                    fmt_count(m.sync.extracted),
+                    m.gpu_ms,
+                    fmt_count(m.sync.uploaded),
+                    m.sync.cpu_ms,
+                    if m.sync.pending > 0 { format!(", {} still to land", fmt_count(m.sync.pending)) } else { String::new() }
+                ),
                 format!("Drawing {} of {} pages of quads{}  ·  {pace}", fmt_count(m.pages_drawn as usize), fmt_count(m.pages_used as usize), if self.viewport.as_ref().is_some_and(|v| v.cull) { " (the rest out of view or facing away)" } else { " (culling off)" }),
             ];
             if let Some(layer) = &m.layer {
