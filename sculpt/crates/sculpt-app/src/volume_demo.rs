@@ -47,6 +47,10 @@ impl Pose {
 enum Act {
     /// Move the camera to a pose over `dur` seconds.
     Camera(Pose),
+    /// Move the eye the levels are chosen from (apart from the camera) to a pose over `dur` seconds.
+    LevelEye(Pose),
+    /// The levels chosen from the camera again.
+    LevelEyeOff,
     /// A stroke along a polyline of viewport fractions over `dur` seconds.
     Stroke { tool: Tool, size: f32, strength: f32, path: Vec<(f32, f32)> },
     Cap(usize),
@@ -115,6 +119,8 @@ pub struct VolumeDemo {
     /// The frame whose image the app is waiting for.
     pub waiting: Option<u32>,
     pub caption: Option<(String, f32)>,
+    /// The eye the levels are chosen from this frame, when not the camera's.
+    pub level_eye: Option<Vec3>,
 }
 
 fn line(a: (f32, f32), b: (f32, f32), wiggle: f32, n: usize) -> Vec<(f32, f32)> {
@@ -286,8 +292,44 @@ impl VolumeDemo {
             at(8.0, 0.0, Generator(|s| s.op = sculpt_core::generator::BoolOp::Subtract));
             end = 9.5;
         }
+        // `SCULPT_DEMO_SCRIPT=fade`: fine work on the ball, then the levels handed over as the eye moves: first with the
+        // camera still and only the eye the levels are chosen from moving (so frames differ by the hand-overs alone),
+        // then a plain dolly out and in.
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("fade") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::at(patch, 1.1)));
+            if std::env::var_os("SCULPT_FADE_TINT").is_some() {
+                at(0.0, 0.0, Tint(true));
+            }
+            at(0.3, 1.5, Stroke { tool: Tool::ClayBuildup, size: 45.0, strength: 1.0, path: line((0.36, 0.42), (0.64, 0.44), 0.03, 12) });
+            at(2.0, 1.5, Stroke { tool: Tool::ClayBuildup, size: 45.0, strength: 1.0, path: line((0.36, 0.56), (0.64, 0.58), 0.03, 12) });
+            at(3.6, 1.0, Camera(Pose::at(patch, 0.32)));
+            for k in 0..4 {
+                let y = 0.38 + 0.08 * k as f32;
+                at(4.8 + 1.0 * k as f32, 0.8, Stroke { tool: Tool::TrimDynamic, size: 14.0, strength: 1.0, path: line((0.38, y), (0.62, y + 0.01), 0.004, 10) });
+            }
+            for k in 0..6 {
+                let x = 0.40 + 0.04 * k as f32;
+                at(8.9 + 0.35 * k as f32, 0.25, Stroke { tool: Tool::ClayBuildup, size: 9.0, strength: 1.0, path: line((x, 0.69), (x + 0.002, 0.69), 0.0, 2) });
+            }
+            // The camera holds; the levels' eye goes out and comes back.
+            let hold = Pose::at(patch, 0.7);
+            at(11.5, 1.0, Camera(hold));
+            at(11.5, 0.0, LevelEye(hold));
+            at(13.0, 5.0, LevelEye(Pose::at(patch, 9.0)));
+            at(19.0, 5.0, LevelEye(hold));
+            // The levels' eye jumps out and back: every hand-over starts on one frame.
+            at(25.0, 0.0, LevelEye(Pose::at(patch, 9.0)));
+            at(26.5, 0.0, LevelEye(hold));
+            at(28.0, 0.0, LevelEyeOff);
+            // A plain dolly out and in.
+            at(28.0, 5.0, Camera(Pose::at(patch, 6.0)));
+            at(33.5, 5.0, Camera(Pose::at(patch, 0.5)));
+            end = 39.0;
+        }
         let n = items.len();
-        VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None }
+        VolumeDemo { dir, items, frame: 0, end, begun: vec![false; n], fired: vec![false; n], waiting: None, caption: None, level_eye: None }
     }
 
     /// Past the script's end (or `SCULPT_DEMO_END` seconds, for a quick look at its start).
@@ -298,13 +340,30 @@ impl VolumeDemo {
 
     /// The camera pose at time `t`: the latest camera move, eased from where the one before it ended.
     fn pose_at(&self, t: f32) -> Option<Pose> {
-        let moves: Vec<&Item> = self.items.iter().filter(|i| matches!(i.act, Act::Camera(_))).collect();
+        self.moves_at(t, |a| if let Act::Camera(p) = a { Some(Some(*p)) } else { None })
+    }
+
+    /// The eye the levels are chosen from at time `t`, when the script sets one apart from the camera.
+    fn level_pose_at(&self, t: f32) -> Option<Pose> {
+        self.moves_at(t, |a| match a {
+            Act::LevelEye(p) => Some(Some(*p)),
+            Act::LevelEyeOff => Some(None),
+            _ => None,
+        })
+    }
+
+    /// The pose at time `t` of the moves `pick` names (`Some(None)` ends them).
+    fn moves_at(&self, t: f32, pick: impl Fn(&Act) -> Option<Option<Pose>>) -> Option<Pose> {
         let mut current: Option<Pose> = None;
-        for m in moves {
-            let Act::Camera(p) = m.act else { continue };
+        for m in &self.items {
+            let Some(p) = pick(&m.act) else { continue };
             if t < m.at {
                 break;
             }
+            let Some(p) = p else {
+                current = None;
+                continue;
+            };
             let from = current.unwrap_or(p);
             let k = if m.dur <= 0.0 { 1.0 } else { ((t - m.at) / m.dur).clamp(0.0, 1.0) };
             current = Some(Pose::lerp(from, p, k));
@@ -328,6 +387,14 @@ impl VolumeDemo {
             c.pitch = p.pitch;
             f.camera = Some(c);
         }
+        self.level_eye = self.level_pose_at(t).map(|p| {
+            let mut c = camera.clone();
+            c.target = p.target;
+            c.distance = p.distance;
+            c.yaw = p.yaw;
+            c.pitch = p.pitch;
+            c.eye()
+        });
         let at = |(x, y): (f32, f32)| Pos2::new(rect.min.x + x * rect.width(), rect.min.y + y * rect.height());
         self.caption = None;
         for (i, item) in self.items.iter().enumerate() {
@@ -396,5 +463,10 @@ impl VolumeDemo {
 
     pub fn current_frame(&self) -> u32 {
         self.frame
+    }
+
+    /// The script's own clock, in seconds.
+    pub fn clock(&self) -> f64 {
+        self.frame as f64 / FPS as f64
     }
 }

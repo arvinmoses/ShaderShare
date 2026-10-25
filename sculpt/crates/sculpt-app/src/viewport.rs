@@ -317,6 +317,10 @@ impl Viewport {
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 ro(6),
+                ro(7),
+                ro(8),
+                ro(9),
+                ro(10),
             ],
         });
         let levels_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("viewport levels"), bind_group_layouts: &[Some(&bgl), Some(&levels_bgl)], immediate_size: 0 });
@@ -409,8 +413,11 @@ impl Viewport {
     }
 
     /// Bring the volume playground's surface up to date: send the blocks that changed and rebuild the surface around them
-    /// on the GPU (everything, for a new volume or a new level cap).
-    pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode, eye: glam::Vec3, focal_px: f32) {
+    /// on the GPU (everything, for a new volume or a new level cap). `clock` is the time in seconds (the wall clock if
+    /// none). True while levels are still fading as they hand over (more frames are wanted).
+    pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode, eye: glam::Vec3, focal_px: f32, clock: Option<f64>) -> bool {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let now = clock.unwrap_or_else(|| START.get_or_init(Instant::now).elapsed().as_secs_f64());
         let t = Instant::now();
         if self.volume.as_ref().is_none_or(|v| v.generation != mode.generation) {
             let gpu = crate::gpu_levels::GpuLevels::new(&rs.device, &rs.queue, &mode.vol, mode.cap);
@@ -425,6 +432,10 @@ impl Viewport {
         v.gpu.view.on = mode.by_distance;
         v.gpu.view.tau_px = mode.level_px;
         v.gpu.view.budget = mode.budget_on.then(|| (mode.budget_m as f64 * 1e6) as u64);
+        // Levels hand over by fading (seconds; `SCULPT_FADE=0` switches it to at once).
+        static FADE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        v.gpu.view.fade_s = *FADE.get_or_init(|| std::env::var("SCULPT_FADE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.25));
+        v.gpu.set_clock(now);
         v.gpu.set_eye(eye, focal_px);
         // A generator edit the GPU joins at its own level (the CPU's job brings the exact field after): the sync
         // leaves the plan's blocks to the join.
@@ -458,8 +469,10 @@ impl Viewport {
             v.buffers_made = v.gpu.buffers_made;
         }
         let (noise_f, noise_i) = noise.as_ref().map_or(sculpt_core::surface_noise::SurfaceNoise { on: false, ..Default::default() }, |n| n.0).uniform();
-        let mask_i = [v.mask_bits, (v.mask_bits > 0 && noise.is_some()) as u32, 0, 0];
-        let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc: [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, 0.0, 0.0], noise_f, noise_i, mask_i };
+        let fading = v.gpu.view.fading();
+        let mask_i = [v.mask_bits, (v.mask_bits > 0 && noise.is_some()) as u32, v.gpu.fade_buffers().4, v.gpu.cap as u32];
+        let misc = [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, if fading { 1.0 } else { 0.0 }, now as f32];
+        let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc, noise_f, noise_i, mask_i };
         rs.queue.write_buffer(&v.uniforms, 0, bytemuck::bytes_of(&u));
         mode.blocks = v.gpu.slots();
         if s.uploaded > 0 || s.full {
@@ -470,10 +483,12 @@ impl Viewport {
         mode.gpu_ms = v.gpu.gpu_ms;
         mode.pages_used = v.gpu.page_capacity().saturating_sub(v.gpu.status[0].max(0) as u32);
         self.last_upload = UploadStats { bytes: s.bytes, ranges: s.uploaded, ms: t.elapsed().as_secs_f32() * 1e3 };
+        fading
     }
 
     fn levels_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, uniforms: &wgpu::Buffer, gpu: &crate::gpu_levels::GpuLevels, mask_hash: &wgpu::Buffer, mask_samples: &wgpu::Buffer) -> wgpu::BindGroup {
         let (_, _, _, verts, cells, slot_pages) = gpu.buffers_for_draw();
+        let (morph, hash, samples, table, _) = gpu.fade_buffers();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("volume levels"),
             layout,
@@ -485,6 +500,10 @@ impl Viewport {
                 wgpu::BindGroupEntry { binding: 4, resource: mask_hash.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: mask_samples.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: slot_pages.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: morph.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: hash.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: samples.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: table.as_entire_binding() },
             ],
         })
     }

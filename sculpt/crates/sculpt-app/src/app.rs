@@ -1067,7 +1067,12 @@ impl SculptApp {
                     ctx.request_repaint();
                 }
                 let focal_px = px[1].max(1) as f32 / (2.0 * (self.camera.fov_y * 0.5).tan());
-                vp.sync_volume(rs, mode, self.camera.eye(), focal_px);
+                // A scripted session runs on its own clock, and may choose the levels from an eye of its own.
+                let demo = self.volume_demo.as_ref();
+                let eye = demo.and_then(|d| d.level_eye).unwrap_or(self.camera.eye());
+                if vp.sync_volume(rs, mode, eye, focal_px, demo.map(|d| d.clock())) {
+                    ctx.request_repaint();
+                }
                 self.stats.upload = vp.last_upload;
             } else if let Some(doc) = self.doc.as_mut() {
                 // Meshes dense enough that a generator edit would not fit a frame update their surface a little each frame.

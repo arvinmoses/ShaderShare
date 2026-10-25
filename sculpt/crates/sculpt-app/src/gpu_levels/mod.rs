@@ -91,6 +91,9 @@ struct Buffers {
     clusters: wgpu::Buffer,
     table: wgpu::Buffer,
     pub draws: wgpu::Buffer,
+    /// Per slot, how far its block has faded in as a line in time (a + b * now, clamped to 0..1): only drawing reads
+    /// it.
+    morph: wgpu::Buffer,
     group: wgpu::BindGroup,
     cull_group: wgpu::BindGroup,
 }
@@ -295,6 +298,7 @@ impl GpuLevels {
         let clusters = make("levels clusters", s * 48, st);
         let table = make("levels table", 256 * 4, st);
         let draws = make("levels draws", pages as u64 * 20, st | wgpu::BufferUsages::INDIRECT);
+        let morph = make("levels morph", s * 8, st);
         let group_with = |p: &wgpu::Buffer| {
             let bufs = [p, &samples, &hash, &meta, &work, &verts, &cells, &pages_buf, &slot_pages, &free_pages, &status, &clusters, &table, &draws];
             let entries: Vec<wgpu::BindGroupEntry> = bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() }).collect();
@@ -302,7 +306,7 @@ impl GpuLevels {
         };
         let group = group_with(&params);
         let cull_group = group_with(&cull_params);
-        Buffers { slots, pages, vpages, hash_len, params, cull_params, samples, hash, meta, work, work_len, verts, cells, pages_buf, slot_pages, free_pages, status, clusters, table, draws, group, cull_group }
+        Buffers { slots, pages, vpages, hash_len, params, cull_params, samples, hash, meta, work, work_len, verts, cells, pages_buf, slot_pages, free_pages, status, clusters, table, draws, morph, group, cull_group }
     }
 
     pub fn page_capacity(&self) -> u32 {
@@ -315,6 +319,34 @@ impl GpuLevels {
 
     pub fn meta_buffer(&self) -> &wgpu::Buffer {
         &self.buf.meta
+    }
+
+    /// What drawing a fade reads: each slot's fade, the slot table, the samples, the cells' piece table, and the slot
+    /// table's size less one.
+    pub fn fade_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, u32) {
+        (&self.buf.morph, &self.buf.hash, &self.buf.samples, &self.buf.table, self.hash.len().max(1) as u32 - 1)
+    }
+
+    /// The time fades are measured by, in seconds.
+    pub fn set_clock(&mut self, now: f64) {
+        self.view.set_clock(now);
+    }
+
+    /// Send the fades of `slots` (steady for a free slot).
+    fn send_fades(&self, slots: &mut Vec<u32>) {
+        slots.sort_unstable();
+        slots.dedup();
+        let mut i = 0;
+        while i < slots.len() {
+            let mut j = i + 1;
+            while j < slots.len() && slots[j] - slots[j - 1] <= 32 {
+                j += 1;
+            }
+            let (a, b) = (slots[i], slots[j - 1]);
+            let data: Vec<[f32; 2]> = (a..=b).map(|s| self.key_of.get(s as usize).copied().flatten().map_or([1.0, 0.0], |k| self.view.fade_line(k).into())).collect();
+            self.queue.write_buffer(&self.buf.morph, a as u64 * 8, bytemuck::cast_slice(&data));
+            i = j;
+        }
     }
 
     pub fn slots(&self) -> usize {
@@ -483,6 +515,8 @@ impl GpuLevels {
             Self::send_packed(&mut self.scatter, &self.device, &self.queue, &self.buf.samples, packed);
         }
         self.send_meta(&blocks);
+        let mut all: Vec<u32> = (0..self.high).collect();
+        self.send_fades(&mut all);
         self.extract(&blocks, &[], stats);
         stats.full = true;
     }
@@ -504,7 +538,7 @@ impl GpuLevels {
     /// Copy what the GPU built into freshly made buffers of the same slot and page counts.
     fn copy_contents(&self, old: &Buffers) {
         let mut enc = self.device.create_command_encoder(&Default::default());
-        for (a, b) in [(&old.samples, &self.buf.samples), (&old.meta, &self.buf.meta), (&old.verts, &self.buf.verts), (&old.cells, &self.buf.cells), (&old.pages_buf, &self.buf.pages_buf), (&old.slot_pages, &self.buf.slot_pages), (&old.free_pages, &self.buf.free_pages), (&old.status, &self.buf.status), (&old.clusters, &self.buf.clusters), (&old.table, &self.buf.table)] {
+        for (a, b) in [(&old.samples, &self.buf.samples), (&old.meta, &self.buf.meta), (&old.verts, &self.buf.verts), (&old.cells, &self.buf.cells), (&old.pages_buf, &self.buf.pages_buf), (&old.slot_pages, &self.buf.slot_pages), (&old.free_pages, &self.buf.free_pages), (&old.status, &self.buf.status), (&old.clusters, &self.buf.clusters), (&old.table, &self.buf.table), (&old.morph, &self.buf.morph)] {
             enc.copy_buffer_to_buffer(a, 0, b, 0, a.size().min(b.size()));
         }
         self.queue.submit([enc.finish()]);
@@ -768,6 +802,8 @@ impl GpuLevels {
             dirty.dedup();
         }
         lap("choose");
+        // Blocks whose fade began, turned or ended: those keeping their slots are sent now, the rest with their slots.
+        let faded = self.view.take_fade_changes();
         if first || self.grow_pages || self.grow_vpages || self.cap_changed || vol.origin() != self.origin {
             self.cap_changed = false;
             self.origin = vol.origin();
@@ -775,7 +811,9 @@ impl GpuLevels {
             stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
             return stats;
         }
+        let mut fade_slots: Vec<u32> = faded.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
         if dirty.is_empty() {
+            self.send_fades(&mut fade_slots);
             return stats;
         }
         // Blocks that went, and blocks that came.
@@ -844,6 +882,9 @@ impl GpuLevels {
             self.queue.write_buffer(&self.buf.meta, s as u64 * 16, bytemuck::cast_slice(&[0i32, 0, 0, -1]));
         }
         self.send_meta(&placed);
+        fade_slots.extend(placed.iter().filter_map(|k| self.slot_of.get(k).copied()));
+        fade_slots.extend_from_slice(&released);
+        self.send_fades(&mut fade_slots);
         lap("slots");
         let n_up = uploads.len();
         let (uploads, pending) = self.upload(vol, &uploads, &mut stats, skip);

@@ -69,11 +69,46 @@ pub struct LevelView {
     last: Option<(Vec3, f32, f32, Option<u64>)>,
     changed: bool,
     pub stats: ViewStats,
+    /// Seconds a block takes to fade in or out as it hands over to the level below (0: at once). While it fades out
+    /// it stays shown; it is hidden once it has faded.
+    pub fade_s: f32,
+    /// The time, in seconds, fades are measured by ([`Self::set_clock`]).
+    clock: f64,
+    /// Blocks shown and fading in or out.
+    fades: HashMap<Key, Fade>,
+    /// Blocks whose fade began, turned or ended since [`Self::take_fade_changes`].
+    fade_changed: Vec<Key>,
+}
+
+/// A block fading: how far in it was (0 the level below's surface, 1 its own) at `at`, and which way it goes.
+#[derive(Clone, Copy, Debug)]
+struct Fade {
+    t0: f32,
+    at: f64,
+    rising: bool,
 }
 
 impl Default for LevelView {
     fn default() -> Self {
-        LevelView { hidden: HashSet::default(), own: HashMap::default(), tree: HashMap::default(), stale: HashMap::default(), syncs: 0, quads: HashMap::default(), base: 0, budget: None, tau_px: 1.0, on: true, last: None, changed: true, stats: ViewStats::default() }
+        LevelView {
+            hidden: HashSet::default(),
+            own: HashMap::default(),
+            tree: HashMap::default(),
+            stale: HashMap::default(),
+            syncs: 0,
+            quads: HashMap::default(),
+            base: 0,
+            budget: None,
+            tau_px: 1.0,
+            on: true,
+            last: None,
+            changed: true,
+            stats: ViewStats::default(),
+            fade_s: 0.0,
+            clock: 0.0,
+            fades: HashMap::default(),
+            fade_changed: Vec::new(),
+        }
     }
 }
 
@@ -100,8 +135,80 @@ impl LevelView {
 
     /// Forget everything (a new volume).
     pub fn clear(&mut self) {
-        let (tau, on, budget) = (self.tau_px, self.on, self.budget);
-        *self = LevelView { tau_px: tau, on, budget, ..Default::default() };
+        let (tau, on, budget, fade_s, clock) = (self.tau_px, self.on, self.budget, self.fade_s, self.clock);
+        *self = LevelView { tau_px: tau, on, budget, fade_s, clock, ..Default::default() };
+    }
+
+    /// The time fades are measured by, in seconds.
+    pub fn set_clock(&mut self, now: f64) {
+        self.clock = now;
+    }
+
+    /// Whether any block is fading.
+    pub fn fading(&self) -> bool {
+        !self.fades.is_empty()
+    }
+
+    /// How far a shown block has faded in at time `now` is `a + b * now` (clamped to 0..1): `(1, 0)` for one not
+    /// fading.
+    pub fn fade_line(&self, k: Key) -> (f32, f32) {
+        match self.fades.get(&k) {
+            None => (1.0, 0.0),
+            Some(f) => {
+                let rate = if f.rising { 1.0 } else { -1.0 } / self.fade_s.max(1e-6);
+                ((f.t0 as f64 - rate as f64 * f.at) as f32, rate)
+            }
+        }
+    }
+
+    /// The blocks whose fade began, turned or ended since last asked.
+    pub fn take_fade_changes(&mut self) -> Vec<Key> {
+        std::mem::take(&mut self.fade_changed)
+    }
+
+    fn fade_now(&self, k: Key) -> f32 {
+        self.fades.get(&k).map_or(1.0, |f| {
+            let d = ((self.clock - f.at) / self.fade_s.max(1e-6) as f64) as f32;
+            (if f.rising { f.t0 + d } else { f.t0 - d }).clamp(0.0, 1.0)
+        })
+    }
+
+    fn set_fade(&mut self, k: Key, t0: f32, rising: bool) {
+        self.fades.insert(k, Fade { t0, at: self.clock, rising });
+        self.fade_changed.push(k);
+    }
+
+    fn end_fade(&mut self, k: Key) {
+        if self.fades.remove(&k).is_some() {
+            self.fade_changed.push(k);
+        }
+    }
+
+    /// Fades that ran their course: those that faded in are shown, those that faded out are hidden with every block
+    /// under them. Returns the blocks hidden.
+    fn retire(&mut self, vol: &LevelVolume) -> Vec<Key> {
+        if self.fades.is_empty() {
+            return Vec::new();
+        }
+        let now = self.clock;
+        let fade = self.fade_s.max(1e-6) as f64;
+        let done: Vec<(Key, bool)> = self.fades.iter().filter(|(_, f)| if f.rising { f.t0 as f64 + (now - f.at) / fade >= 1.0 } else { f.t0 as f64 - (now - f.at) / fade <= 0.0 }).map(|(k, f)| (*k, f.rising)).collect();
+        let mut flips = Vec::new();
+        for (k, rising) in done {
+            self.end_fade(k);
+            if rising {
+                continue;
+            }
+            let mut stack = vec![k];
+            while let Some(k) = stack.pop() {
+                if self.hidden.insert(k) {
+                    flips.push(k);
+                }
+                self.end_fade(k);
+                stack.extend(children(vol, k).filter(|c| !self.hidden.contains(c)));
+            }
+        }
+        flips
     }
 
     /// The blocks `dirty` changed (samples or existence): their detail is to be measured again, and a block that came
@@ -160,6 +267,12 @@ impl LevelView {
                 }
             }
         });
+        // A block changed shows as it is at once: no fade lags behind the work.
+        if !self.fades.is_empty() {
+            for c in &counted {
+                self.end_fade(c.0);
+            }
+        }
         self.retree(vol, up);
         self.changed = true;
     }
@@ -214,14 +327,20 @@ impl LevelView {
         let t = std::time::Instant::now();
         if !self.on {
             let flips: Vec<Key> = self.hidden.drain().collect();
+            let fading: Vec<Key> = self.fades.keys().copied().collect();
+            for k in fading {
+                self.end_fade(k);
+            }
             self.last = None;
             self.stats = ViewStats { shown: 0, hidden: 0, stale: self.stale.len(), flips: flips.len(), ms: t.elapsed().as_secs_f64() * 1e3, triangles: 0, tau_used: 0.0 };
             return flips;
         }
+        let mut flips = self.retire(vol);
         let now = (eye, focal_px, self.tau_px, self.budget);
         if !self.changed && self.last == Some(now) {
-            self.stats.flips = 0;
-            return Vec::new();
+            self.stats.flips = flips.len();
+            self.stats.hidden = self.hidden.len();
+            return flips;
         }
         self.last = Some(now);
         self.changed = false;
@@ -258,8 +377,10 @@ impl LevelView {
             keep = keep.max(cut(room + (OVER - 1.0) * budget as f32));
         }
         let mut triangles = self.base as f32 * 2.0;
-        let mut flips: Vec<Key> = Vec::new();
+        let fading = self.fade_s > 0.0;
         let mut hide_roots: Vec<Key> = Vec::new();
+        // Blocks to fade in from where they are (none: shown at once), set once chosen.
+        let mut refade: Vec<(Key, Option<f32>)> = Vec::new();
         // Level 0 always shows; level by level down from there, through the blocks shown.
         let mut shown = vol.level_len(0);
         let mut candidates: Vec<Key> = vol.level_keys(1).into_iter().map(|bc| (1u8, bc)).collect();
@@ -276,9 +397,20 @@ impl LevelView {
             let mut next = Vec::new();
             for (k, show, was_hidden) in decided {
                 if show {
+                    // Fading in from the level below, unless its detail is still to be measured (work under way
+                    // shows at once).
+                    let measured = self.tree.get(&k).is_some_and(|e| e.is_finite());
                     if was_hidden {
                         self.hidden.remove(&k);
                         flips.push(k);
+                        if fading && measured {
+                            refade.push((k, Some(0.0)));
+                        }
+                    } else if let Some(f) = self.fades.get(&k)
+                        && !f.rising
+                    {
+                        // Wanted again while fading out: back in from where it got to.
+                        refade.push((k, measured.then(|| self.fade_now(k))));
                     }
                     next.push(k);
                 } else if !was_hidden {
@@ -289,10 +421,22 @@ impl LevelView {
             triangles += next.iter().map(&cost).sum::<f32>();
             candidates = next.par_iter().flat_map_iter(|&p| children(vol, p).collect::<Vec<_>>()).collect();
         }
-        // A hidden block takes its finer blocks with it.
+        for (k, from) in refade {
+            match from {
+                Some(t) => self.set_fade(k, t, true),
+                None => self.end_fade(k),
+            }
+        }
+        // A hidden block takes its finer blocks with it. Fading, they fade out first (from where they are), and are
+        // hidden once they have.
         let mut stack = hide_roots;
         while let Some(k) = stack.pop() {
-            if self.hidden.insert(k) {
+            if fading {
+                if self.fades.get(&k).is_none_or(|f| f.rising) {
+                    let now = self.fade_now(k);
+                    self.set_fade(k, now, false);
+                }
+            } else if self.hidden.insert(k) {
                 flips.push(k);
             }
             stack.extend(children(vol, k).filter(|c| !self.hidden.contains(c)));
