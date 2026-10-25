@@ -819,8 +819,22 @@ impl LevelVolume {
     }
 
     /// The blocks changed since [`Self::drain_dirty`] last ran, without taking them.
-    pub(crate) fn dirty_keys(&self) -> Vec<Key> {
+    pub fn dirty_keys(&self) -> Vec<Key> {
         self.dirty.iter().copied().collect()
+    }
+
+    /// Count blocks `keys` as changed (for whoever drains them next).
+    pub fn mark_dirty(&mut self, keys: impl IntoIterator<Item = Key>) {
+        self.dirty.extend(keys);
+    }
+
+    /// A copy to draw a stroke on for a while, before it is done for real (see `Layered::preview_copy`): made in a
+    /// moment, sharing its maps' shards with this one; no history, nothing changed yet.
+    pub fn preview_copy(&self) -> LevelVolume {
+        let mut out = self.snapshot();
+        out.carry_budget = self.carry_budget;
+        out.keep_detail = self.keep_detail;
+        out
     }
 
     pub fn drain_dirty(&mut self) -> Vec<Key> {

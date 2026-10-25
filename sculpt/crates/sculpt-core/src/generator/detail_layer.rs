@@ -157,6 +157,8 @@ pub struct GenJob {
     /// The preview it replaces: if the layer holds another by the time it is done, it is dropped.
     preview: std::sync::Arc<Vec<HashSet<IVec3>>>,
     targets: Vec<(usize, IVec3)>,
+    /// Set when its result is no longer wanted: it stops at the next batch of blocks.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What a [`GenJob`] composed.
@@ -165,14 +167,31 @@ pub struct GenDone {
     part: GenPart,
     preview: std::sync::Arc<Vec<HashSet<IVec3>>>,
     blocks: Vec<(usize, IVec3, Option<Stored>)>,
+    cancelled: bool,
     pub ms: f64,
 }
 
 impl GenJob {
     pub fn run(self) -> GenDone {
         let t = Instant::now();
-        let blocks = compose_all(&self.form, &self.stack, self.from - 1, &self.targets);
-        GenDone { k: self.k, part: self.part, preview: self.preview, blocks, ms: t.elapsed().as_secs_f64() * 1e3 }
+        // In batches, so a job no longer wanted stops soon (each block is composed on its own: batches change
+        // nothing).
+        let mut blocks = Vec::with_capacity(self.targets.len());
+        let mut cancelled = false;
+        for batch in self.targets.chunks(4096) {
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                cancelled = true;
+                blocks.clear();
+                break;
+            }
+            blocks.extend(compose_all(&self.form, &self.stack, self.from - 1, batch));
+        }
+        GenDone { k: self.k, part: self.part, preview: self.preview, blocks, cancelled, ms: t.elapsed().as_secs_f64() * 1e3 }
+    }
+
+    /// A flag that stops the job (its result is then never taken).
+    pub fn canceller(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.cancel.clone()
     }
 }
 
@@ -1092,6 +1111,12 @@ pub struct Layered {
     base_epoch: u64,
     /// [`ordered_from`] as what is shown was last composed with.
     ordered_from: usize,
+    /// The last generator job taken: its layer, the preview it replaces, its part and the blocks it composes (so a
+    /// form stroke can take its part without working it out again: see [`Self::adopt_generators`]).
+    taken: Option<(usize, std::sync::Arc<Vec<HashSet<IVec3>>>, GenPart, Vec<(usize, IVec3)>)>,
+    /// Blocks shown that the stroke's last follow composes besides its own: those of generator jobs a form stroke
+    /// made stale.
+    recompose: Vec<(usize, IVec3)>,
 }
 
 /// A follow to work out on another thread: copies of what it reads (see [`Layered::follow_take`]).
@@ -1106,6 +1131,8 @@ pub struct FollowJob {
     used: Used,
     /// Layer blocks to work out besides those under the region (at the end, all the stroke changed).
     also: Vec<(usize, IVec3)>,
+    /// Blocks shown to compose besides (at the end: see [`Layered::adopt_generators`]).
+    recompose: Vec<(usize, IVec3)>,
 }
 
 /// One layer's new blocks (heights and mask; `None` where it holds nothing any more).
@@ -1208,6 +1235,14 @@ impl FollowJob {
         let mut targets = affected(&self.stack, &changes);
         let had: HashSet<(usize, IVec3)> = targets.iter().copied().collect();
         targets.extend(reading(&self.form, &self.stack, self.from, &self.region).into_iter().filter(|t| !had.contains(t)));
+        if !self.recompose.is_empty() {
+            let had: HashSet<(usize, IVec3)> = targets.iter().copied().collect();
+            let mut more = std::mem::take(&mut self.recompose);
+            more.retain(|t| !had.contains(t));
+            more.sort_unstable_by_key(|t| (t.0, t.1.z, t.1.y, t.1.x));
+            more.dedup();
+            targets.extend(more);
+        }
         let shown = compose_all(&self.form, &self.stack, self.from - 1, &targets);
         stats.parts_ms[3] = t3.elapsed().as_secs_f64() * 1e3;
         stats.ms = t.elapsed().as_secs_f64() * 1e3;
@@ -1475,7 +1510,49 @@ impl Layered {
             changed: HashSet::default(),
             base_epoch: 0,
             noise_epoch: 0,
+            taken: None,
+            recompose: Vec::new(),
         }
+    }
+
+    /// A copy to draw a stroke on for a while, before it is done for real: the form and the layers as they are now,
+    /// no history, nothing queued, its dabs only queueing what follows (nothing runs it). Cheap: the maps share
+    /// their shards with these.
+    pub fn preview_copy(&self) -> Layered {
+        let mut out = Layered::with_form(self.form.snapshot(), self.from, self.stack.clone());
+        out.active = self.active;
+        out.deferred = true;
+        out.ordered_from = self.ordered_from;
+        out.base_epoch = self.base_epoch;
+        out.noise_epoch = self.noise_epoch;
+        out
+    }
+
+    /// Whether a generator is shown coarser than its own level (a drag's preview), waiting for a job.
+    pub fn previewing(&self) -> bool {
+        self.stack.iter().any(|x| x.scatter.as_ref().is_some_and(|p| p.upto != x.level))
+    }
+
+    /// Before a stroke on the form: every generator shown coarser than its own level is held at its own level
+    /// (without composing it), and the blocks its job would have composed are composed by the stroke's last follow
+    /// instead, which composes every block of every generator again anyway. Its job's result is then dropped as
+    /// stale. What the stroke ends with is what it ends with after waiting for the job.
+    pub fn adopt_generators(&mut self) {
+        while self.previewing() {
+            let k = (0..self.stack.len()).find(|&k| self.stack[k].scatter.as_ref().is_some_and(|p| p.upto != self.stack[k].level)).unwrap();
+            let preview = self.stack[k].scatter.as_ref().unwrap().blocks.clone();
+            let (part, targets) = match self.taken.take() {
+                Some((j, p, part, targets)) if j == k && std::sync::Arc::ptr_eq(&p, &preview) => (part, targets),
+                _ => {
+                    let Some(job) = self.generator_take() else { break };
+                    let _ = self.taken.take();
+                    (job.part, job.targets)
+                }
+            };
+            self.stack[k].scatter = Some(part);
+            self.recompose.extend(targets);
+        }
+        self.taken = None;
     }
 
     /// Blocks of level `l` under `keys` (of levels `from` and finer) near the surface of `vol`.
@@ -2030,17 +2107,27 @@ impl Layered {
         self.used.clear();
         self.changed.clear();
         self.follows = 0;
-        self.covered = vec![HashSet::default(); self.form.levels()];
-        for k in 0..self.stack.len() {
-            if self.stack[k].scatter.is_some() {
-                for (l, bc) in self.stack[k].all_keys() {
-                    self.cover(l, &[bc]);
+        // Per level, the blocks over any layer's (a level at a time, in parallel: a generator at a fine level has
+        // a million blocks).
+        let stack = &self.stack;
+        self.covered = (0..self.form.levels())
+            .into_par_iter()
+            .map(|m| {
+                let mut set: HashSet<IVec3> = HashSet::default();
+                for x in stack {
+                    match &x.scatter {
+                        Some(g) => {
+                            for (l, blocks) in g.blocks.iter().enumerate().skip(m) {
+                                set.extend(blocks.iter().map(|bc| *bc >> (l - m) as i32));
+                            }
+                        }
+                        None if x.level >= m => set.extend(x.h.keys().map(|bc| *bc >> (x.level - m) as i32)),
+                        None => {}
+                    }
                 }
-                continue;
-            }
-            let keys: Vec<IVec3> = self.stack[k].h.keys().copied().collect();
-            self.cover(self.stack[k].level, &keys);
-        }
+                set
+            })
+            .collect();
         self.form.begin_stroke();
     }
 
@@ -2177,6 +2264,7 @@ impl Layered {
             end,
             used: if end { HashMap::default() } else { self.used.clone() },
             also: if end { self.changed.iter().copied().collect() } else { Vec::new() },
+            recompose: if end { std::mem::take(&mut self.recompose) } else { Vec::new() },
         })
     }
 
@@ -2189,9 +2277,17 @@ impl Layered {
         let FollowDone { form, region, end, layers, gens, shown: blocks, used, mut stats } = done;
         for (k, part) in gens {
             if let Some(x) = self.stack.get_mut(k).filter(|x| x.scatter.is_some()) {
-                x.scatter = Some(part);
-                let keys = x.all_keys();
-                for (l, bc) in keys {
+                // Only the blocks it did not have are covered anew (the rest are already).
+                let old = x.scatter.replace(part).map(|p| p.blocks);
+                let new = x.scatter.as_ref().unwrap().blocks.clone();
+                let added: Vec<(usize, IVec3)> = (0..new.len())
+                    .into_par_iter()
+                    .flat_map_iter(|l| {
+                        let had = old.as_ref().and_then(|o| o.get(l));
+                        new[l].iter().filter(move |bc| !had.is_some_and(|h| h.contains(*bc))).map(move |bc| (l, *bc)).collect::<Vec<_>>()
+                    })
+                    .collect();
+                for (l, bc) in added {
                     self.cover(l, &[bc]);
                 }
             }
@@ -2590,14 +2686,20 @@ impl Layered {
             (part, affected(&stack, &changes))
         };
         stack[k].scatter = Some(part.clone());
-        Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets })
+        self.taken = Some((k, preview.blocks.clone(), part.clone(), targets.clone()));
+        Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets, cancel: Default::default() })
     }
 
-    /// Take what a [`GenJob`] composed, unless the layer changed meanwhile (then a later job brings it). True if taken.
+    /// Take what a [`GenJob`] composed, unless the layer changed meanwhile (then a later job brings it), or a form
+    /// stroke took the generator at its own level (see [`Self::adopt_generators`]). True if taken.
     pub fn generator_apply(&mut self, shown: &mut LevelVolume, done: GenDone) -> bool {
-        let GenDone { k, part, preview, blocks, .. } = done;
+        let GenDone { k, part, preview, blocks, cancelled, .. } = done;
+        if cancelled {
+            return false;
+        }
         let Some(x) = self.stack.get_mut(k) else { return false };
-        if !x.scatter.as_ref().is_some_and(|p| std::sync::Arc::ptr_eq(&p.blocks, &preview)) {
+        let level = x.level;
+        if !x.scatter.as_ref().is_some_and(|p| std::sync::Arc::ptr_eq(&p.blocks, &preview) && p.upto != level) {
             return false;
         }
         x.scatter = Some(part);
