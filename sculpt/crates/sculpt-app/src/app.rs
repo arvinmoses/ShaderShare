@@ -1209,6 +1209,23 @@ impl SculptApp {
             if let Some((k, on)) = f.layer_visible {
                 m.set_layer_visible(k, on);
             }
+            if let Some((k, l)) = f.layer_level {
+                m.set_layer_level(k, l);
+            }
+            if let Some(k) = f.remove_layer {
+                m.remove_layer(k);
+            }
+            if let Some(k) = f.active_layer {
+                m.set_active_layer(k);
+            }
+            if let Some(to) = f.fill_mask {
+                m.fill_mask(to);
+            }
+            if let Some(level) = f.bake_noise
+                && let Some(k) = m.layer.as_ref().and_then(|l| l.layers().iter().rposition(|x| x.noise))
+            {
+                m.bake_noise(k, level);
+            }
             if let Some(t) = f.target {
                 m.target = t;
             }
@@ -1242,6 +1259,23 @@ impl SculptApp {
                     edit(&mut spec);
                     m.set_generator(k, &spec, false);
                 }
+            }
+        }
+        if f.save_open && let Some(m) = self.volume_mode.as_mut() {
+            // Through a file in the frames' folder: what is shown afterwards is what the file holds.
+            let path = self.volume_demo.as_ref().map(|d| d.dir.join("round_trip.svol")).unwrap_or_default();
+            let saved = std::fs::File::create(&path).and_then(|f| m.write_to(&mut std::io::BufWriter::new(f)));
+            let opened = saved.and_then(|_| std::fs::File::open(&path)).and_then(|f| crate::volume_mode::VolumeMode::read_from(&mut std::io::BufReader::new(f)));
+            match opened {
+                Ok(mut mode) => {
+                    mode.generation = m.generation + 1;
+                    mode.target = m.target;
+                    self.volume_mode = Some(mode);
+                    if let Some(vp) = self.viewport.as_mut() {
+                        vp.clear_volume();
+                    }
+                }
+                Err(e) => eprintln!("demo: the file round trip failed: {e}"),
             }
         }
         if let (Some(on), Some(vp)) = (f.cull, self.viewport.as_mut()) {

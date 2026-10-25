@@ -405,6 +405,49 @@ and visibility like any layer, saved with the layers (section version 3). Files 
 To bake a region only: "Hide all", paint the noise in there, bake. Not done yet: baking off the frame.
 
 
+## The stress session
+
+`tests/stress.rs`: a seeded session mixing, in random order, clay and trim strokes of every size at every level on
+the form and on detail layers (follows and ends at once or in jobs that land late), layers added, removed, hidden,
+moved between levels, generators added and edited (previewed, dragged, jobs dropped when a newer edit comes),
+masks painted and filled, painted density, surface noise changed and baked, undo and redo chains, and files written
+and opened and sculpted on. After every step: no open edges or dropped quads at any level cap; what is shown holds
+exactly the blocks and samples composing the stack afresh over the same form gives (`Layered::composed_afresh`),
+every block's parent exists, undo brings back the exact prior state (every sample of the form, the layers and what
+is shown) and redo the exact later one, and a file written and opened shows the same within a little of the band.
+`cargo test --release --test stress` runs a short one; `-- --ignored` a long one from `SCULPT_STRESS_SEED`
+(`SCULPT_STRESS_SEEDS=a..b`, `SCULPT_STRESS_STEPS`, `SCULPT_STRESS_VOXEL`). `SCULPT_DEMO_SCRIPT=stress` runs the
+same kinds of edits in the app for looking at the frames.
+
+What it found, fixed:
+
+* **A composed block's neighbours were left stale.** Composing a block reads the layers one sample past it all
+  round, and the form as far inward as its heights reach, but only the changed layer blocks and the finer blocks
+  under them were composed again: the surface stepped at block faces next to any layer stroke (1.7 steps at level
+  5). `affected` now takes the neighbours too, and a form change composes every block whose box with its reach
+  reads it again (`reading`).
+* **Reading the form inward by a height was skipped past `band + |h| + v`**, assuming the form's field has slope
+  one; it does not (finer form levels under a big stroke run steeper, and they flatten at their band), so a sample
+  could jump between the form's value and the inward read. The jump read as a steep slope in `finish`, which
+  divided the crossings next to it, moving the surface by a step or more. Every sample under a height is read
+  inward now, and `finish` measures the slope on the values held to the band.
+* **The direction of the inward read** came from the fine field's gradient even where that field is at its band
+  and flat (heights reach 6 steps of the layers' first level, the form's finest level holds distances to 5): a
+  tall height was read off in any direction. Near the band the direction blends into the normal of the first level
+  with room in its band (`inward`).
+* **Composed blocks were never cleared of checkerboard faces** (strokes clear them after each dab); each showed as
+  an edge shared by four quads. `put_shown` clears them in the blocks it writes.
+* **Adding a detail layer above a generator changes how the stack is composed** (in its order), but nothing was
+  composed again, so blocks composed later stood off their neighbours by up to 1.2 steps. Whenever the level the
+  ordered composition starts from changes, everything composed from that level on is composed again.
+* **Level 0 blocks made as parents were never tidied** (only levels 1 and up were), so a generator edit left level
+  0 blocks behind holding a GPU slot for nothing.
+* **Undo did not bring back the active layer**: undoing and redoing "add layer" left another layer selected.
+
+Seen, not fixed: a saddle in a cell next to a finer one is an edge shared by four quads (the cell has one vertex
+whatever its pieces: the extractor's rule, the same on the GPU), a pinch at level boundaries a few times per
+million faces; the test reports them and fails only on any away from a finer cell.
+
 ## The level by distance
 
 Each region of the view shows only the levels whose detail would show on screen from where the eye is ("Level by
