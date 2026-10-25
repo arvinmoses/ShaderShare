@@ -648,8 +648,10 @@ fn reading(form: &LevelVolume, stack: &[Layer], from: usize, region: &[Key]) -> 
                 if per[m].is_empty() {
                     return false;
                 }
-                let s = form.voxel(m) * B as f32;
-                let (a, b) = ((lo / s).floor().as_ivec3(), (hi / s).floor().as_ivec3());
+                // (A point is read from the level's samples around it, interpolated and differenced: two of its steps
+                // past the box, which can be another block's.)
+                let (vm, s) = (form.voxel(m), form.voxel(m) * B as f32);
+                let (a, b) = (((lo - 2.0 * vm) / s).floor().as_ivec3(), ((hi + 2.0 * vm) / s).floor().as_ivec3());
                 (a.z..=b.z).any(|z| (a.y..=b.y).any(|y| (a.x..=b.x).any(|x| per[m].contains(&IVec3::new(x, y, z)))))
             });
             if reads {

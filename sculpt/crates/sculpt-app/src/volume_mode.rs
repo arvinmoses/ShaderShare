@@ -366,21 +366,12 @@ impl VolumeMode {
     /// `LevelVolume::carry_take`); while strokes run ahead, the real state's work, and as much of the strokes for real
     /// as a frame allows.
     pub fn tick(&mut self) {
-        let t = Instant::now();
         if self.ahead.is_none() {
             self.tick_now();
-            if std::env::var_os("SCULPT_TICK_LOG").is_some() && t.elapsed().as_secs_f64() > 0.03 {
-                eprintln!("    tick {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
-            }
             return;
         }
         self.with_real(|m| m.tick_now());
-        let t1 = Instant::now();
-        let done = self.ahead.as_ref().map_or(0, |a| a.done);
         self.catch_up(Some(CATCH_UP_MS));
-        if std::env::var_os("SCULPT_TICK_LOG").is_some() && t.elapsed().as_secs_f64() > 0.03 {
-            eprintln!("    tick ahead: real work {:.0} ms, catching up {:.0} ms ({} events from {done})", (t1 - t).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3, self.ahead.as_ref().map_or(0, |a| a.done) as i64 - done as i64);
-        }
     }
 
     /// `f` on the real state (while running ahead, the copy's put aside meanwhile).
@@ -522,28 +513,19 @@ impl VolumeMode {
                     Err(TryRecvError::Disconnected) => self.form_end = None,
                 }
             }
-            let tl = std::env::var_os("SCULPT_TICK_LOG").is_some();
             if let Some(rx) = &self.follow_job {
                 match rx.try_recv() {
                     Ok(done) => {
-                        let t = Instant::now();
                         layer.follow_apply(&mut self.vol, done);
-                        if tl {
-                            eprintln!("      follow apply {:.0} ms ({:?})", t.elapsed().as_secs_f64() * 1e3, layer.last);
-                        }
                         self.follow_job = None;
                     }
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => self.follow_job = None,
                 }
             }
-            let t2 = Instant::now();
             if self.follow_job.is_none()
                 && let Some(job) = layer.follow_take()
             {
-                if tl {
-                    eprintln!("      follow take {:.0} ms ({} blocks, last {})", t2.elapsed().as_secs_f64() * 1e3, job.len(), job.last());
-                }
                 // On the carrying threads (a quarter of the cores), so the dabs and the sync keep the rest: the
                 // stroke's last too, as the next stroke's dabs may run beside it (on all the cores it slowed them
                 // several times over, and finished hardly sooner). But a last follow composes every generator's
@@ -703,7 +685,6 @@ impl VolumeMode {
         if self.ahead.is_none() && self.waiting_for(target) {
             self.run_ahead();
         }
-        let t1 = Instant::now();
         match self.ahead.as_mut() {
             Some(a) => {
                 a.events.push(Event::Begin(target, now));
@@ -714,9 +695,6 @@ impl VolumeMode {
                 self.begin_now(true);
                 self.lag_ms = 0.0;
             }
-        }
-        if std::env::var_os("SCULPT_TICK_LOG").is_some() {
-            eprintln!("    begin: copy {:.1} ms, begin {:.1} ms", (t1 - now).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
         }
     }
 
