@@ -511,8 +511,10 @@ as much (`carrying_ends_as_its_jobs_land_whoever_waits`). Mask and density strok
 like any other. A stroke's raycasts while running ahead hit the copy's surface (the stroke it ran ahead of not yet
 ended there), so its dabs land where the pen saw them, a little off where waiting would have put them. The last
 follow after a form stroke over a big generator takes its blocks in on the main thread (0.4 s at level 2, 3.5 s at
-level 3), before and now. The long session at seed 2 (40 steps, `SCULPT_STRESS_VOXEL=0.12`) stops at step 42, a
-generator edit leaving a non-manifold edge away from any finer cell; the code before this work does the same there.
+level 3), before and now. Long sessions (`SCULPT_STRESS_VOXEL=0.12`, 30-40 steps): seeds 1 and 3 pass; seed 2 stops
+at a generator edit leaving a non-manifold edge away from any finer cell, seed 5 at a generator edit pushing three
+undo steps, seeds 4, 6 and 8 at a file opened differing from what was live (past the tolerance, or a level 1 block
+only live). The code before this work stops at each of them the same way, with the same numbers.
 
 ## The level by distance
 
