@@ -232,7 +232,7 @@ struct Near {
     nrm: vec3<f32>,
 };
 
-// The surface of slot `s`'s field (block `bc` of level `l`) near `p`: two steps along its gradient, each at most a
+// The surface of slot `s`'s field (block `bc` of level `l`) near `p`: four steps along its gradient, each at most a
 // lattice step, and its normal there. Where the field is flat (outside its band) `p` stays.
 fn lv_nearest(s: u32, l: u32, bc: vec3<i32>, p: vec3<f32>, n: vec3<f32>) -> Near {
     let vx = L.misc.x / f32(1u << l);
@@ -240,7 +240,7 @@ fn lv_nearest(s: u32, l: u32, bc: vec3<i32>, p: vec3<f32>, n: vec3<f32>) -> Near
     var o: Near;
     o.pos = p;
     o.nrm = n;
-    for (var it = 0; it < 2; it++) {
+    for (var it = 0; it < 4; it++) {
         let g = clamp((o.pos - L.origin.xyz) / vx - vec3<f32>(bc * 8), vec3<f32>(0.0), vec3<f32>(8.0));
         let i = vec3<i32>(min(floor(g), vec3<f32>(7.0)));
         let f = g - vec3<f32>(i);
@@ -703,7 +703,9 @@ fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
         var l = level;
         var bc = m.xyz;
         var ps = -1;
-        if (l > 0u) {
+        // Only a vertex of a block fading, or of a cell on its block's far faces (which read the neighbours'
+        // samples), needs the block one level coarser.
+        if (l > 0u && (t_own < 1.0 || any(lc == vec3<i32>(7)))) {
             ps = lv_slot_of(l - 1u, bc >> vec3<u32>(1u));
         }
         if (t_own < 1.0 && ps >= 0) {

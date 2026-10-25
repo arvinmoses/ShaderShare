@@ -445,8 +445,23 @@ distance" in the Mesh menu, on by default, with the pixels it takes):
   it, detail shown down to 14 px, the front's finest work under the eye kept); the GPU check compares a view within
   a budget too.
 
-Not done yet: blending between levels as they hand over (a block appears or goes at once, about a pixel's change),
-and choosing by occlusion.
+* **Hand-overs fade** (0.25 s; `SCULPT_FADE=seconds`, 0 at once). A block chosen to go stays shown and fades out,
+  and goes (with the blocks under it) once it has; a block shown fades in from 0; one wanted again while fading out
+  turns back from where it got to. Blocks changed by work, and blocks still to be measured, show at once (no fade lags
+  a stroke). Only drawing changes: per slot a fade line (a + b * time), sent when a fade begins, turns or ends, and the
+  vertex shader moves vertices while anything fades (nothing otherwise). A vertex of a fading block goes to where the
+  coarser level's cell holding it puts its vertex once the block is gone (its cells collapse onto the coarser cells;
+  the coarser field with finer blocks blended by their fades, transition rule where a finer block wholly in is next
+  to it); a transition cell's vertex and a cell's on its block's far faces (which read a neighbour's samples) move by
+  how their vertex moves with the fading blocks' samples blended towards the coarser field; a coarser level fading
+  too moves them all with it. Vertices are shared by the quads of every block, so nothing opens however they move.
+  Surface noise blends its octaves with the level. Measured with `SCULPT_DEMO_SCRIPT=fade` (camera still, the eye the
+  levels are chosen from moving out and back, so frames differ by the hand-overs alone): pixels changing by more than
+  24 levels in one frame at most 11,202 before, 437 after. Left: where a fine block's detail is more than a coarser
+  cell (seen only when the levels are chosen from far but drawn from near), the coarser cell can hold no surface
+  there, and the hand-over still steps a little when the block goes.
+
+Not done yet: choosing by occlusion.
 
 ## Driver workarounds (Vulkan, this AMD driver)
 

@@ -250,3 +250,65 @@ fn a_triangle_budget_keeps_the_detail_that_shows_most() {
     view.choose(&v, near, FOCAL);
     assert!(view.stats.triangles as f32 > full.1 as f32 * 0.95, "{} of {}", view.stats.triangles, full.1);
 }
+
+/// Fading: blocks going stay shown, fading out, until they have faded, then go with every block under them; blocks
+/// coming fade in from 0; a block wanted again while fading out fades back in from where it got to. The surface closes
+/// all along.
+#[test]
+fn hand_overs_fade_out_before_blocks_go_and_fade_in_as_they_come() {
+    let v = worked();
+    let mut view = fresh_view(&v);
+    view.fade_s = 0.25;
+    view.set_clock(0.0);
+    let near = Vec3::new(0.0, 0.0, 1.25);
+    let far = Vec3::new(0.0, 0.0, 40.0);
+    view.choose(&v, near, FOCAL);
+    // Let what the first choice hid fade out.
+    view.set_clock(1.0);
+    view.choose(&v, near, FOCAL);
+    assert!(!view.fading());
+    let shown_near: Vec<Key> = v.keys().into_iter().filter(|k| k.0 > 0 && !view.hides(*k)).collect();
+    view.take_fade_changes();
+    // Going far: nothing is hidden yet, the blocks to go fade out.
+    view.set_clock(2.0);
+    let flips = view.choose(&v, far, FOCAL);
+    assert!(flips.is_empty(), "blocks went before fading out");
+    assert!(shown_near.iter().all(|k| !view.hides(*k)));
+    let fading: Vec<Key> = view.take_fade_changes();
+    assert!(!fading.is_empty());
+    let at = |view: &LevelView, k: Key, now: f64| {
+        let (a, b) = view.fade_line(k);
+        (a + b * now as f32).clamp(0.0, 1.0)
+    };
+    assert!(fading.iter().all(|k| (at(&view, *k, 2.0) - 1.0).abs() < 1e-3 && at(&view, *k, 2.1) < 0.7));
+    // Half way, a block comes back from where it got to.
+    view.set_clock(2.125);
+    view.choose(&v, near, FOCAL);
+    let k = fading[0];
+    assert!(!view.hides(k));
+    assert!((at(&view, k, 2.125) - 0.5).abs() < 0.02, "fading back in from {}", at(&view, k, 2.125));
+    assert!(at(&view, k, 2.2) > 0.75, "not fading back in");
+    view.set_clock(3.0);
+    view.choose(&v, near, FOCAL);
+    assert!(!view.fading());
+    // Far again, and long enough: the view is level 0's, and closed.
+    view.set_clock(4.0);
+    view.choose(&v, far, FOCAL);
+    view.set_clock(4.1);
+    view.choose(&v, far, FOCAL);
+    let (open, _, dropped, _) = closed(&v, &view);
+    assert_eq!((open, dropped), (0, 0), "open while fading");
+    view.set_clock(5.0);
+    let gone = view.choose(&v, far, FOCAL);
+    assert!(!gone.is_empty());
+    assert!(!view.fading());
+    let (open, _, dropped, faces) = closed(&v, &view);
+    assert_eq!((open, dropped), (0, 0));
+    assert_eq!(faces, v.surface(0).0.faces.len(), "from afar, once faded, the view is level 0's");
+    // Coming near: shown at once (as hidden blocks are not drawn), fading in from 0.
+    view.take_fade_changes();
+    view.set_clock(6.0);
+    let came = view.choose(&v, near, FOCAL);
+    assert!(!came.is_empty());
+    assert!(came.iter().all(|k| at(&view, *k, 6.0) < 1e-3 && (at(&view, *k, 6.25) - 1.0).abs() < 1e-3));
+}
