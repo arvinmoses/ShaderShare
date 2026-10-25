@@ -770,7 +770,7 @@ impl VolumeMode {
 
     /// What strokes work on: with a generator layer selected, its mask, or else the form under it (a generator holds
     /// no sculpting of its own).
-    fn routed(&self) -> Target {
+    pub fn routed(&self) -> Target {
         match (self.target, self.layer.as_ref()) {
             (Target::Detail, Some(layer)) if layer.generator(layer.active()).is_some() || layer.noise(layer.active()).is_some() => Target::Form,
             (t, _) => t,

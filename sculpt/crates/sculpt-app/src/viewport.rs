@@ -1,25 +1,13 @@
 //! GPU viewport.
 //!
-//! Vertex data lives in one GPU buffer of 8-byte vertices (position as three 16-bit values inside the model's box, plus
-//! the overlay scalar), plus a normals buffer only in smooth shading, laid out in the engine's internal vertex order.
-//! Flat shading takes each triangle's normal from the screen derivatives of its position, so it needs no normals at all. Because every
-//! spatial leaf owns a contiguous vertex range, a brush dab becomes a handful
-//! of `write_buffer` calls for exactly the leaves it touched — the GPU never
-//! sees a full re-upload during sculpting.
-//!
-//! The scene renders (4x MSAA) into an offscreen texture that egui shows as
-//! an image, so panels and viewport share one device and one queue.
+//! The volume's surface is built on the GPU (`gpu_levels`) and drawn straight from its buffers: a page of quads per
+//! indirect draw, for the clusters the cull pass keeps. The scene renders (4x MSAA) into an offscreen texture that egui
+//! shows as an image, so panels and viewport share one device and one queue.
 
-use std::ops::Range;
 use std::time::Instant;
 
 use eframe::egui_wgpu::{self, wgpu};
 use glam::{Mat4, Vec3, Vec4};
-use rayon::prelude::*;
-use sculpt_core::bvh::Bvh;
-use sculpt_core::geom::Aabb;
-use sculpt_core::lod::{LodTree, View};
-use sculpt_core::{DirtySet, Document};
 
 use crate::camera::Camera;
 use crate::theme::Theme;
@@ -41,20 +29,9 @@ struct Uniforms {
     bg_bottom: [f32; 4],
     cursor: [f32; 4],
     cursor_color: [f32; 4],
-    /// Corner and size of the box the 16-bit vertex positions are measured in.
+    /// Unused by the volume (the shader's mesh entry points read them).
     box_min: [f32; 4],
     box_size: [f32; 4],
-}
-
-/// What the overlay buffer currently shows.
-#[derive(Clone, Debug, PartialEq)]
-pub enum OverlayKind {
-    None,
-    Freeze,
-    LayerMask,
-    Channel(String),
-    /// App-provided values (pose weights).
-    Custom,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -71,110 +48,14 @@ struct Targets {
     depth: wgpu::TextureView,
 }
 
-/// How the surface is lit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Shading {
-    /// Each triangle has one hard normal, derived on the GPU. Nothing is stored or uploaded, and the CPU skips normals.
-    #[default]
-    Flat,
-    /// Smooth per-vertex normals, computed on the CPU and uploaded.
-    Smooth,
-}
-
-/// The box that 16-bit vertex positions are measured in: a margin around the model, so the model can move a little
-/// before everything has to be re-sent. At 16 bits the step is about 1/65000 of the box, far finer than a triangle.
-#[derive(Clone, Copy, Debug)]
-struct Quant {
-    min: Vec3,
-    size: Vec3,
-}
-
-impl Quant {
-    fn fit(b: Aabb) -> Quant {
-        let centre = (b.min + b.max) * 0.5;
-        let half = ((b.max - b.min) * 0.5 * 1.15).max(Vec3::splat(1e-3));
-        Quant { min: centre - half, size: half * 2.0 }
-    }
-
-    fn contains(&self, b: &Aabb) -> bool {
-        b.min.cmpge(self.min).all() && b.max.cmple(self.min + self.size).all()
-    }
-}
-
-/// Pack positions (and the overlay scalar, 0 to 1) as `Unorm16x4`. `positions` and `ov` cover the same vertices.
-fn pack(q: &Quant, positions: &[Vec3], ov: Option<&[f32]>, out: &mut [[u16; 4]]) {
-    let inv = Vec3::ONE / q.size;
-    out.par_chunks_mut(4096).enumerate().for_each(|(ci, chunk)| {
-        let base = ci * 4096;
-        for (k, o) in chunk.iter_mut().enumerate() {
-            let p = ((positions[base + k] - q.min) * inv).clamp(Vec3::ZERO, Vec3::ONE) * 65535.0 + Vec3::splat(0.5);
-            let w = ov.map_or(0.0, |s| s[base + k].clamp(0.0, 1.0)) * 65535.0 + 0.5;
-            *o = [p.x as u16, p.y as u16, p.z as u16, w as u16];
-        }
-    });
-}
-
-struct MeshBuffers {
-    topology_id: u64,
-    /// 8 bytes per vertex: see [`pack`].
-    vertices: wgpu::Buffer,
-    /// Smooth shading only.
-    normals: Option<wgpu::Buffer>,
-    quant: Quant,
-    /// Plain full-detail indices. Dropped once the LOD pool (whose leaf prefix is the same mesh) is resident.
-    indices: Option<wgpu::Buffer>,
-    index_count: u32,
-}
-
-/// The LOD pool on the GPU plus the buffer that holds this frame's draw list.
-struct LodGpu {
-    topology_id: u64,
-    /// Identity of the uploaded tree, so a rebuilt one is noticed.
-    tree: usize,
-    pool: wgpu::Buffer,
-    indirect: wgpu::Buffer,
-    capacity: u32,
-}
-
-/// What the renderer needs to draw a dense mesh through its LOD tree.
-pub struct LodInput<'a> {
-    pub tree: &'a std::sync::Arc<LodTree>,
-    pub bvh: &'a Bvh,
-    pub topology_id: u64,
-    /// Screen-space error tolerance, in pixels.
-    pub tau_px: f32,
-    /// Hard cap on triangles per frame.
-    pub budget: u64,
-}
-
-#[derive(Clone, Copy, Default)]
-pub struct LodStats {
-    pub active: bool,
-    pub triangles: u64,
-    pub nodes: u32,
-    pub tau_px: f32,
-    pub select_ms: f32,
-}
-
 pub struct Viewport {
-    flat_pipeline: wgpu::RenderPipeline,
-    smooth_pipeline: wgpu::RenderPipeline,
-    /// Set by the app; a change rebuilds the vertex buffers on the next sync.
-    pub shading: Shading,
-    scratch: Vec<[u16; 4]>,
     bg_pipeline: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     targets: Option<Targets>,
-    mesh: Option<MeshBuffers>,
     pub texture_id: Option<egui::TextureId>,
-    overlay_kind: OverlayKind,
     pub last_upload: UploadStats,
-    lod: Option<LodGpu>,
-    pub lod_stats: LodStats,
-    /// Block until the GPU finishes each frame (benchmarking).
-    pub wait_gpu: bool,
-    /// The volume playground's surface, drawn instead of the mesh while it is open.
+    /// The volume's surface.
     volume: Option<VolumeGpu>,
     levels_pipeline: wgpu::RenderPipeline,
     levels_bgl: wgpu::BindGroupLayout,
@@ -276,35 +157,8 @@ impl Viewport {
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
-        let attr = |loc: u32, format: wgpu::VertexFormat, stride: u64| wgpu::VertexBufferLayout {
-            array_stride: stride,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: Box::leak(Box::new([wgpu::VertexAttribute { format, offset: 0, shader_location: loc }])),
-        };
-        let flat_buffers = [Some(attr(0, wgpu::VertexFormat::Unorm16x4, 8))];
-        let smooth_buffers = [Some(attr(0, wgpu::VertexFormat::Unorm16x4, 8)), Some(attr(1, wgpu::VertexFormat::Float32x3, 12))];
         let target = [Some(wgpu::ColorTargetState { format: COLOR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })];
         let ms = wgpu::MultisampleState { count: MSAA, ..Default::default() };
-        let mesh_pipeline = |label: &'static str, vs: &'static str, fs: &'static str, buffers: &[Option<wgpu::VertexBufferLayout<'_>>]| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState { module: &shader, entry_point: Some(vs), compilation_options: Default::default(), buffers },
-                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &target }),
-                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let flat_pipeline = mesh_pipeline("mesh flat", "vs_flat", "fs_flat", &flat_buffers);
         // The volume's surface: vertices pulled from the GPU extractor's buffers.
         let ro = |binding: u32| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let levels_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -341,7 +195,6 @@ impl Viewport {
             multiview_mask: None,
             cache: None,
         });
-        let smooth_pipeline = mesh_pipeline("mesh smooth", "vs_smooth", "fs_smooth", &smooth_buffers);
         let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("background"),
             layout: Some(&layout),
@@ -360,26 +213,17 @@ impl Viewport {
             cache: None,
         });
         Viewport {
-            flat_pipeline,
-            smooth_pipeline,
-            shading: Shading::default(),
-            scratch: Vec::new(),
             bg_pipeline,
             uniforms,
             bind_group,
             targets: None,
-            mesh: None,
             volume: None,
             levels_pipeline,
             levels_bgl,
             cull: true,
             volume_draws: 0,
             texture_id: None,
-            overlay_kind: OverlayKind::None,
             last_upload: UploadStats::default(),
-            lod: None,
-            lod_stats: LodStats::default(),
-            wait_gpu: false,
         }
     }
 
@@ -512,163 +356,18 @@ impl Viewport {
         })
     }
 
-    /// Leave the volume playground: draw the document again.
+    /// Drop the GPU's copy of the volume: the next sync builds it afresh (a new or opened volume).
     pub fn clear_volume(&mut self) {
         self.volume = None;
-        self.mesh = None;
-    }
-
-    /// Bring GPU buffers up to date with the document. Cheap when nothing changed.
-    pub fn sync(&mut self, rs: &egui_wgpu::RenderState, doc: &mut Document, overlay: &OverlayKind, custom: Option<&[f32]>, custom_changed: bool) {
-        let t = Instant::now();
-        let mut stats = UploadStats::default();
-        let queue = &rs.queue;
-        let smooth = self.shading == Shading::Smooth;
-        if smooth {
-            doc.ensure_normals();
-        }
-        let rebuild = self.mesh.as_ref().is_none_or(|m| m.topology_id != doc.topology_id() || m.normals.is_some() != smooth);
-        if rebuild {
-            let old = self.mesh.take();
-            let mesh = create_mesh_buffers(&rs.device, doc, smooth, overlay_source(doc, overlay, custom), old);
-            stats.bytes = doc.vertex_count() * (8 + if smooth { 12 } else { 0 }) + doc.face_count() * 24;
-            stats.ranges = 1;
-            self.mesh = Some(mesh);
-            self.overlay_kind = overlay.clone();
-            doc.take_geometry_dirty();
-            doc.take_scalar_dirty();
-            stats.ms = t.elapsed().as_secs_f32() * 1e3;
-            self.last_upload = stats;
-            return;
-        }
-        // The 16-bit box follows the surface: if the model outgrew it, refit and send every vertex again.
-        let bounds = doc.bounds();
-        let geometry = doc.take_geometry_dirty();
-        let scalar = doc.take_scalar_dirty();
-        let lod_updates = if self.lod.as_ref().is_some_and(|l| l.topology_id == doc.topology_id()) { doc.take_lod_updates() } else { Vec::new() };
-        let mut resend = false;
-        let mesh = self.mesh.as_mut().unwrap();
-        if !mesh.quant.contains(&bounds) {
-            mesh.quant = Quant::fit(bounds);
-            resend = true;
-        }
-        let mesh = self.mesh.as_ref().unwrap();
-        let src = overlay_source(doc, overlay, custom);
-        let all = doc.vertex_count();
-        match if resend { DirtySet::All } else { geometry } {
-            DirtySet::None => {}
-            DirtySet::All => {
-                write_vertices(queue, mesh, doc, 0..all, src, &mut self.scratch, &mut stats);
-                if smooth {
-                    write_normals(queue, mesh, doc, 0..all, &mut stats);
-                }
-            }
-            DirtySet::Leaves(leaves) => {
-                for r in runs(doc, &leaves) {
-                    write_vertices(queue, mesh, doc, r.clone(), src, &mut self.scratch, &mut stats);
-                    if smooth {
-                        write_normals(queue, mesh, doc, r, &mut stats);
-                    }
-                }
-            }
-        }
-        for (first, count) in lod_updates {
-            if let (Some(l), Some(tree)) = (&self.lod, doc.lod()) {
-                let r = first as usize..(first + count) as usize;
-                queue.write_buffer(&l.pool, first as u64 * 4, bytemuck::cast_slice(&tree.indices[r]));
-                stats.bytes += count as usize * 4;
-                stats.ranges += 1;
-            }
-        }
-        // The overlay lives in each vertex's fourth component, so changing it re-sends those vertices.
-        let kind_changed = *overlay != self.overlay_kind;
-        let partial = match (&scalar, overlay) {
-            (_, OverlayKind::None) => None,
-            (_, OverlayKind::Custom) => custom_changed.then_some(DirtySet::All),
-            (DirtySet::None, _) => None,
-            (s, _) => Some(s.clone()),
-        };
-        if kind_changed {
-            if !resend {
-                write_vertices(queue, mesh, doc, 0..all, src, &mut self.scratch, &mut stats);
-            }
-            self.overlay_kind = overlay.clone();
-        } else if let (Some(set), false) = (partial, resend) {
-            match set {
-                DirtySet::Leaves(leaves) => {
-                    for r in runs(doc, &leaves) {
-                        write_vertices(queue, mesh, doc, r, src, &mut self.scratch, &mut stats);
-                    }
-                }
-                DirtySet::None => {}
-                DirtySet::All => write_vertices(queue, mesh, doc, 0..all, src, &mut self.scratch, &mut stats),
-            }
-        }
-        stats.ms = t.elapsed().as_secs_f32() * 1e3;
-        self.last_upload = stats;
-    }
-
-    /// Upload the LOD pool when needed, choose this frame's cut and write the draw list.
-    /// Returns the number of draws, or `None` when the plain mesh should be drawn.
-    fn prepare_lod(&mut self, rs: &egui_wgpu::RenderState, input: Option<LodInput<'_>>, cam: &Camera, size: [u32; 2], view_proj: Mat4) -> Option<u32> {
-        self.lod_stats = LodStats::default();
-        let input = input?;
-        let mesh = self.mesh.as_mut()?;
-        if mesh.topology_id != input.topology_id {
-            return None;
-        }
-        let key = std::sync::Arc::as_ptr(input.tree) as usize;
-        if self.lod.as_ref().is_none_or(|l| l.tree != key || l.topology_id != input.topology_id) {
-            let bytes = (input.tree.indices.len() * 4) as u64;
-            if bytes > rs.device.limits().max_buffer_size {
-                return None;
-            }
-            use wgpu::util::DeviceExt;
-            let pool = rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("lod pool"),
-                contents: bytemuck::cast_slice(&input.tree.indices),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            });
-            let capacity = input.tree.nodes.len() as u32;
-            let indirect = rs.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("lod draws"),
-                size: capacity as u64 * 20,
-                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            mesh.indices = None;
-            self.lod = Some(LodGpu { topology_id: input.topology_id, tree: key, pool, indirect, capacity });
-        }
-        let lod = self.lod.as_ref()?;
-        let t = Instant::now();
-        let focal_px = size[1] as f32 / (2.0 * (cam.fov_y * 0.5).tan());
-        let view = View::from_view_proj(view_proj, cam.eye(), focal_px);
-        let cut = input.tree.select(input.bvh, &view, input.tau_px, input.budget);
-        // DrawIndexedIndirect: index_count, instance_count, first_index, base_vertex, first_instance.
-        let args: Vec<[u32; 5]> = cut.ranges.iter().take(lod.capacity as usize).map(|&(first, count)| [count, 1, first, 0, 0]).collect();
-        if !args.is_empty() {
-            rs.queue.write_buffer(&lod.indirect, 0, bytemuck::cast_slice(&args));
-        }
-        self.lod_stats = LodStats { active: true, triangles: cut.triangles, nodes: cut.nodes, tau_px: cut.tau_px, select_ms: t.elapsed().as_secs_f32() * 1e3 };
-        Some(args.len() as u32)
     }
 
     /// Render into the offscreen texture. Returns the egui texture to display.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, theme: &Theme, overlay_strength: f32, cursor: Option<(Vec3, f32, f32)>, lod_in: Option<LodInput<'_>>) -> Option<egui::TextureId> {
+    pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, theme: &Theme, cursor: Option<(Vec3, f32, f32)>) -> Option<egui::TextureId> {
         let size = [size[0].max(1), size[1].max(1)];
         self.ensure_targets(rs, size);
         let vp = &theme.viewport;
-        let overlay_color = if self.overlay_kind == OverlayKind::Freeze { vp.freeze.0 } else { vp.overlay.0 };
-        let mut overlay = linear(overlay_color);
-        overlay[3] = if self.overlay_kind == OverlayKind::None { 0.0 } else { overlay_strength };
-        // Viewing a layer's mask shows it as greyscale (white = applies, dark = hidden), still lit.
-        let mut clay = linear(vp.clay.0);
-        if self.overlay_kind == OverlayKind::LayerMask {
-            clay = linear(egui::Color32::from_gray(18));
-            overlay = linear(egui::Color32::from_gray(235));
-            overlay[3] = 1.0;
-        }
+        let clay = linear(vp.clay.0);
+        let overlay = [0.0; 4];
         let view_proj: Mat4 = cam.proj(size[0] as f32 / size[1] as f32) * cam.view();
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
@@ -682,12 +381,11 @@ impl Viewport {
             cursor: cursor.map_or(Vec4::ZERO, |(c, r, _)| c.extend(r)).to_array(),
             // Alpha carries the falloff hardness (inner cursor ring).
             cursor_color: { let mut cc = linear(vp.cursor.0); cc[3] = cursor.map_or(0.0, |(_, _, h)| h); cc },
-            box_min: self.mesh.as_ref().map(|m| &m.quant).map_or(Vec4::ZERO, |q| q.min.extend(0.0)).to_array(),
-            box_size: self.mesh.as_ref().map(|m| &m.quant).map_or(Vec4::ONE, |q| q.size.extend(1.0)).to_array(),
+            box_min: [0.0; 4],
+            box_size: [1.0; 4],
         };
         rs.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
-        let draws = self.prepare_lod(rs, lod_in, cam, size, view_proj);
         let targets = self.targets.as_ref().unwrap();
         let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
         if let Some(v) = &self.volume {
@@ -724,163 +422,12 @@ impl Viewport {
                 } else {
                     pass.multi_draw_indexed_indirect(draws, 0, v.gpu.page_capacity());
                 }
-            } else if let Some(m) = &self.mesh {
-                pass.set_pipeline(if m.normals.is_some() { &self.smooth_pipeline } else { &self.flat_pipeline });
-                pass.set_vertex_buffer(0, m.vertices.slice(..));
-                if let Some(n) = &m.normals {
-                    pass.set_vertex_buffer(1, n.slice(..));
-                }
-                match (&self.lod, draws) {
-                    (Some(l), Some(n)) => {
-                        pass.set_index_buffer(l.pool.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.multi_draw_indexed_indirect(&l.indirect, 0, n);
-                    }
-                    (lod, _) => {
-                        // Without a cut the whole mesh is the pool's leaf prefix (or the plain buffer).
-                        let buf = m.indices.as_ref().or(lod.as_ref().filter(|l| l.topology_id == m.topology_id).map(|l| &l.pool));
-                        if let Some(buf) = buf {
-                            pass.set_index_buffer(buf.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..m.index_count, 0, 0..1);
-                        }
-                    }
-                }
             }
         }
         rs.queue.submit([enc.finish()]);
         if let Some(v) = &self.volume {
             v.gpu.after_submit();
         }
-        if self.wait_gpu {
-            let _ = rs.device.poll(wgpu::PollType::wait_indefinitely());
-        }
         self.texture_id
-    }
-}
-
-/// The values the overlay shows right now, or `None` (all zero) when it shows nothing.
-fn overlay_source<'a>(doc: &'a Document, kind: &OverlayKind, custom: Option<&'a [f32]>) -> Option<&'a [f32]> {
-    let active_mask = doc.active_layer().and_then(|id| doc.layer(id)).and_then(|l| l.mask_values());
-    let src: Option<&[f32]> = match kind {
-        OverlayKind::None => None,
-        OverlayKind::Freeze => Some(doc.freeze()),
-        OverlayKind::LayerMask => active_mask,
-        OverlayKind::Channel(n) => doc.channel(n),
-        OverlayKind::Custom => custom,
-    };
-    src.filter(|s| s.len() == doc.vertex_count())
-}
-
-/// Quantize and upload the vertices in `r`.
-fn write_vertices(queue: &wgpu::Queue, mesh: &MeshBuffers, doc: &Document, r: Range<usize>, ov: Option<&[f32]>, scratch: &mut Vec<[u16; 4]>, stats: &mut UploadStats) {
-    scratch.resize(r.len(), [0; 4]);
-    pack(&mesh.quant, &doc.positions()[r.clone()], ov.map(|s| &s[r.clone()]), scratch);
-    queue.write_buffer(&mesh.vertices, r.start as u64 * 8, bytemuck::cast_slice(scratch));
-    stats.bytes += r.len() * 8;
-    stats.ranges += 1;
-}
-
-/// Upload the normals in `r` (smooth shading only).
-fn write_normals(queue: &wgpu::Queue, mesh: &MeshBuffers, doc: &Document, r: Range<usize>, stats: &mut UploadStats) {
-    if let Some(buf) = &mesh.normals {
-        queue.write_buffer(buf, r.start as u64 * 12, bytemuck::cast_slice(&doc.normals()[r.clone()]));
-        stats.bytes += r.len() * 12;
-    }
-}
-
-/// Build the vertex buffers (and, unless `old` is the same topology, the index buffer).
-fn create_mesh_buffers(device: &wgpu::Device, doc: &Document, smooth: bool, ov: Option<&[f32]>, old: Option<MeshBuffers>) -> MeshBuffers {
-    use wgpu::util::DeviceExt;
-    let vb = |label, data: &[u8]| {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: data,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        })
-    };
-    let quant = Quant::fit(doc.bounds());
-    let mut packed = vec![[0u16; 4]; doc.vertex_count()];
-    pack(&quant, doc.positions(), ov, &mut packed);
-    let vertices = vb("vertices", bytemuck::cast_slice(&packed));
-    let normals = smooth.then(|| vb("normals", bytemuck::cast_slice(doc.normals())));
-    let (indices, index_count) = match old.filter(|o| o.topology_id == doc.topology_id()) {
-        Some(o) => (o.indices, o.index_count),
-        None => {
-            let mut idx: Vec<u32> = Vec::with_capacity(doc.face_count() * 6);
-            for f in doc.faces() {
-                for t in sculpt_core::mesh::face_triangles(f) {
-                    idx.extend_from_slice(&t);
-                }
-            }
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("indices"),
-                contents: bytemuck::cast_slice(&idx),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-            (Some(buffer), idx.len() as u32)
-        }
-    };
-    MeshBuffers { topology_id: doc.topology_id(), vertices, normals, quant, indices, index_count }
-}
-
-/// Merge the owned vertex ranges of sorted leaves into contiguous runs.
-fn runs(doc: &Document, leaves: &[u32]) -> Vec<Range<usize>> {
-    let mut out: Vec<Range<usize>> = Vec::new();
-    for &l in leaves {
-        let r = doc.bvh().leaves[l as usize].owned_range();
-        match out.last_mut() {
-            Some(last) if last.end == r.start => last.end = r.end,
-            _ => out.push(r),
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn decode(q: &Quant, v: [u16; 4]) -> Vec3 {
-        q.min + Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32) / 65535.0 * q.size
-    }
-
-    #[test]
-    fn packed_positions_round_trip_within_one_step() {
-        let bounds = Aabb { min: Vec3::new(-1.0, -0.5, -2.0), max: Vec3::new(1.0, 0.5, 2.0) };
-        let q = Quant::fit(bounds);
-        let positions: Vec<Vec3> = (0..10_000).map(|i| Vec3::new((i as f32 * 0.37).sin(), (i as f32 * 0.11).cos() * 0.5, (i as f32 * 0.07).sin() * 2.0)).collect();
-        let overlay: Vec<f32> = (0..positions.len()).map(|i| (i % 100) as f32 / 99.0).collect();
-        let mut out = vec![[0u16; 4]; positions.len()];
-        pack(&q, &positions, Some(&overlay), &mut out);
-        let step = q.size / 65535.0;
-        for ((p, o), w) in positions.iter().zip(&out).zip(&overlay) {
-            let err = (decode(&q, *o) - *p).abs();
-            assert!(err.cmple(step * 0.51).all(), "error {err} exceeds half a step {step}");
-            assert!((o[3] as f32 / 65535.0 - w).abs() < 1e-4, "overlay value survives");
-        }
-        // Without an overlay the fourth component is zero.
-        pack(&q, &positions, None, &mut out);
-        assert!(out.iter().all(|v| v[3] == 0));
-    }
-
-    #[test]
-    fn the_box_contains_its_surface_with_a_margin_and_notices_growth() {
-        let bounds = Aabb { min: Vec3::splat(-1.0), max: Vec3::splat(1.0) };
-        let q = Quant::fit(bounds);
-        assert!(q.contains(&bounds));
-        let nudged = Aabb { min: Vec3::splat(-1.1), max: Vec3::splat(1.1) };
-        assert!(q.contains(&nudged), "a small move stays inside the margin");
-        let grown = Aabb { min: Vec3::splat(-1.5), max: Vec3::splat(1.5) };
-        assert!(!q.contains(&grown), "growing past the margin forces a refit");
-        // At 6.3M faces a triangle edge is about 1.4e-3 of a unit sphere; one step must be far finer.
-        assert!(q.size.max_element() / 65535.0 < 1.4e-3 / 20.0);
-    }
-
-    #[test]
-    fn positions_outside_the_box_clamp_instead_of_wrapping() {
-        let q = Quant::fit(Aabb { min: Vec3::splat(-1.0), max: Vec3::splat(1.0) });
-        let mut out = [[0u16; 4]; 2];
-        pack(&q, &[Vec3::splat(50.0), Vec3::splat(-50.0)], None, &mut out);
-        assert_eq!(out[0][..3], [65535; 3]);
-        assert_eq!(out[1][..3], [0; 3]);
     }
 }

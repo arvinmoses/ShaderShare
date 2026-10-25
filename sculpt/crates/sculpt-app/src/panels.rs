@@ -1,27 +1,21 @@
 //! Panels in a Substance Painter / Mudbox hybrid layout:
 //!
-//! * menu bar, then a Painter-style **context toolbar** (active tool, size,
-//!   strength, falloff, overlay);
-//! * right dock: **LAYERS** stack (layers with masks and mask effects nested
-//!   beneath, Painter-style) over **PROPERTIES** (edits the selection);
-//! * bottom: Mudbox **tool tray** (Sculpt / Paint / Pose / Falloff) and a
-//!   status bar.
+//! * menu bar, then a Painter-style **context toolbar** (brush, size, strength, falloff);
+//! * right dock: the volume's **LAYERS** (form, detail, generator and surface noise layers, and what strokes edit)
+//!   over **PROPERTIES** (the selected layer's settings and the brush);
+//! * bottom: Mudbox **tool tray** (brushes / falloff) and a status bar.
 
 use egui::{Align, Color32, Layout, Rect, RichText, Sense, Ui, UiBuilder, vec2};
-use sculpt_core::LayerId;
-use sculpt_core::bake::MeshAttribute;
-use sculpt_core::brush::{Falloff, SmoothMode};
-use sculpt_core::mask::{BlendMode, MaskLayer, MaskSource, MaskStack};
-use sculpt_core::noise::{NoiseKind, NoiseParams};
+use sculpt_core::brush::Falloff;
 
-use crate::app::{Dialog, SculptApp, Selection, fmt_count};
+use crate::app::{Dialog, SculptApp, fmt_count};
 use crate::icons::{Icon, icon_button};
 use crate::keymap::Command;
 use crate::theme::{Hex, bold};
-use crate::tools::{PoseMode, Tool, Tray};
-use crate::viewport::OverlayKind;
+use crate::tools::Tool;
+use crate::volume_mode::{Target, VolumeMode};
 
-const EFFECT_ROW_H: f32 = 24.0;
+const ROW_H: f32 = 26.0;
 
 // ------------------------------------------------------------------ helpers
 
@@ -70,47 +64,26 @@ pub(crate) fn prop<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) 
     .inner
 }
 
-fn source_icon(s: &MaskSource) -> Icon {
-    match s {
-        MaskSource::Fill { .. } => Icon::Fill,
-        MaskSource::Channel { .. } => Icon::Paint,
-        MaskSource::Noise(_) => Icon::Noise,
-        MaskSource::Mesh { attribute: MeshAttribute::Curvature } => Icon::Curvature,
-        MaskSource::Mesh { attribute: MeshAttribute::Cavity } => Icon::Cavity,
-        MaskSource::Mesh { attribute: MeshAttribute::AmbientOcclusion } => Icon::Occlusion,
-        MaskSource::Mesh { attribute: MeshAttribute::Thickness } => Icon::Thickness,
-        MaskSource::Direction { .. } => Icon::Direction,
-        MaskSource::Gradient { .. } => Icon::Gradient,
+/// What strokes edit right now, in words and the colour that marks it.
+fn target_text(app: &SculptApp) -> (String, Color32) {
+    let m = &app.volume;
+    let ui = &app.theme.ui;
+    let Some(layer) = m.layer.as_ref() else { return ("Strokes edit the volume".into(), ui.accent.0) };
+    let name = layer.layers().get(layer.active()).map_or(String::new(), |l| l.name.clone());
+    match m.routed() {
+        // A generator or noise layer holds no sculpting: strokes go to the form under it.
+        Target::Form if m.target == Target::Detail => (format!("Strokes edit the form ({name} has no sculpting of its own)"), ui.accent.0),
+        Target::Form => (format!("Strokes edit the form (levels 0 to {})", layer.from() - 1), ui.accent.0),
+        Target::Detail => (format!("Strokes edit {name}"), ui.target_delta()),
+        Target::Mask { show: false } => (format!("Strokes hide {name} (its mask)"), ui.target_mask()),
+        Target::Mask { show: true } => (format!("Strokes show {name} again (its mask)"), ui.target_mask()),
+        Target::Density { more } => (format!("Strokes paint where {name}'s rocks {}", if more { "may go" } else { "stay out" }), ui.target_freeze()),
     }
 }
-
-fn source_label(s: &MaskSource) -> &'static str {
-    match s {
-        MaskSource::Fill { .. } => "Fill",
-        MaskSource::Channel { .. } => "Paint",
-        MaskSource::Noise(_) => "Noise",
-        MaskSource::Mesh { attribute: MeshAttribute::Curvature } => "Curvature",
-        MaskSource::Mesh { attribute: MeshAttribute::Cavity } => "Cavity",
-        MaskSource::Mesh { attribute: MeshAttribute::AmbientOcclusion } => "Ambient Occlusion",
-        MaskSource::Mesh { attribute: MeshAttribute::Thickness } => "Thickness",
-        MaskSource::Direction { .. } => "Direction",
-        MaskSource::Gradient { .. } => "Gradient",
-    }
-}
-
-const BLENDS: [BlendMode; 9] = [
-    BlendMode::Normal,
-    BlendMode::Multiply,
-    BlendMode::Add,
-    BlendMode::Subtract,
-    BlendMode::Screen,
-    BlendMode::Overlay,
-    BlendMode::Max,
-    BlendMode::Min,
-    BlendMode::Difference,
-];
 
 // ----------------------------------------------------------------- menu bar
+
+const BALLS: [(&str, f32); 3] = [("Ball, 1M triangles", 1e6), ("Ball, 3M triangles", 3e6), ("Ball, 5M triangles", 5e6)];
 
 pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
     egui::Panel::top("menu").frame(egui::Frame::side_top_panel(ui.style()).fill(app.theme.ui.window.0)).show(ui, |ui| {
@@ -119,10 +92,10 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
             Icon::Base.paint(ui.painter(), logo, app.theme.ui.accent.0);
             ui.add_space(4.0);
             ui.menu_button("File", |ui| {
-                ui.menu_button("New sphere", |ui| {
-                    for (level, label) in [(5u32, "6k faces"), (6, "25k"), (7, "98k"), (8, "393k"), (9, "1.6M"), (10, "6.3M")] {
-                        if ui.button(format!("Level {level} — {label}")).clicked() {
-                            app.dialog = Some(Dialog::NewSphere(level));
+                ui.menu_button("New", |ui| {
+                    for (label, tris) in BALLS {
+                        if ui.button(label).clicked() {
+                            app.dialog = Some(Dialog::New(tris));
                             ui.close();
                         }
                     }
@@ -130,16 +103,7 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 cmd_button(app, ui, Command::Open);
                 cmd_button(app, ui, Command::Save);
                 if ui.button("Save As…").clicked() {
-                    app.dialog = Some(Dialog::SaveAs(app.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or("untitled.sculpt".into())));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Import OBJ…").clicked() {
-                    app.dialog = Some(Dialog::ImportObj(String::new()));
-                    ui.close();
-                }
-                if ui.button("Export OBJ…").clicked() {
-                    app.dialog = Some(Dialog::ExportObj("export.obj".into()));
+                    app.dialog = Some(Dialog::SaveAs(app.volume_path.clone().unwrap_or("untitled.svol".into())));
                     ui.close();
                 }
             });
@@ -147,106 +111,30 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 cmd_button(app, ui, Command::Undo);
                 cmd_button(app, ui, Command::Redo);
                 ui.separator();
-                cmd_button(app, ui, Command::InvertFreeze);
-                cmd_button(app, ui, Command::ClearFreeze);
-                ui.separator();
                 if ui.button("Keyboard shortcuts…").clicked() {
                     app.show_keymap = true;
                     ui.close();
                 }
             });
-            ui.menu_button("Mesh", |ui| {
-                if app.volume_mode.is_some() {
-                    if ui.button("Open volume…").clicked() {
-                        app.dialog = Some(Dialog::OpenVolume(app.volume_path.clone().unwrap_or_default()));
-                        ui.close();
-                    }
-                    if ui.button("Save volume…").clicked() {
-                        app.dialog = Some(Dialog::SaveVolume(app.volume_path.clone().unwrap_or("untitled.svol".into())));
-                        ui.close();
-                    }
-                    ui.separator();
-                    if let Some(m) = app.volume_mode.as_mut() {
-                        let top = m.vol.levels() - 1;
-                        ui.add(egui::Slider::new(&mut m.cap, 0..=top).text("Detail shown up to level"));
-                        ui.checkbox(&mut m.by_distance, "Level by distance").on_hover_text(
-                            "Each region shows only the levels whose detail would show on screen from here: far work is drawn from coarser levels, near work in full.",
-                        );
-                        ui.add_enabled(m.by_distance, egui::Slider::new(&mut m.level_px, 0.25..=4.0).logarithmic(true).text("Detail shown down to (pixels)"));
-                        ui.add_enabled(m.by_distance, egui::Checkbox::new(&mut m.budget_on, "Triangle budget")).on_hover_text(
-                            "Past this many triangles, only the detail that shows most is drawn: the pixels a block's detail must come to rise as far as it takes. Level 0 always shows.",
-                        );
-                        ui.add_enabled(m.by_distance && m.budget_on, egui::Slider::new(&mut m.budget_m, 0.5..=40.0).logarithmic(true).text("Million triangles"));
-                        ui.checkbox(&mut m.tint, "Tint by level");
-                        ui.checkbox(&mut m.vol.keep_detail, "Big brushes keep finer detail").on_hover_text(
-                            "On: a big brush moves the finer detail under it along with the new surface, as sculpting at a lower subdivision level does.\nOff: it builds over the detail like clay, filling grooves and covering bumps where it builds above them.",
-                        );
-                    }
-                    if let Some(vp) = app.viewport.as_mut() {
-                        ui.checkbox(&mut vp.cull, "Skip clusters out of view or facing away");
-                    }
-                    ui.separator();
-                    if ui.button("Leave volume playground").clicked() {
-                        app.close_volume();
-                        ui.close();
-                    }
-                } else {
-                    ui.menu_button("Volume playground", |ui| {
-                        ui.label("Sculpt a solid that never stretches (preview: undo and .svol files, no layers yet)");
-                        for (label, tris) in [("Ball, 1M triangles", 1e6f32), ("Ball, 3M triangles", 3e6), ("Ball, 5M triangles", 5e6)] {
-                            if ui.button(label).clicked() {
-                                app.open_volume(tris);
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-                ui.separator();
-                cmd_button(app, ui, Command::Subdivide);
-                cmd_button(app, ui, Command::NewLayer);
-                ui.separator();
-                ui.menu_button("Bake mesh maps", |ui| {
-                    for a in MeshAttribute::ALL {
-                        if ui.button(source_label(&MaskSource::Mesh { attribute: a })).clicked() {
-                            app.bake(a);
-                            ui.close();
-                        }
-                    }
-                });
-                if ui.button("Store rest pose").on_hover_text("Re-anchor procedural masks to the current base mesh").clicked() {
-                    if let Some(d) = app.doc.as_mut() {
-                        let _ = d.store_rest_pose();
-                    }
-                    ui.close();
-                }
-            });
+            ui.menu_button("Volume", |ui| volume_menu(app, ui));
             ui.menu_button("Display", |ui| {
-                cmd_button(app, ui, Command::FrameMesh);
+                cmd_button(app, ui, Command::Frame);
                 cmd_button(app, ui, Command::ToggleHud);
-                ui.add(egui::Slider::new(&mut app.overlay_strength, 0.0..=1.0).text("Overlay opacity"));
-                if ui.checkbox(&mut app.solid_preview.on, "Live solid preview").on_hover_text("Show the stack as one clean solid mesh with soft blends, as Solidify would make it. It follows your edits; the live mesh shows while you sculpt.").changed() {
-                    app.solid_preview.reset();
-                }
                 ui.separator();
-                ui.label("Shading");
-                for (flat, name, hint) in [(true, "Flat (hard normals)", "One hard normal per triangle. Cheapest: nothing is stored, computed or uploaded for normals."), (false, "Smooth", "Smooth per-vertex normals. Costs time and memory on dense meshes.")] {
-                    if ui.radio(app.flat_shading == flat, name).on_hover_text(hint).clicked() {
-                        app.flat_shading = flat;
-                        app.save_settings();
-                    }
-                }
-                ui.separator();
-                ui.label("Viewport detail (dense meshes)");
-                for d in crate::app::ViewDetail::ALL {
-                    if ui.radio(app.view_detail == d, d.name()).on_hover_text(d.hint()).clicked() {
-                        app.view_detail = d;
-                        app.save_settings();
-                    }
-                }
-                ui.separator();
-                if ui.button("Mesh info…").clicked() {
-                    app.show_mesh_info = true;
-                    ui.close();
+                let m = &mut app.volume;
+                let top = m.vol.levels() - 1;
+                ui.add(egui::Slider::new(&mut m.cap, 0..=top).text("Detail shown up to level"));
+                ui.checkbox(&mut m.by_distance, "Level by distance").on_hover_text(
+                    "Each region shows only the levels whose detail would show on screen from here: far work is drawn from coarser levels, near work in full.",
+                );
+                ui.add_enabled(m.by_distance, egui::Slider::new(&mut m.level_px, 0.25..=4.0).logarithmic(true).text("Detail shown down to (pixels)"));
+                ui.add_enabled(m.by_distance, egui::Checkbox::new(&mut m.budget_on, "Triangle budget")).on_hover_text(
+                    "Past this many triangles, only the detail that shows most is drawn: the pixels a block's detail must come to rise as far as it takes. Level 0 always shows.",
+                );
+                ui.add_enabled(m.by_distance && m.budget_on, egui::Slider::new(&mut m.budget_m, 0.5..=40.0).logarithmic(true).text("Million triangles"));
+                ui.checkbox(&mut m.tint, "Tint by level");
+                if let Some(vp) = app.viewport.as_mut() {
+                    ui.checkbox(&mut vp.cull, "Skip clusters out of view or facing away");
                 }
             });
             ui.menu_button("Theme", |ui| {
@@ -265,7 +153,7 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                 }
             });
             // Document title, centred like Painter's project name.
-            let title = app.project_path.as_ref().and_then(|p| p.file_name()).map_or("Untitled".to_string(), |n| n.to_string_lossy().into_owned());
+            let title = app.volume_path.as_deref().map_or("Untitled".to_string(), crate::app::file_name);
             let full = ui.max_rect();
             ui.painter().text(
                 egui::pos2(full.center().x, full.center().y),
@@ -276,6 +164,54 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
             );
         });
     });
+}
+
+const NOISE_HOVER: &str = "A layer of noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Its mask fades it. Brushes work on the surface under it.";
+const GENERATOR_HOVER: &str = "A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with. Its settings are under Properties; sculpting the form carries it along.";
+
+/// The Volume menu: new layers, merging them, and how big brushes treat detail.
+fn volume_menu(app: &mut SculptApp, ui: &mut Ui) {
+    let m = &mut app.volume;
+    let top = m.vol.levels() - 1;
+    if ui.button("New generator layer").on_hover_text(GENERATOR_HOVER).clicked() {
+        m.add_generator();
+        ui.close();
+    }
+    if ui.button("New surface noise layer").on_hover_text(NOISE_HOVER).clicked() {
+        m.add_noise();
+        ui.close();
+    }
+    match m.layer.as_ref().map(|l| l.from()) {
+        None => {
+            ui.menu_button("Move detail to a layer", |ui| {
+                ui.label(RichText::new("The work at this level and finer goes into a detail layer over the form.").small());
+                for l in 1..=top {
+                    if ui.button(format!("From level {l}  (step {:.5})", m.vol.voxel(l))).clicked() {
+                        m.make_layer(l);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        Some(from) => {
+            ui.menu_button("New detail layer", |ui| {
+                for l in from..=top {
+                    if ui.button(format!("At level {l}  (step {:.5})", m.vol.voxel(l))).clicked() {
+                        m.add_layer(l);
+                        ui.close();
+                    }
+                }
+            });
+            if ui.button("Merge the layers into the form").on_hover_text("One volume again, as shown. Undo starts afresh.").clicked() {
+                m.merge_layer();
+                ui.close();
+            }
+        }
+    }
+    ui.separator();
+    ui.checkbox(&mut m.vol.keep_detail, "Big brushes keep finer detail").on_hover_text(
+        "On: a big brush moves the finer detail under it along with the new surface, as sculpting at a lower subdivision level does.\nOff: it builds over the detail like clay, filling grooves and covering bumps where it builds above them.",
+    );
 }
 
 // ----------------------------------------------------------- context toolbar
@@ -299,35 +235,16 @@ pub fn context_bar(app: &mut SculptApp, ui: &mut Ui) {
             ui.add(egui::Slider::new(&mut p.strength, 0.0..=1.0).max_decimals(2));
             ui.label(RichText::new("Falloff").weak());
             ui.add(egui::Slider::new(&mut p.hardness, 0.0..=0.95).max_decimals(2)).on_hover_text("Hardness: 0 = soft, 1 = hard edge");
-            ui.toggle_value(&mut p.front_faces_only, "Front only").on_hover_text("Ignore back-facing surfaces");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icon_button(ui, Icon::Eye, 22.0, app.hud, "Performance HUD (H)").clicked() {
-                    app.hud = !app.hud;
+                if icon_button(ui, Icon::Eye, 22.0, app.hud, "Engine readout (H)").clicked() {
+                    let ctx = ui.ctx().clone();
+                    app.run(&ctx, Command::ToggleHud);
                 }
-                let current = overlay_label(app);
-                egui::ComboBox::from_id_salt("overlay").selected_text(current).width(130.0).show_ui(ui, |ui| {
-                    let mut overlays = vec![("None".to_string(), OverlayKind::None), ("Freeze".into(), OverlayKind::Freeze), ("Layer mask".into(), OverlayKind::LayerMask)];
-                    if let Some(d) = &app.doc {
-                        overlays.extend(d.channels().keys().map(|n| (n.clone(), OverlayKind::Channel(n.clone()))));
-                    }
-                    for (label, kind) in overlays {
-                        ui.selectable_value(&mut app.overlay, kind, label);
-                    }
-                });
-                ui.label(RichText::new("Overlay").weak());
+                let (text, color) = target_text(app);
+                ui.label(RichText::new(text).color(color));
             });
         });
     });
-}
-
-fn overlay_label(app: &SculptApp) -> String {
-    match &app.overlay {
-        OverlayKind::None => "None".into(),
-        OverlayKind::Freeze => "Freeze".into(),
-        OverlayKind::LayerMask => "Layer mask".into(),
-        OverlayKind::Channel(n) => n.clone(),
-        OverlayKind::Custom => "Pose weights".into(),
-    }
 }
 
 // --------------------------------------------------------------- status bar
@@ -338,16 +255,11 @@ pub fn status_bar(app: &mut SculptApp, ui: &mut Ui) {
             let weak = app.theme.weak_text();
             ui.label(RichText::new(app.tool.hint()).color(weak));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(d) = &app.doc {
-                    ui.label(RichText::new(format!("{} faces", fmt_count(d.face_count()))).color(weak));
-                    ui.separator();
-                    let _ = d;
-                    if let Some(c) = crate::layer_panel::breadcrumb::crumbs(app) {
-                        ui.label(RichText::new(format!("{} — {}", c.parts.join(" › "), c.verb)).color(c.color));
-                    }
-                    ui.separator();
-                }
-                ui.label(RichText::new(format!("Pen: {} {:.2}", app.pen.source.label(), app.pen.pressure)).color(weak));
+                let m = &app.volume;
+                let blocks: usize = m.vol.memory().0.iter().sum();
+                ui.label(RichText::new(format!("{} blocks  ·  about {} triangles shown", fmt_count(blocks), fmt_count(m.view.triangles as usize))).color(weak));
+                ui.separator();
+                ui.label(RichText::new(format!("Pen: {} {:.2}", app.pen.source.label(), app.pen.pressure)).color(weak)).on_hover_text(&app.pen.status);
                 // Transient messages fade out after a few seconds.
                 if app.status != app.status_seen.0 {
                     app.status_seen = (app.status.clone(), std::time::Instant::now());
@@ -356,7 +268,7 @@ pub fn status_bar(app: &mut SculptApp, ui: &mut Ui) {
                 if !app.status.is_empty() && age < 6.0 {
                     let alpha = (6.0 - age).clamp(0.0, 1.0);
                     ui.separator();
-                    ui.label(RichText::new(&app.status).color(weak.gamma_multiply(alpha)));
+                    ui.add(egui::Label::new(RichText::new(&app.status).color(weak.gamma_multiply(alpha))).truncate());
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
                 }
             });
@@ -370,25 +282,27 @@ pub fn tray(app: &mut SculptApp, ui: &mut Ui) {
     let tile = app.theme.metrics.tray_tile;
     let fill = app.theme.ui.tray.0;
     egui::Panel::bottom("tray").exact_size(tile + 36.0).frame(egui::Frame::side_top_panel(ui.style()).fill(fill)).show(ui, |ui| {
+        let tab_id = egui::Id::new("tray_falloff");
+        let mut falloff = ui.data(|d| d.get_temp::<bool>(tab_id)).unwrap_or(false);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            for (t, label) in [(Tray::Sculpt, "Sculpt Tools"), (Tray::Paint, "Paint Tools"), (Tray::Pose, "Pose Tools"), (Tray::Falloff, "Falloff")] {
-                let sel = app.tray == t;
+            for (on, label) in [(false, "Brushes"), (true, "Falloff")] {
+                let sel = falloff == on;
                 let text = if sel { RichText::new(label).strong() } else { RichText::new(label).color(app.theme.weak_text()) };
                 if ui.add(egui::Button::selectable(sel, text).corner_radius(0)).clicked() {
-                    app.tray = t;
+                    falloff = on;
                 }
             }
         });
+        ui.data_mut(|d| d.insert_temp(tab_id, falloff));
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            if app.tray == Tray::Falloff {
+            if falloff {
                 falloff_tray(app, ui, tile);
                 return;
             }
-            let tray_tools: Vec<Tool> = Tool::ALL.into_iter().filter(|t| t.tray() == app.tray).collect();
-            for t in tray_tools {
+            for t in Tool::ALL {
                 let selected = app.tool == t;
                 let key = app.tool_hotkey(ui.ctx(), t);
                 let resp = tile_ui(ui, app, tile, selected, |p, r, c| t.paint_icon(p, r, c), t.label(), &key);
@@ -426,7 +340,7 @@ fn tile_ui(ui: &mut Ui, app: &SculptApp, tile: f32, selected: bool, icon: impl F
     resp
 }
 
-/// Mudbox's Falloff tray: curve presets applied to the current tool.
+/// Mudbox's Falloff tray: curve presets applied to the current brush.
 fn falloff_tray(app: &mut SculptApp, ui: &mut Ui, tile: f32) {
     let current = app.tools.params(app.tool).hardness;
     for (label, h) in [("Soft", 0.0f32), ("Smooth", 0.2), ("Medium", 0.45), ("Firm", 0.7), ("Hard", 0.9)] {
@@ -458,302 +372,26 @@ fn falloff_tray(app: &mut SculptApp, ui: &mut Ui, tile: f32) {
 
 // --------------------------------------------------------------- right dock
 
-/// The volume's stack in the Layers panel: one volume, or the form with a detail layer (and its mask) over it, and
-/// which of them strokes work on.
-const NOISE_HOVER: &str = "A layer of noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Its mask fades it. Brushes work on the surface under it.";
-
-pub fn volume_stack(app: &mut SculptApp, ui: &mut Ui) {
-    use crate::volume_mode::Target;
-    let weak = app.theme.weak_text();
-    let Some(m) = app.volume_mode.as_mut() else { return };
-    ui.add_space(6.0);
-    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| {
-        match m.layer.as_ref().map(|_| ()) {
-            None => {
-                ui.label("One volume: strokes work on all of it.");
-                ui.add_space(4.0);
-                let id = ui.id().with("layer_from");
-                let top = m.vol.levels() - 1;
-                let mut from = ui.data_mut(|d| *d.get_temp_mut_or(id, 3usize)).clamp(1, top);
-                ui.add(egui::Slider::new(&mut from, 1..=top).text("Detail from level"));
-                ui.data_mut(|d| d.insert_temp(id, from));
-                if ui.button("New generator").on_hover_text("A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with.").clicked() {
-                    m.add_generator();
-                }
-                if ui.button("New surface noise").on_hover_text(NOISE_HOVER).clicked() {
-                    m.add_noise();
-                }
-                if ui
-                    .button("Move detail to a layer")
-                    .on_hover_text("The work at this level and finer goes into a detail layer over the rest. Sculpting the form under it then carries the detail along, and its mask hides it where painted.")
-                    .clicked()
-                {
-                    m.make_layer(from);
-                }
-            }
-            Some(_) => {
-                let layer = m.layer.as_ref().unwrap();
-                let (from, active, layers) = (layer.from(), layer.active(), layer.layers());
-                let top = m.vol.levels() - 1;
-                let texts: Vec<String> = (0..=top).map(|l| format!("level {l}  (step {:.5})", m.vol.voxel(l))).collect();
-                ui.label(RichText::new("Layers, top first: strokes work on the one selected").small().color(weak));
-                ui.add_space(2.0);
-                // What the rows asked for, done after drawing them.
-                let mut select = None;
-                let mut visible = None;
-                let mut level = None;
-                let mut remove = None;
-                let mut fill: Option<f32> = None;
-                for k in (0..layers.len()).rev() {
-                    let info = &layers[k];
-                    ui.horizontal(|ui| {
-                        let mut on = info.visible;
-                        if ui.checkbox(&mut on, "").on_hover_text("Show or hide this layer").changed() {
-                            visible = Some((k, on));
-                        }
-                        let picked = m.target == Target::Detail && active == k;
-                        let label = if info.generator {
-                            format!("{}  (generator, {} blocks)", info.name, info.blocks)
-                        } else if info.noise {
-                            format!("{}  (drawn by the GPU)", info.name)
-                        } else {
-                            format!("{}  ({} blocks)", info.name, info.blocks)
-                        };
-                        if ui.selectable_label(picked, label).clicked() {
-                            select = Some(k);
-                        }
-                        let mut l = info.level;
-                        // A generator's resolution can be any level; a detail layer's, the layers' first or finer;
-                        // surface noise has none (it is drawn at every fineness).
-                        let first = if info.generator { 0 } else { from };
-                        if !info.noise {
-                            egui::ComboBox::from_id_salt(("layer_level", k)).selected_text(format!("level {l}")).show_ui(ui, |ui| {
-                                for (c, t) in texts.iter().enumerate().skip(first) {
-                                    ui.selectable_value(&mut l, c, t.as_str());
-                                }
-                            });
-                        }
-                        if l != info.level {
-                            level = Some((k, l));
-                        }
-                        if ui.small_button("×").on_hover_text("Remove this layer (undo brings it back)").clicked() {
-                            remove = Some(k);
-                        }
-                    });
-                    if active == k {
-                        ui.horizontal(|ui| {
-                            ui.add_space(26.0);
-                            if ui.selectable_label(m.target == Target::Mask { show: false }, "Mask: hide").clicked() {
-                                m.target = Target::Mask { show: false };
-                            }
-                            if ui.selectable_label(m.target == Target::Mask { show: true }, "Mask: show").clicked() {
-                                m.target = Target::Mask { show: true };
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add_space(26.0);
-                            if ui.small_button("Hide all").on_hover_text("Hide this layer everywhere, then paint it in where wanted (Mask: show is picked). One undo.").clicked() {
-                                fill = Some(0.0);
-                            }
-                            if ui.small_button("Show all").on_hover_text("Clear this layer's mask: it shows everywhere again. One undo.").clicked() {
-                                fill = Some(1.0);
-                            }
-                        });
-                        // Where a generator's rocks go, when its density is painted.
-                        if m.layer.as_ref().and_then(|l| l.generator(k)).is_some_and(|s| matches!(s.density, sculpt_core::generator::density::Density::Painted { .. })) {
-                            ui.horizontal(|ui| {
-                                ui.add_space(26.0);
-                                if ui.selectable_label(m.target == Target::Density { more: false }, "Density: less").on_hover_text("Paint where the rocks stay out. They scatter again when the stroke ends.").clicked() {
-                                    m.target = Target::Density { more: false };
-                                }
-                                if ui.selectable_label(m.target == Target::Density { more: true }, "Density: more").on_hover_text("Paint where the rocks may go.").clicked() {
-                                    m.target = Target::Density { more: true };
-                                }
-                            });
-                        }
-                    }
-                }
-                if ui.selectable_label(m.target == Target::Form, format!("Form  (levels 0 to {})", from - 1)).clicked() {
-                    m.target = Target::Form;
-                }
-                if let Some(k) = select {
-                    m.set_active_layer(k);
-                    m.target = Target::Detail;
-                }
-                if let Some((k, on)) = visible {
-                    m.set_layer_visible(k, on);
-                }
-                if let Some((k, l)) = level {
-                    m.set_layer_level(k, l);
-                }
-                if let Some(k) = remove {
-                    m.remove_layer(k);
-                }
-                if let Some(to) = fill {
-                    m.fill_mask(to);
-                    // Hidden everywhere: the next strokes paint it back in.
-                    if to < 1.0 {
-                        m.target = Target::Mask { show: true };
-                    }
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let id = ui.id().with("new_layer_level");
-                    let mut l = ui.data_mut(|d| *d.get_temp_mut_or(id, top)).clamp(from, top);
-                    if ui.button("New layer").on_hover_text("An empty layer on top, at the resolution beside").clicked() {
-                        m.add_layer(l);
-                    }
-                    egui::ComboBox::from_id_salt("new_layer_level").selected_text(format!("level {l}")).show_ui(ui, |ui| {
-                        for (c, t) in texts.iter().enumerate().skip(from) {
-                            ui.selectable_value(&mut l, c, t.as_str());
-                        }
-                    });
-                    ui.data_mut(|d| d.insert_temp(id, l));
-                });
-                if ui
-                    .button("New generator")
-                    .on_hover_text("A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with. Its settings are under Properties; sculpting the form carries it along.")
-                    .clicked()
-                {
-                    m.add_generator();
-                }
-                if ui.button("New surface noise").on_hover_text(NOISE_HOVER).clicked() {
-                    m.add_noise();
-                }
-                if ui.button("Merge the layers into the form").clicked() {
-                    m.merge_layer();
-                }
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Sculpting the form carries every layer along. Each layer has its own resolution: coarse ones cost little, and hold broad detail; fine ones hold the smallest. Detail layers add up; a detail layer above a generator stands on what it scattered, and rides it. Saved with the volume.")
-                        .small()
-                        .color(weak),
-                );
-            }
-        }
-    });
-}
-
 pub fn right_panel(app: &mut SculptApp, ui: &mut Ui) {
     let fill = app.theme.ui.panel.0;
     egui::Panel::right("dock").default_size(340.0).min_size(280.0).frame(egui::Frame::side_top_panel(ui.style()).fill(fill).inner_margin(0)).show(ui, |ui| {
         let total = ui.available_height();
-        // The stack keeps 42% to 75% of the dock whatever the window size, so it never collapses to a few rows.
+        // The stack keeps 30% to 70% of the dock whatever the window size, so it never collapses to a few rows.
         egui::Panel::top("layers_panel")
             .resizable(true)
-            .default_size(total * 0.55)
-            .size_range((total * 0.42).max(200.0)..=(total * 0.75))
+            .default_size(total * 0.45)
+            .size_range((total * 0.3).max(180.0)..=(total * 0.7))
             .frame(egui::Frame::NONE.fill(fill))
-            .show(ui, |ui| crate::layer_panel::layers_panel(app, ui));
+            .show(ui, |ui| layers_panel(app, ui));
         egui::CentralPanel::no_frame().show(ui, |ui| properties_panel(app, ui));
     });
 }
 
-/// Keep the mask editing copy pointed at the active layer. Returns true if
-/// the active layer changed since the copy was made.
-pub(crate) fn sync_mask_edit(app: &mut SculptApp) -> bool {
-    let Some(doc) = app.doc.as_ref() else { return false };
-    let active = doc.active_layer();
-    if app.mask_edit.as_ref().map(|(id, _)| *id) == active && active.is_some() {
-        return false;
-    }
-    let stored = active.and_then(|id| doc.layer(id).and_then(|l| l.mask.clone()).map(|s| (id, s)));
-    let changed = app.mask_edit.as_ref().map(|(id, _)| *id) != stored.as_ref().map(|(id, _)| *id) || app.last_active != active;
-    app.mask_edit = stored;
-    app.last_active = active;
-    changed
-}
-
-pub(crate) fn select_layer(app: &mut SculptApp, id: Option<LayerId>, sel: Selection) {
-    if let Some(d) = app.doc.as_mut() {
-        let _ = d.set_active_layer(id);
-    }
-    sync_mask_edit(app);
-    app.selection = sel;
-    match sel {
-        Selection::Layer => {
-            if app.overlay == OverlayKind::LayerMask {
-                app.overlay = OverlayKind::None;
-            }
-        }
-        Selection::Mask => app.overlay = OverlayKind::LayerMask,
-        Selection::Effect(i) => {
-            app.overlay = OverlayKind::LayerMask;
-            // Selecting a Paint effect makes Mask Paint draw into it (Painter behaviour).
-            if let Some(MaskSource::Channel { name }) = app.mask_edit.as_ref().and_then(|(_, s)| s.layers.get(i)).map(|l| l.source.clone()) {
-                app.tools.mask_channel = name;
-            }
-        }
-    }
-}
-
-pub(crate) fn add_mask(app: &mut SculptApp, base: f32) {
-    let Some(id) = app.doc.as_ref().and_then(|d| d.active_layer()) else { return };
-    app.mask_edit = Some((id, MaskStack::new(base)));
-    app.expanded.insert(id);
-    app.mask_dirty = true;
-    app.selection = Selection::Mask;
-    app.overlay = OverlayKind::LayerMask;
-}
-
-pub(crate) fn add_effect(app: &mut SculptApp, label: &str, src: MaskSource) {
-    if app.mask_edit.is_none() {
-        add_mask(app, 1.0);
-    }
-    let Some((id, stack)) = app.mask_edit.as_mut() else { return };
-    let blend = if stack.layers.is_empty() && stack.base >= 1.0 { BlendMode::Multiply } else { BlendMode::Normal };
-    let src = match src {
-        MaskSource::Channel { .. } => MaskSource::Channel { name: format!("paint.layer{}", id.0) },
-        s => s,
-    };
-    let is_paint = matches!(src, MaskSource::Channel { .. });
-    stack.layers.push(MaskLayer::new(label, src).blend(blend));
-    let idx = stack.layers.len() - 1;
-    let id = *id;
-    app.expanded.insert(id);
-    app.mask_dirty = true;
-    select_layer(app, Some(id), Selection::Effect(idx));
-    if is_paint {
-        app.select_tool(Tool::MaskPaint);
-        app.overlay = OverlayKind::LayerMask;
-    }
-}
-
-pub(crate) fn effect_menu(app: &mut SculptApp, ui: &mut Ui) {
-    let items: [(&str, MaskSource); 9] = [
-        ("Paint", MaskSource::Channel { name: String::new() }),
-        ("Fill", MaskSource::Fill { value: 1.0 }),
-        ("Noise", MaskSource::Noise(NoiseParams::default())),
-        ("Curvature", MaskSource::Mesh { attribute: MeshAttribute::Curvature }),
-        ("Cavity", MaskSource::Mesh { attribute: MeshAttribute::Cavity }),
-        ("Ambient Occlusion", MaskSource::Mesh { attribute: MeshAttribute::AmbientOcclusion }),
-        ("Thickness", MaskSource::Mesh { attribute: MeshAttribute::Thickness }),
-        ("Direction", MaskSource::Direction { axis: glam::Vec3::Y, sharpness: 1.0 }),
-        ("Gradient", MaskSource::Gradient { axis: glam::Vec3::Y, from: -1.0, to: 1.0 }),
-    ];
-    for (label, src) in items {
-        let resp = ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            source_icon(&src).paint(ui.painter(), r, ui.visuals().text_color());
-            ui.add(egui::Button::new(label).frame(false))
-        });
-        if resp.inner.clicked() {
-            add_effect(app, label, src);
-            ui.close();
-        }
-    }
-}
-
-/// Row background + a child Ui for its contents.
-fn row_frame(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: bool) -> (egui::Response, Ui) {
-    row_frame_tinted(ui, app, height, indent, selected, None)
-}
-
-/// Like `row_frame`, with an optional selection fill (mask rows use the mask colour so they read differently from layers).
-fn row_frame_tinted(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, selected: bool, tint: Option<Color32>) -> (egui::Response, Ui) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
+/// Row background + a child Ui for its contents. `bar` marks the selected row's left edge.
+fn row_frame(ui: &mut Ui, app: &SculptApp, indent: f32, selected: bool, bar: Color32) -> (egui::Response, Ui) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let bg = if selected {
-        tint.unwrap_or_else(|| app.theme.ui.row_selected())
+        app.theme.ui.row_selected()
     } else if resp.hovered() {
         ui.visuals().widgets.hovered.bg_fill.gamma_multiply(0.5)
     } else {
@@ -761,104 +399,151 @@ fn row_frame_tinted(ui: &mut Ui, app: &SculptApp, height: f32, indent: f32, sele
     };
     ui.painter().rect_filled(rect, 0.0, bg);
     if selected {
-        let bar = if tint.is_some() { app.theme.ui.target_mask() } else { app.theme.ui.accent.0 };
-        ui.painter().rect_filled(Rect::from_min_max(rect.left_top(), rect.left_bottom() + vec2(2.0, 0.0)), 0.0, bar);
+        ui.painter().rect_filled(Rect::from_min_max(rect.left_top(), rect.left_bottom() + vec2(3.0, 0.0)), 0.0, bar);
     }
     ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
-    // Same right edge as the layer rows' strength column, so numbers line up down the list.
-    let inner = rect.shrink2(vec2(4.0, 0.0)).with_min_x(rect.left() + 4.0 + indent).with_max_x(rect.right() - 6.0);
+    let inner = rect.shrink2(vec2(4.0, 0.0)).with_min_x(rect.left() + 6.0 + indent).with_max_x(rect.right() - 6.0);
     let child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
     (resp, child)
 }
 
-pub(crate) fn mask_rows(app: &mut SculptApp, ui: &mut Ui, id: LayerId, depth: usize) {
-    let base_indent = depth as f32 * crate::layer_panel::row::INDENT;
-    let active = app.doc.as_ref().unwrap().active_layer() == Some(id);
-    let stack = if active { app.mask_edit.as_ref().map(|(_, s)| s.clone()) } else { app.doc.as_ref().unwrap().layer(id).and_then(|l| l.mask.clone()) };
-    let Some(stack) = stack else { return };
-    let weak = app.theme.weak_text();
-
-    // Effects, top of the stack first.
-    let mut op_rows: Vec<crate::layer_panel::op_drag::OpRow> = Vec::new();
-    for i in (0..stack.layers.len()).rev() {
-        let e = &stack.layers[i];
-        let selected = active && app.selection == Selection::Effect(i);
-        let tint = app.theme.ui.target_mask().gamma_multiply(0.32);
-        let (resp, mut row) = row_frame_tinted(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected, Some(tint));
-        op_rows.push((i, resp.rect));
-        if resp.drag_started() && active {
-            app.layers.op_drag = Some((id, i));
-        }
-        row.spacing_mut().item_spacing.x = 4.0;
-        if icon_button(&mut row, if e.enabled { Icon::Eye } else { Icon::EyeOff }, 18.0, false, "Enable").clicked() {
-            select_layer(app, Some(id), Selection::Effect(i));
-            if let Some((_, s)) = app.mask_edit.as_mut() {
-                s.layers[i].enabled = !s.layers[i].enabled;
-                app.mask_dirty = true;
-            }
-        }
-        let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-        source_icon(&e.source).paint(row.painter(), r, row.visuals().text_color());
-        let title = if e.name.is_empty() { source_label(&e.source).to_string() } else { e.name.clone() };
-        row.label(RichText::new(title).size(app.theme.metrics.font_size * 0.92));
-        row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(format!("{:?} {:.0}%", e.blend, e.opacity * 100.0)).size(app.theme.metrics.font_size * 0.85).color(weak));
-        });
-        if resp.clicked() {
-            select_layer(app, Some(id), Selection::Effect(i));
-        }
-        let (count, enabled) = (stack.layers.len(), e.enabled);
-        egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::op_menu(app, ui, id, i, count, enabled));
-    }
-    crate::layer_panel::op_drag::update(app, ui, id, &op_rows);
-    // Mask base value row.
-    let selected = active && app.selection == Selection::Mask;
-    let (resp, mut row) = row_frame_tinted(ui, app, EFFECT_ROW_H, 40.0 + base_indent, selected, Some(app.theme.ui.target_mask().gamma_multiply(0.32)));
-    let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-    Icon::Mask.paint(row.painter(), r, row.visuals().text_color());
-    row.label(RichText::new(if stack.base >= 0.5 { "White mask" } else { "Black mask" }).size(app.theme.metrics.font_size * 0.92).color(weak));
-    if resp.clicked() {
-        select_layer(app, Some(id), Selection::Mask);
-    }
-    egui::Popup::context_menu(&resp).show(|ui| crate::layer_panel::menus::add_mask_items(app, ui, id));
+/// A small explanatory paragraph, inset like the rows' contents.
+fn note(ui: &mut Ui, text: &str, color: Color32) {
+    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| ui.label(RichText::new(text).small().color(color)));
 }
 
-pub(crate) fn base_row(app: &mut SculptApp, ui: &mut Ui) {
-    let selected = app.doc.as_ref().unwrap().active_layer().is_none();
-    let (resp, mut row) = row_frame(ui, app, crate::layer_panel::row::Metrics::of(app.layers.compact).row_h, 0.0, selected);
-    row.add_space(40.0);
-    let (sw, _) = row.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-    row.painter().rect_filled(sw, 2.0, app.theme.viewport.background_bottom.0);
-    Icon::Base.paint(row.painter(), sw.shrink(2.0), app.theme.viewport.clay.0.gamma_multiply(0.7));
-    row.label(RichText::new("Base").italics());
-    if resp.clicked() {
-        app.layers.selection.clear();
-        select_layer(app, None, Selection::Layer);
+/// What a layer row asked for, done after the rows are drawn.
+#[derive(Default)]
+struct RowActions {
+    select: Option<usize>,
+    visible: Option<(usize, bool)>,
+    remove: Option<usize>,
+    target: Option<Target>,
+}
+
+/// The volume's stack: its layers top first, then the form under them; the selected row is what strokes edit.
+fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
+    panel_header(ui, app, "LAYERS", |_| {});
+    let weak = app.theme.weak_text();
+    let fs = app.theme.metrics.font_size;
+    let (accent, detail, mask) = (app.theme.ui.accent.0, app.theme.ui.target_delta(), app.theme.ui.target_mask());
+    let mut act = RowActions::default();
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let m = &app.volume;
+        match m.layer.as_ref() {
+            None => {
+                let (_, mut row) = row_frame(ui, app, 0.0, true, accent);
+                let (r, _) = row.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                Icon::Base.paint(row.painter(), r, app.theme.viewport.clay.0);
+                row.label("Volume");
+                row.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format!("{} levels", m.vol.levels())).size(fs * 0.85).color(weak)));
+                ui.add_space(8.0);
+                note(ui, "One volume: strokes work on all of it. Add a generator or surface noise layer, or move the finer detail to a layer, to work in layers.", weak);
+            }
+            Some(layer) => {
+                let (active, layers) = (layer.active(), layer.layers());
+                for k in (0..layers.len()).rev() {
+                    let info = &layers[k];
+                    let selected = active == k && m.target != Target::Form;
+                    let bar = match m.routed() {
+                        Target::Mask { .. } => mask,
+                        Target::Detail => detail,
+                        _ => accent,
+                    };
+                    let (resp, mut row) = row_frame(ui, app, 0.0, selected, bar);
+                    if icon_button(&mut row, if info.visible { Icon::Eye } else { Icon::EyeOff }, 20.0, false, "Show or hide this layer").clicked() {
+                        act.visible = Some((k, !info.visible));
+                    }
+                    let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    let icon = if info.noise {
+                        Icon::Noise
+                    } else if info.generator {
+                        Icon::Scatter
+                    } else {
+                        Icon::Paint
+                    };
+                    icon.paint(row.painter(), r, row.visuals().text_color());
+                    let name = RichText::new(&info.name);
+                    row.label(if info.visible { name } else { name.color(weak) });
+                    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, Icon::Trash, 20.0, false, "Remove this layer (undo brings it back)").clicked() {
+                            act.remove = Some(k);
+                        }
+                        let what = if info.noise {
+                            "noise".to_string()
+                        } else {
+                            format!("L{}  ·  {} blocks", info.level, fmt_count(info.blocks))
+                        };
+                        ui.label(RichText::new(what).size(fs * 0.85).color(weak));
+                    });
+                    if resp.clicked() {
+                        act.select = Some(k);
+                    }
+                    // The active layer's mask (and a generator's painted density): what else strokes can paint.
+                    if active == k {
+                        let (_, mut row) = row_frame(ui, app, 26.0, false, mask);
+                        let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                        Icon::Mask.paint(row.painter(), r, mask);
+                        for (show, label, hover) in [(false, "Hide", "Strokes hide this layer where they go."), (true, "Show", "Strokes show it again.")] {
+                            if row.selectable_label(m.target == Target::Mask { show }, label).on_hover_text(hover).clicked() {
+                                act.target = Some(Target::Mask { show });
+                            }
+                        }
+                        if layer.generator(k).is_some_and(|s| matches!(s.density, sculpt_core::generator::density::Density::Painted { .. })) {
+                            row.separator();
+                            for (more, label, hover) in [(false, "Less", "Paint where the rocks stay out. They scatter again when the stroke ends."), (true, "More", "Paint where the rocks may go.")] {
+                                if row.selectable_label(m.target == Target::Density { more }, label).on_hover_text(hover).clicked() {
+                                    act.target = Some(Target::Density { more });
+                                }
+                            }
+                        }
+                    }
+                }
+                let (resp, mut row) = row_frame(ui, app, 0.0, m.target == Target::Form, accent);
+                row.add_space(24.0);
+                let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                Icon::Base.paint(row.painter(), r, app.theme.viewport.clay.0);
+                row.label("Form");
+                row.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format!("levels 0 to {}", layer.from() - 1)).size(fs * 0.85).color(weak)));
+                if resp.clicked() {
+                    act.target = Some(Target::Form);
+                }
+                ui.add_space(8.0);
+                note(ui, "Sculpting the form carries every layer along. Each layer has its own resolution: coarse ones cost little, fine ones hold the smallest detail.", weak);
+            }
+        }
+        ui.add_space(6.0);
+        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| {
+            ui.menu_button(RichText::new("+ Layer"), |ui| volume_menu(app, ui));
+        });
+    });
+    let m = &mut app.volume;
+    if let Some(k) = act.select {
+        m.set_active_layer(k);
+        m.target = Target::Detail;
+    }
+    if let Some(t) = act.target {
+        m.target = t;
+    }
+    if let Some((k, on)) = act.visible {
+        m.set_layer_visible(k, on);
+    }
+    if let Some(k) = act.remove {
+        m.remove_layer(k);
     }
 }
 
 // --------------------------------------------------------------- properties
 
 fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
-    // Folders can be selected without becoming the sculpt target, so Properties follows the primary row.
-    let target = app.doc.as_ref().and_then(|d| app.layers.selection.primary().or(d.active_layer()).and_then(|id| d.layer(id)).map(|l| (l.id, l.is_folder())));
-    let active = app.doc.as_ref().and_then(|d| d.active_layer());
     panel_header(ui, app, "PROPERTIES", |_| {});
-    crate::remesh_ui::sections(app, ui);
-    egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 5)).show(ui, |ui| crate::layer_panel::breadcrumb::show(app, ui));
-    ui.painter().line_segment([ui.cursor().left_top(), ui.cursor().right_top()], egui::Stroke::new(1.0, app.theme.ui.separator.0));
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
-            crate::generator_ui::volume_generator_props(app, ui);
-            crate::generator_ui::volume_noise_props(app, ui);
-            match (app.selection, target) {
-                _ if app.layers.selection.len() > 1 => multi_props(app, ui),
-                (Selection::Effect(i), Some((id, false))) if active == Some(id) => effect_props(app, ui, i),
-                (Selection::Mask, Some((id, false))) if active == Some(id) => mask_props(app, ui),
-                (_, Some((id, _))) => layer_props(app, ui, id),
-                _ => {
-                    ui.label(RichText::new("Sculpting directly on the base mesh. Add a layer (+) to sculpt non-destructively.").color(app.theme.weak_text()));
-                }
+            layer_props(app, ui);
+            if app.volume.target != Target::Form {
+                crate::generator_ui::volume_generator_props(app, ui);
+                crate::generator_ui::volume_noise_props(app, ui);
             }
             ui.add_space(6.0);
             brush_props(app, ui);
@@ -866,384 +551,125 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
     });
 }
 
-/// Several rows selected: shared fields, with a mixed state where they differ. Each change applies to all.
-fn multi_props(app: &mut SculptApp, ui: &mut Ui) {
-    use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
-    let Some(doc) = app.doc.as_ref() else { return };
-    let order: Vec<LayerId> = doc.layer_tree().iter().map(|r| r.id).collect();
-    let ids = app.layers.selection.in_order(&order);
-    let metas: Vec<_> = ids.iter().filter_map(|id| doc.layer(*id)).map(|l| (l.is_folder(), l.meta())).collect();
-    let Some(first) = metas.first().map(|(_, m)| m.clone()) else { return };
-    let all = |f: &dyn Fn(&sculpt_core::LayerMeta) -> bool| metas.iter().all(|(_, m)| f(m));
-    let (mixed_strength, mixed_vis, mixed_lock) = (!all(&|m| m.opacity == first.opacity), !all(&|m| m.visible == first.visible), !all(&|m| m.locked == first.locked));
-    let sculpt: Vec<_> = metas.iter().filter(|(f, _)| !f).map(|(_, m)| m.blend).collect();
-    let mixed_blend = sculpt.windows(2).any(|w| w[0] != w[1]);
-    let blend = sculpt.first().copied();
+/// The selected layer's own settings: its name, resolution, visibility and mask; or the form's, or the whole volume's.
+fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
     let fs = app.theme.metrics.font_size;
-    section(ui, fs, "multi", &format!("{} LAYERS", ids.len()), |ui| {
-        // Strength is applied when the drag ends, so one gesture is one undo step.
-        let key = ui.id().with("multi_strength");
-        let shown = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(first.opacity * 100.0);
-        let mut pct = shown;
-        let r = prop(ui, if mixed_strength { "Strength (mixed)" } else { "Strength" }, |ui| ui.add(egui::Slider::new(&mut pct, -100.0..=200.0).suffix("%").max_decimals(0)));
-        if r.dragged() || r.has_focus() {
-            ui.data_mut(|d| d.insert_temp(key, pct));
+    let weak = app.theme.weak_text();
+    let m = &mut app.volume;
+    let top = m.vol.levels() - 1;
+    let level_text = |m: &VolumeMode, l: usize| format!("level {l}  (step {:.5})", m.vol.voxel(l));
+    let Some(layer) = m.layer.as_ref() else {
+        section(ui, fs, "volume", "VOLUME", |ui| {
+            let (counts, bytes) = m.vol.memory();
+            prop(ui, "Levels", |ui| ui.label(format!("{}  (finest step {:.5})", counts.len(), m.vol.voxel(top))));
+            prop(ui, "Blocks", |ui| ui.label(format!("{}  ·  {:.0} MB", fmt_count(counts.iter().sum()), bytes as f64 / 1e6)));
+            ui.label(RichText::new("Strokes work at the level that suits the brush's size on screen.").small().color(weak));
+        });
+        return;
+    };
+    let from = layer.from();
+    if m.target == Target::Form {
+        section(ui, fs, "form", "FORM", |ui| {
+            prop(ui, "Levels", |ui| ui.label(format!("0 to {}", from - 1)));
+            prop(ui, "Blocks", |ui| ui.label(fmt_count(layer.form().memory().0.iter().sum())));
+            ui.label(RichText::new("The shape under the layers. Sculpting it carries every layer along.").small().color(weak));
+        });
+        return;
+    }
+    let k = layer.active();
+    let Some(info) = layer.layers().get(k).cloned() else { return };
+    let kind = if info.noise {
+        "SURFACE NOISE LAYER"
+    } else if info.generator {
+        "GENERATOR LAYER"
+    } else {
+        "DETAIL LAYER"
+    };
+    let (mut rename, mut level, mut visible, mut fill) = (None, None, None, None);
+    section(ui, fs, "layer", kind, |ui| {
+        let id = ui.id().with(("layer_name", k));
+        let mut name = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(info.name.clone());
+        let r = prop(ui, "Name", |ui| ui.text_edit_singleline(&mut name));
+        if r.lost_focus() {
+            ui.data_mut(|d| d.remove_temp::<String>(id));
+            if name != info.name && !name.trim().is_empty() {
+                rename = Some(name);
+            }
+        } else if r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(id, name));
         }
-        if r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus()) {
-            ui.data_mut(|d| d.remove_temp::<f32>(key));
-            command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Strength(pct / 100.0) });
+        let mut on = info.visible;
+        if prop(ui, "", |ui| ui.checkbox(&mut on, "Visible")).changed() {
+            visible = Some(on);
         }
-        if let Some(current) = blend {
-            prop(ui, "Blend", |ui| {
-                egui::ComboBox::from_id_salt("multi_blend").selected_text(if mixed_blend { "Mixed" } else { current.label() }).show_ui(ui, |ui| {
-                    for mode in sculpt_core::LayerBlend::ALL {
-                        if ui.selectable_label(!mixed_blend && current == mode, mode.label()).clicked() {
-                            command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Blend(mode) });
-                        }
+        if !info.noise {
+            // A generator's resolution can be any level; a detail layer's, the layers' first or finer.
+            let first = if info.generator { 0 } else { from };
+            let mut l = info.level;
+            prop(ui, "Resolution", |ui| {
+                egui::ComboBox::from_id_salt(("layer_level", k)).selected_text(level_text(m, l)).show_ui(ui, |ui| {
+                    for c in first..=top {
+                        ui.selectable_value(&mut l, c, level_text(m, c));
                     }
                 })
             });
-        }
-        let (mut v, mut lk) = (first.visible, first.locked);
-        prop(ui, "", |ui| {
-            if ui.add(egui::Checkbox::new(&mut v, "Visible").indeterminate(mixed_vis)).changed() {
-                command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Visible(v) });
+            if l != info.level {
+                level = Some(l);
             }
-            if ui.add(egui::Checkbox::new(&mut lk, "Locked").indeterminate(mixed_lock)).changed() {
-                command::execute(app, LayerCommand::EditMany { ids: ids.clone(), edit: MetaEdit::Locked(lk) });
-            }
-        });
-        prop(ui, "", |ui| {
-            if ui.button("Group").on_hover_text("Put the selection in a new folder (Ctrl+G)").clicked() {
-                command::execute(app, LayerCommand::Group);
-            }
-            if ui.button("Duplicate").clicked() {
-                command::execute(app, LayerCommand::Duplicate);
-            }
-        });
-    });
-}
-
-fn layer_props(app: &mut SculptApp, ui: &mut Ui, id: LayerId) {
-    use crate::layer_panel::command::{self, LayerCommand, MetaEdit};
-    let Some(l) = app.doc.as_ref().and_then(|d| d.layer(id)) else { return };
-    let (name, opacity, visible, locked, has_mask, is_folder, blend) = (l.name.clone(), l.opacity, l.visible, l.locked, l.mask.is_some(), l.is_folder(), l.blend);
-    let is_generator = l.is_generator();
-    let fs = app.theme.metrics.font_size;
-    section(ui, fs, "layer", if is_folder { "FOLDER" } else { "LAYER" }, |ui| {
-        let mut n = name.clone();
-        if prop(ui, "Name", |ui| ui.text_edit_singleline(&mut n)).lost_focus() && n != name {
-            command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Name(n), coalesce: false });
-        }
-        let mut pct = opacity * 100.0;
-        let slider = prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut pct, -100.0..=200.0).suffix("%").max_decimals(0)));
-        if slider.changed() {
-            command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Strength(pct / 100.0), coalesce: slider.dragged() && !slider.drag_started() });
-        }
-        if !is_folder && !is_generator {
-            prop(ui, "Blend", |ui| {
-                egui::ComboBox::from_id_salt(("layer_blend", id)).selected_text(blend.label()).show_ui(ui, |ui| {
-                    for mode in sculpt_core::LayerBlend::ALL {
-                        if ui.selectable_label(blend == mode, mode.label()).on_hover_text(mode.hint()).clicked() {
-                            command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Blend(mode), coalesce: false });
-                        }
-                    }
-                })
-            });
-        }
-        let (mut v, mut lk) = (visible, locked);
-        prop(ui, "", |ui| {
-            if ui.checkbox(&mut v, "Visible").changed() {
-                command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Visible(v), coalesce: false });
-            }
-            if ui.checkbox(&mut lk, "Locked").changed() {
-                command::execute(app, LayerCommand::Edit { id, edit: MetaEdit::Locked(lk), coalesce: false });
-            }
-        });
-        if is_folder {
-            let kids = app.doc.as_ref().map_or(0, |d| d.children(Some(id)).len());
-            prop(ui, "Contains", |ui| ui.label(RichText::new(format!("{kids} item{}", if kids == 1 { "" } else { "s" })).weak()));
-            return;
-        }
-        if is_generator {
-            return;
+            prop(ui, "Blocks", |ui| ui.label(fmt_count(info.blocks)));
         }
         prop(ui, "Mask", |ui| {
-            if has_mask {
-                if ui.button("Edit mask").clicked() {
-                    select_layer(app, Some(id), Selection::Mask);
-                }
-            } else {
-                if ui.button("Add white").clicked() {
-                    add_mask(app, 1.0);
-                }
-                if ui.button("Add black").clicked() {
-                    add_mask(app, 0.0);
-                }
+            if ui.button("Hide all").on_hover_text("Hide this layer everywhere, then paint it in where wanted. One undo.").clicked() {
+                fill = Some(0.0);
+            }
+            if ui.button("Show all").on_hover_text("Clear this layer's mask: it shows everywhere again. One undo.").clicked() {
+                fill = Some(1.0);
             }
         });
-        let mb = app.doc.as_ref().unwrap().layer(id).map_or(0, |l| l.delta_bytes());
-        prop(ui, "Data", |ui| ui.label(RichText::new(format!("{:.1} MB sparse", mb as f64 / 1e6)).weak()));
     });
-    if is_generator {
-        crate::generator_ui::generator_props(app, ui, id);
-    }
-}
-
-fn mask_props(app: &mut SculptApp, ui: &mut Ui) {
-    let fs = app.theme.metrics.font_size;
-    section(ui, fs, "mask", "MASK", |ui| {
-        let Some((_, stack)) = app.mask_edit.as_mut() else { return };
-        let mut changed = prop(ui, "Base value", |ui| ui.add(egui::Slider::new(&mut stack.base, 0.0..=1.0))).changed();
-        prop(ui, "", |ui| {
-            if ui.button("White").clicked() {
-                stack.base = 1.0;
-                changed = true;
-            }
-            if ui.button("Black").clicked() {
-                stack.base = 0.0;
-                changed = true;
-            }
-        });
-        prop(ui, "Overlay", |ui| {
-            let mut show = app.overlay == OverlayKind::LayerMask;
-            if ui.checkbox(&mut show, "Show in viewport").changed() {
-                app.overlay = if show { OverlayKind::LayerMask } else { OverlayKind::None };
-            }
-        });
-        ui.label(RichText::new("Add effects with the ✦ button in the Layers panel.").small().color(app.theme.weak_text()));
-        if changed {
-            app.mask_dirty = true;
-        }
-    });
-}
-
-fn effect_props(app: &mut SculptApp, ui: &mut Ui, i: usize) {
-    let weak = app.theme.weak_text();
-    let fs = app.theme.metrics.font_size;
-    let label = app.mask_edit.as_ref().and_then(|(_, s)| s.layers.get(i)).map_or("EFFECT".to_string(), |e| source_label(&e.source).to_uppercase());
-    section(ui, fs, "effect", &label, |ui| {
-        let Some((_, stack)) = app.mask_edit.as_mut() else { return };
-        let n = stack.layers.len();
-        if i >= n {
-            return;
-        }
-        let mut changed = false;
-        let mut action = None;
-        {
-            let e = &mut stack.layers[i];
-            prop(ui, "Name", |ui| changed |= ui.text_edit_singleline(&mut e.name).lost_focus());
-            prop(ui, "", |ui| {
-                changed |= ui.checkbox(&mut e.enabled, "Enabled").changed();
-                changed |= ui.checkbox(&mut e.invert, "Invert").changed();
-            });
-            prop(ui, "Blend", |ui| {
-                egui::ComboBox::from_id_salt("blend").selected_text(format!("{:?}", e.blend)).show_ui(ui, |ui| {
-                    for b in BLENDS {
-                        changed |= ui.selectable_value(&mut e.blend, b, format!("{b:?}")).changed();
-                    }
-                });
-            });
-            changed |= prop(ui, "Opacity", |ui| ui.add(egui::Slider::new(&mut e.opacity, 0.0..=1.0))).changed();
-            ui.add_space(4.0);
-            changed |= source_props(ui, &mut e.source, weak);
-            ui.add_space(4.0);
-            ui.label(RichText::new("Adjustments").strong().size(ui.style().text_styles[&egui::TextStyle::Body].size * 0.9));
-            changed |= prop(ui, "Levels in", |ui| {
-                let a = ui.add(egui::DragValue::new(&mut e.levels.in_min).range(0.0..=1.0).speed(0.005)).changed();
-                let b = ui.add(egui::DragValue::new(&mut e.levels.in_max).range(0.0..=1.0).speed(0.005)).changed();
-                a | b
-            });
-            changed |= prop(ui, "Gamma", |ui| ui.add(egui::Slider::new(&mut e.levels.gamma, 0.1..=5.0).logarithmic(true))).changed();
-            changed |= prop(ui, "Blur", |ui| ui.add(egui::Slider::new(&mut e.blur, 0..=20))).changed();
-            ui.add_space(4.0);
-            prop(ui, "Order", |ui| {
-                if icon_button(ui, Icon::ArrowUp, 22.0, false, "Move up").clicked() && i + 1 < n {
-                    action = Some(i + 1);
-                }
-                if icon_button(ui, Icon::ArrowDown, 22.0, false, "Move down").clicked() && i > 0 {
-                    action = Some(i - 1);
-                }
-            });
-        }
-        if let Some(j) = action {
-            stack.layers.swap(i, j);
-            app.selection = Selection::Effect(j);
-            changed = true;
-        }
-        if let MaskSource::Channel { name } = &stack.layers[i.min(stack.layers.len() - 1)].source
-            && ui.button("Paint into this mask").clicked() {
-                app.tools.mask_channel = name.clone();
-                app.select_tool(Tool::MaskPaint);
-                app.overlay = OverlayKind::LayerMask;
-            }
-        if changed {
-            app.mask_dirty = true;
-        }
-    });
-}
-
-fn source_props(ui: &mut Ui, src: &mut MaskSource, weak: Color32) -> bool {
-    let mut changed = false;
-    match src {
-        MaskSource::Fill { value } => changed |= prop(ui, "Value", |ui| ui.add(egui::Slider::new(value, 0.0..=1.0))).changed(),
-        MaskSource::Channel { name } => {
-            prop(ui, "Channel", |ui| changed |= ui.text_edit_singleline(name).lost_focus());
-            ui.label(RichText::new("Hand-painted with Mask Paint (or imported data).").small().color(weak));
-        }
-        MaskSource::Noise(p) => {
-            prop(ui, "Type", |ui| {
-                egui::ComboBox::from_id_salt("noise_kind").selected_text(format!("{:?}", p.kind)).show_ui(ui, |ui| {
-                    for k in [NoiseKind::Fbm, NoiseKind::Perlin, NoiseKind::Ridged, NoiseKind::Turbulence, NoiseKind::Cellular] {
-                        changed |= ui.selectable_value(&mut p.kind, k, format!("{k:?}")).changed();
-                    }
-                });
-            });
-            changed |= prop(ui, "Scale", |ui| ui.add(egui::Slider::new(&mut p.scale, 0.1..=50.0).logarithmic(true))).changed();
-            changed |= prop(ui, "Octaves", |ui| ui.add(egui::Slider::new(&mut p.octaves, 1..=8))).changed();
-            changed |= prop(ui, "Roughness", |ui| ui.add(egui::Slider::new(&mut p.gain, 0.1..=0.9))).changed();
-            changed |= prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut p.seed))).changed();
-        }
-        MaskSource::Mesh { attribute } => {
-            ui.label(RichText::new(format!("Reads the '{}' bake. Re-bake from Mesh ▸ Bake mesh maps after sculpting.", attribute.channel_name())).small().color(weak));
-        }
-        MaskSource::Direction { axis, sharpness } => {
-            changed |= axis_prop(ui, axis);
-            changed |= prop(ui, "Sharpness", |ui| ui.add(egui::Slider::new(sharpness, 0.1..=8.0))).changed();
-        }
-        MaskSource::Gradient { axis, from, to } => {
-            changed |= axis_prop(ui, axis);
-            changed |= prop(ui, "Range", |ui| {
-                let a = ui.add(egui::DragValue::new(from).speed(0.01)).changed();
-                let b = ui.add(egui::DragValue::new(to).speed(0.01)).changed();
-                a | b
-            });
+    if let Some(name) = rename {
+        m.settle();
+        if let Some(layer) = m.layer.as_mut() {
+            layer.rename(k, &name);
         }
     }
-    changed
-}
-
-fn axis_prop(ui: &mut Ui, axis: &mut glam::Vec3) -> bool {
-    prop(ui, "Axis", |ui| {
-        let mut changed = false;
-        for (label, v) in [("X", glam::Vec3::X), ("Y", glam::Vec3::Y), ("Z", glam::Vec3::Z), ("−Y", -glam::Vec3::Y)] {
-            if ui.selectable_label(*axis == v, label).clicked() {
-                *axis = v;
-                changed = true;
-            }
+    if let Some(on) = visible {
+        m.set_layer_visible(k, on);
+    }
+    if let Some(l) = level {
+        m.set_layer_level(k, l);
+    }
+    if let Some(to) = fill {
+        m.fill_mask(to);
+        // Hidden everywhere: the next strokes paint it back in.
+        if to < 1.0 {
+            m.target = Target::Mask { show: true };
         }
-        changed
-    })
+    }
 }
 
 fn brush_props(app: &mut SculptApp, ui: &mut Ui) {
     let tool = app.tool;
     let title = format!("BRUSH — {}", tool.label().to_uppercase());
     let fs = app.theme.metrics.font_size;
+    let weak = app.theme.weak_text();
     section(ui, fs, "brush", &title, |ui| {
         let p = app.tools.params_mut(tool);
         prop(ui, "Size", |ui| ui.add(egui::Slider::new(&mut p.size_px, 2.0..=600.0).logarithmic(true).suffix(" px").max_decimals(0)));
         prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut p.strength, 0.0..=1.0)));
         prop(ui, "Falloff", |ui| ui.add(egui::Slider::new(&mut p.hardness, 0.0..=0.95)));
-        prop(ui, "", |ui| ui.checkbox(&mut p.front_faces_only, "Front faces only"));
-        match tool {
-            Tool::ClayBuildup => {
-                let c = &mut app.tools.clay;
-                prop(ui, "Height", |ui| ui.add(egui::Slider::new(&mut c.height, 0.02..=0.6)));
-                prop(ui, "Squareness", |ui| ui.add(egui::Slider::new(&mut c.squareness, 2.0..=10.0)));
-                prop(ui, "", |ui| ui.checkbox(&mut c.accumulate, "Accumulate within stroke"));
-            }
-            Tool::TrimDynamic => {
-                let t = &mut app.tools.trim;
-                prop(ui, "Depth", |ui| ui.add(egui::Slider::new(&mut t.depth, 0.0..=0.3)));
-                prop(ui, "Smooth border", |ui| ui.add(egui::Slider::new(&mut t.smooth_border, 0.0..=1.0)));
-            }
-            Tool::Smooth => {
-                prop(ui, "Mode", |ui| {
-                    ui.selectable_value(&mut app.tools.smooth.mode, SmoothMode::Laplacian, "Strong");
-                    ui.selectable_value(&mut app.tools.smooth.mode, SmoothMode::Surface, "Keep form");
-                });
-            }
-            Tool::Move => {
-                prop(ui, "", |ui| ui.checkbox(&mut app.tools.move_topological, "Topological"));
-            }
-            Tool::MaskPaint => {
-                prop(ui, "Channel", |ui| ui.text_edit_singleline(&mut app.tools.mask_channel));
-            }
-            Tool::Pose => {
-                prop(ui, "Mode", |ui| {
-                    ui.selectable_value(&mut app.tools.pose_mode, PoseMode::Rotate, "Rotate");
-                    ui.selectable_value(&mut app.tools.pose_mode, PoseMode::Translate, "Translate");
-                });
-                prop(ui, "Joint softness", |ui| ui.add(egui::Slider::new(&mut app.tools.pose_softness, 0.0..=1.0)));
-                prop(ui, "Mask blur", |ui| ui.add(egui::Slider::new(&mut app.tools.pose_blur, 0..=10)));
-            }
-            Tool::Freeze => {}
-        }
+        ui.label(RichText::new(tool.hint()).small().color(weak));
     });
-}
-
-/// Push the edited mask stack to the document (deferred until mouse release
-/// so slider drags don't re-evaluate the mask every frame).
-/// Write the mask editing copy back to the document as one undoable step.
-pub fn apply_mask_edit(app: &mut SculptApp) {
-    let Some((id, stack)) = app.mask_edit.clone() else { return };
-    let write = move |d: &mut sculpt_core::Document| -> Result<(), String> {
-        let Some(layer) = d.layer(id) else { return Ok(()) };
-        let mut meta = layer.meta();
-        meta.mask = Some(stack);
-        d.set_layer_meta(id, meta, false).map_err(|e| e.to_string())
-    };
-    if app.doc.as_ref().is_some_and(|d| d.vertex_count() > 400_000) {
-        app.start_doc_job("Evaluating mask", write);
-    } else if let Some(d) = app.doc.as_mut()
-        && let Err(e) = write(d)
-    {
-        app.status = e;
-    }
 }
 
 // ------------------------------------------------------------ windows
 
-pub fn mesh_info(app: &mut SculptApp, ctx: &egui::Context) {
-    if !app.show_mesh_info {
-        return;
-    }
-    let mut open = true;
-    egui::Window::new("Mesh info").open(&mut open).resizable(false).show(ctx, |ui| {
-        let Some(doc) = &app.doc else { return };
-        egui::Grid::new("obj").num_columns(2).striped(true).show(ui, |ui| {
-            let mb: usize = doc.layers().iter().map(|l| l.delta_bytes()).sum();
-            for (k, v) in [
-                ("Faces", fmt_count(doc.face_count())),
-                ("Vertices", fmt_count(doc.vertex_count())),
-                ("Subdivisions", doc.level().to_string()),
-                ("Spatial leaves", doc.bvh().leaves.len().to_string()),
-                ("Layers", doc.layers().len().to_string()),
-                ("Layer data", format!("{:.1} MB", mb as f64 / 1e6)),
-                ("Channels", doc.channels().keys().cloned().collect::<Vec<_>>().join(", ")),
-                ("Project", app.project_path.as_ref().map_or("unsaved".into(), |p| p.display().to_string())),
-                ("Pen", format!("{} — {}", app.pen.source.label(), app.pen.status)),
-            ] {
-                ui.label(RichText::new(k).weak());
-                ui.label(v);
-                ui.end_row();
-            }
-        });
-    });
-    app.show_mesh_info = open;
-}
-
 pub fn dialogs(app: &mut SculptApp, ctx: &egui::Context) {
     let Some(d) = app.dialog.as_mut() else { return };
     let (title, field) = match d {
-        Dialog::Open(p) => ("Open project (.sculpt folder)", Some(p)),
-        Dialog::SaveAs(p) => ("Save project as", Some(p)),
-        Dialog::ImportObj(p) => ("Import OBJ", Some(p)),
-        Dialog::ExportObj(p) => ("Export OBJ (composited)", Some(p)),
-        Dialog::NewSphere(_) => ("New sphere", None),
-        Dialog::OpenVolume(p) => ("Open volume (.svol)", Some(p)),
-        Dialog::SaveVolume(p) => ("Save volume as (.svol)", Some(p)),
+        Dialog::Open(p) => ("Open volume (.svol)", Some(p)),
+        Dialog::SaveAs(p) => ("Save volume as (.svol)", Some(p)),
+        Dialog::New(_) => ("New volume", None),
     };
     let mut ok = false;
     let mut cancel = false;
@@ -1257,7 +683,7 @@ pub fn dialogs(app: &mut SculptApp, ctx: &egui::Context) {
                 }
             }
             None => {
-                ui.label("Replace the current document? Unsaved changes are lost.");
+                ui.label("Replace the current volume? Unsaved changes are lost.");
             }
         }
         ui.horizontal(|ui| {
@@ -1304,6 +730,7 @@ pub fn theme_editor(app: &mut SculptApp, ctx: &egui::Context) {
             egui::Grid::new("ui_colors").num_columns(2).show(ui, |ui| {
                 let header_fallback = t.ui.header();
                 let row_fallback = t.ui.row_selected();
+                let (detail_fallback, mask_fallback, density_fallback) = (t.ui.target_delta(), t.ui.target_mask(), t.ui.target_freeze());
                 let c = &mut t.ui;
                 for (l, h) in [
                     ("Window / menu", &mut c.window),
@@ -1321,20 +748,15 @@ pub fn theme_editor(app: &mut SculptApp, ctx: &egui::Context) {
                 }
                 changed |= optional_color_row(ui, "Panel header", &mut c.header, header_fallback);
                 changed |= optional_color_row(ui, "Selected row", &mut c.row_selected, row_fallback);
+                changed |= optional_color_row(ui, "Detail layer target", &mut c.target_delta, detail_fallback);
+                changed |= optional_color_row(ui, "Mask target", &mut c.target_mask, mask_fallback);
+                changed |= optional_color_row(ui, "Density target", &mut c.target_freeze, density_fallback);
             });
         });
         egui::CollapsingHeader::new("Viewport").default_open(true).show(ui, |ui| {
             egui::Grid::new("vp_colors").num_columns(2).show(ui, |ui| {
                 let c = &mut t.viewport;
-                for (l, h) in [
-                    ("Background top", &mut c.background_top),
-                    ("Background bottom", &mut c.background_bottom),
-                    ("Clay", &mut c.clay),
-                    ("Mask overlay", &mut c.overlay),
-                    ("Freeze overlay", &mut c.freeze),
-                    ("Brush cursor", &mut c.cursor),
-                    ("HUD text", &mut c.hud_text),
-                ] {
+                for (l, h) in [("Background top", &mut c.background_top), ("Background bottom", &mut c.background_bottom), ("Clay", &mut c.clay), ("Brush cursor", &mut c.cursor), ("HUD text", &mut c.hud_text)] {
                     changed |= color_row(ui, l, h);
                 }
             });
@@ -1381,7 +803,7 @@ pub fn keymap_window(app: &mut SculptApp, ctx: &egui::Context) {
                 ui.monospace(ctx.format_shortcut(s));
                 ui.end_row();
             }
-            for (k, what) in [("Alt + LMB / RMB drag", "Orbit"), ("Alt + MMB / MMB drag", "Pan"), ("Alt + RMB drag / wheel", "Zoom"), ("Shift + stroke", "Smooth"), ("Ctrl + stroke", "Invert")] {
+            for (k, what) in [("Alt + LMB / RMB drag", "Orbit"), ("Alt + MMB / MMB drag", "Pan"), ("Alt + RMB drag / wheel", "Zoom"), ("Ctrl + stroke", "Add / carve swapped")] {
                 ui.label(what);
                 ui.monospace(k);
                 ui.end_row();

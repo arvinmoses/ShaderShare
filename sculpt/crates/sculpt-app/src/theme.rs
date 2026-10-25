@@ -86,9 +86,6 @@ impl UiColors {
     pub fn target_freeze(&self) -> Color32 {
         self.target_freeze.map_or(Color32::from_rgb(0x4c, 0x7c, 0xf0), |h| h.0)
     }
-    pub fn danger(&self) -> Color32 {
-        self.danger.map_or(Color32::from_rgb(0xe0, 0x4a, 0x4a), |h| h.0)
-    }
     pub fn row_selected(&self) -> Color32 {
         self.row_selected.map_or(self.accent.0.gamma_multiply(0.45), |h| h.0)
     }

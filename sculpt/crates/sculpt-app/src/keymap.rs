@@ -18,40 +18,14 @@ pub enum Command {
     Open,
     ToolClayBuildup,
     ToolTrimDynamic,
-    ToolMove,
-    ToolSmooth,
-    ToolFreeze,
-    ToolMaskPaint,
-    ToolPose,
     BrushSizeUp,
     BrushSizeDown,
     StrengthUp,
     StrengthDown,
-    FrameMesh,
-    Subdivide,
-    NewLayer,
-    NewFolder,
-    LayerDuplicate,
-    LayerMergeDown,
-    LayerDelete,
-    LayerGroup,
-    LayerUngroup,
-    LayerRename,
-    LayerSolo,
-    LayerLock,
-    LayerHide,
-    LayerFlatten,
-    LayerSwitcher,
-    LayerRadial,
-    MaskToggle,
-    MaskCopy,
-    MaskPaste,
-    ToggleTarget,
-    ViewMask,
+    /// Named for the mesh it once framed, so keymaps that bind it keep working.
+    #[serde(rename = "frame_mesh")]
+    Frame,
     ToggleHud,
-    CycleOverlay,
-    InvertFreeze,
-    ClearFreeze,
 }
 
 impl Command {
@@ -63,40 +37,12 @@ impl Command {
             Command::Open => "Open…",
             Command::ToolClayBuildup => "Clay Buildup",
             Command::ToolTrimDynamic => "Trim Dynamic",
-            Command::ToolMove => "Move",
-            Command::ToolSmooth => "Smooth",
-            Command::ToolFreeze => "Freeze",
-            Command::ToolMaskPaint => "Mask Paint",
-            Command::ToolPose => "Pose",
             Command::BrushSizeUp => "Brush size +",
             Command::BrushSizeDown => "Brush size −",
             Command::StrengthUp => "Strength +",
             Command::StrengthDown => "Strength −",
-            Command::FrameMesh => "Frame mesh",
-            Command::Subdivide => "Subdivide",
-            Command::NewLayer => "New sculpt layer",
-            Command::NewFolder => "New folder",
-            Command::LayerDuplicate => "Duplicate layer",
-            Command::LayerMergeDown => "Merge down",
-            Command::LayerDelete => "Delete layer",
-            Command::LayerGroup => "Group into folder",
-            Command::LayerUngroup => "Ungroup folder",
-            Command::LayerRename => "Rename layer",
-            Command::LayerSolo => "Solo layer",
-            Command::LayerLock => "Lock layer",
-            Command::LayerHide => "Hide layer",
-            Command::LayerFlatten => "Flatten folder",
-            Command::LayerSwitcher => "Switch layer…",
-            Command::LayerRadial => "Layer radial menu",
-            Command::MaskToggle => "Disable / enable mask",
-            Command::MaskCopy => "Copy mask",
-            Command::MaskPaste => "Paste mask",
-            Command::ToggleTarget => "Toggle layer / mask target",
-            Command::ViewMask => "View mask",
-            Command::ToggleHud => "Toggle HUD",
-            Command::CycleOverlay => "Cycle overlay",
-            Command::InvertFreeze => "Invert freeze",
-            Command::ClearFreeze => "Clear freeze",
+            Command::Frame => "Frame volume",
+            Command::ToggleHud => "Toggle readout",
         }
     }
 }
@@ -134,16 +80,22 @@ pub fn parse_shortcut(s: &str) -> Option<KeyboardShortcut> {
 const DEFAULT: &str = include_str!("../keymap.json");
 
 impl Keymap {
-    /// Built-in bindings, overridden per command by `user` if it exists.
+    /// Built-in bindings, overridden per command by `user` if it exists. Entries the app does not know (commands of
+    /// older versions) are skipped, not the whole file.
     pub fn load(user: &Path) -> Keymap {
         let mut bindings: Vec<Binding> = serde_json::from_str(DEFAULT).expect("default keymap parses");
         let mut errors = Vec::new();
         if let Ok(text) = std::fs::read_to_string(user) {
-            match serde_json::from_str::<Vec<Binding>>(&text) {
-                Ok(overrides) => {
-                    for o in overrides {
-                        bindings.retain(|b| b.command != o.command);
-                        bindings.push(o);
+            match serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                Ok(entries) => {
+                    for e in entries {
+                        match serde_json::from_value::<Binding>(e.clone()) {
+                            Ok(o) => {
+                                bindings.retain(|b| b.command != o.command);
+                                bindings.push(o);
+                            }
+                            Err(_) => errors.push(format!("{}: skipped {e} (no such command)", user.display())),
+                        }
                     }
                 }
                 Err(e) => errors.push(format!("{}: {e}", user.display())),
@@ -202,9 +154,21 @@ mod tests {
                 assert!(prev == b.command, "{:?} and {:?} share {}", prev, b.command, b.keys);
             }
         }
-        // The layer commands people reach for from the viewport are all bound.
-        for cmd in [Command::LayerDuplicate, Command::LayerGroup, Command::LayerSolo, Command::LayerSwitcher, Command::ToggleTarget, Command::ViewMask, Command::LayerMergeDown] {
+        for cmd in [Command::Undo, Command::Redo, Command::Save, Command::Open, Command::ToolClayBuildup, Command::ToolTrimDynamic, Command::Frame] {
             assert!(km.bindings.iter().any(|(_, b)| b.command == cmd), "{cmd:?} has no default key");
         }
+    }
+
+    #[test]
+    fn a_user_keymap_with_old_commands_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("sculpt-keymap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, r#"[{ "keys": "3", "command": "tool_pose" }, { "keys": "G", "command": "frame_mesh" }]"#).unwrap();
+        let km = Keymap::load(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(km.errors.len(), 1, "{:?}", km.errors);
+        let frame: Vec<&str> = km.bindings.iter().filter(|(_, b)| b.command == Command::Frame).map(|(_, b)| b.keys.as_str()).collect();
+        assert_eq!(frame, ["G"]);
     }
 }

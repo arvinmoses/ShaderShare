@@ -69,16 +69,6 @@ impl Camera {
         2.0 * depth * (self.fov_y * 0.5).tan() / viewport_height.max(1.0)
     }
 
-    /// Project a world point to viewport pixels.
-    pub fn project(&self, p: Vec3, size: Vec2) -> Option<Vec2> {
-        let clip = self.proj(size.x / size.y) * self.view() * p.extend(1.0);
-        if clip.w <= 0.0 {
-            return None;
-        }
-        let ndc = clip.truncate() / clip.w;
-        Some(Vec2::new((ndc.x + 1.0) * 0.5 * size.x, (1.0 - ndc.y) * 0.5 * size.y))
-    }
-
     pub fn orbit(&mut self, delta_px: Vec2) {
         self.yaw -= delta_px.x * 0.008;
         self.pitch = (self.pitch + delta_px.y * 0.008).clamp(-1.55, 1.55);
