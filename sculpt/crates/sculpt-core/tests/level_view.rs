@@ -312,3 +312,100 @@ fn hand_overs_fade_out_before_blocks_go_and_fade_in_as_they_come() {
     assert!(!came.is_empty());
     assert!(came.iter().all(|k| at(&view, *k, 6.0) < 1e-3 && (at(&view, *k, 6.25) - 1.0).abs() < 1e-3));
 }
+
+/// At the stress session's scale (a ball of 1M triangles at level 0, a patch of some hundred thousand level 3 blocks):
+/// what noting, measuring and choosing cost a frame.
+/// `cargo test -p sculpt-core --release --test level_view big_patch -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn big_patch_view_costs() {
+    use std::time::Instant;
+    let t = Instant::now();
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let u = patch.cross(Vec3::Y).normalize();
+    let w = patch.cross(u);
+    v.begin_stroke();
+    let n = 26;
+    for i in 0..n {
+        for j in 0..n {
+            let a = -0.8 + 1.6 * i as f32 / (n - 1) as f32;
+            let b = -0.8 + 1.6 * j as f32 / (n - 1) as f32;
+            let d = (patch + u * a + w * b).normalize();
+            let Some((hit, nrm)) = v.raycast(d * 3.0, -d, 3, true) else { continue };
+            v.plane_dab(3, hit, nrm, 0.05, 0.002, 0.5, 0.4, false);
+        }
+    }
+    v.end_stroke();
+    v.carry_pending(None);
+    eprintln!("built in {:.0} ms: blocks per level {:?}", t.elapsed().as_secs_f64() * 1e3, v.memory().0);
+    // The sets a sync works out for a region of a few thousand blocks landing (with their coarser blocks), as a big
+    // change landing region by region does every sync.
+    {
+        let mut keys: Vec<Key> = v.keys().into_iter().filter(|k| k.0 == 3).collect();
+        keys.sort_by_key(|k| {
+            let c = k.1.div_euclid(glam::IVec3::splat(8)) + glam::IVec3::splat(1 << 19);
+            let mut m: u64 = 0;
+            for b in 0..20 {
+                m |= (((c.x >> b) & 1) as u64) << (3 * b) | (((c.y >> b) & 1) as u64) << (3 * b + 1) | (((c.z >> b) & 1) as u64) << (3 * b + 2);
+            }
+            m
+        });
+        for n in [6000usize, 24000] {
+            let mut region: Vec<Key> = keys[keys.len() / 3..keys.len() / 3 + n].to_vec();
+            let mut up: Vec<Key> = region.iter().flat_map(|k| (0..k.0).map(move |l| (l, k.1.div_euclid(glam::IVec3::splat(1 << (k.0 - l)))))).collect();
+            up.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+            up.dedup();
+            region.extend(up);
+            region.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+            let show = sculpt_core::generator::level_volume::Show::upto(5);
+            for _ in 0..2 {
+                let t = Instant::now();
+                let u = v.upload_set_in(&region, &show);
+                let t_up = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                let e = v.extract_set_in(&region, &show);
+                eprintln!("a region of {} blocks: upload set {} in {t_up:.1} ms, extract set {} in {:.1} ms", region.len(), u.len(), e.len(), t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+    }
+    let eye = patch * 3.0;
+    let mut view = LevelView::default();
+    view.budget = Some(6_000_000);
+    let t = Instant::now();
+    view.note(&v, &v.keys());
+    eprintln!("note of all: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    v.drain_dirty();
+    let mut frames = 0;
+    let (mut t_refresh, mut t_choose, mut flips) = (0.0, 0.0, 0usize);
+    let t_all = Instant::now();
+    loop {
+        // As a sync does: noting (nothing) bumps the sync count, so the last sync's blocks may be measured.
+        view.note(&v, &[]);
+        let t = Instant::now();
+        view.refresh(&v, 768);
+        let r = t.elapsed().as_secs_f64() * 1e3;
+        t_refresh += r;
+        let t = Instant::now();
+        let f = view.choose(&v, eye, 1000.0).len();
+        let c = t.elapsed().as_secs_f64() * 1e3;
+        t_choose += c;
+        flips += f;
+        if frames < 4 {
+            eprintln!("frame {frames}: refresh {r:.1} ms, choose {c:.1} ms ({f} flips, {} shown, {} stale)", view.stats.shown, view.stats.stale);
+        }
+        frames += 1;
+        if view.stats.stale == 0 || frames >= 40 {
+            break;
+        }
+    }
+    eprintln!("{frames} frames measuring 768 a frame: refresh {:.1} ms, choose {:.1} ms a frame; {flips} flips; {} left to measure; {:.0} ms in all", t_refresh / frames as f64, t_choose / frames as f64, view.stats.stale, t_all.elapsed().as_secs_f64() * 1e3);
+    let t = Instant::now();
+    view.refresh(&v, usize::MAX);
+    eprintln!("measuring the rest ({}): {:.1} ms", view.stats.stale, t.elapsed().as_secs_f64() * 1e3);
+    for (name, e) in [("same eye", eye), ("moved", eye * 1.01), ("same again", eye * 1.01), ("far", eye * 3.0), ("near", eye * 0.4)] {
+        let t = Instant::now();
+        let f = view.choose(&v, e, 1000.0);
+        eprintln!("choose, {name}: {:.1} ms, {} flips, {} shown, {} hidden, {:.2} px", t.elapsed().as_secs_f64() * 1e3, f.len(), view.stats.shown, view.stats.hidden, view.stats.tau_used);
+    }
+}

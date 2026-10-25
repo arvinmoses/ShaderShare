@@ -141,6 +141,11 @@ impl<K: Sharded, V: Clone> Shared<K, V> {
         self.shards.iter().flat_map(|s| s.keys())
     }
 
+    /// The shards, for going over the map on several threads.
+    pub(crate) fn shards(&self) -> &[Arc<HashMap<K, V>>] {
+        &self.shards
+    }
+
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.shards.iter().flat_map(|s| s.values())
     }
@@ -3257,20 +3262,31 @@ impl LevelVolume {
         }
     }
 
-    /// Level `m`'s blocks the view shows, as bits over their box; none when that is too spread out.
+    /// Level `m`'s blocks the view shows, as bits over their box; none when that is too spread out. A level can hold
+    /// hundreds of thousands of blocks: its box and its bits are worked out over the threads, a shard each.
     fn shown_bits(&self, m: usize, v: &Show) -> Option<Named> {
-        let keys = self.level_keys(m);
-        let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
-        for c in &keys {
-            lo = lo.min(*c);
-            hi = hi.max(*c);
-        }
-        let n = hi - lo + IVec3::ONE;
-        if keys.is_empty() || m > v.cap || n.x as i64 * n.y as i64 * n.z as i64 > Named::MOST_BITS {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let map = &self.blocks[m];
+        if map.is_empty() || m > v.cap {
             return None;
         }
+        let shards = map.shards();
+        let (lo, hi) = shards.par_iter().map(|s| s.keys().fold((IVec3::MAX, IVec3::MIN), |(lo, hi), c| (lo.min(*c), hi.max(*c)))).reduce(|| (IVec3::MAX, IVec3::MIN), |a, b| (a.0.min(b.0), a.1.max(b.1)));
+        let n = hi - lo + IVec3::ONE;
+        if n.x as i64 * n.y as i64 * n.z as i64 > Named::MOST_BITS {
+            return None;
+        }
+        let words = ((n.x as i64 * n.y as i64 * n.z as i64 + 63) / 64) as usize;
+        let bits: Vec<AtomicU64> = (0..words).map(|_| AtomicU64::new(0)).collect();
+        shards.par_iter().for_each(|s| {
+            for c in s.keys() {
+                let d = *c - lo;
+                let i = ((d.z * n.y + d.y) * n.x + d.x) as usize;
+                bits[i >> 6].fetch_or(1 << (i & 63), Ordering::Relaxed);
+            }
+        });
         // All of them, less the hidden ones (few, against looking each block up).
-        let mut named = Named::of(keys.iter().copied());
+        let mut named = Named::Bits { lo, n, bits: bits.into_iter().map(|b| b.into_inner()).collect() };
         if let Some(hidden) = v.hidden {
             for k in hidden {
                 if k.0 as usize == m {
