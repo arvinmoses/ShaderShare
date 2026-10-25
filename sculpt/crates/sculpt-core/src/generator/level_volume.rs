@@ -813,6 +813,16 @@ impl LevelVolume {
     }
 
     /// Blocks whose samples or existence changed since the last call.
+    /// Whether block `k` changed since [`Self::drain_dirty`] last ran (for checks).
+    pub fn dirty_contains(&self, k: Key) -> bool {
+        self.dirty.contains(&k)
+    }
+
+    /// The blocks changed since [`Self::drain_dirty`] last ran, without taking them.
+    pub(crate) fn dirty_keys(&self) -> Vec<Key> {
+        self.dirty.iter().copied().collect()
+    }
+
     pub fn drain_dirty(&mut self) -> Vec<Key> {
         let mut out: Vec<Key> = self.dirty.drain().collect();
         out.par_sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
@@ -2067,20 +2077,39 @@ impl LevelVolume {
         differs(&s).then_some(s)
     }
 
+    /// [`Self::clear_checkerboards`] around blocks `blocks` of level `l`, whose samples were all written anew (a layer
+    /// stack composed there).
+    pub(crate) fn clear_checkerboards_at(&mut self, l: usize, blocks: &[IVec3]) {
+        if blocks.is_empty() {
+            return;
+        }
+        // With the blocks past them on each axis: a face on a block's far side is looked at from the block past it,
+        // and the cleanup looks at the blocks given and the ones below them.
+        let flipped: HashMap<IVec3, SignMask> = blocks.iter().flat_map(|bc| (0..8).map(move |k| *bc + IVec3::new(k & 1, (k >> 1) & 1, (k >> 2) & 1))).map(|bc| (bc, [u64::MAX; 8])).collect();
+        self.clear_checkerboards_in(l, flipped, true);
+    }
+
     /// Remove checkerboard faces (a cell face whose corners alternate in sign, which pieces cannot represent cleanly)
     /// from level `l`'s stored field, by filling one outside corner of each, repeatedly, as `volume.rs` does. Only the
     /// blocks with a sample whose sign changed (`flipped`) and the ones below them can have gained one.
-    fn clear_checkerboards(&mut self, l: usize, mut flipped: HashMap<IVec3, SignMask>) {
+    fn clear_checkerboards(&mut self, l: usize, flipped: HashMap<IVec3, SignMask>) {
+        self.clear_checkerboards_in(l, flipped, false);
+    }
+
+    /// [`Self::clear_checkerboards`]; with `unstored`, the blocks looked at include those not stored (a face between a
+    /// stored block and the empty one before it along an axis is looked at from the empty one; a composed region's
+    /// edge has such faces, a stroke's region hardly ever).
+    fn clear_checkerboards_in(&mut self, l: usize, mut flipped: HashMap<IVec3, SignMask>, unstored: bool) {
         let fill = -1e-3 * self.voxel(l);
         for _ in 0..32 {
             if flipped.is_empty() {
                 break;
             }
-            let mut look: Vec<IVec3> = flipped.keys().flat_map(|&b| (0..8).map(move |k| b - IVec3::new(k & 1, (k >> 1) & 1, (k >> 2) & 1))).filter(|b| self.blocks[l].contains_key(b)).collect();
+            let mut look: Vec<IVec3> = flipped.keys().flat_map(|&b| (0..8).map(move |k| b - IVec3::new(k & 1, (k >> 1) & 1, (k >> 2) & 1))).filter(|b| unstored || self.blocks[l].contains_key(b)).collect();
             look.sort_unstable_by_key(|v| (v.z, v.y, v.x));
             look.dedup();
             let me = &*self;
-            let mut flips: Vec<IVec3> = look
+            let mut flips: Vec<(IVec3, bool)> = look
                 .par_iter()
                 .flat_map_iter(|&bc| {
                     let base = bc * B;
@@ -2105,7 +2134,11 @@ impl LevelVolume {
                         c[3][v] += 1;
                         let stored = |q: &&IVec3| me.blocks[l].contains_key(&(base + **q).div_euclid(B3));
                         if let Some(q) = c.iter().filter(stored).find(|q| g[idx(**q)] >= 0.0) {
-                            out.push(base + *q);
+                            out.push((base + *q, true));
+                        } else if let Some(q) = c.iter().filter(stored).find(|q| g[idx(**q)] < 0.0) {
+                            // Every outside corner lies in a block that is not stored (the edge of what a layer
+                            // composes): an inside one is carved instead.
+                            out.push((base + *q, false));
                         }
                     };
                     for z in 0..8 {
@@ -2128,15 +2161,15 @@ impl LevelVolume {
                     out
                 })
                 .collect();
-            flips.sort_unstable_by_key(|p| (p.z, p.y, p.x));
-            flips.dedup();
+            flips.sort_unstable_by_key(|p| (p.0.z, p.0.y, p.0.x, !p.1));
+            flips.dedup_by_key(|p| p.0);
             flipped.clear();
-            for p in flips {
+            for (p, inward) in flips {
                 let bc = p.div_euclid(B3);
                 self.keep((l as u8, bc));
                 let i = local(p);
                 if let Some(s) = self.blocks[l].get_mut(&bc) {
-                    Arc::make_mut(s)[i] = fill;
+                    Arc::make_mut(s)[i] = if inward { fill } else { -fill };
                 }
                 self.dirty.insert((l as u8, bc));
                 flipped.entry(bc).or_insert([0; 8])[i / 64] |= 1 << (i % 64);

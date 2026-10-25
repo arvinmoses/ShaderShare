@@ -367,7 +367,7 @@ fn layers_of_two_resolutions_ride_together_and_save() {
     let mut lv = Lv::new(v, 3);
     assert_eq!(lv.l.layers().len(), 1);
     let fine = 0;
-    let broad = lv.l.add_layer("Broad", 3);
+    let broad = lv.l.add_layer(&mut lv.s, "Broad", 3);
     assert_eq!((lv.l.layers()[fine].level, lv.l.layers()[broad].level), (4, 3));
     // A broad bump on the coarse layer, then small bumps on the fine one, over and beside it.
     lv.l.set_active(broad);
