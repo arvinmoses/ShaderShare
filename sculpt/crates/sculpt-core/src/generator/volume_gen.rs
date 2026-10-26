@@ -500,8 +500,22 @@ impl VolumeGen {
         Self::with_anchors(spec, Arc::new(anchors), Arc::new(frames))
     }
 
+    /// The same, with its edge frames as they were saved (a file keeps them: read again on the form's 16-bit samples
+    /// they can turn an instance by a hundredth of a radian).
+    pub fn from_saved(form: &LevelVolume, spec: &GeneratorSpec, anchors: Vec<Anchor>, frames: Option<Vec<(Vec3, Vec3)>>) -> VolumeGen {
+        match frames {
+            Some(frames) if frames.len() == anchors.len() => Self::with_anchors(spec, Arc::new(anchors), Arc::new(frames)),
+            _ => Self::from_anchors_on(form, spec, anchors),
+        }
+    }
+
     pub fn anchors(&self) -> &[Anchor] {
         &self.anchors
+    }
+
+    /// Each anchor's edge frame (along the edge, and the bisector); empty unless placed along edges.
+    pub fn frames(&self) -> &[(Vec3, Vec3)] {
+        &self.frames
     }
 
     pub fn instances(&self) -> &[super::Instance] {

@@ -2945,7 +2945,7 @@ impl Layered {
     pub fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
         self.form.write_to(w)?;
         w.write_all(b"SLAY")?;
-        for x in [4u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
+        for x in [5u32, self.from as u32, self.stack.len() as u32, self.active as u32] {
             w.write_all(&x.to_le_bytes())?;
         }
         for layer in &self.stack {
@@ -3003,6 +3003,13 @@ impl Layered {
                     let buf: Vec<u8> = layer.d[&bc].iter().flat_map(|v| v.to_le_bytes()).collect();
                     w.write_all(&buf)?;
                 }
+                // The edge frames (version 5), as they are: read again on the form as saved (16 bits) they can differ.
+                w.write_all(&(g.g.frames().len() as u32).to_le_bytes())?;
+                for (t, up) in g.g.frames() {
+                    for x in t.to_array().into_iter().chain(up.to_array()) {
+                        w.write_all(&x.to_le_bytes())?;
+                    }
+                }
                 continue;
             }
             let mut keys: Vec<IVec3> = layer.h.keys().copied().collect();
@@ -3051,7 +3058,7 @@ impl Layered {
             Ok(u32::from_le_bytes(b))
         };
         let version = u32s(r)?;
-        if !(1..=4).contains(&version) {
+        if !(1..=5).contains(&version) {
             return Err(bad("unknown layer section version"));
         }
         let (from, count, active) = (u32s(r)? as usize, u32s(r)? as usize, u32s(r)? as usize);
@@ -3131,7 +3138,21 @@ impl Layered {
                         layer.d.insert(IVec3::from_array(c), Stored::from(d));
                     }
                 }
-                let mut g = VolumeGen::from_anchors_on(&form, &spec, anchors);
+                let frames = if version >= 5 {
+                    let n = u32s(r)? as usize;
+                    let mut frames = Vec::with_capacity(n.min(1 << 20));
+                    for _ in 0..n {
+                        let mut f = [0f32; 6];
+                        for x in &mut f {
+                            *x = f32::from_bits(u32s(r)?);
+                        }
+                        frames.push((Vec3::new(f[0], f[1], f[2]), Vec3::new(f[3], f[4], f[5])));
+                    }
+                    Some(frames)
+                } else {
+                    None
+                };
+                let mut g = VolumeGen::from_saved(&form, &spec, anchors, frames);
                 if !layer.d.is_empty() {
                     g = g.with_painted(0, layer.d.clone());
                 }

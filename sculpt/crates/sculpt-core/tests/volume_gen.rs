@@ -1131,3 +1131,23 @@ fn painting_density_needs_a_painted_density() {
     let _ = lv.add(2, &rocks());
     assert!(!lv.l.paint_density(Vec3::Z, 0.3, 0.0));
 }
+
+#[test]
+fn rocks_along_edges_come_back_from_a_file_turned_as_they_were() {
+    // The form is saved at 16 bits; an edge's frame read again on those samples can differ, so the file keeps them.
+    let mut s = pillar(0.02, 4);
+    let mut l = Layered::new(&mut s, 2);
+    let spec = GeneratorSpec { count: 60, size: 0.05, min_spacing: 0.06, lift: 0.0, random_spin: false, blend: 0.2, place_on: PlaceOn::Edges { angle: 40.0, side: EdgeSide::Both }, ..rocks() };
+    let k = l.add_generator(&mut s, "Rubble", 3, &spec);
+    assert!(l.generator_instances(k).len() > 5);
+    let mut buf = Vec::new();
+    l.write_to(&mut buf).unwrap();
+    let (_, opened) = Layered::read_from(&mut &buf[..], 4).unwrap();
+    let opened = opened.expect("layers");
+    let (a, b) = (l.generator_instances(k), opened.generator_instances(k));
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert_eq!(x.rotation, y.rotation, "an instance turned");
+        assert_eq!(x.translation, y.translation);
+    }
+}
