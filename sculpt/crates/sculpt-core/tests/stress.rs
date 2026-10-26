@@ -353,6 +353,11 @@ impl World {
                 let only_afresh: Vec<_> = b.difference(&a).take(4).collect();
                 if !only_live.is_empty() || !only_afresh.is_empty() {
                     report.push(format!("level {lv}: blocks only live {only_live:?} ({}), only afresh {only_afresh:?} ({})", a.difference(&b).count(), b.difference(&a).count()));
+                    for k in only_afresh.iter().take(2) {
+                        let bc = IVec3::from_array(**k);
+                        let holders: Vec<usize> = (0..l.layers().len()).filter(|&j| l.layer_holds(j, lv, bc)).collect();
+                        report.push(format!("   only afresh {k:?}: held by layers {holders:?}, in the form {}, children live {}, parent live {}", l.form().exists(lv, bc), (0..8).filter(|q| lv + 1 < LEVELS && s.exists(lv + 1, bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))).count(), lv > 0 && s.exists(lv - 1, bc.div_euclid(IVec3::splat(2)))));
+                    }
                 }
                 // (A checkerboard fill of this level, or of a coarser one: a block made again from the level below
                 // copies its samples.)

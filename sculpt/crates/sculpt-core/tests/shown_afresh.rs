@@ -153,3 +153,33 @@ fn every_operation_leaves_shown_as_composed_afresh() {
     check("a form stroke under the rocks", &s, &l);
     assert!(bad.is_empty(), "shown holds other blocks than composing it afresh gives, after: {bad:?}");
 }
+
+/// Working on a hidden layer shows it again, all of it: its blocks away from the stroke come back too.
+#[test]
+fn a_stroke_on_a_hidden_layer_shows_the_whole_layer() {
+    let mut s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, LEVELS);
+    let mut l = Layered::new(&mut s, 4);
+    l.deferred = true;
+    l.add_layer(&mut s, "Fine", 5);
+    l.set_active(1);
+    // Work in two places far apart, then hide the layer.
+    for x in [-0.4f32, 0.4] {
+        let d = Vec3::new(x, 0.0, 1.0).normalize();
+        let (hit, _) = s.raycast(d * 3.0, -d, 5, false).unwrap();
+        s.begin_stroke();
+        s.ball_dab(5, hit, 0.01, 0.003, false);
+        s.end_stroke();
+        l.take_detail(&mut s);
+    }
+    l.set_visible(&mut s, 1, false);
+    assert_eq!(differ("hidden", &s, &l), 0);
+    // A stroke at one of them with the layer still hidden brings the other back too.
+    let d = Vec3::new(-0.4, 0.0, 1.0).normalize();
+    let (hit, _) = s.raycast(d * 3.0, -d, 5, false).unwrap();
+    s.begin_stroke();
+    s.ball_dab(5, hit, 0.01, 0.003, false);
+    s.end_stroke();
+    l.take_detail(&mut s);
+    assert!(l.layers()[1].visible);
+    assert_eq!(differ("worked on while hidden", &s, &l), 0, "blocks of the layer away from the stroke were left out");
+}

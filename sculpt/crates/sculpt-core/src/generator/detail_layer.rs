@@ -1670,7 +1670,8 @@ impl Layered {
         for key in coarse {
             shown.mirror(&self.form, key);
         }
-        self.stack[k].visible = true;
+        // A hidden layer worked on is shown again, all of it (not only the blocks the stroke reached).
+        self.set_visible(shown, k, true);
         self.take_heights(shown, &detail, k, &blocks, &keys);
         self.history.push(Undo::Layers(was, self.active));
         self.redo.clear();
