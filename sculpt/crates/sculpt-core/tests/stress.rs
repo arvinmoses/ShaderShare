@@ -874,12 +874,13 @@ impl World {
         }
         if preview {
             l.preview_generator(&mut self.s, k, &spec);
-            if self.rng.chance(0.5) {
+            // (Only a drag changes it more than once, and a drag is one undo step; the app's other edits come one at a time.)
+            if self.rng.chance(0.5) && drag {
                 // A second change while the first is still a preview.
                 spec.size *= 1.1;
                 l.preview_generator(&mut self.s, k, &spec);
             }
-            if self.rng.chance(0.5) {
+            if self.rng.chance(0.5) && drag {
                 // The job for the first preview, landing after a newer one: dropped.
                 if let Some(job) = l.generator_take() {
                     let done = job.run();
