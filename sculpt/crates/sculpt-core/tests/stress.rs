@@ -468,7 +468,19 @@ impl World {
                     }
                 }
                 self.drift[lv] = self.drift[lv].max(most.0);
-                if most.0 > tol {
+                // The form at 16 bits moves composing's inputs by a few millionths of a band, which a join or a
+                // root search can turn into a jump at a lone sample (up to a step); more than a few samples of a
+                // block over the tolerance, or one past a step, is real drift.
+                let over = |d: f32| d > tol;
+                let many = a.intersection(&b).any(|k| {
+                    let bc = IVec3::from_array(*k);
+                    if !l.form().exists(lv, bc) && !(0..l.layers().len()).any(|j| l.layer_holds(j, lv, bc)) {
+                        return false;
+                    }
+                    let (x, y) = (s.block((lv as u8, bc)).unwrap(), again.block((lv as u8, bc)).unwrap());
+                    (0..x.len()).filter(|&i| !(is_fill(x[i]) || is_fill(y[i])) && over((x[i] - y[i]).abs())).count() > 4
+                });
+                if most.0 > tol && (many || most.0 > s.voxel(lv)) {
                     let (d, bc, i) = most;
                     let cell = IVec3::new((i & 7) as i32, ((i >> 3) & 7) as i32, (i >> 6) as i32);
                     let p = s.origin() + (bc * 8 + cell).as_vec3() * s.voxel(lv);
