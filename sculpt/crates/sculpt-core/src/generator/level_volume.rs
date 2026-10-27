@@ -846,6 +846,16 @@ impl LevelVolume {
         band.min(Self::redistance_reach(vx, band) as f32 * vx)
     }
 
+    /// How far from the surface level `l`'s samples are drawn from: its band, but at level 0 its plateau, since a
+    /// sample beyond that holds only a bound on its distance. The GPU is sent each sample clamped to it, and the
+    /// reference extraction reads them so. Nothing drawn reads one farther out (a cell the surface crosses has every
+    /// corner within about two steps of it), and a wide stroke at level 0 changes a slab of samples sixteen steps
+    /// either side of the surface across its whole disc: the blocks it changes only out there come out as the GPU
+    /// holds them already, and are neither sent nor extracted again.
+    pub fn sent_reach(&self, l: usize) -> f32 {
+        if l == 0 { self.plateau(0) } else { self.band(l) }
+    }
+
     /// Stored blocks per level, and the bytes their samples take at 16 bits.
     pub fn memory(&self) -> (Vec<usize>, usize) {
         let counts: Vec<usize> = self.blocks.iter().map(|m| m.len()).collect();
@@ -3715,9 +3725,9 @@ impl LevelVolume {
         // Every value as the GPU's 16-bit samples hold it, so that the surface here is the GPU's to the last bit of
         // arithmetic: a value interpolated from full-precision samples can land on the other side of zero.
         let mut g = self.gather9_in(l, bc, v);
-        let held_band = self.band(l);
+        let (held_band, reach) = (self.band(l), self.sent_reach(l));
         for v in g.iter_mut() {
-            *v = as_held(*v, held_band);
+            *v = as_held(v.clamp(-reach, reach), held_band);
         }
         let (vx, band) = (self.voxel(l), self.band(l));
         let base = bc * B;

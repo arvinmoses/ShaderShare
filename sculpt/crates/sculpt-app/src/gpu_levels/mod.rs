@@ -208,12 +208,12 @@ pub(super) fn packed_samples(vol: &LevelVolume, k: Key, hidden: Option<&KeySet<K
 
 fn pack_into(vol: &LevelVolume, k: Key, hidden: Option<&KeySet<Key>>, out: &mut [u32; SAMPLE_WORDS as usize]) {
     let (l, bc) = (k.0 as usize, k.1);
-    let band = vol.band(l);
+    let (band, reach) = (vol.band(l), vol.sent_reach(l));
     let mut g = [0.0f32; 729];
     vol.gather9_hiding(l, bc, &mut g, hidden);
     let mut q = [0u16; 730];
     for (q, v) in q.iter_mut().zip(g.iter()) {
-        *q = quantize(*v, band) as u16;
+        *q = quantize(v.clamp(-reach, reach), band) as u16;
     }
     for (w, pair) in out.iter_mut().zip(q.chunks_exact(2)) {
         *w = pair[0] as u32 | ((pair[1] as u32) << 16);

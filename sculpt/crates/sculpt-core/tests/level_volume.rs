@@ -1602,3 +1602,48 @@ fn far_scrubbed_clay_strokes() {
         mesh_picture(&v, 0, (patch + t1 * a + t2 * b).normalize(), half, 900, &path);
     }
 }
+
+/// Level 0's samples as the GPU is sent them: each block's 9x9x9, clamped to what is drawn from, at 16 bits.
+fn sent0(v: &LevelVolume, bc: glam::IVec3) -> Vec<i16> {
+    let (band, reach) = (v.band(0), v.sent_reach(0));
+    let mut g = [0.0f32; 729];
+    v.gather9_into(0, bc, &mut g);
+    g.iter().map(|x| sculpt_core::generator::level_volume::quantize(x.clamp(-reach, reach), band)).collect()
+}
+
+/// A wide clay stroke at level 0 (seen from far) changes a slab of samples sixteen steps either side of the surface
+/// across its whole disc, but what is drawn reads only those within the plateau, six steps: at the app's default
+/// strength over an earlier stroke, the blocks whose samples as the GPU is sent them change are about two thirds of
+/// those its dabs change (2617 of 3785 here; at full strength over a fresh ball, about half), and only they are sent
+/// and extracted again (all of them were).
+#[test]
+fn a_wide_far_dab_sends_only_the_blocks_it_changes_near_the_surface() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 2);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    // An earlier stroke, ended: what a later one works over.
+    far_clay_stroke(&mut v, patch, &[(-0.3, -0.1), (0.3, 0.1)], 0.5, 0.5);
+    let (t1, _) = patch.any_orthonormal_pair();
+    v.drain_dirty();
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let (mut changed, mut sent) = (0usize, 0usize);
+    for i in 0..6 {
+        let d = (patch + t1 * (-0.2 + 0.08 * i as f32)).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
+        let before: HashMap<glam::IVec3, Vec<i16>> = v.level_keys(0).into_iter().map(|bc| (bc, sent0(&v, bc))).collect();
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, 0.5, 0.5 * 0.047, 0.5, 0.22, false) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+        for (l, bc) in v.drain_dirty() {
+            if l == 0 && v.exists(0, bc) {
+                changed += 1;
+                sent += (before.get(&bc) != Some(&sent0(&v, bc))) as usize;
+            }
+        }
+    }
+    v.end_stroke();
+    eprintln!("the dabs changed {changed} level 0 blocks, {sent} of them as sent");
+    assert!(changed > 3000, "the dabs changed too little to tell: {changed} blocks");
+    assert!((sent as f32) < 0.8 * changed as f32, "{sent} of the {changed} blocks the dabs changed are sent again");
+}
