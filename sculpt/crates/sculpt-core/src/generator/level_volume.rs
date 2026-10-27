@@ -345,7 +345,9 @@ impl Ground {
         for _ in 0..3 {
             for axis in 0..2 {
                 let prev = self.h.clone();
-                for b in 0..size {
+                // A row at a time over the threads: a wide brush's are a few hundred columns each way.
+                self.h.par_chunks_mut(size as usize).enumerate().for_each(|(b, row)| {
+                    let b = b as i32;
                     for a in 0..size {
                         let (mut sum, mut count) = (0.0f32, 0usize);
                         for d in -radius..=radius {
@@ -359,9 +361,9 @@ impl Ground {
                                 count += 1;
                             }
                         }
-                        self.h[(b * size + a) as usize] = if count > 0 { sum / count as f32 } else { f32::NAN };
+                        row[a as usize] = if count > 0 { sum / count as f32 } else { f32::NAN };
                     }
-                }
+                });
             }
         }
     }
