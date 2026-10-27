@@ -2750,8 +2750,6 @@ impl LevelVolume {
                     let g = me.grid(l, lo, bc * B + IVec3::splat(B - 1 + reach.max(1)), false);
                     let n = g.n;
                     let hi = lo + n - IVec3::ONE;
-                    let at = |q: IVec3| ((q.z * n.y + q.y) * n.x + q.x) as usize;
-                    let len = (n.x * n.y * n.z) as usize;
                     // A sample's distance (in steps) to the plane through where the surface crosses its own lattice
                     // edges: the intercepts along each axis that crosses, one over the root of the sum of their
                     // inverse squares. Where one axis crosses, both ends of the edge keep their crossing exactly;
@@ -2784,16 +2782,22 @@ impl LevelVolume {
                     };
                     // The samples next to the surface seed the distances, with their own values (or with `near_too`,
                     // their distances to the plane through their crossings); every other sample starts at the cap.
-                    let mut d = vec![cap; len];
-                    let mut seed = vec![false; len];
+                    // Held with a border of one sample all round that reads as no neighbour (infinitely far), so the
+                    // sweep reads each sample's six neighbours without asking whether they are in the box.
+                    let pn = n + IVec3::splat(2);
+                    let pat = |q: IVec3| (((q.z + 1) * pn.y + q.y + 1) * pn.x + q.x + 1) as usize;
+                    let plen = (pn.x * pn.y * pn.z) as usize;
+                    let mut d = vec![f32::INFINITY; plen];
+                    let mut seed = vec![false; plen];
                     let mut any_seed = false;
                     for z in 0..n.z {
                         for y in 0..n.y {
                             for x in 0..n.x {
                                 let q = IVec3::new(x, y, z);
+                                let k = pat(q);
+                                d[k] = cap;
                                 let t = intercept(lo + q);
                                 if t.is_finite() {
-                                    let k = at(q);
                                     seed[k] = true;
                                     any_seed = true;
                                     d[k] = if near_too { t } else { g.at(lo + q).abs() / vx }.min(cap);
@@ -2804,47 +2808,54 @@ impl LevelVolume {
                     if any_seed {
                         // Fast sweeping: the upwind solution of |grad d| = 1 (exact for a plane), swept once in each of
                         // the eight orders of the axes' directions (a second round changes nothing that shows).
-                        for _ in 0..1 {
-                            for o in 0..8 {
-                                let (sx, sy, sz) = (o & 1 == 1, o & 2 == 2, o & 4 == 4);
-                                for zi in 0..n.z {
-                                    let z = if sz { n.z - 1 - zi } else { zi };
-                                    for yi in 0..n.y {
-                                        let y = if sy { n.y - 1 - yi } else { yi };
-                                        for xi in 0..n.x {
-                                            let x = if sx { n.x - 1 - xi } else { xi };
-                                            let q = IVec3::new(x, y, z);
-                                            let k = at(q);
-                                            if seed[k] {
-                                                continue;
-                                            }
-                                            let least = |axis: usize| -> f32 {
-                                                let mut m = f32::INFINITY;
-                                                for dir in [-1, 1] {
-                                                    let mut j = q;
-                                                    j[axis] += dir;
-                                                    if j[axis] >= 0 && j[axis] < n[axis] {
-                                                        m = m.min(d[at(j)]);
-                                                    }
-                                                }
-                                                m
-                                            };
-                                            let mut a = [least(0), least(1), least(2)];
-                                            a.sort_unstable_by(f32::total_cmp);
-                                            let mut u = a[0] + 1.0;
-                                            if u > a[1] {
-                                                u = 0.5 * (a[0] + a[1] + (2.0 - (a[0] - a[1]) * (a[0] - a[1])).max(0.0).sqrt());
-                                                if u > a[2] {
-                                                    let s = a[0] + a[1] + a[2];
-                                                    let disc = s * s - 3.0 * (a[0] * a[0] + a[1] * a[1] + a[2] * a[2] - 1.0);
-                                                    u = (s + disc.max(0.0).sqrt()) / 3.0;
-                                                }
-                                            }
-                                            if u < d[k] {
-                                                d[k] = u;
+                        // A sample's update is never less than its least neighbour, and no sample holds more than the
+                        // cap: a row whose own samples and the four rows beside it all hold the cap (most of the box,
+                        // past a few steps from the surface) changes nothing, and is passed over. Each row's least
+                        // value is kept as the sweep lowers it.
+                        let row = |y: i32, z: i32| ((z + 1) * pn.y + y + 1) as usize;
+                        let mut least_in = vec![f32::INFINITY; (pn.y * pn.z) as usize];
+                        for z in 0..n.z {
+                            for y in 0..n.y {
+                                let k0 = pat(IVec3::new(0, y, z));
+                                least_in[row(y, z)] = d[k0..k0 + n.x as usize].iter().copied().fold(f32::INFINITY, f32::min);
+                            }
+                        }
+                        let (sy, sz) = (pn.x as usize, (pn.x * pn.y) as usize);
+                        for o in 0..8 {
+                            let (fx, fy, fz) = (o & 1 == 1, o & 2 == 2, o & 4 == 4);
+                            for zi in 0..n.z {
+                                let z = if fz { n.z - 1 - zi } else { zi };
+                                for yi in 0..n.y {
+                                    let y = if fy { n.y - 1 - yi } else { yi };
+                                    let r = row(y, z);
+                                    let near = least_in[r].min(least_in[r - 1]).min(least_in[r + 1]).min(least_in[r - pn.y as usize]).min(least_in[r + pn.y as usize]);
+                                    if near >= cap {
+                                        continue;
+                                    }
+                                    let mut low = least_in[r];
+                                    for xi in 0..n.x {
+                                        let x = if fx { n.x - 1 - xi } else { xi };
+                                        let k = pat(IVec3::new(x, y, z));
+                                        if seed[k] {
+                                            continue;
+                                        }
+                                        let mut a = [d[k - 1].min(d[k + 1]), d[k - sy].min(d[k + sy]), d[k - sz].min(d[k + sz])];
+                                        a.sort_unstable_by(f32::total_cmp);
+                                        let mut u = a[0] + 1.0;
+                                        if u > a[1] {
+                                            u = 0.5 * (a[0] + a[1] + (2.0 - (a[0] - a[1]) * (a[0] - a[1])).max(0.0).sqrt());
+                                            if u > a[2] {
+                                                let s = a[0] + a[1] + a[2];
+                                                let disc = s * s - 3.0 * (a[0] * a[0] + a[1] * a[1] + a[2] * a[2] - 1.0);
+                                                u = (s + disc.max(0.0).sqrt()) / 3.0;
                                             }
                                         }
+                                        if u < d[k] {
+                                            d[k] = u;
+                                            low = low.min(u);
+                                        }
                                     }
+                                    least_in[r] = low;
                                 }
                             }
                         }
@@ -2854,7 +2865,7 @@ impl LevelVolume {
                     let mut any = false;
                     for (i, v) in s.iter_mut().enumerate() {
                         let p = bc * B + cell_of(i);
-                        let k = at(p - lo);
+                        let k = pat(p - lo);
                         if seed[k] && !near_too {
                             continue;
                         }
