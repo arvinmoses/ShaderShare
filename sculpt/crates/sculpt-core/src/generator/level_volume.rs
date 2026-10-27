@@ -1419,10 +1419,22 @@ impl LevelVolume {
         };
         // New samples for each candidate, worked out in parallel from the field as it is.
         let origin = self.origin;
+        let fill = if carve { band } else { -band };
         let me = &*self;
         let built: Vec<(IVec3, Stored, Stored, SignMask)> = cand
             .par_iter()
             .filter_map(|&bc| {
+                // A sample at the band on the side the dab pushes toward (inside for clay) stays there: the dab moves
+                // it no farther than its own value, and the clamp brings it back. A block of only such samples (the
+                // slab of a wide dab reaches sixteen steps into the solid across its disc, all of it at the band where
+                // no stroke has been yet) changes nothing, and is passed over.
+                let at_fill = match me.blocks[l].get(&bc) {
+                    Some(b) => b.iter().all(|&v| v == fill),
+                    None => l == 0 && me.inside0.contains(&bc) != carve,
+                };
+                if at_fill {
+                    return None;
+                }
                 let old = me.block_values(l, bc, false);
                 // The block as the stroke found it. Only a sample still holding what it held then can hold the bound:
                 // one a dab of this stroke blended holds a distance of its own, even where it came out within a
@@ -1436,6 +1448,9 @@ impl LevelVolume {
                 let mut any = false;
                 let corner = origin + (bc * B).as_vec3() * vx;
                 for (i, v) in s.iter_mut().enumerate() {
+                    if *v == fill {
+                        continue;
+                    }
                     let p = corner + cell_of(i).as_vec3() * vx;
                     let w = weight(p);
                     if w <= 0.0 {
