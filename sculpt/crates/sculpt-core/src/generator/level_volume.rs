@@ -1403,6 +1403,12 @@ impl LevelVolume {
             .par_iter()
             .filter_map(|&bc| {
                 let old = me.block_values(l, bc, false);
+                // The block as the stroke found it. Only a sample still holding what it held then can hold the bound:
+                // one a dab of this stroke blended holds a distance of its own, even where it came out within a
+                // hundredth of a step of the bound (a little blending out on a wide brush's falloff does that). Read as
+                // the bound, the next dab took the ground for it while its neighbours went on from their own values,
+                // and it stood out from them by up to half a step: a pit, once the clay reached it.
+                let found = ground.map(|_| me.block_values(l, bc, true));
                 let mut s = old.clone();
                 let mut d = Box::new([0.0f32; N]);
                 let mut flips = [0u64; 8];
@@ -1418,7 +1424,8 @@ impl LevelVolume {
                     // Only a sample the dab changes, and blends (a full-weight dab takes the shape outright), needs
                     // its distance.
                     let changes = if carve { -blob > *v } else { blob < *v };
-                    let was = if changes && w < 1.0 { from_ground(p, *v) } else { *v };
+                    let held = found.as_ref().is_some_and(|f| f[i].to_bits() == v.to_bits());
+                    let was = if changes && w < 1.0 && held { from_ground(p, *v) } else { *v };
                     let full = if carve { was.max(-blob) } else { was.min(blob) };
                     let next = (was + w * (full - was)).clamp(-band, band);
                     if next != *v {

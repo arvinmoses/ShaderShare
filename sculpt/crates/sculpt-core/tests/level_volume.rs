@@ -1436,6 +1436,73 @@ fn a_clay_stroke_over_earlier_clay_brings_up_no_grain() {
     assert!(on <= 30, "the second stroke brought up grain: {on} samples at the surface stand out");
 }
 
+/// A sample an earlier dab of the stroke blended keeps blending from its own value, even where that came out at level
+/// 0's bound. Blended a little, out on a wide brush's falloff, a sample far off the surface can land within what
+/// holding it at 16 bits would move the bound; read as the bound again, the next dab took the ground under the brush
+/// for its distance instead while its neighbours went on from their own, and it jumped from them by up to half a step:
+/// once the clay reached it, a pit. Here: over a stroke scrubbed back and forth, the samples a dab left within a
+/// hundredth of a step of the bound, and how many of them the next dab moved unlike their neighbours the stroke
+/// blended too (by more than a fifth of a step from their mean change): 3415 of 16749 when they were read as the bound,
+/// 9 of 16981 now.
+#[test]
+fn a_sample_the_stroke_blended_onto_the_bound_keeps_its_own_distance() {
+    use glam::IVec3;
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 2);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    // An earlier stroke, ended: its samples off the surface hold the bound.
+    far_clay_stroke(&mut v, patch, &[(-0.3, -0.1), (0.3, 0.1)], 0.5, 0.5);
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let (vx, plateau) = (v.voxel(0), v.plateau(0));
+    let start = v.preview_copy();
+    let r = 0.5f32;
+    let mut pts = Vec::new();
+    for leg in 0..6 {
+        for i in 0..=8 {
+            let f = i as f32 / 8.0;
+            let f = if leg % 2 == 0 { f } else { 1.0 - f };
+            pts.push((-0.3 + 0.6 * f, 0.05 - 0.1 * f));
+        }
+    }
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let (mut onto, mut jumped) = (0usize, 0usize);
+    let mut watch: Vec<IVec3> = Vec::new();
+    for (x, y) in pts {
+        let d = (patch + t1 * x + t2 * y).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
+        let before = v.preview_copy();
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, r * 0.047, 0.5, 0.22, false) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+        // How the samples left on the bound last dab moved this one, against their neighbours the stroke blended too
+        // (a neighbour still holding the bound reads the ground, as it should).
+        let change = |i: IVec3| v.sample(0, i, false) - before.sample(0, i, false);
+        for &i in &watch {
+            let blended: Vec<f32> = [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z].iter().map(|&o| i + o).filter(|&j| before.sample(0, j, false) != start.sample(0, j, false)).map(change).collect();
+            if blended.len() >= 2 && (change(i) - blended.iter().sum::<f32>() / blended.len() as f32).abs() > 0.2 * vx {
+                jumped += 1;
+            }
+        }
+        // The samples this dab blended that came out within a hundredth of a step of the bound.
+        watch.clear();
+        for bc in v.level_keys(0) {
+            let b = v.block((0, bc)).unwrap();
+            for (k, &s) in b.iter().enumerate() {
+                let i = bc * 8 + IVec3::new((k % 8) as i32, ((k / 8) % 8) as i32, (k / 64) as i32);
+                if (s.abs() - plateau).abs() <= 0.01 * vx && s != before.sample(0, i, false) && s != start.sample(0, i, false) {
+                    watch.push(i);
+                }
+            }
+        }
+        onto += watch.len();
+    }
+    v.end_stroke();
+    eprintln!("{onto} samples blended onto the bound; {jumped} of them jumped from their neighbours on the next dab");
+    assert!(onto > 0, "no sample was blended onto the bound: the test no longer looks at anything");
+    assert!(jumped <= 20, "{jumped} samples blended onto the bound jumped from their neighbours on the next dab");
+}
+
 /// The extracted surface (levels up to `cap`) seen straight down `-w` over a square `half` across around `w`, flat
 /// shaded with a grazing light (each face its own shade), as an `n` by `n` PGM at `path`.
 fn mesh_picture(v: &LevelVolume, cap: usize, w: Vec3, half: f32, n: usize, path: &str) {
