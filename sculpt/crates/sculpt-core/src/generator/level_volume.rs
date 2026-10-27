@@ -1315,14 +1315,19 @@ impl LevelVolume {
         let ground = ground.as_ref();
         // A sample's distance to the surface for the dab to blend from: its value, unless that is only a bound and the
         // ground under the brush says how far the surface is (on the same side, and no nearer than the bound allows).
+        // Only the bound itself (within what holding it at 16 bits moves it) takes the ground's distance outright: a
+        // sample a dab already blended holds a distance of its own, and the ground can only bring it nearer. Set back
+        // to the surface's distance each dab, a sample the dabs kept past the bound stood still while its neighbours
+        // just under the bound accumulated the dabs', and the mismatch along that line rippled the wall the dabs raise.
+        let tolerance = 0.01 * vx;
         let from_ground = |p: Vec3, v: f32| -> f32 {
             if let Some(g) = ground
-                && v.abs() >= 0.999 * plateau
+                && v.abs() >= plateau - tolerance
                 && let Some(d) = g.distance(p)
                 && (d < 0.0) == (v < 0.0)
                 && d.abs() >= 0.9 * v.abs()
             {
-                return d;
+                return if v.abs() <= plateau + tolerance { d } else if d.abs() < v.abs() { d } else { v };
             }
             v
         };

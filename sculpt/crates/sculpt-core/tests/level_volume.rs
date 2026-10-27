@@ -1074,7 +1074,8 @@ fn picture_a_wide_clay_stroke_on_a_fresh_ball() {
         let d = (patch + t1 * (-0.6 + 1.2 * i as f32 / steps as f32)).normalize();
         let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
         let rough = if along == Vec3::ZERO { n } else { along };
-        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, r * 0.095, 0.2, 0.4, false) {
+        let trim = std::env::var_os("SCULPT_TRIM").is_some();
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, r * if trim { 0.075 } else { 0.095 }, 0.2, 0.4, trim) {
             along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
         }
     }
@@ -1082,11 +1083,28 @@ fn picture_a_wide_clay_stroke_on_a_fresh_ball() {
     let w = patch;
     let u = w.any_orthonormal_vector();
     let t = w.cross(u);
-    let (n, half) = (800, 0.8f32);
+    // `SCULPT_WIN=a,b,half`: only that window (default the whole ball), at 400 pixels, and the wall's ripple as a number.
+    let win: Vec<f32> = std::env::var("SCULPT_WIN").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+    let (n, half, (ca, cb)) = if win.len() == 3 { (400, win[2], (win[0], win[1])) } else { (800, 0.8f32, (0.0, 0.0)) };
+    if win.len() == 3 {
+        // Height over a grid half a step apart; the ripple is the mean absolute second difference along both axes.
+        let g = 0.5 * voxel;
+        let m = (2.0 * half / g) as usize;
+        let hts: Vec<f32> = (0..m * m).map(|k| { let (i, j) = (k % m, k / m); v.raycast(w * 4.0 + u * (ca - half + g * i as f32) + t * (cb - half + g * j as f32), -w, 0, false).map_or(f32::NAN, |(q, _)| q.dot(w)) }).collect();
+        let (mut sum, mut across, mut along, mut cnt) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+        for j in 1..m - 1 { for i in 1..m - 1 {
+            let c = hts[j * m + i];
+            let (da, db) = ((hts[j * m + i - 1] + hts[j * m + i + 1] - 2.0 * c).abs(), (hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 2.0 * c).abs());
+            let d = da + db;
+            if d.is_finite() { sum += d as f64; across += da as f64; along += db as f64; cnt += 1; }
+        } }
+        let steps = |x: f64| x / cnt as f64 / voxel as f64;
+        eprintln!("RIPPLE mean |second difference| {:.3e} (in steps of {voxel:.4}: {:.4}; across the wall {:.4}, along it {:.4}) over {cnt} points", sum / cnt as f64, steps(sum), steps(across), steps(along));
+    }
     let mut img = vec![0u8; n * n];
     for y in 0..n {
         for x in 0..n {
-            let (a, b) = (-half + 2.0 * half * x as f32 / n as f32, half - 2.0 * half * y as f32 / n as f32);
+            let (a, b) = (ca - half + 2.0 * half * x as f32 / n as f32, cb + half - 2.0 * half * y as f32 / n as f32);
             if let Some((_, nrm)) = v.raycast(w * 4.0 + u * a + t * b, -w, 0, false) {
                 img[y * n + x] = (35.0 + 220.0 * nrm.dot((w * 0.8 + u * -0.4 + t * 0.5).normalize()).max(0.0)) as u8;
             }
@@ -1095,4 +1113,53 @@ fn picture_a_wide_clay_stroke_on_a_fresh_ball() {
     let mut out = format!("P5 {n} {n} 255\n").into_bytes();
     out.extend(img);
     std::fs::write(path, out).unwrap();
+}
+
+/// The lattice a wide clay stroke's wall picks up at level 0 when it is scrubbed densely (sixty dabs along 1.2 of a
+/// coarse ball, a brush of radius 0.7 so its plane stands above level 0's measured distances): the mean |second
+/// difference| of the surface's height along the wall (where the wall's own shape is flat), in steps, sampled half a
+/// step apart over a window on the wall. Samples holding only the bound on their distance read the ground under the
+/// brush once; read again each dab (as any sample near the bound once was), they were set back to the surface's
+/// distance while their neighbours accumulated the dabs', and the wall's foot came out dotted with a lattice of pits
+/// (0.088 steps along the wall here, against 0.026 reading the ground once).
+#[test]
+fn a_densely_scrubbed_clay_stroke_leaves_no_lattice_on_its_wall() {
+    let voxel = 0.01f32;
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 3);
+    let r = 0.7f32;
+    let patch = Vec3::new(0.0, 0.3, 1.0).normalize();
+    let (t1, t2) = patch.any_orthonormal_pair();
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let steps = 60;
+    for i in 0..=steps {
+        let d = (patch + t1 * (-0.6 + 1.2 * i as f32 / steps as f32)).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, r * 0.095, 0.2, 0.4, false) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    v.end_stroke();
+    // A window across the wall (the rim is 0.7 to the side of the stroke's line), at the stroke's middle.
+    let (half, g) = (0.3 * r, 0.5 * voxel);
+    let m = (2.0 * half / g) as usize;
+    let height = |a: f32, b: f32| v.raycast(patch * 4.0 + t2 * (-0.85 * r + a) + t1 * b, -patch, 0, false).map_or(f32::NAN, |(q, _)| q.dot(patch));
+    let hts: Vec<f32> = (0..m * m).map(|k| height(-half + g * (k % m) as f32, -half + g * (k / m) as f32)).collect();
+    let (mut across, mut along, mut cnt) = (0.0f64, 0.0f64, 0usize);
+    for j in 1..m - 1 {
+        for i in 1..m - 1 {
+            let c = hts[j * m + i];
+            let (da, db) = ((hts[j * m + i - 1] + hts[j * m + i + 1] - 2.0 * c).abs(), (hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 2.0 * c).abs());
+            if (da + db).is_finite() {
+                across += da as f64;
+                along += db as f64;
+                cnt += 1;
+            }
+        }
+    }
+    let steps = |x: f64| x / cnt as f64 / voxel as f64;
+    eprintln!("wall ripple: across it {:.4}, along it {:.4} steps over {cnt} points", steps(across), steps(along));
+    assert!(cnt > m * m / 2, "the window missed the surface: {cnt} of {} points", m * m);
+    assert!(steps(along) < 0.05, "the wall is rippled along its length: mean |second difference| {:.4} steps", steps(along));
 }
