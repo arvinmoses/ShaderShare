@@ -1163,3 +1163,53 @@ fn a_densely_scrubbed_clay_stroke_leaves_no_lattice_on_its_wall() {
     assert!(cnt > m * m / 2, "the window missed the surface: {cnt} of {} points", m * m);
     assert!(steps(along) < 0.05, "the wall is rippled along its length: mean |second difference| {:.4} steps", steps(along));
 }
+
+/// A clay stroke as wide as the ball (the app's first strokes, seen from far: radius 0.9 on a ball of radius 1) lays a
+/// shell that follows the ball. Laid to the brush's plane, each dab was a flat disc tilted with its own normal, the
+/// ball curving away 0.4 under its rim: the dabs stacked as terraces, with block-sized stairs where they met the ball.
+#[test]
+fn a_clay_stroke_as_wide_as_the_ball_lays_a_shell_that_follows_it() {
+    let voxel = 0.01f32;
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 3);
+    let r = 0.9f32;
+    let h = 0.095 * r;
+    let patch = Vec3::new(0.0, 0.3, 1.0).normalize();
+    let (t1, t2) = patch.any_orthonormal_pair();
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    for i in 0..=12 {
+        let d = (patch + t1 * (-0.2 + 0.4 * i as f32 / 12.0)).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, h, 0.2, 0.4, false) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    v.end_stroke();
+    // Heights over the ball on a grid two steps apart across the brush: nowhere much more than the brush's height,
+    // and smooth (the mean |second difference| in steps).
+    let (half, g) = (0.6f32, 2.0 * voxel);
+    let m = (2.0 * half / g) as usize;
+    let height = |a: f32, b: f32| {
+        let d = (patch + t1 * a + t2 * b).normalize();
+        v.raycast(d * 3.0, -d, 0, false).map_or(f32::NAN, |(q, _)| q.length() - 1.0)
+    };
+    let hts: Vec<f32> = (0..m * m).map(|k| height(-half + g * (k % m) as f32, -half + g * (k / m) as f32)).collect();
+    let (mut sum, mut cnt, mut most) = (0.0f64, 0usize, 0.0f32);
+    for j in 1..m - 1 {
+        for i in 1..m - 1 {
+            let c = hts[j * m + i];
+            most = most.max(c);
+            let d = (hts[j * m + i - 1] + hts[j * m + i + 1] - 2.0 * c).abs() + (hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 2.0 * c).abs();
+            if d.is_finite() {
+                sum += d as f64;
+                cnt += 1;
+            }
+        }
+    }
+    let ripple = sum / cnt as f64 / voxel as f64;
+    eprintln!("the shell is at most {most:.4} high (the brush's height {h:.4}); ripple {ripple:.4} steps over {cnt} points");
+    assert!(most > 0.5 * h, "the stroke built nothing: {most:.4}");
+    assert!(most < 1.5 * h, "the stroke piled up beyond its height: {most:.4} against {h:.4}");
+    assert!(ripple < 0.3, "the shell is terraced: mean |second difference| {ripple:.4} steps");
+}

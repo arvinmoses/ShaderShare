@@ -305,6 +305,67 @@ impl Ground {
         2 * self.half + 1
     }
 
+    /// The signed distance from `p` to the tangent plane of the surface under it, the surface interpolated smoothly
+    /// (Catmull-Rom over the four columns around it each way, so its slope is continuous across columns: clay laid on
+    /// it shows no seam at the columns), when all sixteen meet the surface.
+    fn distance_smooth(&self, p: Vec3) -> Option<f32> {
+        let q = p - self.on;
+        let s = q.dot(self.t1) / self.step + self.half as f32;
+        let t = q.dot(self.t2) / self.step + self.half as f32;
+        let (i, j) = (s.floor() as i32, t.floor() as i32);
+        if i < 1 || j < 1 || i + 2 >= self.size() || j + 2 >= self.size() {
+            return None;
+        }
+        let (fs, ft) = (s - i as f32, t - j as f32);
+        // A Catmull-Rom segment's value and slope at `x`.
+        let spline = |p0: f32, p1: f32, p2: f32, p3: f32, x: f32| -> (f32, f32) {
+            let (a, b, c) = (-p0 + 3.0 * p1 - 3.0 * p2 + p3, 2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3, -p0 + p2);
+            (0.5 * (((a * x + b) * x + c) * x + 2.0 * p1), 0.5 * ((3.0 * a * x + 2.0 * b) * x + c))
+        };
+        let mut rows = [(0.0f32, 0.0f32); 4];
+        for (k, row) in rows.iter_mut().enumerate() {
+            let at = |a: i32| self.h[((j - 1 + k as i32) * self.size() + a) as usize];
+            let (h0, h1, h2, h3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+            if !(h0.is_finite() && h1.is_finite() && h2.is_finite() && h3.is_finite()) {
+                return None;
+            }
+            *row = spline(h0, h1, h2, h3, fs);
+        }
+        let (h, ht) = spline(rows[0].0, rows[1].0, rows[2].0, rows[3].0, ft);
+        let (hs, _) = spline(rows[0].1, rows[1].1, rows[2].1, rows[3].1, ft);
+        let (hs, ht) = (hs / self.step, ht / self.step);
+        Some((q.dot(self.n) - h) / (1.0 + hs * hs + ht * ht).sqrt())
+    }
+
+    /// The heights smoothed over `radius` columns either way (a box three times over, so near a Gaussian), leaving
+    /// only the form at the brush's scale: what clay laid on the surface follows. A column with no surface takes its
+    /// neighbours' mean, when any has one.
+    fn smooth(&mut self, radius: i32) {
+        let size = self.size();
+        for _ in 0..3 {
+            for axis in 0..2 {
+                let prev = self.h.clone();
+                for b in 0..size {
+                    for a in 0..size {
+                        let (mut sum, mut count) = (0.0f32, 0usize);
+                        for d in -radius..=radius {
+                            let (x, y) = if axis == 0 { (a + d, b) } else { (a, b + d) };
+                            if x < 0 || y < 0 || x >= size || y >= size {
+                                continue;
+                            }
+                            let v = prev[(y * size + x) as usize];
+                            if v.is_finite() {
+                                sum += v;
+                                count += 1;
+                            }
+                        }
+                        self.h[(b * size + a) as usize] = if count > 0 { sum / count as f32 } else { f32::NAN };
+                    }
+                }
+            }
+        }
+    }
+
     /// The signed distance from `p` to the surface's tangent plane under it, when its column and the three around it
     /// meet the surface.
     fn distance(&self, p: Vec3) -> Option<f32> {
@@ -1311,7 +1372,7 @@ impl LevelVolume {
         // brush. (A finer level holds distances to its band, and a sample at its band reads the levels below.)
         let plateaus: Vec<f32> = (0..self.levels()).map(|k| self.plateau(k)).collect();
         let plateau = plateaus[l];
-        let ground = if l > 0 { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band)) };
+        let ground = if l > 0 { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band, false)) };
         let ground = ground.as_ref();
         // A sample's distance to the surface for the dab to blend from: its value, unless that is only a bound and the
         // ground under the brush says how far the surface is (on the same side, and no nearer than the bound allows).
@@ -2206,13 +2267,13 @@ impl LevelVolume {
     /// The surface of level `l` as it is now under a plane brush at `on` with normal `n` and radius `r` (see
     /// [`Ground`]): each column marched from `top` along `-n` (or up, where `top` is inside) to the field's first
     /// crossing, no farther down than `bottom` (heights along `n` from `on`).
-    fn ground(&self, l: usize, on: Vec3, n: Vec3, r: f32, top: f32, bottom: f32) -> Ground {
+    fn ground(&self, l: usize, on: Vec3, n: Vec3, r: f32, top: f32, bottom: f32, base: bool) -> Ground {
         let (vx, band) = (self.voxel(l), self.band(l));
         let step = 2.0 * vx;
         let half = (r / step).ceil() as i32 + 1;
         let size = 2 * half + 1;
         let (t1, t2) = n.any_orthonormal_pair();
-        let f = |a: i32, b: i32, u: f32| self.value_at(l, (on + t1 * ((a - half) as f32 * step) + t2 * ((b - half) as f32 * step) + n * u - self.origin) / vx, false);
+        let f = |a: i32, b: i32, u: f32| self.value_at(l, (on + t1 * ((a - half) as f32 * step) + t2 * ((b - half) as f32 * step) + n * u - self.origin) / vx, base);
         let h: Vec<f32> = (0..size * size)
             .into_par_iter()
             .map(|k| {
@@ -2360,12 +2421,49 @@ impl LevelVolume {
             };
             self.modify(l, on, reach, k, true, (n, plane, level + depth), Some(Push { on, n, r, hard }), &weight, &shape)
         } else {
-            let shape = move |p: Vec3| {
+            let band = self.band(l);
+            let flat = move |p: Vec3| {
                 let q = p - on;
                 let u = q.dot(n);
                 (u - plane).max((level - depth) - u).max((q - n * u).length() - r)
             };
-            self.modify(l, on, reach, k, false, (n, level - depth, plane), Some(Push { on, n, r, hard }), &weight, &shape)
+            // Under a brush wide enough for the form to curve away from the plane under it (by more than a band, and
+            // the brush's rings lie more than 0.14 of its radius below its centre on average, where the dab's slab,
+            // 0.35 of the radius deep, begins to leave the rim floating: a stroke seen from far, as wide as the ball,
+            // not a small brush on a bump of its own size), clay lies on the surface as it was when the stroke began,
+            // not on the plane: heights are measured from that surface under each point (see [`Ground`], smoothed to
+            // the brush's scale), so the stroke lays a shell that follows the form instead of a stack of flat discs,
+            // one per dab, each tilted with its own normal, that terrace where they meet; and nothing is laid where
+            // no surface lies under the brush. The two mix by how far the form curves away, so a brush just that
+            // wide shows no seam; under a smaller one the plane is used as it is.
+            let x = ((-base / r - 0.14) / 0.1).clamp(0.0, 1.0);
+            let floor = if x > 0.0 { Some(self.ground(l, on, n, r + 4.0 * self.voxel(l), plane + band, -(2.0 * r + band), true)) } else { None };
+            let (mut low, mut high) = (0.0f32, 0.0f32);
+            if let Some(floor) = &floor {
+                for (i, &h) in floor.h.iter().enumerate() {
+                    let (a, b) = ((i as i32 % floor.size() - floor.half) as f32, (i as i32 / floor.size() - floor.half) as f32);
+                    if h.is_finite() && (a * a + b * b).sqrt() * floor.step <= r {
+                        low = low.min(h);
+                        high = high.max(h);
+                    }
+                }
+            }
+            let x = x.min(((high - low - band) / band).clamp(0.0, 1.0));
+            let follow = x * x * (3.0 - 2.0 * x);
+            if follow <= 0.0 {
+                self.modify(l, on, reach, k, false, (n, level - depth, plane), Some(Push { on, n, r, hard }), &weight, &flat)
+            } else {
+                let mut floor = floor.unwrap();
+                floor.smooth((floor.half / 8).max(1));
+                let shape = move |p: Vec3| {
+                    let q = p - on;
+                    let u = q.dot(n);
+                    let Some(d) = floor.distance_smooth(p) else { return f32::INFINITY };
+                    let d = u + follow * (d - u);
+                    (d - plane).max((level - depth) - d).max((q - n * u).length() - r)
+                };
+                self.modify(l, on, reach, k, false, (n, level - depth + follow * low, plane + follow * high), Some(Push { on, n, r, hard }), &weight, &shape)
+            }
         };
         Some((n, dab))
     }
