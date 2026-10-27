@@ -1351,6 +1351,15 @@ impl LevelVolume {
                     if u < s_lo - margin || u > s_hi + margin {
                         continue;
                     }
+                    // Beyond a plane brush's radius from its axis its weight is nothing: a block whose every sample
+                    // lies there, and every finer level's sample within its cells, changes nothing (the distance from
+                    // the axis moves no faster than the point, and those lie within 4.5 steps of the centre per axis).
+                    if let Some(p) = push {
+                        let q = centre - p.on;
+                        if (q - p.n * q.dot(p.n)).length() >= p.r + 4.5 * vx * 3f32.sqrt() {
+                            continue;
+                        }
+                    }
                     // Far outside the shape, combining changes nothing.
                     let sd = shape(centre);
                     if sd > diag + band {
@@ -1462,6 +1471,15 @@ impl LevelVolume {
                 .filter_map(|&(m, bc)| {
                     let (vm, fband) = (me.voxel(m), me.band(m));
                     let old = me.blocks[m].get(&bc)?;
+                    let corner = origin + (bc * B).as_vec3() * vm;
+                    // A sample already at the band on the side the dab pushes toward (inside for clay) stays there,
+                    // whatever it reads below: the dab moves it no farther than that side's own reading, which the
+                    // clamp brings back to the band. A block with only such samples under the brush (finer work a
+                    // big stroke has buried, under each of its dabs) is left as it is without reading the levels below.
+                    let fill = if carve { fband } else { -fband };
+                    if old.iter().enumerate().all(|(i, &v)| v == fill || weight(corner + cell_of(i).as_vec3() * vm) <= 0.0) {
+                        return None;
+                    }
                     // The levels below over the block, for samples this level holds only clamped.
                     let below: Vec<Grid> = (0..m)
                         .map(|k| {
@@ -1469,7 +1487,6 @@ impl LevelVolume {
                             me.grid(k, (bc * B).div_euclid(d) - IVec3::ONE, (bc * B + B3).div_euclid(d) + IVec3::ONE, false)
                         })
                         .collect();
-                    let corner = origin + (bc * B).as_vec3() * vm;
                     let mut s: Block = Box::new(**old);
                     let mut any = false;
                     for (i, v) in s.iter_mut().enumerate() {
