@@ -864,7 +864,10 @@ fn the_review_sessions_patch_rides_its_big_stroke() {
     for (k, (b, a)) in dots0.iter().zip(dots1.iter()).enumerate() {
         assert!(*a > 0.75 * b, "dot {k} faded: {a:.5} against {b:.5}");
     }
-    assert!(rough1 < 3.5 * rough0, "the surface got rougher: {rough1:.6} against {rough0:.6}");
+    // Held to what it was when the bar was 3.5 times the roughness before (0.000147 then, against an allowance of
+    // 0.000182): the first big stroke's falloff no longer leaves a row of pits over the patch, so the roughness
+    // before is lower (0.000036, from 0.000052) and the ratio no longer measures this stroke alone.
+    assert!(rough1 < 0.00015, "the surface got rougher: {rough1:.6} against {rough0:.6}");
 }
 
 /// By default a coarse clay stroke buries the fine detail under it as much as it adds clay there, as clay does: bumps
@@ -1212,4 +1215,151 @@ fn a_clay_stroke_as_wide_as_the_ball_lays_a_shell_that_follows_it() {
     assert!(most > 0.5 * h, "the stroke built nothing: {most:.4}");
     assert!(most < 1.5 * h, "the stroke piled up beyond its height: {most:.4} against {h:.4}");
     assert!(ripple < 0.3, "the shell is terraced: mean |second difference| {ripple:.4} steps");
+}
+
+/// Far strokes over earlier work (a session's): fine clay dabs over a patch, then overlapping level 0 clay strokes of
+/// mixed width over it, then a small brush and a big one. Prints each stroke's dab cost and blocks changed, the
+/// surface's bumpiness over the patch, and with `SCULPT_PICTURE` a shaded picture of it.
+#[test]
+#[ignore]
+fn far_mixed_strokes_over_fine_work() {
+    let voxel = (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 6);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let at = |a: f32, b: f32| (patch + t1 * a + t2 * b).normalize();
+    let dab = |v: &mut LevelVolume, l: usize, d: Vec3, r: f32, along: &mut Vec3| -> Option<(f64, usize)> {
+        let (hit, n) = v.raycast(d * 3.0, -d, l, true)?;
+        let rough = if *along == Vec3::ZERO { n } else { *along };
+        let (n, s) = v.plane_dab(l, hit, rough, r, r * 0.095, 0.2, 0.4, false)?;
+        *along = if *along == Vec3::ZERO { n } else { (*along * 0.5 + n * 0.5).normalize() };
+        Some((s.ms, s.changed + s.carried))
+    };
+    for i in 0..40 {
+        v.begin_stroke();
+        let mut along = Vec3::ZERO;
+        dab(&mut v, 4, at(-0.06 + 0.003 * i as f32, 0.04 * ((i * 7 % 11) as f32 / 11.0 - 0.5)), 0.006, &mut along);
+        v.end_stroke();
+    }
+    let only: Option<usize> = std::env::var("SCULPT_ONLY").ok().and_then(|s| s.parse().ok());
+    let strokes = [(0.45f32, -0.05f32), (0.25, 0.03), (0.6, -0.02), (0.33, 0.08), (0.18, 0.0), (0.5, 0.05), (0.08, 0.01), (0.7, -0.04)];
+    for (k, &(r, b)) in strokes.iter().enumerate() {
+        if only.is_some_and(|o| o != k) || std::env::var("SCULPT_UPTO").ok().and_then(|s| s.parse::<usize>().ok()).is_some_and(|u| k > u) {
+            continue;
+        }
+        let steps = ((0.4 / (0.15 * r)).ceil() as usize).max(1);
+        v.begin_stroke();
+        let mut along = Vec3::ZERO;
+        let (mut ms, mut most, mut blocks) = (0.0f64, 0.0f64, 0usize);
+        for i in 0..=steps {
+            let a = -0.2 + 0.4 * i as f32 / steps as f32;
+            if let Some((m, n)) = dab(&mut v, 0, at(if k % 2 == 0 { a } else { -a }, b + 0.05 * a), r, &mut along) {
+                ms += m;
+                most = most.max(m);
+                blocks = blocks.max(n);
+            }
+        }
+        let t = std::time::Instant::now();
+        v.end_stroke();
+        eprintln!("stroke {k} r {r}: {} dabs, {:.1} ms a dab (most {most:.1}), up to {blocks} blocks a dab; its end {:.0} ms", steps + 1, ms / (steps + 1) as f64, t.elapsed().as_secs_f64() * 1e3);
+    }
+    let cap = v.levels() - 1;
+    let (half, g) = (0.3f32, 0.5 * voxel);
+    let m = (2.0 * half / g) as usize;
+    let height = |a: f32, b: f32| v.raycast(patch * 4.0 + t1 * a + t2 * b, -patch, cap, false).map_or(f32::NAN, |(q, _)| q.dot(patch));
+    let hts: Vec<f32> = (0..m * m).map(|k| height(-half + g * (k % m) as f32, -half + g * (k / m) as f32)).collect();
+    // Bumpiness: the mean |second difference| in steps, and specks: points where it is over a fifth of a step.
+    let (mut sum, mut cnt, mut specks) = (0.0f64, 0usize, 0usize);
+    for j in 1..m - 1 {
+        for i in 1..m - 1 {
+            let c = hts[j * m + i];
+            let d = (hts[j * m + i - 1] + hts[j * m + i + 1] - 2.0 * c).abs() + (hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 2.0 * c).abs();
+            if d.is_finite() {
+                sum += d as f64;
+                cnt += 1;
+                if d > 0.2 * voxel {
+                    specks += 1;
+                }
+            }
+        }
+    }
+    eprintln!("BUMPS mean |second difference| {:.4} steps; {specks} specks over {cnt} points", sum / cnt as f64 / voxel as f64);
+    // `SCULPT_BUMPS`: the second difference as a picture (grey is flat, a speck is a dark or light dot).
+    if let Ok(path) = std::env::var("SCULPT_BUMPS") {
+        let mut img = vec![128u8; m * m];
+        for j in 1..m - 1 {
+            for i in 1..m - 1 {
+                let d = hts[j * m + i - 1] + hts[j * m + i + 1] + hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 4.0 * hts[j * m + i];
+                img[(m - 1 - j) * m + i] = if d.is_finite() { (128.0 + 400.0 * d / voxel).clamp(0.0, 255.0) as u8 } else { 0 };
+            }
+        }
+        let mut out = format!("P5 {m} {m} 255
+").into_bytes();
+        out.extend(img);
+        std::fs::write(path, out).unwrap();
+    }
+    if let Ok(path) = std::env::var("SCULPT_PICTURE") {
+        let n = 600;
+        let light = (t1 * -0.6 + t2 * 0.8).normalize();
+        let mut img = vec![0u8; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let (a, b) = (-half + 2.0 * half * x as f32 / n as f32, half - 2.0 * half * y as f32 / n as f32);
+                // Shaded by the normal's tilt from the ball's (so only what the strokes made shows), steeply.
+                if let Some((q, nrm)) = v.raycast(patch * 4.0 + t1 * a + t2 * b, -patch, cap, false) {
+                    img[y * n + x] = (128.0 + 250.0 * (nrm - q.normalize()).dot(light)).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+        out.extend(img);
+        std::fs::write(path, out).unwrap();
+    }
+}
+
+/// A wide clay stroke at level 0 whose brush is not quite wide enough to follow the form (radius 0.5 on a ball of 1,
+/// seen from far) leaves no pits along its dabs' rims. Out on its falloff the ball curves away from the brush's plane
+/// and the samples there hold only level 0's bound on their distance; the ground under the brush says how far, and
+/// was taken only when it came within 0.9 of the bound (the bound otherwise), a jump of a tenth of the bound between
+/// neighbouring samples where the ground crossed that line: each dab left a dotted row of pits along its rim (175 over
+/// this window, against none now).
+#[test]
+fn a_wide_clay_strokes_falloff_leaves_no_pits() {
+    let voxel = 0.005f32;
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 2);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let at = |a: f32, b: f32| (patch + t1 * a + t2 * b).normalize();
+    let r = 0.5f32;
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let steps = (0.4 / (0.15 * r)).ceil() as usize;
+    for i in 0..=steps {
+        let a = 0.2 - 0.4 * i as f32 / steps as f32;
+        let Some((hit, n)) = v.raycast(at(a, 0.05 + 0.05 * a) * 3.0, -at(a, 0.05 + 0.05 * a), 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, r * 0.095, 0.2, 0.4, false) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    v.end_stroke();
+    // Heights half a step apart over the window; a pit is a point whose |second difference| is over a fifth of a step.
+    let (half, g) = (0.3f32, 0.5 * voxel);
+    let m = (2.0 * half / g) as usize;
+    let height = |a: f32, b: f32| v.raycast(patch * 4.0 + t1 * a + t2 * b, -patch, 0, false).map_or(f32::NAN, |(q, _)| q.dot(patch));
+    let hts: Vec<f32> = (0..m * m).map(|k| height(-half + g * (k % m) as f32, -half + g * (k / m) as f32)).collect();
+    let (mut cnt, mut pits) = (0usize, 0usize);
+    for j in 1..m - 1 {
+        for i in 1..m - 1 {
+            let c = hts[j * m + i];
+            let d = (hts[j * m + i - 1] + hts[j * m + i + 1] - 2.0 * c).abs() + (hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 2.0 * c).abs();
+            if d.is_finite() {
+                cnt += 1;
+                pits += (d > 0.2 * voxel) as usize;
+            }
+        }
+    }
+    eprintln!("{pits} pits over {cnt} points");
+    assert!(cnt > m * m / 2, "the window missed the surface: {cnt} of {} points", m * m);
+    assert!(pits <= 10, "the stroke's falloff is pitted: {pits} points over a fifth of a step");
 }

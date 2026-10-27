@@ -372,6 +372,35 @@ impl VolumeDemo {
             at(8.0, 2.0, Stroke { tool: Tool::ClayBuildup, size: 159.0, strength: 1.0, path: line((0.65, 0.45), (0.35, 0.65), 0.02, 12) });
             end = 12.0;
         }
+        // `SCULPT_DEMO_SCRIPT=farmix`: fine work, then many overlapping clay strokes of mixed size over it seen from
+        // far, then more clay there with a small brush and a big one (a session's far strokes over earlier detail).
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("farmix") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::at(patch, 1.1)));
+            at(0.2, 1.0, Stroke { tool: Tool::ClayBuildup, size: 45.0, strength: 1.0, path: line((0.36, 0.42), (0.64, 0.44), 0.03, 12) });
+            at(1.4, 1.0, Camera(Pose::at(patch, 0.32)));
+            for k in 0..4 {
+                let y = 0.38 + 0.08 * k as f32;
+                at(2.6 + 0.8 * k as f32, 0.6, Stroke { tool: Tool::TrimDynamic, size: 14.0, strength: 1.0, path: line((0.38, y), (0.62, y + 0.01), 0.004, 10) });
+            }
+            for k in 0..6 {
+                let x = 0.40 + 0.04 * k as f32;
+                at(6.0 + 0.3 * k as f32, 0.2, Stroke { tool: Tool::ClayBuildup, size: 9.0, strength: 1.0, path: line((x, 0.69), (x + 0.002, 0.69), 0.0, 2) });
+            }
+            at(8.0, 1.5, Camera(Pose::at(patch, 3.0)));
+            let mut t = 9.8;
+            for (k, size) in [220.0f32, 120.0, 300.0, 160.0, 90.0, 260.0].into_iter().enumerate() {
+                let y = 0.40 + 0.04 * k as f32;
+                let (a, b) = if k % 2 == 0 { ((0.32, y), (0.66, y + 0.06)) } else { ((0.66, y + 0.03), (0.34, y - 0.02)) };
+                at(t, 1.5, Stroke { tool: Tool::ClayBuildup, size, strength: 1.0, path: line(a, b, 0.02, 12) });
+                t += 2.2;
+            }
+            at(t, 1.5, Stroke { tool: Tool::ClayBuildup, size: 40.0, strength: 1.0, path: line((0.40, 0.48), (0.60, 0.52), 0.01, 12) });
+            t += 2.2;
+            at(t, 1.5, Stroke { tool: Tool::ClayBuildup, size: 380.0, strength: 1.0, path: line((0.38, 0.62), (0.62, 0.60), 0.01, 12) });
+            end = t + 2.5;
+        }
         // `SCULPT_DEMO_SCRIPT=stress`: the stress test's kinds of edits in the app, for looking at the frames: strokes
         // of every size at every level on the form and on layers, layers added, moved between levels, hidden and
         // removed, masks, a generator edited, noise baked, a file round trip, undo and redo, and the camera moving

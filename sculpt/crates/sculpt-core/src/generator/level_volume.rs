@@ -1375,27 +1375,31 @@ impl LevelVolume {
         let ground = if l > 0 { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band, false)) };
         let ground = ground.as_ref();
         // A sample's distance to the surface for the dab to blend from: its value, unless that is only a bound and the
-        // ground under the brush says how far the surface is (on the same side, and no nearer than the bound allows).
-        // Only the bound itself (within what holding it at 16 bits moves it) takes the ground's distance outright: a
-        // sample a dab already blended holds a distance of its own, and the ground can only bring it nearer. Set back
-        // to the surface's distance each dab, a sample the dabs kept past the bound stood still while its neighbours
-        // just under the bound accumulated the dabs', and the mismatch along that line rippled the wall the dabs raise.
+        // ground under the brush says how far the surface is (on the same side, and farther than the bound: a bound
+        // says the surface is at least that far, and the ground's tangent plane comes short of a surface curving away
+        // under it). Only the bound itself (within what holding it at 16 bits moves it) reads the ground: a sample a
+        // dab already blended holds a distance of its own. Set back to the surface's distance each dab, a sample the
+        // dabs kept past the bound stood still while its neighbours just under the bound accumulated the dabs', and
+        // the mismatch along that line rippled the wall the dabs raise. And the choice is continuous in the ground's
+        // distance: taking it only when it came within 0.9 of the bound, and the bound otherwise, jumped by a tenth of
+        // the bound from one sample to the next where the ground crossed that line, out on a wide brush's falloff where
+        // the form curves away from its plane, and every dab there left a row of pits along its rim.
         let tolerance = 0.01 * vx;
         let from_ground = |p: Vec3, v: f32| -> f32 {
             if let Some(g) = ground
-                && v.abs() >= plateau - tolerance
+                && (v.abs() - plateau).abs() <= tolerance
                 && let Some(d) = g.distance(p)
                 && (d < 0.0) == (v < 0.0)
-                && d.abs() >= 0.9 * v.abs()
+                && d.abs() > v.abs()
             {
-                return if v.abs() <= plateau + tolerance { d } else if d.abs() < v.abs() { d } else { v };
+                return d;
             }
             v
         };
         // New samples for each candidate, worked out in parallel from the field as it is.
         let origin = self.origin;
         let me = &*self;
-        let built: Vec<(IVec3, Block, Block, SignMask)> = cand
+        let built: Vec<(IVec3, Stored, Stored, SignMask)> = cand
             .par_iter()
             .filter_map(|&bc| {
                 let old = me.block_values(l, bc, false);
@@ -1428,7 +1432,8 @@ impl LevelVolume {
                         any = true;
                     }
                 }
-                any.then_some((bc, s, d, flips))
+                // Made shared here, in parallel: a wide dab at level 0 changes thousands of blocks.
+                any.then(|| (bc, Stored::from(s), Stored::from(d), flips))
             })
             .collect();
         // Unless the finer detail is kept (carried), the finer levels under the dab take it as their own: each of their
@@ -1518,10 +1523,16 @@ impl LevelVolume {
             if !self.blocks[l].contains_key(&bc) {
                 stats.created += 1;
             }
-            self.put(l, bc, s);
-            let total = Arc::make_mut(self.carry.get_or_insert_with(bc, || Arc::new([0.0; N])));
-            for (t, x) in total.iter_mut().zip(d.iter()) {
-                *t += x;
+            self.put_stored(l, bc, s);
+            match self.carry.get_mut(&bc) {
+                Some(total) => {
+                    for (t, x) in Arc::make_mut(total).iter_mut().zip(d.iter()) {
+                        *t += x;
+                    }
+                }
+                None => {
+                    self.carry.insert(bc, d);
+                }
             }
             self.recent.insert(bc);
             changed.push(bc);
