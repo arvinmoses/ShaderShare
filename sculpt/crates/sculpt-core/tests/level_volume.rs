@@ -1030,7 +1030,7 @@ fn measure_steps_under_a_big_stroke() {
                 let mut worst = 0.0f32;
                 for i in 0..21 {
                     for j in 0..21 {
-                        let p = patch + t1 * (-0.06 + 0.006 * i as f32) + t2 * (-0.06 + 0.006 * j as f32);
+                        let p = patch + t1 * (-0.2 + 0.02 * i as f32) + t2 * (-0.2 + 0.02 * j as f32);
                         let (a, b) = (h(v, p, 5), h(v, p, l));
                         if a.is_finite() && b.is_finite() {
                             worst = worst.max((a - b).abs());
@@ -1039,14 +1039,14 @@ fn measure_steps_under_a_big_stroke() {
                 }
                 worst
             };
-            for l in [1usize, 2] {
-                let r = if l == 1 { 0.12 } else { 0.06 };
+            for l in [0usize, 1, 2] {
+                let r = [0.4f32, 0.12, 0.06][l];
                 let before = gap(&v, l);
                 v.begin_stroke();
                 let mut along = Vec3::ZERO;
                 let mut mid = 0.0f32;
                 for i in 0..14 {
-                    dab(&mut v, l, at(-0.05 + 0.008 * i as f32, 0.0), r, trim, &mut along);
+                    dab(&mut v, l, at(-0.15 + 0.022 * i as f32, 0.0), r, trim, &mut along);
                     mid = mid.max(gap(&v, l));
                 }
                 v.end_stroke();
@@ -1054,4 +1054,45 @@ fn measure_steps_under_a_big_stroke() {
             }
         }
     }
+}
+
+/// A fresh 1M-triangle ball and one wide clay stroke at level 0 (the app's first stroke), as a shaded picture of the
+/// result (a PGM at `SCULPT_PICTURE`): its rim should be as smooth as the brush's own falloff.
+#[test]
+#[ignore]
+fn picture_a_wide_clay_stroke_on_a_fresh_ball() {
+    let Ok(path) = std::env::var("SCULPT_PICTURE") else { return };
+    let voxel = (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 6);
+    let r: f32 = std::env::var("SCULPT_R").ok().and_then(|s| s.parse().ok()).unwrap_or(0.4);
+    let patch = Vec3::new(0.0, 0.3, 1.0).normalize();
+    let (t1, _) = patch.any_orthonormal_pair();
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let steps: usize = std::env::var("SCULPT_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    for i in 0..=steps {
+        let d = (patch + t1 * (-0.6 + 1.2 * i as f32 / steps as f32)).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, r * 0.095, 0.2, 0.4, false) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    v.end_stroke();
+    let w = patch;
+    let u = w.any_orthonormal_vector();
+    let t = w.cross(u);
+    let (n, half) = (800, 0.8f32);
+    let mut img = vec![0u8; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let (a, b) = (-half + 2.0 * half * x as f32 / n as f32, half - 2.0 * half * y as f32 / n as f32);
+            if let Some((_, nrm)) = v.raycast(w * 4.0 + u * a + t * b, -w, 0, false) {
+                img[y * n + x] = (35.0 + 220.0 * nrm.dot((w * 0.8 + u * -0.4 + t * 0.5).normalize()).max(0.0)) as u8;
+            }
+        }
+    }
+    let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+    out.extend(img);
+    std::fs::write(path, out).unwrap();
 }
