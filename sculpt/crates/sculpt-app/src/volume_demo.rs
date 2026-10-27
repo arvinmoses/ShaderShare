@@ -361,6 +361,17 @@ impl VolumeDemo {
             at(13.0, 3.0, Stroke { tool: Tool::ClayBuildup, size: 120.0, strength: 0.8, path: line((0.35, 0.45), (0.65, 0.50), 0.01, 14) });
             end = 17.0;
         }
+        // `SCULPT_DEMO_SCRIPT=far`: wide clay strokes seen from far, one over another (the app's first strokes), with a
+        // pause after each so the frames show what the stroke landed as.
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("far") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::whole(7.2, 0.2, 0.2)));
+            at(0.3, 2.0, Stroke { tool: Tool::ClayBuildup, size: 159.0, strength: 1.0, path: line((0.30, 0.55), (0.62, 0.50), 0.02, 12) });
+            at(4.0, 2.0, Stroke { tool: Tool::ClayBuildup, size: 159.0, strength: 1.0, path: line((0.35, 0.40), (0.68, 0.62), 0.02, 12) });
+            at(8.0, 2.0, Stroke { tool: Tool::ClayBuildup, size: 159.0, strength: 1.0, path: line((0.65, 0.45), (0.35, 0.65), 0.02, 12) });
+            end = 12.0;
+        }
         // `SCULPT_DEMO_SCRIPT=stress`: the stress test's kinds of edits in the app, for looking at the frames: strokes
         // of every size at every level on the form and on layers, layers added, moved between levels, hidden and
         // removed, masks, a generator edited, noise baked, a file round trip, undo and redo, and the camera moving
