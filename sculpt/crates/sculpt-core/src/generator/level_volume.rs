@@ -3425,33 +3425,37 @@ impl LevelVolume {
         Some(named)
     }
 
-    /// [`Self::upload_set_in`] a changed block at a time, as it was first written: the reference the chunked one is
-    /// tested against.
+    /// [`Self::upload_set_in`] worked out plainly: the reference the chunked one is tested against. At each changed
+    /// block's level, it and the seven blocks below it; and the finer blocks under those, level by level, whose box
+    /// meets the box of any changed block of that level (grown by a sample), listed where a block above them is missing.
+    /// (Descending from each changed block's own blocks alone, as this first did, missed a finer block under the
+    /// blocks below one changed block that meets the box of another next to it, which the chunked one finds.)
     #[doc(hidden)]
     pub fn upload_set_in_reference(&self, changed: &[Key], v: &Show) -> Vec<Key> {
-        let mut v: Vec<Key> = changed.par_iter().flat_map_iter(|&(l8, bc)| {
-            let mut out: Vec<Key> = Vec::new();
-            let l = l8 as usize;
-            if l >= self.levels() {
-                return out;
+        let mut out: Vec<Key> = Vec::new();
+        for l in 0..self.levels() {
+            let at_l: Vec<IVec3> = changed.iter().filter(|k| k.0 as usize == l).map(|k| k.1).collect();
+            if at_l.is_empty() {
+                continue;
             }
-            for o in 0..8 {
-                let n = bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1);
-                if self.shows(v, l, n) {
-                    out.push((l8, n));
-                }
-            }
-            let (rlo, rhi) = (bc * B - IVec3::ONE, bc * B + IVec3::splat(B + 1));
-            let mut frontier: Vec<IVec3> = (0..8).map(|o| bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1)).collect();
+            let mut frontier: Vec<IVec3> = at_l.iter().flat_map(|&bc| (0..8).map(move |o| bc - IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1))).collect();
+            frontier.sort_unstable_by_key(|v| (v.z, v.y, v.x));
+            frontier.dedup();
+            out.extend(frontier.iter().filter(|&&n| self.shows(v, l, n)).map(|&n| (l as u8, n)));
             for m in l + 1..self.levels() {
                 let s = 1i32 << (m - l);
-                let (flo, fhi) = (rlo * s, rhi * s);
+                let meets = |c: IVec3| {
+                    let (clo, chi) = (c * B, c * B + B3);
+                    at_l.iter().any(|&bc| {
+                        let (flo, fhi) = ((bc * B - IVec3::ONE) * s, (bc * B + IVec3::splat(B + 1)) * s);
+                        !(chi.cmplt(flo).any() || clo.cmpgt(fhi).any())
+                    })
+                };
                 let mut next = Vec::new();
                 for p in &frontier {
                     for q in 0..8 {
                         let c = *p * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
-                        let (clo, chi) = (c * B, c * B + B3);
-                        if chi.cmplt(flo).any() || clo.cmpgt(fhi).any() || !self.shows(v, m, c) {
+                        if !self.shows(v, m, c) || !meets(c) {
                             continue;
                         }
                         if (1..8).any(|o| !self.shows(v, m, c + IVec3::new(o & 1, (o >> 1) & 1, o >> 2 & 1))) {
@@ -3467,11 +3471,10 @@ impl LevelVolume {
                 next.dedup();
                 frontier = next;
             }
-            out
-        }).collect();
-        v.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
-        v.dedup();
-        v
+        }
+        out.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        out.dedup();
+        out
     }
 
     /// [`Self::extract_set_where`] a changed block at a time, as it was first written: the reference the chunked one
