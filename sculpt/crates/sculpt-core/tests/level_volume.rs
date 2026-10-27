@@ -998,3 +998,60 @@ fn a_big_clay_stroke_keeps_unit_slope_beyond_level_zeros_measured_distances() {
         assert!(low * 20 < total, "{name}: {low} of {total} samples near the new surface have a slope under 0.75: {h:?}");
     }
 }
+
+/// How far the finest level's surface stands from the stroke's own level's, over the brush: a stale piece of old
+/// surface left standing on the trimmed ground (or a ledge under clay) reads as a big gap, and fine work as a small one.
+#[test]
+#[ignore]
+fn measure_steps_under_a_big_stroke() {
+    for keep in [false, true] {
+        for trim in [true, false] {
+            let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 6);
+            v.keep_detail = keep;
+            let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+            let (t1, t2) = patch.any_orthonormal_pair();
+            let at = |a: f32, b: f32| (patch + t1 * a + t2 * b).normalize();
+            let dab = |v: &mut LevelVolume, l: usize, d: Vec3, r: f32, trim: bool, along: &mut Vec3| {
+                let Some((hit, n)) = v.raycast(d * 3.0, -d, l, true) else { return };
+                let rough = if *along == Vec3::ZERO { n } else { *along };
+                if let Some((n, _)) = v.plane_dab(l, hit, rough, r, r * if trim { 0.075 } else { 0.095 }, 0.3, 0.4, trim) {
+                    *along = if *along == Vec3::ZERO { n } else { (*along * 0.5 + n * 0.5).normalize() };
+                }
+            };
+            // Fine work: level 4 clay dabs scattered over the patch.
+            for i in 0..40 {
+                v.begin_stroke();
+                let mut along = Vec3::ZERO;
+                dab(&mut v, 4, at(-0.06 + 0.003 * i as f32, 0.04 * ((i * 7 % 11) as f32 / 11.0 - 0.5)), 0.006, false, &mut along);
+                v.end_stroke();
+            }
+            let h = |v: &LevelVolume, p: Vec3, cap: usize| v.raycast(p + patch * 2.0, -patch, cap, false).map_or(f32::NAN, |(q, _)| q.dot(patch));
+            let gap = |v: &LevelVolume, l: usize| {
+                let mut worst = 0.0f32;
+                for i in 0..21 {
+                    for j in 0..21 {
+                        let p = patch + t1 * (-0.06 + 0.006 * i as f32) + t2 * (-0.06 + 0.006 * j as f32);
+                        let (a, b) = (h(v, p, 5), h(v, p, l));
+                        if a.is_finite() && b.is_finite() {
+                            worst = worst.max((a - b).abs());
+                        }
+                    }
+                }
+                worst
+            };
+            for l in [1usize, 2] {
+                let r = if l == 1 { 0.12 } else { 0.06 };
+                let before = gap(&v, l);
+                v.begin_stroke();
+                let mut along = Vec3::ZERO;
+                let mut mid = 0.0f32;
+                for i in 0..14 {
+                    dab(&mut v, l, at(-0.05 + 0.008 * i as f32, 0.0), r, trim, &mut along);
+                    mid = mid.max(gap(&v, l));
+                }
+                v.end_stroke();
+                eprintln!("keep {keep} trim {trim} level {l}: gap to the stroke's level before {before:.4}, worst during {mid:.4}, after {:.4}", gap(&v, l));
+            }
+        }
+    }
+}

@@ -344,6 +344,23 @@ impl VolumeDemo {
             at(33.5, 5.0, Camera(Pose::at(patch, 0.5)));
             end = 39.0;
         }
+        // `SCULPT_DEMO_SCRIPT=trim`: fine work, then wide Trim Dynamic and clay strokes over it, slowly, so frames show
+        // a stroke while it is still being drawn (the preview) and after it ends.
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("trim") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::at(patch, 0.7)));
+            at(0.2, 1.2, Stroke { tool: Tool::ClayBuildup, size: 120.0, strength: 1.0, path: line((0.30, 0.40), (0.70, 0.44), 0.03, 12) });
+            at(1.6, 1.2, Stroke { tool: Tool::ClayBuildup, size: 60.0, strength: 1.0, path: line((0.30, 0.55), (0.70, 0.58), 0.03, 12) });
+            for k in 0..3 {
+                let y = 0.35 + 0.1 * k as f32;
+                at(3.0 + 0.8 * k as f32, 0.6, Stroke { tool: Tool::TrimDynamic, size: 20.0, strength: 1.0, path: line((0.35, y), (0.65, y + 0.01), 0.004, 10) });
+            }
+            at(6.0, 3.0, Stroke { tool: Tool::TrimDynamic, size: 120.0, strength: 0.8, path: line((0.35, 0.50), (0.65, 0.52), 0.01, 14) });
+            at(9.5, 3.0, Stroke { tool: Tool::TrimDynamic, size: 80.0, strength: 0.8, path: line((0.35, 0.40), (0.65, 0.62), 0.01, 14) });
+            at(13.0, 3.0, Stroke { tool: Tool::ClayBuildup, size: 120.0, strength: 0.8, path: line((0.35, 0.45), (0.65, 0.50), 0.01, 14) });
+            end = 17.0;
+        }
         // `SCULPT_DEMO_SCRIPT=stress`: the stress test's kinds of edits in the app, for looking at the frames: strokes
         // of every size at every level on the form and on layers, layers added, moved between levels, hidden and
         // removed, masks, a generator edited, noise baked, a file round trip, undo and redo, and the camera moving
