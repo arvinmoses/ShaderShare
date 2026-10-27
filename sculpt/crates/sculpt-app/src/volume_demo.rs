@@ -401,6 +401,28 @@ impl VolumeDemo {
             at(t, 1.5, Stroke { tool: Tool::ClayBuildup, size: 380.0, strength: 1.0, path: line((0.38, 0.62), (0.62, 0.60), 0.01, 12) });
             end = t + 2.5;
         }
+        // `SCULPT_DEMO_SCRIPT=pits`: many wide clay strokes at the default strength seen from far, scrubbed back and
+        // forth over one another and ending on earlier ones, then a close look at the smooth surface they built.
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("pits") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::at(patch, 3.0)));
+            let mut t = 0.3;
+            for k in 0..14 {
+                let f = k as f32;
+                let size = 170.0 + 30.0 * ((f * 1.7).sin() + 1.0);
+                let (x0, y0) = (0.38 + 0.08 * (f * 2.3).sin(), 0.42 + 0.08 * (f * 1.1).cos());
+                let (x1, y1) = (0.62 + 0.08 * (f * 0.7).cos(), 0.58 + 0.08 * (f * 2.9).sin());
+                let mut path = line((x0, y0), (x1, y1), 0.0, 8);
+                path.extend(line((x1, y1), (x0 + 0.05, y0 + 0.03), 0.0, 8));
+                path.extend(line((x0 + 0.05, y0 + 0.03), (0.5 * (x0 + x1), 0.5 * (y0 + y1)), 0.0, 4));
+                at(t, 1.5, Stroke { tool: Tool::ClayBuildup, size, strength: 0.4, path });
+                t += 1.8;
+            }
+            at(t, 1.0, Camera(Pose::at(patch, 1.6)));
+            at(t + 1.5, 1.0, Camera(Pose::at((patch + Vec3::new(0.25, 0.1, -0.1)).normalize(), 1.2)));
+            end = t + 3.0;
+        }
         // `SCULPT_DEMO_SCRIPT=stress`: the stress test's kinds of edits in the app, for looking at the frames: strokes
         // of every size at every level on the form and on layers, layers added, moved between levels, hidden and
         // removed, masks, a generator edited, noise baked, a file round trip, undo and redo, and the camera moving

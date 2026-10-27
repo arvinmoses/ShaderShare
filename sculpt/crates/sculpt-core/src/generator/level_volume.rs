@@ -2668,9 +2668,15 @@ impl LevelVolume {
     /// Make the touched blocks' samples distances again. Plane brushes move samples part of the way to a shape, so deep
     /// inside clay a stroke built up, or far above what it cut, values stay near zero instead of growing with the
     /// distance to the surface; the sign is right, but anything that reads distances (carrying detail, moving form down
-    /// a level, the next brush's plane) would be misled. Samples next to the surface keep their values, so the surface
-    /// does not move; every other sample becomes its distance to the nearest crossing of the surface with the lattice,
-    /// within the band.
+    /// a level, the next brush's plane) would be misled. Samples next to the surface (a neighbour along an axis on the
+    /// other side) keep their values, so the surface does not move; every other sample becomes its distance to the
+    /// surface those samples place, within the band: the solution of `|grad d| = 1` grown out from them (swept across
+    /// the block and the samples around it, as narrow-band level sets are re-initialised). That distance is smooth from
+    /// sample to sample, as it must be: a later stroke moves the surface onto what are now samples a few steps off it,
+    /// and its blends start from their values. Taken instead as the distance to the nearest point where the surface
+    /// crossed a lattice edge, each was off by its own part of the crossings' spacing (up to half a step, too far), and
+    /// a stroke raising the surface a couple of steps over earlier clay brought that grain up as scattered pits, and as
+    /// a broken stair along an earlier stroke's wall.
     /// With `near_too`, the samples next to the surface become distances as well (see below); otherwise they keep
     /// their values, which place the surface.
     fn redistance(&mut self, touched: &[Key], near_too: bool) {
@@ -2680,58 +2686,31 @@ impl LevelVolume {
                 continue;
             }
             let (vx, band) = (self.voxel(l), self.band(l));
-            // Crossings within a few steps: deeper samples get that far as a lower bound (the plateau), which is all
+            // Distances within a few steps: deeper samples get that far as a lower bound (the plateau), which is all
             // anything here reads them for (steps toward the surface; a plane dab reads the ground under the brush
-            // instead, see [`Ground`]), and the search stays small for level 0's wide band.
+            // instead, see [`Ground`]), and the sweep stays small for level 0's wide band.
             let reach = Self::redistance_reach(vx, band);
+            let cap = (band / vx).min(reach as f32);
             let me = &*self;
             let fixed: Vec<(IVec3, Block)> = blocks
                 .par_iter()
                 .filter_map(|&bc| {
                     let lo = bc * B - IVec3::splat(reach.max(1));
                     let g = me.grid(l, lo, bc * B + IVec3::splat(B - 1 + reach.max(1)), false);
-                    // Where the surface crosses the lattice's edges, in lattice units.
-                    let mut crossings: Vec<Vec3> = Vec::new();
-                    for z in 0..g.n.z {
-                        for y in 0..g.n.y {
-                            for x in 0..g.n.x {
-                                let i = lo + IVec3::new(x, y, z);
-                                let a = g.at(i);
-                                for (axis, inside) in [(0, x + 1 < g.n.x), (1, y + 1 < g.n.y), (2, z + 1 < g.n.z)] {
-                                    if !inside {
-                                        continue;
-                                    }
-                                    let mut j = i;
-                                    j[axis] += 1;
-                                    let b = g.at(j);
-                                    if (a < 0.0) != (b < 0.0) {
-                                        crossings.push(i.as_vec3().lerp(j.as_vec3(), a / (a - b)));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let hi = lo + g.n - IVec3::ONE;
-                    let old = &me.blocks[l][&bc];
-                    let mut s: Block = Box::new(**old);
-                    let mut any = false;
-                    for (i, v) in s.iter_mut().enumerate() {
-                        let p = bc * B + cell_of(i);
+                    let n = g.n;
+                    let hi = lo + n - IVec3::ONE;
+                    let at = |q: IVec3| ((q.z * n.y + q.y) * n.x + q.x) as usize;
+                    let len = (n.x * n.y * n.z) as usize;
+                    // A sample's distance (in steps) to the plane through where the surface crosses its own lattice
+                    // edges: the intercepts along each axis that crosses, one over the root of the sum of their
+                    // inverse squares. Where one axis crosses, both ends of the edge keep their crossing exactly;
+                    // elsewhere it moves by what the plane model is off, a grain at the sample's scale, which is why
+                    // it is taken only with `near_too`, where moving form down a level left the field compressed
+                    // around its surface (carried detail reading that a step or two off the old surface came out as a
+                    // lattice of dips). No gradient is used: the field's gradient is no guide to the surface's normal
+                    // inside fresh clay. Infinite for a sample with no crossing edge.
+                    let intercept = |p: IVec3| -> f32 {
                         let a = g.at(p);
-                        // A sample next to the surface, when asked for: its distance to the plane through the
-                        // crossings on its own lattice edges (the intercepts along each axis that crosses, one over
-                        // the root of the sum of their inverse squares). Where one axis crosses, both ends of the
-                        // edge keep their crossing exactly; elsewhere it moves by what the plane model is off, a
-                        // grain at the sample's scale, which is why it is done only where moving form down a level
-                        // left the field compressed around its surface (carried detail reading that a step or two
-                        // off the old surface came out as a lattice of dips). No gradient is used: the field's
-                        // gradient is no guide to the surface's normal inside fresh clay. Every other sample takes
-                        // its distance to the nearest crossing point, at most half the crossings' spacing too far.
-                        let pf = p.as_vec3();
-                        let near = (0..27).any(|q| q != 13 && (g.at(p + IVec3::new(q % 3 - 1, (q / 3) % 3 - 1, q / 9 - 1)) < 0.0) != (a < 0.0));
-                        if near && !near_too {
-                            continue;
-                        }
                         let mut inv2 = 0.0f32;
                         for axis in 0..3 {
                             let mut t_near = f32::INFINITY;
@@ -2750,14 +2729,86 @@ impl LevelVolume {
                                 inv2 += 1.0 / (t_near * t_near).max(1e-12);
                             }
                         }
-                        let d = if inv2 > 0.0 {
-                            vx / inv2.sqrt()
-                        } else {
-                            let d2 = crossings.iter().map(|c| c.distance_squared(pf)).fold(f32::INFINITY, f32::min);
-                            if d2.is_finite() { d2.sqrt() * vx } else { band }
-                        };
-                        let d = d.min(band).min(reach as f32 * vx);
-                        let next = if a < 0.0 { -d } else { d };
+                        if inv2 > 0.0 { 1.0 / inv2.sqrt() } else { f32::INFINITY }
+                    };
+                    // The samples next to the surface seed the distances, with their own values (or with `near_too`,
+                    // their distances to the plane through their crossings); every other sample starts at the cap.
+                    let mut d = vec![cap; len];
+                    let mut seed = vec![false; len];
+                    let mut any_seed = false;
+                    for z in 0..n.z {
+                        for y in 0..n.y {
+                            for x in 0..n.x {
+                                let q = IVec3::new(x, y, z);
+                                let t = intercept(lo + q);
+                                if t.is_finite() {
+                                    let k = at(q);
+                                    seed[k] = true;
+                                    any_seed = true;
+                                    d[k] = if near_too { t } else { g.at(lo + q).abs() / vx }.min(cap);
+                                }
+                            }
+                        }
+                    }
+                    if any_seed {
+                        // Fast sweeping: the upwind solution of |grad d| = 1 (exact for a plane), swept once in each of
+                        // the eight orders of the axes' directions (a second round changes nothing that shows).
+                        for _ in 0..1 {
+                            for o in 0..8 {
+                                let (sx, sy, sz) = (o & 1 == 1, o & 2 == 2, o & 4 == 4);
+                                for zi in 0..n.z {
+                                    let z = if sz { n.z - 1 - zi } else { zi };
+                                    for yi in 0..n.y {
+                                        let y = if sy { n.y - 1 - yi } else { yi };
+                                        for xi in 0..n.x {
+                                            let x = if sx { n.x - 1 - xi } else { xi };
+                                            let q = IVec3::new(x, y, z);
+                                            let k = at(q);
+                                            if seed[k] {
+                                                continue;
+                                            }
+                                            let least = |axis: usize| -> f32 {
+                                                let mut m = f32::INFINITY;
+                                                for dir in [-1, 1] {
+                                                    let mut j = q;
+                                                    j[axis] += dir;
+                                                    if j[axis] >= 0 && j[axis] < n[axis] {
+                                                        m = m.min(d[at(j)]);
+                                                    }
+                                                }
+                                                m
+                                            };
+                                            let mut a = [least(0), least(1), least(2)];
+                                            a.sort_unstable_by(f32::total_cmp);
+                                            let mut u = a[0] + 1.0;
+                                            if u > a[1] {
+                                                u = 0.5 * (a[0] + a[1] + (2.0 - (a[0] - a[1]) * (a[0] - a[1])).max(0.0).sqrt());
+                                                if u > a[2] {
+                                                    let s = a[0] + a[1] + a[2];
+                                                    let disc = s * s - 3.0 * (a[0] * a[0] + a[1] * a[1] + a[2] * a[2] - 1.0);
+                                                    u = (s + disc.max(0.0).sqrt()) / 3.0;
+                                                }
+                                            }
+                                            if u < d[k] {
+                                                d[k] = u;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let old = &me.blocks[l][&bc];
+                    let mut s: Block = Box::new(**old);
+                    let mut any = false;
+                    for (i, v) in s.iter_mut().enumerate() {
+                        let p = bc * B + cell_of(i);
+                        let k = at(p - lo);
+                        if seed[k] && !near_too {
+                            continue;
+                        }
+                        let dist = (d[k] * vx).min(band);
+                        let next = if g.at(p) < 0.0 { -dist } else { dist };
                         if next != *v {
                             *v = next;
                             any = true;

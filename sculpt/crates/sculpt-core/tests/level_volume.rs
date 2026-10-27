@@ -1363,3 +1363,175 @@ fn a_wide_clay_strokes_falloff_leaves_no_pits() {
     assert!(cnt > m * m / 2, "the window missed the surface: {cnt} of {} points", m * m);
     assert!(pits <= 10, "the stroke's falloff is pitted: {pits} points over a fifth of a step");
 }
+
+/// Level 0 samples between `lo` and `hi` steps from the surface (by their values) that stand out from their neighbours
+/// along all three axes, each second difference past `by` steps the same way (a sample off by its own amount), and how
+/// many samples were looked at.
+fn grain(v: &LevelVolume, lo: f32, hi: f32, by: f32) -> (usize, usize) {
+    use glam::IVec3;
+    let vx = v.voxel(0);
+    let (mut odd, mut all) = (0, 0);
+    for bc in v.level_keys(0) {
+        let b = v.block((0, bc)).unwrap();
+        for (k, &s) in b.iter().enumerate() {
+            if s.abs() < lo * vx || s.abs() > hi * vx {
+                continue;
+            }
+            all += 1;
+            let i = bc * 8 + IVec3::new((k % 8) as i32, ((k / 8) % 8) as i32, (k / 64) as i32);
+            let second = [IVec3::X, IVec3::Y, IVec3::Z].map(|d| (v.sample(0, i + d, false) + v.sample(0, i - d, false) - 2.0 * s) / vx);
+            if second.iter().all(|&x| x < -by) || second.iter().all(|&x| x > by) {
+                odd += 1;
+            }
+        }
+    }
+    (odd, all)
+}
+
+/// A clay stroke at level 0 at the app's default strength (seen from far) along the polyline `path` (offsets along the
+/// patch's tangents), its dabs spaced as the app spaces them.
+fn far_clay_stroke(v: &mut LevelVolume, patch: Vec3, path: &[(f32, f32)], r: f32, hardness: f32) {
+    let (t1, t2) = patch.any_orthonormal_pair();
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let mut pts = vec![path[0]];
+    for w in path.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let steps = ((((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() / (0.15 * r)).ceil() as usize).max(1);
+        pts.extend((1..=steps).map(|i| (a.0 + (b.0 - a.0) * i as f32 / steps as f32, a.1 + (b.1 - a.1) * i as f32 / steps as f32)));
+    }
+    for (x, y) in pts {
+        let d = (patch + t1 * x + t2 * y).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        // Strength 0.4: a height of 0.047 of the radius, 0.22 of the way each dab.
+        if let Some((n, _)) = v.plane_dab(0, hit, rough, r, r * 0.047, hardness, 0.22, false) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    v.end_stroke();
+}
+
+/// A wide clay stroke over an earlier one (at level 0, seen from far) brings up no grain. The stroke's end makes the
+/// samples off the surface distances again; measured to the nearest point where the surface crossed a lattice edge,
+/// each was off by its own part of the crossings' spacing, up to half a step. That grain lay off the surface unseen
+/// (236 samples standing out from their neighbours along all three axes here, against 6 now) until the next stroke
+/// raised the surface onto it, where each such sample shades as a star-shaped pit or bump (455 at the surface after
+/// the second stroke here, against 3 now). `SCULPT_PICTURE` writes the surface, flat shaded.
+#[test]
+fn a_clay_stroke_over_earlier_clay_brings_up_no_grain() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 2);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    far_clay_stroke(&mut v, patch, &[(-0.3, -0.1), (0.3, 0.1)], 0.5, 0.5);
+    let (off, looked) = grain(&v, 1.5, 5.0, 0.3);
+    eprintln!("after the first stroke, {off} of {looked} samples off the surface stand out");
+    assert!(looked > 100_000, "too few samples off the surface: {looked}");
+    assert!(off <= 25, "the field off the surface is grainy: {off} samples stand out");
+    far_clay_stroke(&mut v, patch, &[(-0.3, 0.05), (0.3, -0.05)], 0.5, 0.5);
+    let (on, looked) = grain(&v, 0.0, 1.5, 0.3);
+    eprintln!("after the second, {on} of {looked} samples at the surface stand out");
+    if let Ok(path) = std::env::var("SCULPT_PICTURE") {
+        mesh_picture(&v, 0, patch, 0.3, 900, &path);
+    }
+    assert!(on <= 30, "the second stroke brought up grain: {on} samples at the surface stand out");
+}
+
+/// The extracted surface (levels up to `cap`) seen straight down `-w` over a square `half` across around `w`, flat
+/// shaded with a grazing light (each face its own shade), as an `n` by `n` PGM at `path`.
+fn mesh_picture(v: &LevelVolume, cap: usize, w: Vec3, half: f32, n: usize, path: &str) {
+    let (mesh, _) = v.surface(cap);
+    let (u, t) = w.any_orthonormal_pair();
+    let light = (w * 0.45 + u * 0.7 + t * 0.55).normalize();
+    let mut depth = vec![f32::NEG_INFINITY; n * n];
+    let mut img = vec![0u8; n * n];
+    let px = |p: Vec3| ((p.dot(u) + half) / (2.0 * half) * n as f32, (half - p.dot(t)) / (2.0 * half) * n as f32, p.dot(w));
+    for f in &mesh.faces {
+        let nrm = sculpt_core::mesh::face_normal(&mesh.positions, f).normalize_or_zero();
+        if nrm.dot(w) <= 0.0 {
+            continue;
+        }
+        let shade = (30.0 + 225.0 * nrm.dot(light).max(0.0)) as u8;
+        for tri in sculpt_core::mesh::face_triangles(f) {
+            let [a, b, c] = tri.map(|i| px(mesh.positions[i as usize]));
+            let (x0, x1) = (a.0.min(b.0).min(c.0).floor().max(0.0) as i32, a.0.max(b.0).max(c.0).ceil().min(n as f32 - 1.0) as i32);
+            let (y0, y1) = (a.1.min(b.1).min(c.1).floor().max(0.0) as i32, a.1.max(b.1).max(c.1).ceil().min(n as f32 - 1.0) as i32);
+            let area = (b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1);
+            if area.abs() < 1e-12 {
+                continue;
+            }
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let (sx, sy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let l1 = ((b.0 - sx) * (c.1 - sy) - (c.0 - sx) * (b.1 - sy)) / area;
+                    let l2 = ((c.0 - sx) * (a.1 - sy) - (a.0 - sx) * (c.1 - sy)) / area;
+                    let l3 = 1.0 - l1 - l2;
+                    if l1 < 0.0 || l2 < 0.0 || l3 < 0.0 {
+                        continue;
+                    }
+                    let z = l1 * a.2 + l2 * b.2 + l3 * c.2;
+                    let k = y as usize * n + x as usize;
+                    if z > depth[k] {
+                        depth[k] = z;
+                        img[k] = shade;
+                    }
+                }
+            }
+        }
+    }
+    let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+    out.extend(img);
+    std::fs::write(path, out).unwrap();
+    // And as the app shades it, by the field's gradient where the field's own surface lies (`path` with `.grad.pgm`).
+    let h = 0.02 * v.voxel(0);
+    let mut img = vec![0u8; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let (a, b) = (-half + 2.0 * half * (x as f32 + 0.5) / n as f32, half - 2.0 * half * (y as f32 + 0.5) / n as f32);
+            if let Some((q, _)) = v.raycast(w * 4.0 + u * a + t * b, -w, cap, false) {
+                let d = |o: Vec3| v.value_upto(q + o, cap, false) - v.value_upto(q - o, cap, false);
+                let nrm = Vec3::new(d(Vec3::X * h), d(Vec3::Y * h), d(Vec3::Z * h)).normalize_or_zero();
+                img[y * n + x] = (30.0 + 225.0 * nrm.dot(light).max(0.0)) as u8;
+            }
+        }
+    }
+    let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+    out.extend(img);
+    std::fs::write(format!("{path}.grad.pgm"), out).unwrap();
+}
+
+/// Many overlapping wide clay strokes at level 0 (seen from far, radius `SCULPT_RS` steps, 120 by default), scrubbed
+/// back and forth, some ending on earlier ones, at the app's default strength and hardness `SCULPT_HARD` (0.5): after
+/// each, the samples at the surface that stand out from their neighbours. `SCULPT_N` strokes (10); `SCULPT_PICTURE`
+/// writes the surface at the end, flat shaded, over `SCULPT_WIN=a,b,half` (offsets along the patch's tangents).
+#[test]
+#[ignore]
+fn far_scrubbed_clay_strokes() {
+    let voxel = (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 6);
+    let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
+    let (hard, count, base_r) = (env("SCULPT_HARD", 0.5), env("SCULPT_N", 10.0) as usize, env("SCULPT_RS", 120.0));
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let mut rng = 12345u32;
+    let mut rand = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        (rng as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    for k in 0..count {
+        let r = voxel * (base_r + base_r / 6.0 * rand());
+        let (a, b) = ((0.2 * rand(), 0.2 * rand()), (0.2 * rand(), 0.2 * rand()));
+        let mid = (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+        // Scrubbed: there, back, and partway there again, in one stroke.
+        let t = std::time::Instant::now();
+        far_clay_stroke(&mut v, patch, &[a, b, a, mid], r, hard);
+        let (on, looked) = grain(&v, 0.0, 1.5, 0.3);
+        eprintln!("stroke {k} r {:.0} steps ({:.0} ms): {on} of {looked} samples at the surface stand out", r / voxel, t.elapsed().as_secs_f64() * 1e3);
+    }
+    if let Ok(path) = std::env::var("SCULPT_PICTURE") {
+        let win: Vec<f32> = std::env::var("SCULPT_WIN").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+        let (a, b, half) = if win.len() == 3 { (win[0], win[1], win[2]) } else { (0.0, 0.0, 0.35) };
+        let (t1, t2) = patch.any_orthonormal_pair();
+        mesh_picture(&v, 0, (patch + t1 * a + t2 * b).normalize(), half, 900, &path);
+    }
+}
