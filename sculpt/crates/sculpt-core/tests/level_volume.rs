@@ -1637,6 +1637,17 @@ fn far_scrubbed_clay_strokes() {
         let (on, looked) = grain(&v, 0.0, 1.5, 0.3);
         eprintln!("stroke {k} r {:.0} steps ({:.0} ms): {on} of {looked} samples at the surface stand out", r / voxel, t.elapsed().as_secs_f64() * 1e3);
     }
+    // `SCULPT_PROF=a0,b0,a1,b1`: the surface's height over the ball along that line, a fifth of a step apart.
+    let prof: Vec<f32> = std::env::var("SCULPT_PROF").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+    if prof.len() == 4 {
+        let (t1, t2) = patch.any_orthonormal_pair();
+        let len = ((prof[2] - prof[0]).powi(2) + (prof[3] - prof[1]).powi(2)).sqrt();
+        let k = (len / (0.2 * voxel)) as usize;
+        let hs: Vec<f32> = (0..=k).map(|i| { let f = i as f32 / k as f32; let d = (patch + t1 * (prof[0] + f * (prof[2] - prof[0])) + t2 * (prof[1] + f * (prof[3] - prof[1]))).normalize(); v.raycast(d * 3.0, -d, 0, false).map_or(f32::NAN, |(q, _)| (q.length() - 1.0) / voxel) }).collect();
+        for i in 1..k {
+            println!("PROF {:.4} {:.4} {:.4} {:.4}", i as f32 / k as f32 * len / voxel, hs[i], (hs[i + 1] - hs[i - 1]) / 0.4, (hs[i + 1] + hs[i - 1] - 2.0 * hs[i]) / 0.04);
+        }
+    }
     if let Ok(path) = std::env::var("SCULPT_PICTURE") {
         let win: Vec<f32> = std::env::var("SCULPT_WIN").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
         let (a, b, half) = if win.len() == 3 { (win[0], win[1], win[2]) } else { (0.0, 0.0, 0.35) };
@@ -1656,7 +1667,7 @@ fn relief_picture(v: &LevelVolume, cap: usize, w: Vec3, half: f32, n: usize, pat
         for x in 0..n {
             let (a, b) = (-half + 2.0 * half * (x as f32 + 0.5) / n as f32, half - 2.0 * half * (y as f32 + 0.5) / n as f32);
             if let Some((q, nrm)) = v.raycast(w * 4.0 + u * a + t * b, -w, cap, false) {
-                img[y * n + x] = (128.0 + 400.0 * (nrm - q.normalize()).dot(light)).clamp(0.0, 255.0) as u8;
+                img[y * n + x] = (128.0 + std::env::var("SCULPT_GAIN").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(400.0) * (nrm - q.normalize()).dot(light)).clamp(0.0, 255.0) as u8;
             }
         }
     }
