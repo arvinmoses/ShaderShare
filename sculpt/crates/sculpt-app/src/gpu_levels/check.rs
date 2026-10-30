@@ -49,7 +49,13 @@ fn read(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer) -> Vec<u
 /// A clay (or trim) stroke at level `l` between two directions, as the app lays dabs.
 /// A stroke from `a` to `b`, `each` run after every dab and `last` before the stroke ends.
 #[allow(clippy::too_many_arguments)]
-fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, mut each: impl FnMut(&mut LevelVolume), last: impl FnOnce(&mut LevelVolume)) {
+fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, each: impl FnMut(&mut LevelVolume), last: impl FnOnce(&mut LevelVolume)) {
+    stroke_with(v, l, a, b, r, trim, false, each, last)
+}
+
+/// [`stroke`], or with `smooth` a smooth stroke.
+#[allow(clippy::too_many_arguments)]
+fn stroke_with(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, smooth: bool, mut each: impl FnMut(&mut LevelVolume), last: impl FnOnce(&mut LevelVolume)) {
     v.begin_stroke();
     let steps = (((b - a).length() / (0.15 * r)).ceil() as usize).max(1);
     let mut along = Vec3::ZERO;
@@ -58,7 +64,8 @@ fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool, m
         let Some((hit, n)) = v.raycast(dir * 3.0, -dir, l, true) else { continue };
         let h = r * if trim { 0.075 } else { 0.095 };
         let rough = if along == Vec3::ZERO { n } else { along };
-        if let Some((n, _)) = v.plane_dab(l, hit, rough, r, h, 0.5, 0.4, trim) {
+        let dabbed = if smooth { v.smooth_dab(l, hit, rough, r, 0.4, 0.5) } else { v.plane_dab(l, hit, rough, r, h, 0.5, 0.4, trim) };
+        if let Some((n, _)) = dabbed {
             along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
         }
         each(v);
@@ -458,16 +465,20 @@ pub fn run(args: &[String]) -> Res<()> {
         gpu.land_limit = Some(200);
         gpu.sync(&mut vol);
         compare(&device, &queue, &gpu, &vol, &format!("{pass}fresh ball"))?;
-        let plan: [(usize, Vec3, Vec3, f32, bool); 7] = [
-            (0, Vec3::new(-0.6, 0.2, 1.0), Vec3::new(0.6, 0.3, 1.0), 0.35, false),
-            (1, Vec3::new(-0.4, -0.1, 1.0), Vec3::new(0.3, -0.05, 1.0), 0.06, false),
-            (2, Vec3::new(0.1, 0.0, 1.0), Vec3::new(0.25, 0.05, 1.0), 0.03, true),
-            (3, Vec3::new(0.0, 0.12, 1.0), Vec3::new(0.05, 0.12, 1.0), 0.012, false),
-            (0, Vec3::new(-0.5, -0.4, 1.0), Vec3::new(0.4, -0.3, 1.0), 0.3, true),
-            (2, Vec3::new(-0.2, 0.1, 1.0), Vec3::new(0.0, 0.2, 1.0), 0.02, false),
-            (0, Vec3::new(-0.2, 0.0, 1.0), Vec3::new(0.2, 0.1, 1.0), 0.4, false),
+        // Clay and trim strokes, then smooth strokes over them (`None`).
+        let plan: [(usize, Vec3, Vec3, f32, Option<bool>); 9] = [
+            (0, Vec3::new(-0.6, 0.2, 1.0), Vec3::new(0.6, 0.3, 1.0), 0.35, Some(false)),
+            (1, Vec3::new(-0.4, -0.1, 1.0), Vec3::new(0.3, -0.05, 1.0), 0.06, Some(false)),
+            (2, Vec3::new(0.1, 0.0, 1.0), Vec3::new(0.25, 0.05, 1.0), 0.03, Some(true)),
+            (3, Vec3::new(0.0, 0.12, 1.0), Vec3::new(0.05, 0.12, 1.0), 0.012, Some(false)),
+            (0, Vec3::new(-0.5, -0.4, 1.0), Vec3::new(0.4, -0.3, 1.0), 0.3, Some(true)),
+            (2, Vec3::new(-0.2, 0.1, 1.0), Vec3::new(0.0, 0.2, 1.0), 0.02, Some(false)),
+            (0, Vec3::new(-0.2, 0.0, 1.0), Vec3::new(0.2, 0.1, 1.0), 0.4, Some(false)),
+            (2, Vec3::new(0.05, 0.0, 1.0), Vec3::new(0.3, 0.1, 1.0), 0.04, None),
+            (0, Vec3::new(-0.4, -0.3, 1.0), Vec3::new(0.4, 0.2, 1.0), 0.3, None),
         ];
-        for (i, (l, a, b, r, trim)) in plan.iter().enumerate() {
+        for (i, (l, a, b, r, kind)) in plan.iter().enumerate() {
+            let (trim, smooth) = (&kind.unwrap_or(false), kind.is_none());
             // Synced after every dab, as the app does each frame.
             let every = std::env::var("SCULPT_CHECK_EVERY_DAB").is_ok();
             let mut dab = 0;
@@ -478,7 +489,7 @@ pub fn run(args: &[String]) -> Res<()> {
                     v.carry_apply(job.run());
                 }
             };
-            stroke(&mut vol, *l, *a, *b, *r, *trim, |v| {
+            stroke_with(&mut vol, *l, *a, *b, *r, *trim, smooth, |v| {
                 if jobs {
                     bring_in(v);
                     *held.borrow_mut() = v.carry_take(64);
@@ -514,7 +525,7 @@ pub fn run(args: &[String]) -> Res<()> {
                 return Err(e.into());
             }
             sync_all(&device, &queue, &mut gpu, &mut vol, &format!("{pass}stroke {}", i + 1), false)?;
-            compare(&device, &queue, &gpu, &vol, &format!("{pass}stroke {} (level {l}, {})", i + 1, if *trim { "trim" } else { "clay" }))?;
+            compare(&device, &queue, &gpu, &vol, &format!("{pass}stroke {} (level {l}, {})", i + 1, if smooth { "smooth" } else if *trim { "trim" } else { "clay" }))?;
         }
         for i in 0..4 {
             vol.undo();

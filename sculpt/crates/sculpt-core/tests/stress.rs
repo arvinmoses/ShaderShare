@@ -247,6 +247,12 @@ fn plane_stroke(dab: &mut dyn FnMut(usize, Vec3, Vec3, f32, bool, usize), hit: &
     }
 }
 
+/// Whether a stroke of radius `r` smooths (about one in four), decided without the session's random numbers so that
+/// seeds keep the rest of their sessions.
+fn smooths(r: f32) -> bool {
+    (r.to_bits() >> 7) % 4 == 0
+}
+
 /// A stroke on the form: its level, radius, clay or trim, where, followed in jobs, ended in a job.
 #[derive(Clone, Copy)]
 struct FormStroke {
@@ -269,10 +275,12 @@ fn form_dabs(l: &mut Layered, s: &mut LevelVolume, f: &FormStroke) {
     l.adopt_generators();
     l.begin_stroke();
     let mut along = Vec3::ZERO;
+    let smooth = smooths(r);
     for (k, h) in hits.into_iter().enumerate() {
         let Some((at, n)) = h else { continue };
         let rough = if along == Vec3::ZERO { n } else { along };
-        if let Some((n, _)) = l.plane_dab(s, level, at, rough, r, r * 0.095, 0.5, 0.4, trim) {
+        let dabbed = if smooth { l.smooth_dab(s, level, at, rough, r, 0.4, 0.5) } else { l.plane_dab(s, level, at, rough, r, r * 0.095, 0.5, 0.4, trim) };
+        if let Some((n, _)) = dabbed {
             along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
         }
         if jobs && k % 3 == 2 && let Some(job) = l.follow_take() {
@@ -563,10 +571,12 @@ impl World {
             (0..=6).map(|k| hit((d + side * span * (-1.0 + k as f32 / 3.0)).normalize(), level)).collect()
         };
         let mut along = Vec3::ZERO;
+        let smooth = smooths(r);
         for (k, h) in hits.into_iter().enumerate() {
             let Some((at, n)) = h else { continue };
             let rough = if along == Vec3::ZERO { n } else { along };
-            if let Some((n, _)) = s.plane_dab(level, at, rough, r, r * 0.095, 0.5, 0.4, trim) {
+            let dabbed = if smooth { s.smooth_dab(level, at, rough, r, 0.4, 0.5) } else { s.plane_dab(level, at, rough, r, r * 0.095, 0.5, 0.4, trim) };
+            if let Some((n, _)) = dabbed {
                 along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
             }
             if jobs && k % 2 == 1 {

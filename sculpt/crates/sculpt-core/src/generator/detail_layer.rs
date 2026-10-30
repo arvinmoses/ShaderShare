@@ -2161,6 +2161,13 @@ impl Layered {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn smooth_dab(&mut self, shown: &mut LevelVolume, l: usize, at: Vec3, along: Vec3, r: f32, hardness: f32, alpha: f32) -> Option<(Vec3, LevelDab)> {
+        let out = self.form.smooth_dab(l, at, along, r, hardness, alpha);
+        self.dabbed(shown);
+        out
+    }
+
     pub fn ball_dab(&mut self, shown: &mut LevelVolume, l: usize, c: Vec3, r: f32, k: f32, carve: bool) -> LevelDab {
         let out = self.form.ball_dab(l, c, r, k, carve);
         self.dabbed(shown);

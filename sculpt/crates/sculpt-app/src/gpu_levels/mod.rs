@@ -1041,8 +1041,21 @@ impl GpuLevels {
             self.hash_remove(*k);
         }
         lap("gone");
-        let uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
+        let mut uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
         if spread {
+            // A block sent as a neighbour of what changed, whose own change was left for later, lands now: its change
+            // counts as this sync's too, so the blocks below it (whose first layer past them is its samples) go with
+            // it. Sent alone, a block left for later under it kept its old samples there, and the two disagreed on
+            // their shared face until it landed (a smooth stroke's end, changing most blocks under it, showed it).
+            loop {
+                let have: KeySet<Key> = dirty.iter().copied().collect();
+                let more: Vec<Key> = uploads.iter().copied().filter(|k| self.pending_set.contains(k) && !have.contains(k)).collect();
+                if more.is_empty() {
+                    break;
+                }
+                dirty.extend(more);
+                uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
+            }
             // Blocks sent now have landed, whether or not their own change was left for later.
             for k in &uploads {
                 self.pending_set.remove(k);

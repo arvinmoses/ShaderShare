@@ -289,6 +289,7 @@ struct Push {
 /// [`LevelVolume::plateau`]) reads its distance from here: its height over the column's surface, to the tangent plane
 /// there. Blended from a bound instead, a dab would put the new surface where the bound ran out and leave the field
 /// around it with the dab's weight for a slope, a lattice of facets along a big brush's rim.
+#[derive(Clone)]
 struct Ground {
     on: Vec3,
     n: Vec3,
@@ -1343,9 +1344,11 @@ impl LevelVolume {
     /// overlapping dabs blend into one smooth change. Then the finer levels' detail moves with the surface.
     #[allow(clippy::too_many_arguments)]
     /// `push`: the dab as a direction the surface is moved in (a plane brush's), which finer detail is carried along;
-    /// `None` carries it along the surface's normal.
+    /// `None` carries it along the surface's normal. `set`: instead of combining with the shape, each sample moves
+    /// toward the shape's distance itself (the smooth brush's target surface; infinite where it has none), but only
+    /// down to `set` under that surface (fading over its last 0.3), so the brush leaves alone what lies deeper.
     #[allow(clippy::too_many_arguments)]
-    fn modify(&mut self, l: usize, c: Vec3, reach: f32, k: f32, carve: bool, slab: (Vec3, f32, f32), push: Option<Push>, weight: &(dyn Fn(Vec3) -> f32 + Sync), shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> LevelDab {
+    fn modify(&mut self, l: usize, c: Vec3, reach: f32, k: f32, carve: bool, slab: (Vec3, f32, f32), push: Option<Push>, set: Option<f32>, weight: &(dyn Fn(Vec3) -> f32 + Sync), shape: &(dyn Fn(Vec3) -> f32 + Sync)) -> LevelDab {
         let t = Instant::now();
         let mut stats = LevelDab { level: l, ..Default::default() };
         let (vx, band) = (self.voxel(l), self.band(l));
@@ -1378,8 +1381,9 @@ impl LevelVolume {
                             continue;
                         }
                     }
-                    // Far outside the shape, combining changes nothing.
-                    let sd = shape(centre);
+                    // Far outside the shape, combining changes nothing. (Setting is limited by the slab and the
+                    // brush's disc alone.)
+                    let sd = if set.is_some() { 0.0 } else { shape(centre) };
                     if sd > diag + band {
                         continue;
                     }
@@ -1399,7 +1403,7 @@ impl LevelVolume {
         // its band reads the levels below.)
         let plateaus: Vec<f32> = (0..self.levels()).map(|k| self.plateau(k)).collect();
         let plateau = plateaus[l];
-        let ground = if l > 0 { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band, false)) };
+        let ground = if l > 0 || set.is_some() { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band, false)) };
         let ground = ground.as_ref();
         // A sample's distance to the surface for the dab to blend from: its value, unless that is only a bound and the
         // ground under the brush says how far the surface is (on the same side, and farther than the bound: a bound
@@ -1423,6 +1427,15 @@ impl LevelVolume {
             }
             v
         };
+        // Setting: the weight a sample `blob` from the target surface moves toward it with (none deep under it).
+        let set_weight = move |blob: f32, w: f32| -> f32 {
+            let Some(deep) = set else { return w };
+            if !blob.is_finite() {
+                return 0.0;
+            }
+            let x = ((-blob / deep - 0.7) / 0.3).clamp(0.0, 1.0);
+            w * (1.0 - x * x * (3.0 - 2.0 * x))
+        };
         // New samples for each candidate, worked out in parallel from the field as it is.
         let origin = self.origin;
         let fill = if carve { band } else { -band };
@@ -1434,10 +1447,11 @@ impl LevelVolume {
                 // it no farther than its own value, and the clamp brings it back. A block of only such samples (the
                 // slab of a wide dab reaches sixteen steps into the solid across its disc, all of it at the band where
                 // no stroke has been yet) changes nothing, and is passed over.
-                let at_fill = match me.blocks[l].get(&bc) {
-                    Some(b) => b.iter().all(|&v| v == fill),
-                    None => l == 0 && me.inside0.contains(&bc) != carve,
-                };
+                let at_fill = set.is_none()
+                    && match me.blocks[l].get(&bc) {
+                        Some(b) => b.iter().all(|&v| v == fill),
+                        None => l == 0 && me.inside0.contains(&bc) != carve,
+                    };
                 if at_fill {
                     return None;
                 }
@@ -1454,7 +1468,7 @@ impl LevelVolume {
                 let mut any = false;
                 let corner = origin + (bc * B).as_vec3() * vx;
                 for (i, v) in s.iter_mut().enumerate() {
-                    if *v == fill {
+                    if *v == fill && set.is_none() {
                         continue;
                     }
                     let p = corner + cell_of(i).as_vec3() * vx;
@@ -1463,6 +1477,22 @@ impl LevelVolume {
                         continue;
                     }
                     let blob = shape(p);
+                    if set.is_some() {
+                        let w = set_weight(blob, w);
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        let next = (*v + w * (blob - *v)).clamp(-band, band);
+                        if next != *v {
+                            if (next < 0.0) != (*v < 0.0) {
+                                flips[i / 64] |= 1 << (i % 64);
+                            }
+                            d[i] = next - *v;
+                            *v = next;
+                            any = true;
+                        }
+                        continue;
+                    }
                     // Only a sample the dab changes, and blends (a full-weight dab takes the shape outright), needs
                     // its distance.
                     let changes = if carve { -blob > *v } else { blob < *v };
@@ -1510,7 +1540,7 @@ impl LevelVolume {
                     // clamp brings back to the band. A block with only such samples under the brush (finer work a
                     // big stroke has buried, under each of its dabs) is left as it is without reading the levels below.
                     let fill = if carve { fband } else { -fband };
-                    if old.iter().enumerate().all(|(i, &v)| v == fill || weight(corner + cell_of(i).as_vec3() * vm) <= 0.0) {
+                    if old.iter().enumerate().all(|(i, &v)| (v == fill && set.is_none()) || weight(corner + cell_of(i).as_vec3() * vm) <= 0.0) {
                         return None;
                     }
                     // The levels below over the block, for samples this level holds only clamped.
@@ -1525,6 +1555,10 @@ impl LevelVolume {
                     for (i, v) in s.iter_mut().enumerate() {
                         let p = corner + cell_of(i).as_vec3() * vm;
                         let w = weight(p);
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        let w = if set.is_some() { set_weight(shape(p), w) } else { w };
                         if w <= 0.0 {
                             continue;
                         }
@@ -1555,7 +1589,13 @@ impl LevelVolume {
                             }
                             was = farther(was, deep);
                         }
-                        let full = if carve { was.max(-blob) } else { was.min(blob) };
+                        let full = if set.is_some() {
+                            blob
+                        } else if carve {
+                            was.max(-blob)
+                        } else {
+                            was.min(blob)
+                        };
                         let next = (was + w * (full - was)).clamp(-fband, fband);
                         if next != *v {
                             *v = next;
@@ -2492,7 +2532,7 @@ impl LevelVolume {
                 let u = q.dot(n);
                 (plane - u).max(u - (level + depth)).max((q - n * u).length() - r)
             };
-            self.modify(l, on, reach, k, true, (n, plane, level + depth), Some(Push { on, n, r, hard }), &weight, &shape)
+            self.modify(l, on, reach, k, true, (n, plane, level + depth), Some(Push { on, n, r, hard }), None, &weight, &shape)
         } else {
             let band = self.band(l);
             let flat = move |p: Vec3| {
@@ -2524,7 +2564,7 @@ impl LevelVolume {
             let x = x.min(((high - low - band) / band).clamp(0.0, 1.0));
             let follow = x * x * (3.0 - 2.0 * x);
             if follow <= 0.0 {
-                self.modify(l, on, reach, k, false, (n, level - depth, plane), Some(Push { on, n, r, hard }), &weight, &flat)
+                self.modify(l, on, reach, k, false, (n, level - depth, plane), Some(Push { on, n, r, hard }), None, &weight, &flat)
             } else {
                 let mut floor = floor.unwrap();
                 floor.smooth((floor.half / 8).max(1));
@@ -2535,7 +2575,7 @@ impl LevelVolume {
                     let d = u + follow * (d - u);
                     (d - plane).max((level - depth) - d).max((q - n * u).length() - r)
                 };
-                self.modify(l, on, reach, k, false, (n, level - depth + follow * low, plane + follow * high), Some(Push { on, n, r, hard }), &weight, &shape)
+                self.modify(l, on, reach, k, false, (n, level - depth + follow * low, plane + follow * high), Some(Push { on, n, r, hard }), None, &weight, &shape)
             }
         };
         Some((n, dab))
@@ -2546,7 +2586,62 @@ impl LevelVolume {
         let l = l.min(self.levels() - 1);
         let shape = move |p: Vec3| (p - c).length() - r;
         let weight = |_: Vec3| 1.0;
-        self.modify(l, c, r + k, k, carve, (Vec3::Z, -(r + k), r + k), None, &weight, &shape)
+        self.modify(l, c, r + k, k, carve, (Vec3::Z, -(r + k), r + k), None, None, &weight, &shape)
+    }
+
+    /// One dab of the smooth brush at level `l`: the surface under the brush, as heights along its overall normal (see
+    /// [`Ground`], read from the field as it is now, so scrubbing goes on smoothing), is smoothed at about a quarter
+    /// of the radius, and each sample moves `alpha` of the way (with the falloff, as the plane brushes' does) to its
+    /// distance from that smoothed surface. The smoothing keeps the form at the brush's scale: twice the heights
+    /// blurred less the heights blurred twice keeps a quadric as it is (a fresh ball stays a ball, not flattened
+    /// under the brush) while bumps, ridges and terraces narrower than the blur go. Like the plane brushes it works
+    /// on the surface facing along the normal, down to 0.35 of the radius under it; finer levels under it take the
+    /// smoothed surface (their detail is buried, or carried with `keep_detail`). Returns the normal and what it did.
+    pub fn smooth_dab(&mut self, l: usize, at: Vec3, along: Vec3, r: f32, hardness: f32, alpha: f32) -> Option<(Vec3, LevelDab)> {
+        let l = l.min(self.levels() - 1);
+        let on = self.onto_base(l, at, along);
+        if self.normal_upto(on, l, true) == Vec3::ZERO {
+            return None;
+        }
+        let first = self.area_normal(l, on, along, r);
+        let n = self.area_normal(l, on, first, r);
+        let (vx, band) = (self.voxel(l), self.band(l));
+        let depth = 0.35 * r;
+        // Columns out past the radius by the blur's reach, so the blur inside it sees both sides.
+        let heights = self.ground(l, on, n, 1.75 * r, depth + band, -(2.0 * depth + band), false);
+        let rho = ((r / heights.step / 4.0).round() as i32).max(1);
+        let mut once = heights.clone();
+        once.smooth(rho);
+        let mut twice = once.clone();
+        twice.smooth(rho);
+        let mut target = heights.clone();
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for (i, t) in target.h.iter_mut().enumerate() {
+            if t.is_finite() {
+                let h = *t;
+                *t = 2.0 * once.h[i] - twice.h[i];
+                let (a, b) = ((i as i32 % heights.size() - heights.half) as f32, (i as i32 / heights.size() - heights.half) as f32);
+                if (a * a + b * b).sqrt() * heights.step <= r + 2.0 * heights.step {
+                    lo = lo.min(h.min(*t));
+                    hi = hi.max(h.max(*t));
+                }
+            }
+        }
+        if !lo.is_finite() {
+            return None;
+        }
+        let hard = hardness.clamp(0.0, 0.95);
+        let weight = move |p: Vec3| {
+            let q = p - on;
+            let t = (q - n * q.dot(n)).length();
+            let x = ((t / r - hard) / (1.0 - hard)).clamp(0.0, 1.0);
+            alpha * (1.0 - x * x * (3.0 - 2.0 * x))
+        };
+        let shape = move |p: Vec3| target.distance_smooth(p).unwrap_or(f32::INFINITY);
+        let (s_lo, s_hi) = (lo - depth, hi + band);
+        let reach = (r * r + s_lo.abs().max(s_hi.abs()).powi(2)).sqrt();
+        let dab = self.modify(l, on, reach, vx, false, (n, s_lo, s_hi), Some(Push { on, n, r, hard }), Some(depth), &weight, &shape);
+        Some((n, dab))
     }
 
     // ------------------------------------------------------------------ strokes and history

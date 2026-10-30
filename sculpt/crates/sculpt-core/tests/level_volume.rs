@@ -1765,3 +1765,156 @@ fn far_crossing_strokes_on_the_new_ball() {
         relief_picture(&v, 0, patch, env("SCULPT_HALF", 0.9), 900, &format!("{path}.relief.pgm"));
     }
 }
+
+/// A smooth stroke at level `l` along `path` (offsets along the patch's tangents), dabs spaced as the app spaces them.
+fn smooth_stroke(v: &mut LevelVolume, l: usize, patch: Vec3, path: &[(f32, f32)], r: f32, alpha: f32) -> f64 {
+    let (t1, t2) = patch.any_orthonormal_pair();
+    v.begin_stroke();
+    let mut along = Vec3::ZERO;
+    let mut pts = vec![path[0]];
+    for w in path.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let steps = ((((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt() / (0.15 * r)).ceil() as usize).max(1);
+        pts.extend((1..=steps).map(|i| (a.0 + (b.0 - a.0) * i as f32 / steps as f32, a.1 + (b.1 - a.1) * i as f32 / steps as f32)));
+    }
+    let mut ms = 0.0;
+    for (x, y) in pts {
+        let d = (patch + t1 * x + t2 * y).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, l, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, dab)) = v.smooth_dab(l, hit, rough, r, 0.3, alpha) {
+            ms += dab.ms;
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    v.end_stroke();
+    ms
+}
+
+/// Heights along `patch` over a window `half` either way, `g` apart (NaN where the ray misses), seen with levels up
+/// to `cap`.
+fn heights(v: &LevelVolume, cap: usize, patch: Vec3, half: f32, g: f32) -> (usize, Vec<f32>) {
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let m = (2.0 * half / g) as usize;
+    let h = (0..m * m)
+        .map(|k| v.raycast(patch * 4.0 + t1 * (-half + g * (k % m) as f32) + t2 * (-half + g * (k / m) as f32), -patch, cap, false).map_or(f32::NAN, |(q, _)| q.dot(patch)))
+        .collect();
+    (m, h)
+}
+
+/// The mean |second difference| over the window (its bend, in world units), and the points bending by more than
+/// `pit`.
+fn bend(m: usize, h: &[f32], pit: f32) -> (f32, usize) {
+    let (mut sum, mut cnt, mut pits) = (0.0f64, 0usize, 0usize);
+    for j in 1..m - 1 {
+        for i in 1..m - 1 {
+            let c = h[j * m + i];
+            let d = (h[j * m + i - 1] + h[j * m + i + 1] - 2.0 * c).abs() + (h[(j - 1) * m + i] + h[(j + 1) * m + i] - 2.0 * c).abs();
+            if d.is_finite() {
+                sum += d as f64;
+                cnt += 1;
+                pits += (d > pit) as usize;
+            }
+        }
+    }
+    ((sum / cnt.max(1) as f64) as f32, pits)
+}
+
+/// The smooth brush on a fresh ball leaves a ball: the surface under a scrubbed stroke stays within a fraction of a
+/// step of the sphere, closed, with no pits.
+#[test]
+fn smoothing_a_fresh_ball_leaves_a_ball() {
+    let voxel = 0.01f32;
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 2);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let ms = smooth_stroke(&mut v, 0, patch, &[(-0.3, -0.1), (0.3, 0.1), (-0.3, 0.0)], 0.3, 0.6);
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let mut worst = 0.0f32;
+    for k in 0..400 {
+        let d = (patch + t1 * (-0.3 + 0.03 * (k % 20) as f32) + t2 * (-0.3 + 0.03 * (k / 20) as f32)).normalize();
+        if let Some((q, _)) = v.raycast(d * 3.0, -d, 1, false) {
+            worst = worst.max((q.length() - 1.0).abs());
+        }
+    }
+    let (m, h) = heights(&v, 1, patch, 0.2, 0.5 * voxel);
+    let (b, pits) = bend(m, &h, 0.2 * voxel);
+    eprintln!("smoothed ball: off the sphere by at most {:.3} steps; bend {:.5} steps, {pits} pits; dabs took {ms:.1} ms", worst / voxel, b / voxel);
+    assert!(worst < 0.25 * voxel, "the smoothed ball is off the sphere by {} steps", worst / voxel);
+    assert!(pits <= 3, "the smoothed ball is pitted: {pits} points");
+    let (open, nm, dropped, _) = check(&v, 1);
+    assert_eq!((open, nm, dropped), (0, 0, 0));
+    // What the same stroke's dabs cost as clay, at the app's default strength.
+    let mut clay = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 2);
+    let (mut clay_ms, mut along) = (0.0, Vec3::ZERO);
+    clay.begin_stroke();
+    for k in 0..=40 {
+        let x = -0.3 + 0.6 * k as f32 / 40.0;
+        let d = (patch + t1 * x + t2 * (x / 3.0)).normalize();
+        let Some((hit, n)) = clay.raycast(d * 3.0, -d, 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, dab)) = clay.plane_dab(0, hit, rough, 0.3, 0.3 * 0.047, 0.3, 0.22, false) {
+            clay_ms += dab.ms;
+            along = n;
+        }
+    }
+    clay.end_stroke();
+    let mut smooth = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 2);
+    let smooth_ms = smooth_stroke(&mut smooth, 0, patch, &[(-0.3, -0.1), (0.3, 0.1)], 0.3, 0.6);
+    eprintln!("the same stroke's dabs: clay {clay_ms:.1} ms, smooth {smooth_ms:.1} ms");
+}
+
+/// Smoothing a bumpy, terraced patch takes the bumps and the terrace's edge down (its bend falls by more than half),
+/// leaves no pits, keeps the surface closed, and undoes and saves exactly.
+#[test]
+fn smoothing_a_bumpy_patch_flattens_it_without_pits() {
+    let voxel = 0.01f32;
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 3);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let (t1, t2) = patch.any_orthonormal_pair();
+    // A terrace (a trim across the patch) and a scatter of bumps at level 1.
+    let a = (patch + t1 * -0.25 + t2 * 0.05).normalize();
+    let b = (patch + t1 * 0.25 + t2 * 0.05).normalize();
+    stroke(&mut v, 0, a, b, 0.12, 1.0, true);
+    v.begin_stroke();
+    for k in 0..25 {
+        let (x, y) = (-0.2 + 0.1 * (k % 5) as f32 + 0.02 * ((k * 7) % 3) as f32, -0.2 + 0.1 * (k / 5) as f32);
+        let p = (patch + t1 * x + t2 * y).normalize();
+        v.ball_dab(1, p * if k % 2 == 0 { 1.0 } else { 0.99 }, 0.025, 0.008, k % 2 == 1);
+    }
+    v.end_stroke();
+    let (m, before) = heights(&v, 2, patch, 0.15, 0.5 * voxel);
+    let (bend0, pits0) = bend(m, &before, 0.2 * voxel);
+    let bytes = |v: &LevelVolume| {
+        let mut out = Vec::new();
+        v.write_to(&mut out).unwrap();
+        out
+    };
+    let start = bytes(&v);
+    if let Ok(path) = std::env::var("SCULPT_PICTURE") {
+        relief_picture(&v, 2, patch, 0.3, 600, &format!("{path}.before.pgm"));
+    }
+    let mut ms = 0.0;
+    for pass in 0..3 {
+        let o = 0.05 * pass as f32;
+        ms += smooth_stroke(&mut v, 0, patch, &[(-0.3, -0.1 + o), (0.3, -0.05 + o), (-0.3, 0.0 + o), (0.3, 0.1 - o)], 0.3, 0.6);
+    }
+    let (_, after) = heights(&v, 2, patch, 0.15, 0.5 * voxel);
+    let (bend1, pits1) = bend(m, &after, 0.2 * voxel);
+    eprintln!("bend {:.4} -> {:.4} steps; points bending by over a fifth of a step {pits0} -> {pits1}; smoothing dabs {ms:.0} ms", bend0 / voxel, bend1 / voxel);
+    if let Ok(path) = std::env::var("SCULPT_PICTURE") {
+        relief_picture(&v, 2, patch, 0.3, 600, &path);
+    }
+    assert!(bend1 < 0.5 * bend0, "smoothing left the bend at {bend1} of {bend0}");
+    assert!(pits1 * 10 <= pits0, "smoothing left {pits1} of {pits0} bent points");
+    let (open, nm, dropped, _) = check(&v, 2);
+    assert_eq!((open, nm, dropped), (0, 0, 0));
+    let end = bytes(&v);
+    for _ in 0..3 {
+        v.undo();
+    }
+    assert_eq!(bytes(&v), start, "undo did not restore the bumps");
+    while v.redo() {}
+    assert_eq!(bytes(&v), end, "redo did not restore the smoothing");
+    let read = LevelVolume::read_from(&mut end.as_slice(), 3).unwrap();
+    assert_eq!(bytes(&read), end, "a saved volume reads back differently");
+}
