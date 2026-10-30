@@ -430,7 +430,7 @@ impl<'a> Below<'a> {
     /// The form's distance at `p` for a join: from the finest level whose band holds it, as far as level 0 holds
     /// distances (as composing reads it).
     fn distance(&self, p: Vec3) -> f32 {
-        let reach = 0.95 * self.form.plateau(0);
+        let reach = 0.95 * self.form.sent_reach(0);
         for l in (0..=self.below).rev() {
             let v = self.form.value_upto(p, l, false);
             if v.abs() < 0.8 * self.form.band(l) {
@@ -748,7 +748,7 @@ fn compose_blocks(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, k
             // And past what level 0 holds as distances (six of its steps: past them, a stored block holds a bound and
             // an unstored one its band) the form counts as that far, everywhere alike: a blend wider than that reads
             // the same value on both sides of every block's face.
-            let reach = 0.95 * form.plateau(0);
+            let reach = 0.95 * form.sent_reach(0);
             let coarse = (l > 0 && !near.is_empty()).then(|| {
                 let s = 1i32 << l;
                 let (clo, chi) = (lo.div_euclid(IVec3::splat(s)), hi.div_euclid(IVec3::splat(s)) + IVec3::ONE);
@@ -834,7 +834,7 @@ fn compose_ordered(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, 
     let points: Vec<IVec3> = (0..pn.x * pn.y * pn.z).map(|k| plo + IVec3::new(k % pn.x, (k / pn.x) % pn.y, k / (pn.x * pn.y))).collect();
     let mut g = unclamped(form, l, below, plo, phi);
     let sat = if l <= below { band } else { form.band(below) };
-    let reach = 0.95 * form.plateau(0);
+    let reach = 0.95 * form.sent_reach(0);
     // Level 0's distance over the box, for joins wider than this level holds one (see `compose_blocks`).
     let coarse = (l > 0).then(|| {
         let s = 1i32 << l;
@@ -942,7 +942,7 @@ fn base_block(form: &LevelVolume, stack: &[Layer], l: usize, below: usize, bc: I
         (0..8).map(|q| corner_weight(q, f) * pa(i + corner_offset(q))).sum::<f32>()
     };
     let sat = if l <= below { band } else { form.band(below) };
-    let reach = 0.95 * form.plateau(0);
+    let reach = 0.95 * form.sent_reach(0);
     let coarse = (l > 0 && join).then(|| {
         let s = 1i32 << l;
         let (clo, chi) = (lo.div_euclid(IVec3::splat(s)), hi.div_euclid(IVec3::splat(s)) + IVec3::ONE);

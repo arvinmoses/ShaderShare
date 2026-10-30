@@ -836,26 +836,32 @@ impl LevelVolume {
         if l == 0 { 16.0 * self.voxel0 } else { 2.5 * self.voxel(l) }
     }
 
-    /// How many steps from the surface [`Self::redistance`] measures at a level with step `vx` and band `band`.
+    /// How many steps from the surface [`Self::redistance`] measures at a level with step `vx` and band `band`: the
+    /// whole band.
     fn redistance_reach(vx: f32, band: f32) -> i32 {
-        ((band / vx).ceil() as i32 + 1).min(6)
+        (band / vx).ceil() as i32 + 1
     }
 
-    /// How far from the surface level `l` holds distances: its band, or at level 0 the six steps [`Self::redistance`]
-    /// measures. A sample at or beyond this holds only a bound on its distance.
+    /// How far from the surface level `l` holds distances: its band. A sample at the band holds only a bound on its
+    /// distance. (Level 0 once held them only six steps out, and a plane dab read the rest from the ground under the
+    /// brush, see [`Ground`]; where that estimate and its neighbours' own distances disagreed, a wall's foot jumped
+    /// from sample to sample, and a later stroke raising the surface six steps over an earlier one showed where the two
+    /// met as a crease.)
     pub fn plateau(&self, l: usize) -> f32 {
         let (vx, band) = (self.voxel(l), self.band(l));
         band.min(Self::redistance_reach(vx, band) as f32 * vx)
     }
 
-    /// How far from the surface level `l`'s samples are drawn from: its band, but at level 0 its plateau, since a
-    /// sample beyond that holds only a bound on its distance. The GPU is sent each sample clamped to it, and the
-    /// reference extraction reads them so. Nothing drawn reads one farther out (a cell the surface crosses has every
-    /// corner within about two steps of it), and a wide stroke at level 0 changes a slab of samples sixteen steps
-    /// either side of the surface across its whole disc: the blocks it changes only out there come out as the GPU
-    /// holds them already, and are neither sent nor extracted again.
+    /// Steps from the surface level 0 is drawn from (see [`Self::sent_reach`]).
+    pub const SENT0_STEPS: f32 = 6.0;
+
+    /// How far from the surface level `l`'s samples are drawn from: its band, but at level 0 six steps. The GPU is
+    /// sent each sample clamped to it, and the reference extraction reads them so. Nothing drawn reads one farther out
+    /// (a cell the surface crosses has every corner within about two steps of it), and a wide stroke at level 0 changes
+    /// a slab of samples sixteen steps either side of the surface across its whole disc: the blocks it changes only out
+    /// there come out as the GPU holds them already, and are neither sent nor extracted again.
     pub fn sent_reach(&self, l: usize) -> f32 {
-        if l == 0 { self.plateau(0) } else { self.band(l) }
+        if l == 0 { Self::SENT0_STEPS * self.voxel0 } else { self.band(l) }
     }
 
     /// Stored blocks per level, and the bytes their samples take at 16 bits.
@@ -1389,8 +1395,8 @@ impl LevelVolume {
             }
         }
         // A plane brush's dab blends each sample part of the way, so it needs the samples' distances; at level 0,
-        // which holds them only six steps out, those holding only a bound read theirs from the surface under the
-        // brush. (A finer level holds distances to its band, and a sample at its band reads the levels below.)
+        // those at its band (only a bound) read theirs from the surface under the brush. (A finer level's sample at
+        // its band reads the levels below.)
         let plateaus: Vec<f32> = (0..self.levels()).map(|k| self.plateau(k)).collect();
         let plateau = plateaus[l];
         let ground = if l > 0 { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band, false)) };
@@ -2736,10 +2742,11 @@ impl LevelVolume {
             if blocks.is_empty() {
                 continue;
             }
+            if l == 0 && self.redistance0(&blocks, near_too) {
+                continue;
+            }
             let (vx, band) = (self.voxel(l), self.band(l));
-            // Distances within a few steps: deeper samples get that far as a lower bound (the plateau), which is all
-            // anything here reads them for (steps toward the surface; a plane dab reads the ground under the brush
-            // instead, see [`Ground`]), and the sweep stays small for level 0's wide band.
+            // Distances out to the band (level 0 has its own sweep, `redistance0`, unless its blocks span too much).
             let reach = Self::redistance_reach(vx, band);
             let cap = (band / vx).min(reach as f32);
             let me = &*self;
@@ -2883,6 +2890,256 @@ impl LevelVolume {
                 self.put(l, bc, s);
             }
         }
+    }
+
+    /// [`Self::redistance`] at level 0, out to its whole band (sixteen steps). Swept over a box around each block, as
+    /// the finer levels are, the box would have to reach sixteen steps past the block on every side (forty samples
+    /// across for its eight) and the sweep would cost several times the stroke. Instead the blocks the stroke touched
+    /// and the stored blocks within the band of them are swept together: each block is swept on its own (in the eight
+    /// orders), reading its neighbours' faces as they were after the last round, and rounds go on until nothing
+    /// changes, only blocks next to one that changed being swept again. Every sample then holds the same solution of
+    /// `|grad d| = 1` a sweep over the whole region gives. Unstored blocks (all at the band) are no neighbour. False
+    /// (nothing done) when the touched blocks span too wide a box to index.
+    fn redistance0(&mut self, blocks: &[IVec3], near_too: bool) -> bool {
+        let (vx, band) = (self.voxel(0), self.band(0));
+        let cap = band / vx;
+        let halo = (cap / B as f32).ceil() as i32;
+        let (mut lo, mut hi) = (blocks[0], blocks[0]);
+        for &b in blocks {
+            lo = lo.min(b);
+            hi = hi.max(b);
+        }
+        lo -= IVec3::splat(halo);
+        hi += IVec3::splat(halo);
+        let dim = hi - lo + IVec3::ONE;
+        let total = dim.x as usize * dim.y as usize * dim.z as usize;
+        if total > 1 << 26 {
+            return false;
+        }
+        let cell = |c: IVec3| ((c.z - lo.z) as usize * dim.y as usize + (c.y - lo.y) as usize) * dim.x as usize + (c.x - lo.x) as usize;
+        // The touched blocks, grown by the halo along each axis in turn (a cube around each).
+        let mut mark = vec![false; total];
+        for &b in blocks {
+            mark[cell(b)] = true;
+        }
+        for axis in 0..3 {
+            let step = [1usize, dim.x as usize, dim.x as usize * dim.y as usize][axis];
+            let len = dim[axis] as usize;
+            let prev = mark.clone();
+            for k in 0..total {
+                if !prev[k] {
+                    continue;
+                }
+                let at = (k / step) % len;
+                for o in at.saturating_sub(halo as usize)..(at + halo as usize + 1).min(len) {
+                    mark[k - at * step + o * step] = true;
+                }
+            }
+        }
+        let me = &*self;
+        let mut index = vec![u32::MAX; total];
+        let mut region: Vec<IVec3> = Vec::new();
+        let mut vals: Vec<&[f32; N]> = Vec::new();
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let c = IVec3::new(x, y, z);
+                    let k = cell(c);
+                    if mark[k]
+                        && let Some(s) = me.blocks[0].get(&c)
+                    {
+                        index[k] = region.len() as u32;
+                        region.push(c);
+                        vals.push(&**s);
+                    }
+                }
+            }
+        }
+        // Each block's neighbours across its faces: -x, +x, -y, +y, -z, +z.
+        const FACE: [IVec3; 6] = [IVec3::NEG_X, IVec3::X, IVec3::NEG_Y, IVec3::Y, IVec3::NEG_Z, IVec3::Z];
+        let nb: Vec<[u32; 6]> = region
+            .iter()
+            .map(|&c| {
+                FACE.map(|f| {
+                    let q = c + f;
+                    if q.cmplt(lo).any() || q.cmpgt(hi).any() { u32::MAX } else { index[cell(q)] }
+                })
+            })
+            .collect();
+        // A sample's value, `p` within the block or one past it along one axis (in the neighbour across that face).
+        let value = |r: usize, p: IVec3| -> Option<f32> {
+            for axis in 0..3 {
+                if p[axis] < 0 || p[axis] >= B {
+                    let f = 2 * axis + (p[axis] >= B) as usize;
+                    let n = nb[r][f];
+                    if n == u32::MAX {
+                        return None;
+                    }
+                    let mut q = p;
+                    q[axis] = q[axis].rem_euclid(B);
+                    return Some(vals[n as usize][local(q)]);
+                }
+            }
+            Some(vals[r][local(p)])
+        };
+        // The seeds (samples next to the surface, as in `redistance`) and every other sample at the cap.
+        let mut d: Vec<Box<[f32; N]>> = Vec::with_capacity(region.len());
+        let mut seeds: Vec<SignMask> = Vec::with_capacity(region.len());
+        (0..region.len())
+            .into_par_iter()
+            .map(|r| {
+                let mut dd = Box::new([cap; N]);
+                let mut seed = [0u64; 8];
+                for (i, out) in dd.iter_mut().enumerate() {
+                    let p = cell_of(i);
+                    let a = vals[r][i];
+                    let mut inv2 = 0.0f32;
+                    for axis in 0..3 {
+                        let mut t_near = f32::INFINITY;
+                        for dir in [-1, 1] {
+                            let mut q = p;
+                            q[axis] += dir;
+                            if let Some(b) = value(r, q)
+                                && (a < 0.0) != (b < 0.0)
+                            {
+                                t_near = t_near.min(a / (a - b));
+                            }
+                        }
+                        if t_near.is_finite() {
+                            inv2 += 1.0 / (t_near * t_near).max(1e-12);
+                        }
+                    }
+                    if inv2 > 0.0 {
+                        seed[i / 64] |= 1 << (i % 64);
+                        *out = if near_too { 1.0 / inv2.sqrt() } else { a.abs() / vx }.min(cap);
+                    }
+                }
+                (dd, seed)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .for_each(|(dd, s)| {
+                d.push(dd);
+                seeds.push(s);
+            });
+        let is_seed = |r: usize, i: usize| seeds[r][i / 64] >> (i % 64) & 1 == 1;
+        // Rounds of sweeping: a block is swept when it or a neighbour changed in the last round (at first, the blocks
+        // holding seeds).
+        let mut changed: Vec<bool> = seeds.iter().map(|s| s.iter().any(|&m| m != 0)).collect();
+        const P: usize = (B + 2) as usize;
+        for _ in 0..64 {
+            let active: Vec<usize> = (0..region.len()).filter(|&r| changed[r] || nb[r].iter().any(|&n| n != u32::MAX && changed[n as usize])).collect();
+            if active.is_empty() {
+                break;
+            }
+            let swept: Vec<(usize, Option<Box<[f32; N]>>)> = active
+                .par_iter()
+                .map(|&r| {
+                    // The block with a border of its neighbours' faces (none: infinitely far).
+                    let mut pd = [f32::INFINITY; P * P * P];
+                    let pat = |x: usize, y: usize, z: usize| (z * P + y) * P + x;
+                    for i in 0..N {
+                        let p = cell_of(i);
+                        pd[pat(p.x as usize + 1, p.y as usize + 1, p.z as usize + 1)] = d[r][i];
+                    }
+                    for (f, &n) in nb[r].iter().enumerate() {
+                        if n == u32::MAX {
+                            continue;
+                        }
+                        let (axis, far) = (f / 2, f % 2 == 1);
+                        for a in 0..B {
+                            for b in 0..B {
+                                let mut q = IVec3::ZERO;
+                                q[(axis + 1) % 3] = a;
+                                q[(axis + 2) % 3] = b;
+                                q[axis] = if far { 0 } else { B - 1 };
+                                let mut t = q + IVec3::ONE;
+                                t[axis] = if far { B + 1 } else { 0 };
+                                pd[pat(t.x as usize, t.y as usize, t.z as usize)] = d[n as usize][local(q)];
+                            }
+                        }
+                    }
+                    let (sy, sz) = (P, P * P);
+                    let mut any = false;
+                    for o in 0..8 {
+                        let (fx, fy, fz) = (o & 1 == 1, o & 2 == 2, o & 4 == 4);
+                        for zi in 0..B as usize {
+                            let z = if fz { B as usize - 1 - zi } else { zi };
+                            for yi in 0..B as usize {
+                                let y = if fy { B as usize - 1 - yi } else { yi };
+                                for xi in 0..B as usize {
+                                    let x = if fx { B as usize - 1 - xi } else { xi };
+                                    if is_seed(r, (z * 64 + y * 8 + x) as usize) {
+                                        continue;
+                                    }
+                                    let k = pat(x + 1, y + 1, z + 1);
+                                    let mut a = [pd[k - 1].min(pd[k + 1]), pd[k - sy].min(pd[k + sy]), pd[k - sz].min(pd[k + sz])];
+                                    a.sort_unstable_by(f32::total_cmp);
+                                    if a[0] >= pd[k] {
+                                        continue;
+                                    }
+                                    let mut u = a[0] + 1.0;
+                                    if u > a[1] {
+                                        u = 0.5 * (a[0] + a[1] + (2.0 - (a[0] - a[1]) * (a[0] - a[1])).max(0.0).sqrt());
+                                        if u > a[2] {
+                                            let s = a[0] + a[1] + a[2];
+                                            let disc = s * s - 3.0 * (a[0] * a[0] + a[1] * a[1] + a[2] * a[2] - 1.0);
+                                            u = (s + disc.max(0.0).sqrt()) / 3.0;
+                                        }
+                                    }
+                                    if u < pd[k] - 1e-5 {
+                                        pd[k] = u;
+                                        any = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !any {
+                        return (r, None);
+                    }
+                    let mut out = Box::new([0.0f32; N]);
+                    for (i, v) in out.iter_mut().enumerate() {
+                        let p = cell_of(i);
+                        *v = pd[pat(p.x as usize + 1, p.y as usize + 1, p.z as usize + 1)];
+                    }
+                    (r, Some(out))
+                })
+                .collect();
+            changed.iter_mut().for_each(|c| *c = false);
+            for (r, out) in swept {
+                if let Some(out) = out {
+                    d[r] = out;
+                    changed[r] = true;
+                }
+            }
+        }
+        // The touched blocks take the distances (the seeds keep their values unless `near_too`).
+        let fixed: Vec<(IVec3, Block)> = blocks
+            .par_iter()
+            .filter_map(|&bc| {
+                let r = index[cell(bc)] as usize;
+                let old = vals[r];
+                let mut s: Block = Box::new(*old);
+                let mut any = false;
+                for (i, v) in s.iter_mut().enumerate() {
+                    if is_seed(r, i) && !near_too {
+                        continue;
+                    }
+                    let dist = (d[r][i] * vx).min(band);
+                    let next = if old[i] < 0.0 { -dist } else { dist };
+                    if next != *v {
+                        *v = next;
+                        any = true;
+                    }
+                }
+                any.then_some((bc, s))
+            })
+            .collect();
+        for (bc, s) in fixed {
+            self.put(0, bc, s);
+        }
+        true
     }
 
     /// Fine work that built real form, moved down a level: at each level from the finest, under each touched block,
@@ -4000,7 +4257,8 @@ impl LevelVolume {
     /// blocks with their samples at 16 bits.
     pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         w.write_all(b"SVOL")?;
-        w.write_all(&2u32.to_le_bytes())?;
+        // Version 3: level 0 holds distances out to its band (version 2, six steps).
+        w.write_all(&3u32.to_le_bytes())?;
         for f in [self.voxel0, self.origin.x, self.origin.y, self.origin.z] {
             w.write_all(&f.to_le_bytes())?;
         }
@@ -4057,7 +4315,7 @@ impl LevelVolume {
             let old = super::volume::Volume::read_from(&mut rest.as_slice())?;
             return Ok(LevelVolume::from_volume(&old, levels));
         }
-        if version != 2 {
+        if version != 2 && version != 3 {
             return Err(bad("unknown volume file version"));
         }
         let mut f = [0f32; 4];
@@ -4078,6 +4336,9 @@ impl LevelVolume {
             v.inside0.insert(ivec(r)?);
         }
         let mut buf = vec![0u8; N * 2];
+        // A version 2 file's level 0 holds, past six steps from the surface, only that bound: it becomes the band, the
+        // bound level 0 holds now.
+        let old_bound = if version == 2 { quantize(Self::SENT0_STEPS * v.voxel0, v.band(0)) as u16 } else { u16::MAX };
         for l in 0..n {
             let band = v.band(l);
             for _ in 0..u32_(r)? {
@@ -4085,7 +4346,8 @@ impl LevelVolume {
                 r.read_exact(&mut buf)?;
                 let mut s = Box::new([0f32; N]);
                 for (i, x) in s.iter_mut().enumerate() {
-                    *x = i16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]) as f32 / 32767.0 * band;
+                    let q = i16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+                    *x = if l == 0 && q.unsigned_abs() == old_bound { (q.signum() as f32) * band } else { q as f32 / 32767.0 * band };
                 }
                 v.blocks[l].insert(bc, s);
             }

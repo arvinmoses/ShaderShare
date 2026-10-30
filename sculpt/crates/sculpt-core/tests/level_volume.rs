@@ -954,11 +954,12 @@ fn slope_histogram(v: &LevelVolume, at: Vec3, half: f32) -> [usize; 8] {
     hist
 }
 
-/// Level 0 measures distances only six steps out from the surface when a stroke ends; farther samples hold that as a
-/// bound. A big clay stroke over a curved form has its plane well beyond six steps above the surface at its rim (here
-/// 0.1, twenty steps), so its dabs build the new surface out of samples holding the bound. Blended from the bound,
-/// the field around the new surface had the dab's weight for a slope instead of one, and the surface showed a lattice
-/// of facets along the rim, mid-stroke and after: the field near the new surface must keep its unit slope.
+/// Level 0 once measured distances only six steps out from the surface when a stroke ended, farther samples holding
+/// that as a bound (it now measures them out to its band, sixteen steps). A big clay stroke over a curved form has its
+/// plane well beyond six steps above the surface at its rim (here 0.1, twenty steps), so its dabs build the new surface
+/// out of samples that held the bound. Blended from the bound, the field around the new surface had the dab's weight
+/// for a slope instead of one, and the surface showed a lattice of facets along the rim, mid-stroke and after: the
+/// field near the new surface must keep its unit slope.
 #[test]
 fn a_big_clay_stroke_keeps_unit_slope_beyond_level_zeros_measured_distances() {
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 4);
@@ -966,12 +967,13 @@ fn a_big_clay_stroke_keeps_unit_slope_beyond_level_zeros_measured_distances() {
     // brush still moves the surface a quarter of the way per dab.
     let rim = Vec3::new(0.33, 0.0, (1.0f32 - 0.33 * 0.33).sqrt());
     // An earlier, smaller stroke there: when it ends, the blocks it touched (to 0.1 and more above the surface) hold
-    // distances six steps out from the surface and the bound beyond.
+    // distances out to the band, sixteen steps from the surface.
     stroke(&mut v, 0, (rim + Vec3::new(-0.05, -0.03, 0.0)).normalize(), (rim + Vec3::new(0.05, 0.03, 0.0)).normalize(), 0.3, 0.3, false);
-    let bound = v.plateau(0);
+    // Where level 0 once held only its bound.
+    let bound = 6.0 * v.voxel(0);
     let (on_rim, n_rim) = v.raycast(rim * 3.0, -rim, 0, false).unwrap();
-    let far: Vec<f32> = (7..=14).map(|k| v.value_upto(on_rim + n_rim * (k as f32 * v.voxel(0)), 0, false)).collect();
-    assert!(far.iter().all(|&d| (d - bound).abs() < 1e-4), "the earlier stroke should leave only the bound {bound} seven to fourteen steps out: {far:?}");
+    let far: Vec<f32> = (7..=14).map(|k| v.value_upto(on_rim + n_rim * (k as f32 * v.voxel(0)), 0, false) / v.voxel(0)).collect();
+    assert!(far.iter().zip(7..).all(|(&d, k)| (d - k as f32).abs() < 0.3), "the earlier stroke should leave distances seven to fourteen steps out, in steps: {far:?}");
     // The big stroke: three dabs of a brush of radius 0.45 at the front, its plane 0.045 above the surface at its
     // centre and 0.1 (twenty steps) above it at `rim`: the surface there ends up ten steps out, past the bound.
     let front = Vec3::new(0.0, 0.0, 1.0);
@@ -1390,7 +1392,7 @@ fn grain(v: &LevelVolume, lo: f32, hi: f32, by: f32) -> (usize, usize) {
 
 /// A clay stroke at level 0 at the app's default strength (seen from far) along the polyline `path` (offsets along the
 /// patch's tangents), its dabs spaced as the app spaces them.
-fn far_clay_stroke(v: &mut LevelVolume, patch: Vec3, path: &[(f32, f32)], r: f32, hardness: f32) {
+fn far_clay_stroke(v: &mut LevelVolume, patch: Vec3, path: &[(f32, f32)], r: f32, hardness: f32) -> f64 {
     let (t1, t2) = patch.any_orthonormal_pair();
     v.begin_stroke();
     let mut along = Vec3::ZERO;
@@ -1409,7 +1411,7 @@ fn far_clay_stroke(v: &mut LevelVolume, patch: Vec3, path: &[(f32, f32)], r: f32
             along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
         }
     }
-    v.end_stroke();
+    v.end_stroke().ms
 }
 
 /// A wide clay stroke over an earlier one (at level 0, seen from far) brings up no grain. The stroke's end makes the
@@ -1443,7 +1445,8 @@ fn a_clay_stroke_over_earlier_clay_brings_up_no_grain() {
 /// once the clay reached it, a pit. Here: over a stroke scrubbed back and forth, the samples a dab left within a
 /// hundredth of a step of the bound, and how many of them the next dab moved unlike their neighbours the stroke
 /// blended too (by more than a fifth of a step from their mean change): 3415 of 16749 when they were read as the bound,
-/// 9 of 16981 now.
+/// 9 of 16981 when they were not but level 0 held distances only six steps out (its neighbours past that read the
+/// ground under the brush), none of 30679 now that it holds them out to its band.
 #[test]
 fn a_sample_the_stroke_blended_onto_the_bound_keeps_its_own_distance() {
     use glam::IVec3;
@@ -1500,7 +1503,44 @@ fn a_sample_the_stroke_blended_onto_the_bound_keeps_its_own_distance() {
     v.end_stroke();
     eprintln!("{onto} samples blended onto the bound; {jumped} of them jumped from their neighbours on the next dab");
     assert!(onto > 0, "no sample was blended onto the bound: the test no longer looks at anything");
-    assert!(jumped <= 20, "{jumped} samples blended onto the bound jumped from their neighbours on the next dab");
+    assert!(jumped <= 2, "{jumped} samples blended onto the bound jumped from their neighbours on the next dab");
+}
+
+/// A wide clay stroke raising the surface over the samples off an earlier one's (seen from far, on the app's new ball)
+/// shows no crease where the two met. Level 0 held distances only six steps out from the surface when a stroke ended,
+/// and a plane dab read the samples beyond from the ground under the brush instead, a guess that near an earlier
+/// stroke's wall came out unlike its neighbours' own distances: the field kinked along the line six steps off the
+/// earlier surface, and once the later stroke's clay reached it, a beaded crease ran across it. Here: three crossing
+/// strokes, and over a window across where the third rises over the earlier two, the points where the surface's
+/// height bends by more than 0.08 of a step (its second differences half a step apart, summed over both axes): 13 with
+/// the guess (4 past a tenth of a step), 5 now (none).
+#[test]
+fn a_wide_stroke_over_earlier_ones_shows_no_crease_where_they_met() {
+    // The app's new ball: level 0 at twice the step a million-triangle ball names.
+    let voxel = 2.0 * (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 7);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    for path in [[(-0.5, -0.2), (0.4, -0.15)], [(-0.3, 0.4), (0.05, -0.15)], [(0.4, 0.35), (-0.1, 0.1)]] {
+        far_clay_stroke(&mut v, patch, &path, 0.5, 0.5);
+    }
+    let (t1, t2) = patch.any_orthonormal_pair();
+    let (ca, cb, half, g) = (0.36f32, 0.24f32, 0.15f32, 0.5 * voxel);
+    let m = (2.0 * half / g) as usize;
+    let hts: Vec<f32> = (0..m * m).map(|k| v.raycast(patch * 4.0 + t1 * (ca - half + g * (k % m) as f32) + t2 * (cb - half + g * (k / m) as f32), -patch, 0, false).map_or(f32::NAN, |(q, _)| q.dot(patch))).collect();
+    let (mut cnt, mut bent) = (0usize, 0usize);
+    for j in 1..m - 1 {
+        for i in 1..m - 1 {
+            let c = hts[j * m + i];
+            let d = (hts[j * m + i - 1] + hts[j * m + i + 1] - 2.0 * c).abs() + (hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 2.0 * c).abs();
+            if d.is_finite() {
+                cnt += 1;
+                bent += (d > 0.08 * voxel) as usize;
+            }
+        }
+    }
+    eprintln!("{bent} of {cnt} points bend by more than 0.08 of a step");
+    assert!(cnt > m * m / 2, "the window missed the surface: {cnt} of {} points", m * m);
+    assert!(bent <= 7, "a crease where the strokes met: {bent} points bend by more than 0.08 of a step");
 }
 
 /// The extracted surface (levels up to `cap`) seen straight down `-w` over a square `half` across around `w`, flat
@@ -1573,9 +1613,11 @@ fn mesh_picture(v: &LevelVolume, cap: usize, w: Vec3, half: f32, n: usize, path:
 #[test]
 #[ignore]
 fn far_scrubbed_clay_strokes() {
-    let voxel = (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
-    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 6);
     let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
+    // `SCULPT_LEVELS=7`: the app's new ball (a coarser level 0, twice the step).
+    let levels = env("SCULPT_LEVELS", 6.0) as usize;
+    let voxel = (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt() * if levels >= 7 { 2.0 } else { 1.0 };
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, levels);
     let (hard, count, base_r) = (env("SCULPT_HARD", 0.5), env("SCULPT_N", 10.0) as usize, env("SCULPT_RS", 120.0));
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
     let mut rng = 12345u32;
@@ -1600,7 +1642,27 @@ fn far_scrubbed_clay_strokes() {
         let (a, b, half) = if win.len() == 3 { (win[0], win[1], win[2]) } else { (0.0, 0.0, 0.35) };
         let (t1, t2) = patch.any_orthonormal_pair();
         mesh_picture(&v, 0, (patch + t1 * a + t2 * b).normalize(), half, 900, &path);
+        relief_picture(&v, 0, (patch + t1 * a + t2 * b).normalize(), half, 900, &format!("{path}.relief.pgm"));
     }
+}
+
+/// The field's surface (levels up to `cap`) seen straight down `-w` over a square `half` across around `w`, shaded
+/// steeply by its normal's tilt from the ball's (so only what strokes made shows), as an `n` by `n` PGM at `path`.
+fn relief_picture(v: &LevelVolume, cap: usize, w: Vec3, half: f32, n: usize, path: &str) {
+    let (u, t) = w.any_orthonormal_pair();
+    let light = (u * -0.6 + t * 0.8).normalize();
+    let mut img = vec![0u8; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let (a, b) = (-half + 2.0 * half * (x as f32 + 0.5) / n as f32, half - 2.0 * half * (y as f32 + 0.5) / n as f32);
+            if let Some((q, nrm)) = v.raycast(w * 4.0 + u * a + t * b, -w, cap, false) {
+                img[y * n + x] = (128.0 + 400.0 * (nrm - q.normalize()).dot(light)).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    let mut out = format!("P5 {n} {n} 255\n").into_bytes();
+    out.extend(img);
+    std::fs::write(path, out).unwrap();
 }
 
 /// Level 0's samples as the GPU is sent them: each block's 9x9x9, clamped to what is drawn from, at 16 bits.
@@ -1646,4 +1708,49 @@ fn a_wide_far_dab_sends_only_the_blocks_it_changes_near_the_surface() {
     eprintln!("the dabs changed {changed} level 0 blocks, {sent} of them as sent");
     assert!(changed > 3000, "the dabs changed too little to tell: {changed} blocks");
     assert!((sent as f32) < 0.8 * changed as f32, "{sent} of the {changed} blocks the dabs changed are sent again");
+}
+
+/// Wide far clay strokes crossing on the app's new ball (radius `SCULPT_R`, 0.5; hardness `SCULPT_HARD`, 0.5; the first
+/// `SCULPT_UPTO` of three), each one's time and its end's, with `SCULPT_WIN=a,b,half` the surface's bending over that
+/// window, and a picture shaded by the surface's tilt from the ball's at `SCULPT_PICTURE`.relief.pgm.
+#[test]
+#[ignore]
+fn far_crossing_strokes_on_the_new_ball() {
+    let path = std::env::var("SCULPT_PICTURE").ok();
+    let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
+    let voxel = 2.0 * (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 7);
+    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+    let (r, hard) = (env("SCULPT_R", 0.5), env("SCULPT_HARD", 0.5));
+    let strokes: [&[(f32, f32)]; 3] = [&[(-0.5, -0.2), (0.4, -0.15)], &[(-0.3, 0.4), (0.05, -0.15)], &[(0.4, 0.35), (-0.1, 0.1)]];
+    let upto = env("SCULPT_UPTO", 3.0) as usize;
+    for (k, s) in strokes.iter().enumerate().take(upto) {
+        let t = std::time::Instant::now();
+        let end = far_clay_stroke(&mut v, patch, s, r, hard);
+        eprintln!("stroke {k}: {:.0} ms, its end {end:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+    let win: Vec<f32> = std::env::var("SCULPT_WIN").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+    if win.len() == 3 {
+        let (t1, t2) = patch.any_orthonormal_pair();
+        let (ca, cb, h) = (win[0], win[1], win[2]);
+        let g = 0.5 * voxel;
+        let m = (2.0 * h / g) as usize;
+        let hts: Vec<f32> = (0..m * m).map(|k| v.raycast(patch * 4.0 + t1 * (ca - h + g * (k % m) as f32) + t2 * (cb - h + g * (k / m) as f32), -patch, 0, false).map_or(f32::NAN, |(q, _)| q.dot(patch))).collect();
+        let (mut sum, mut cnt, mut big) = (0.0f64, 0usize, 0usize);
+        for j in 1..m - 1 {
+            for i in 1..m - 1 {
+                let c = hts[j * m + i];
+                let d = (hts[j * m + i - 1] + hts[j * m + i + 1] - 2.0 * c).abs() + (hts[(j - 1) * m + i] + hts[(j + 1) * m + i] - 2.0 * c).abs();
+                if d.is_finite() {
+                    sum += d as f64;
+                    cnt += 1;
+                    big += (d > 0.1 * voxel) as usize;
+                }
+            }
+        }
+        eprintln!("WINDOW mean |second difference| {:.4} steps, {big} over a tenth of a step, over {cnt} points", sum / cnt as f64 / voxel as f64);
+    }
+    if let Some(path) = path {
+        relief_picture(&v, 0, patch, env("SCULPT_HALF", 0.9), 900, &format!("{path}.relief.pgm"));
+    }
 }

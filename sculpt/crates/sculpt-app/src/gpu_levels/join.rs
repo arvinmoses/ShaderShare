@@ -61,7 +61,7 @@ fn join(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
                 }
                 c = c + (joined - c) * m;
             }
-            // Within what the level is drawn from (`LevelVolume::sent_reach`): at level 0 its plateau, six steps.
+            // Within what the level is drawn from (`LevelVolume::sent_reach`): at level 0 six steps.
             let reach = select(band, 6.0 * JP.misc.x, l == 0u);
             let e = clamp(clamp(c, -reach, reach) / band, -1.0, 1.0);
             var qv = i32(round(e * 32767.0));
