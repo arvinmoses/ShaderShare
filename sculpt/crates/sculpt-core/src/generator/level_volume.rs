@@ -1533,22 +1533,27 @@ impl LevelVolume {
                         // the next level down is often clamped too, and when even level 0 holds only its bound, the
                         // ground under the brush. Blended from a bound, the dab would reach it sooner here than on the
                         // levels below, and clay would show at this level's blocks (a block at a time, as a step)
-                        // before it shows around them.
+                        // before it shows around them. A level's reading near its plateau mixes in the levels below
+                        // it, the more the nearer it lies, from 0.7 of the plateau on: taken whole up to the plateau and the
+                        // deeper reading past it, the choice jumped where the reading crossed that line (as levels
+                        // clamped there interpolate, in a lattice at their spacing), by up to the next level's band
+                        // less this one's; a wide trim cutting down past a finer level's band through earlier fine work
+                        // showed a lattice of dents and steps there, one a block, while the stroke was drawn and after.
                         let blob = shape(p);
                         let mut was = *v;
                         if was.abs() >= 0.999 * fband {
-                            for k in (0..m).rev() {
-                                let b = below[k].trilinear((bc * B + cell_of(i)).as_vec3() / (1 << (m - k)) as f32);
-                                if (b < 0.0) == (was < 0.0) && b.abs() > was.abs() {
-                                    was = b;
-                                }
-                                if b.abs() < 0.999 * plateaus[k] {
-                                    break;
-                                }
+                            let farther = |a: f32, b: f32| if (b < 0.0) == (a < 0.0) && b.abs() > a.abs() { b } else { a };
+                            let at = |k: usize| below[k].trilinear((bc * B + cell_of(i)).as_vec3() / (1 << (m - k)) as f32);
+                            let mut deep = at(0);
+                            if deep.abs() >= 0.999 * plateaus[0] && w < 1.0 {
+                                deep = from_ground(p, deep);
                             }
-                            if was.abs() >= 0.999 * plateaus[0] && w < 1.0 {
-                                was = from_ground(p, was);
+                            for k in 1..m {
+                                let b = at(k);
+                                let x = ((b.abs() / plateaus[k] - 0.7) / 0.3).clamp(0.0, 1.0);
+                                deep = b + x * x * (3.0 - 2.0 * x) * (farther(b, deep) - b);
                             }
+                            was = farther(was, deep);
                         }
                         let full = if carve { was.max(-blob) } else { was.min(blob) };
                         let next = (was + w * (full - was)).clamp(-fband, fband);

@@ -1928,6 +1928,148 @@ mod tests {
         dump_box(&mode.vol, "end");
     }
 
+    /// Points of a height map whose bending (|second differences| over both axes) passes `by`: pits and grain.
+    fn bent(vol: &LevelVolume, c: Vec3, half: f32, px: usize, by: f32) -> (usize, usize) {
+        use rayon::prelude::*;
+        let n = c.normalize();
+        let u = n.cross(Vec3::Y).normalize();
+        let v = n.cross(u);
+        let step = 2.0 * half / px as f32;
+        let hs: Vec<f32> = (0..px * px)
+            .into_par_iter()
+            .map(|k| {
+                let q = c + u * (-half + step * (k % px) as f32) + v * (-half + step * (k / px) as f32);
+                vol.raycast(q + n * 0.3, -n, std::env::var("SCULPT_REPLAY_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(vol.levels() - 1), false).map_or(f32::NAN, |(hit, _)| (hit - c).dot(n))
+            })
+            .collect();
+        let (mut cnt, mut out) = (0, 0);
+        for j in 1..px - 1 {
+            for i in 1..px - 1 {
+                let h = hs[j * px + i];
+                let d = (hs[j * px + i - 1] + hs[j * px + i + 1] - 2.0 * h).abs() + (hs[(j - 1) * px + i] + hs[(j + 1) * px + i] - 2.0 * h).abs();
+                if d.is_finite() {
+                    cnt += 1;
+                    out += (d > by) as usize;
+                }
+            }
+        }
+        (out, cnt)
+    }
+
+    /// The demo's `trim` script on the app's fresh ball (clay at levels 2 and 3, grooves trimmed at level 4, then a wide
+    /// trim at level 2 cutting down through them), its strokes as straight lines between their first and last dabs: the
+    /// wide trim leaves no lattice of dents. A finer level's sample at its band holds only a bound and reads its distance
+    /// from the levels below; it took a level's reading whole up to that level's plateau and the deeper reading past it,
+    /// a jump where the reading crossed that line, so the finer blocks under the dab came out dented in a lattice, while
+    /// the stroke was drawn and after. Points whose height bends by more than a fifth of the finest step: over a window
+    /// across the trim 916 of 158404 with the jump, 614 now (what is left lies where the trim crossed the clay built at
+    /// level 3); over where it cut through the middle groove's start, 182 of 39204, 4 now.
+    #[test]
+    fn a_wide_trim_through_fine_grooves_leaves_no_lattice() {
+        let mut mode = VolumeMode::ball(1e6);
+        let strokes: [([f32; 3], [f32; 3], f32, f32, f32, bool, usize); 6] = [
+            ([0.1607, 0.3789, 0.9114], [0.4199, 0.3604, 0.8329], 0.0661, 1.0, 0.2, false, 30),
+            ([0.1684, 0.3160, 0.9338], [0.4311, 0.3028, 0.8503], 0.0330, 1.0, 0.2, false, 60),
+            ([0.1954, 0.4023, 0.9012], [0.3797, 0.3977, 0.8413], 0.0109, 1.0, 0.3, true, 120),
+            ([0.2012, 0.3615, 0.9175], [0.3839, 0.3572, 0.8591], 0.0108, 1.0, 0.3, true, 120),
+            ([0.2052, 0.3193, 0.9302], [0.3886, 0.3153, 0.8719], 0.0109, 1.0, 0.3, true, 120),
+            ([0.2035, 0.3406, 0.9243], [0.3957, 0.3321, 0.8634], 0.0650, 0.8, 0.3, true, 22),
+        ];
+        let mut before = 0;
+        for (k, &(a, b, r, strength, hardness, carve, n)) in strokes.iter().enumerate() {
+            let (a, b) = (Vec3::from(a), Vec3::from(b));
+            if k == 5 {
+                before = bent(&mode.vol, a, 0.06, 400, 0.2 * mode.vol.voxel(6)).0;
+            }
+            mode.begin_stroke();
+            for i in 0..n {
+                let d = a.lerp(b, i as f32 / (n - 1) as f32).normalize();
+                if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
+                    mode.dab(hit, r, 0.00055, strength, hardness, carve);
+                }
+                mode.tick();
+            }
+            mode.end_stroke();
+            mode.settle();
+        }
+        let (after, cnt) = bent(&mode.vol, Vec3::from(strokes[5].0), 0.06, 400, 0.2 * mode.vol.voxel(6));
+        // Where the trim cut through the middle groove's start.
+        let c = Vec3::from(strokes[5].0);
+        let n = c.normalize();
+        let u = n.cross(Vec3::Y).normalize();
+        let w = c + u * 0.005 - n.cross(u) * 0.023;
+        let (dents, near) = bent(&mode.vol, w, 0.015, 200, 0.2 * mode.vol.voxel(6));
+        eprintln!("{before} points bent before the wide trim, {after} of {cnt} after; over the groove's start {dents} of {near}");
+        assert!(cnt > 100_000 && near > 30_000, "the window missed the surface: {cnt}, {near} points");
+        assert!(dents <= 20, "the wide trim left a lattice of dents over the groove's start: {dents} points bent");
+    }
+
+    /// The strokes of a dab log (`SCULPT_REPLAY_DABS`, from `SCULPT_DAB_LOG`) on the app's fresh ball; during the
+    /// strokes from `SCULPT_REPLAY_FROM` on (0), every `SCULPT_REPLAY_EVERY` dabs (8) the surface's bent points around
+    /// the stroke's first dab and its small pieces, and height maps in `SCULPT_REPLAY_OUT` when set.
+    #[test]
+    #[ignore]
+    fn replay_a_dab_log() {
+        let Ok(path) = std::env::var("SCULPT_REPLAY_DABS") else { return };
+        let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
+        let (from, every, half) = (env("SCULPT_REPLAY_FROM", 0.0) as usize, env("SCULPT_REPLAY_EVERY", 8.0) as usize, env("SCULPT_REPLAY_HALF", 0.06));
+        let out = std::env::var("SCULPT_REPLAY_OUT").ok().map(std::path::PathBuf::from);
+        let log = std::fs::read_to_string(path).unwrap();
+        let mut mode = VolumeMode::ball(1e6);
+        let strokes: Vec<&str> = log.split("BEGIN").filter(|s| s.contains("DAB")).collect();
+        for (s, text) in strokes.iter().enumerate() {
+            let dabs: Vec<(Vec<f32>, bool)> = text.lines().filter(|l| l.starts_with("DAB")).map(|l| (l.split_whitespace().skip(1).take(7).map(|x| x.parse().unwrap()).collect(), l.ends_with("true"))).collect();
+            let c = Vec3::new(dabs[0].0[0], dabs[0].0[1], dabs[0].0[2]);
+            let by = 0.2 * mode.vol.voxel(mode.vol.levels() - 1);
+            let look = |mode: &VolumeMode, name: &str| {
+                let (b, cnt) = bent(&mode.vol, c, half, 400, by);
+                let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
+                let small = pieces(&mesh).iter().filter(|&&p| p < sculpt_core::generator::level_volume::SPECK_VERTS).count();
+                eprintln!("stroke {s} {name}: {b} of {cnt} points bent, {small} small pieces");
+                if let Some(dir) = &out {
+                    height_map(&mode.vol, c, half, 700, &dir.join(format!("s{s}_{name}.pgm")));
+                }
+            };
+            if s >= from {
+                look(&mode, "before");
+            }
+            mode.begin_stroke();
+            for (k, (d, carve)) in dabs.iter().enumerate() {
+                mode.dab(Vec3::new(d[0], d[1], d[2]), d[3], d[4], d[5], d[6], *carve);
+                mode.tick();
+                if s >= from && k % every == every - 1 {
+                    look(&mode, &format!("dab{k:03}"));
+                }
+            }
+            // `SCULPT_REPLAY_PROF=u0,v0,u1,v1`: heights at every cap along that line (offsets as the height maps').
+            let profile = |mode: &VolumeMode, tag: &str| {
+                let prof: Vec<f32> = std::env::var("SCULPT_REPLAY_PROF").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if prof.len() == 4 {
+                    let n = c.normalize();
+                    let u = n.cross(Vec3::Y).normalize();
+                    let v = n.cross(u);
+                    for i in 0..=60 {
+                        let f = i as f32 / 60.0;
+                        let q = c + u * (prof[0] + f * (prof[2] - prof[0])) + v * (prof[1] + f * (prof[3] - prof[1]));
+                        let hs: Vec<String> = (0..mode.vol.levels()).map(|cap| mode.vol.raycast(q + n * 0.3, -n, cap, false).map_or("-".into(), |(hit, _)| format!("{:7.3}", (hit - c).dot(n) / mode.vol.voxel(4)))).collect();
+                        let hit = mode.vol.raycast(q + n * 0.3, -n, mode.vol.levels() - 1, false).map(|(h, _)| h).unwrap_or(q);
+                        println!("PROF {tag} {f:.3} level {} heights in level 4 steps by cap {}", mode.vol.level_of(hit), hs.join(" "));
+                    }
+                }
+            };
+            if s >= from {
+                profile(&mode, "last-dab");
+            }
+            mode.end_stroke();
+            mode.settle();
+            if s >= from {
+                eprintln!("stroke {s}: {} dabs at level {} r {:.4} carve {}", dabs.len(), mode.level, dabs[0].0[3], dabs[0].1);
+                look(&mode, "end");
+                profile(&mode, "end");
+            }
+        }
+    }
+
     /// A big level 0 stroke over sculpted form and fine work, as the review's: what its surface looks like mid-stroke
     /// (small loose pieces, open or tangled edges), dab by dab.
     #[test]
