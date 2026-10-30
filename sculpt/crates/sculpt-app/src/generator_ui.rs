@@ -52,9 +52,12 @@ fn touched(r: &egui::Response) -> bool {
     r.dragged() || r.drag_started() || r.drag_stopped() || r.has_focus() || r.lost_focus() || r.clicked() || r.is_pointer_button_down_on()
 }
 
-/// Record a widget edit. A drag in progress coalesces into one undo step.
+/// Record a widget edit. A drag in progress coalesces into one undo step. The frame a drag ends is not an edit: egui
+/// takes the pointer where it is at the end of that frame, not where the button was let go, and after a long frame (a
+/// big generator's preview can take seconds) the release and a move away come in together, which would snap a slider
+/// to its end. The value the drag left stays. (A tap, begun and ended in one frame, is still an edit.)
 fn note(r: &egui::Response, changed: &mut bool, coalesce: &mut bool) {
-    if r.changed() && touched(r) {
+    if r.changed() && touched(r) && !(r.drag_stopped() && !r.drag_started()) {
         *changed = true;
         *coalesce = r.dragged() && !r.drag_started();
     }
@@ -292,5 +295,59 @@ pub(crate) fn volume_noise_props(app: &mut SculptApp, ui: &mut Ui) {
         m.set_noise(k, n, dragging || coalesce);
     } else if !dragging {
         m.set_noise(k, n0, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vslider;
+    use egui::{CentralPanel, Context, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
+
+    /// One frame of a Size slider as the generator section has it; the value is kept only when noted as an edit.
+    fn frame(ctx: &Context, size: &mut f32, time: f64, events: Vec<Event>) -> Rect {
+        let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), time: Some(time), events, ..Default::default() };
+        let mut rect = Rect::NOTHING;
+        let _ = ctx.run_ui(raw, |ui| {
+            CentralPanel::default().show_inside(ui, |ui| {
+                ui.spacing_mut().slider_width = 150.0;
+                let mut next = *size;
+                let (mut c, mut co, mut d) = (false, false, false);
+                vslider(ui, "Size", egui::Slider::new(&mut next, 0.005..=0.5).logarithmic(true).max_decimals(3), None, &mut c, &mut co, &mut d);
+                rect = ui.min_rect();
+                if c {
+                    *size = next;
+                }
+            });
+        });
+        rect
+    }
+
+    /// A drag to the top of the Size slider, then a long frame (a big generator's preview) in which the button is let
+    /// go and the pointer moves away to the left: the size stays where the drag left it, not snapped to the bottom.
+    #[test]
+    fn a_slow_frame_ending_a_drag_does_not_snap_the_slider() {
+        let ctx = Context::default();
+        let mut size = 0.08f32;
+        let r = frame(&ctx, &mut size, 0.0, vec![]);
+        let (y, x0) = (r.top() + 10.0, r.left() + 120.0);
+        let button = |x: f32, pressed: bool| Event::PointerButton { pos: pos2(x, y), button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let mut t = 0.0;
+        for events in [vec![Event::PointerMoved(pos2(x0, y))], vec![button(x0, true)]] {
+            t += 0.016;
+            frame(&ctx, &mut size, t, events);
+        }
+        let mut x = x0;
+        while size < 0.45 && x < r.right() + 200.0 {
+            x += 4.0;
+            t += 0.016;
+            frame(&ctx, &mut size, t, vec![Event::PointerMoved(pos2(x, y))]);
+        }
+        assert!(size >= 0.45, "the drag never reached the top: {size}");
+        let top = size;
+        t += 3.0;
+        frame(&ctx, &mut size, t, vec![button(x, false), Event::PointerMoved(pos2(10.0, y + 200.0))]);
+        t += 0.016;
+        frame(&ctx, &mut size, t, vec![]);
+        assert_eq!(size, top, "the slider snapped when the drag ended");
     }
 }
