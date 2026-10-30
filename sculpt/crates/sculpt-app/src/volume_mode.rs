@@ -891,6 +891,11 @@ impl VolumeMode {
 
     /// Change generator layer `k`'s parameters. While `dragging`, the changes undo as one, until a change that is not.
     pub fn set_generator(&mut self, k: usize, spec: &GeneratorSpec, dragging: bool) {
+        // Mid-drag, the job composing an earlier frame's rocks at their own level is stale: stopped, not waited on
+        // (no job starts again until the drag is over: see `start_generator_job`).
+        if self.generator_edit {
+            self.cancel_generator_job();
+        }
         self.settle();
         let Some(layer) = self.layer.as_mut() else { return };
         if dragging && !self.generator_edit {
@@ -913,7 +918,8 @@ impl VolumeMode {
 
     /// Start composing a previewed generator at its own level on another thread, unless one is under way.
     fn start_generator_job(&mut self) {
-        if self.gen_job.is_some() {
+        // While a drag goes on, each frame's change would make it stale: it starts once the drag is over.
+        if self.gen_job.is_some() || self.generator_edit {
             return;
         }
         let Some(job) = self.layer.as_mut().and_then(|l| l.generator_take()) else { return };
@@ -926,6 +932,14 @@ impl VolumeMode {
             let _ = tx.send(done);
         });
         self.gen_job = Some(rx);
+    }
+
+    /// Stop the generator job under way, if any (its result is never taken).
+    fn cancel_generator_job(&mut self) {
+        self.gen_job = None;
+        if let Some(c) = self.gen_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Take a generator job that finished (and start the next, if a newer edit wants one); with `wait`, the one under
@@ -2115,6 +2129,90 @@ mod tests {
         stroke(&mut mode, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.1, 0.02, 1.0), 0.45, 0.02, false, 8, true);
         let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
         eprintln!("after the stroke ended: {} pieces, {} spiky vertices", pieces(&mesh).len(), spikes(&mesh, 0.6).len());
+    }
+
+    /// A new ball's rocks at `size`, then a five-frame drag of their size: each frame's `set_generator` (ms), and the
+    /// release's. Between frames no job composes the rocks at their own level; once the frames after the release
+    /// have brought it in, what is shown is the stack composed afresh, and the drag undoes as one step.
+    fn drag_rocks(size: f32, level: Option<usize>) -> (Vec<f64>, f64) {
+        let mut mode = VolumeMode::ball(1e6);
+        mode.add_generator();
+        let k = mode.layer.as_ref().unwrap().active();
+        if let Some(l) = level {
+            mode.layer.as_mut().unwrap().set_level(&mut mode.vol, k, l);
+        }
+        let level = mode.layer.as_ref().unwrap().layers()[k].level;
+        let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+        spec.size = size;
+        mode.set_generator(k, &spec, false);
+        mode.settle();
+        // Sent to the GPU, as the viewport takes them a frame at a time.
+        mode.vol.drain_dirty();
+        let before = mode.layer.as_ref().unwrap().history_len();
+        let mut frames = Vec::new();
+        for i in 1..=5 {
+            // (A slider's drag moves it a little a frame.)
+            spec.size = size * (1.0 + 0.01 * i as f32);
+            let t = Instant::now();
+            mode.set_generator(k, &spec, true);
+            frames.push(t.elapsed().as_secs_f64() * 1e3);
+            mode.tick();
+            mode.vol.drain_dirty();
+            assert!(mode.gen_job.is_none(), "a generator job runs between the drag's frames");
+        }
+        let t = Instant::now();
+        mode.end_generator_edit();
+        let release = t.elapsed().as_secs_f64() * 1e3;
+        let start = Instant::now();
+        while mode.busy() && start.elapsed().as_secs() < 120 {
+            mode.tick();
+            mode.vol.drain_dirty();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let landed = start.elapsed().as_secs_f64() * 1e3;
+        assert!(!mode.busy(), "the rocks never came in at their own level");
+        let layer = mode.layer.as_ref().unwrap();
+        assert_eq!(layer.generator(k), Some(&spec));
+        assert_eq!(layer.history_len(), before + 1, "the drag is not one undo step");
+        // Shown as composed afresh, to the tolerance `wide_far_stroke_over_layers` holds the file to.
+        let afresh = layer.composed_afresh();
+        let (mut live, mut fresh) = (mode.vol.keys(), afresh.keys());
+        live.sort_by_key(|k| (k.0, k.1.to_array()));
+        fresh.sort_by_key(|k| (k.0, k.1.to_array()));
+        assert!(live == fresh, "shown holds other blocks than composed afresh: {} against {}", live.len(), fresh.len());
+        let round0 = 2.0 * mode.vol.band(0) / 32767.0;
+        let mut apart = vec![0.0f32; mode.vol.levels()];
+        for &key in &live {
+            for (a, b) in mode.vol.block(key).unwrap().iter().zip(afresh.block(key).unwrap().iter()) {
+                let e = &mut apart[key.0 as usize];
+                *e = e.max((a - b).abs());
+            }
+        }
+        for (l, a) in apart.iter().enumerate() {
+            assert!(*a < (0.01 * mode.vol.voxel(l)).max(round0), "size {size}: at level {l} shown differs from composed afresh by {a}");
+        }
+        eprintln!("size {size} at level {level}: drag frames {frames:.1?} ms, release {release:.1} ms, landed {landed:.0} ms later; {} blocks", live.len());
+        (frames, release)
+    }
+
+    /// A drag of the size of rocks shown by the GPU at their own level (2) does not wait each frame on composing an
+    /// earlier frame's at their own level (it did: each frame about 3 s at size 0.2, against 0.2 s now).
+    #[test]
+    fn dragging_a_rock_slider_does_not_wait_each_frame() {
+        let (frames, release) = drag_rocks(0.2, Some(2));
+        let worst = frames.iter().cloned().fold(0.0, f64::max);
+        assert!(worst < 600.0 && release < 200.0, "a drag frame took {worst:.0} ms, the release {release:.0}");
+    }
+
+    /// [`drag_rocks`] at three sizes, for the times: at the level a new generator takes, and (`SCULPT_GEN_LEVEL`)
+    /// another.
+    #[test]
+    #[ignore]
+    fn rock_drag_times() {
+        let level = std::env::var("SCULPT_GEN_LEVEL").ok().and_then(|s| s.parse().ok());
+        for size in [0.05, 0.2, 0.4] {
+            drag_rocks(size, level);
+        }
     }
 
     /// With a detail layer, a mask stroke hides the layer where it passes, and undo brings it back.
