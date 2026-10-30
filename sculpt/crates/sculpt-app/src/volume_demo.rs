@@ -157,7 +157,7 @@ impl VolumeDemo {
         let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
         use Act::*;
         at(0.0, 0.0, Camera(start));
-        at(0.0, 5.0, Caption("The volume engine on the GPU: a ball whose level 0 alone is 1M triangles, and five finer levels for detail"));
+        at(0.0, 5.0, Caption("The volume engine on the GPU: a ball whose level 0 alone is 250k triangles, and six finer levels for detail"));
         // Big brushes: coarse form at level 0.
         at(5.0, 10.0, Caption("A big brush works at level 0: broad form. The surface of every block it touched is rebuilt on the GPU"));
         at(5.5, 2.4, Stroke { tool: Tool::ClayBuildup, size: 150.0, strength: 0.9, path: line((0.33, 0.40), (0.62, 0.36), 0.02, 12) });
@@ -170,7 +170,7 @@ impl VolumeDemo {
         at(18.5, 2.0, Stroke { tool: Tool::ClayBuildup, size: 45.0, strength: 1.0, path: line((0.36, 0.42), (0.64, 0.44), 0.03, 12) });
         at(20.7, 2.0, Stroke { tool: Tool::ClayBuildup, size: 45.0, strength: 1.0, path: line((0.36, 0.56), (0.64, 0.58), 0.03, 12) });
         at(23.0, 3.0, Camera(Pose::at(patch, 0.32)));
-        at(23.0, 9.0, Caption("Closer still: grooves and dots at levels 4 and 5, 16 to 32 times finer than level 0, only where they are carved"));
+        at(23.0, 9.0, Caption("Closer still: grooves and dots at levels 5 and 6, 32 to 64 times finer than level 0, only where they are carved"));
         for k in 0..4 {
             let y = 0.38 + 0.08 * k as f32;
             at(26.2 + 1.2 * k as f32, 1.0, Stroke { tool: Tool::TrimDynamic, size: 14.0, strength: 1.0, path: line((0.38, y), (0.62, y + 0.01), 0.004, 10) });
@@ -184,10 +184,10 @@ impl VolumeDemo {
         at(34.0, 0.0, Tint(true));
         at(34.0, 5.5, Caption("Tinted by level: each level holds blocks only where it was sculpted (the readout counts them)"));
         // Detail shown by level cap.
-        at(39.5, 8.0, CapSweep(5, 0));
+        at(39.5, 8.0, CapSweep(6, 0));
         at(39.5, 8.0, Caption("Showing fewer levels, as a distant view would: the finest detail goes first, the form stays"));
-        at(47.5, 3.0, CapSweep(0, 5));
-        at(50.5, 0.0, Cap(5));
+        at(47.5, 3.0, CapSweep(0, 6));
+        at(50.5, 0.0, Cap(6));
         at(50.5, 0.0, Tint(false));
         // A big coarse stroke over the detail.
         at(50.5, 2.5, Camera(Pose::at(patch, 3.0)));
@@ -198,7 +198,7 @@ impl VolumeDemo {
         at(60.0, 0.0, Undo);
         at(60.0, 2.0, Camera(Pose::at(patch, 3.0)));
         at(60.0, 9.0, Caption("Undone. Now the grooves and dots go into a detail layer (Layers panel), and the big stroke works on the form under it: the layer rides along"));
-        at(61.5, 0.0, MakeLayer(4));
+        at(61.5, 0.0, MakeLayer(5));
         at(62.0, 0.0, Target(crate::volume_mode::Target::Form));
         at(62.5, 2.5, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.50, 0.40), (0.60, 0.42), 0.0, 8) });
         at(65.5, 3.0, Camera(Pose::at(patch * 1.05, 0.34)));
@@ -213,8 +213,8 @@ impl VolumeDemo {
         at(77.3, 1.2, Stroke { tool: Tool::ClayBuildup, size: 80.0, strength: 1.0, path: line((0.40, 0.615), (0.58, 0.615), 0.0, 8) });
         at(79.0, 0.0, Target(crate::volume_mode::Target::Detail));
         // A second layer, at a resolution of its own.
-        at(79.5, 0.0, AddLayer(5));
-        at(79.5, 6.0, Caption("A second layer, finer (level 5, the first is level 4): fine strokes painted on it go into it. Layers add up, each at its own resolution"));
+        at(79.5, 0.0, AddLayer(6));
+        at(79.5, 6.0, Caption("A second layer, finer (level 6, the first is level 5): fine strokes painted on it go into it. Layers add up, each at its own resolution"));
         for k in 0..4 {
             let x = 0.46 + 0.07 * k as f32;
             at(80.5 + 1.0 * k as f32, 0.8, Stroke { tool: Tool::TrimDynamic, size: 12.0, strength: 1.0, path: line((x, 0.40), (x + 0.04, 0.66), 0.0, 10) });
@@ -439,7 +439,7 @@ impl VolumeDemo {
             at(5.7, 3.0, Caption("Zoomed in: finer levels"));
             at(7.9, 1.4, Stroke { tool: Tool::ClayBuildup, size: 45.0, strength: 1.0, path: line((0.36, 0.42), (0.64, 0.44), 0.03, 12) });
             at(9.5, 2.0, Camera(Pose::at(patch, 0.32)));
-            at(9.5, 4.0, Caption("Grooves and dots at levels 4 and 5"));
+            at(9.5, 4.0, Caption("Grooves and dots at levels 5 and 6"));
             for k in 0..3 {
                 let y = 0.40 + 0.08 * k as f32;
                 at(11.7 + 0.8 * k as f32, 0.7, Stroke { tool: Tool::TrimDynamic, size: 14.0, strength: 1.0, path: line((0.38, y), (0.62, y + 0.01), 0.004, 10) });
@@ -449,10 +449,10 @@ impl VolumeDemo {
                 at(14.2 + 0.3 * k as f32, 0.2, Stroke { tool: Tool::ClayBuildup, size: 9.0, strength: 1.0, path: line((x, 0.69), (x + 0.002, 0.69), 0.0, 2) });
             }
             // The fine work into a layer; a big stroke on the form under it.
-            at(15.5, 0.0, MakeLayer(4));
+            at(15.5, 0.0, MakeLayer(5));
             at(15.5, 0.0, Target(crate::volume_mode::Target::Form));
             at(15.6, 2.0, Camera(Pose::at(patch, 3.0)));
-            at(15.6, 4.0, Caption("Layer made from level 4; a big form stroke under it"));
+            at(15.6, 4.0, Caption("Layer made from level 5; a big form stroke under it"));
             at(17.8, 1.8, Stroke { tool: Tool::ClayBuildup, size: 170.0, strength: 1.0, path: line((0.50, 0.40), (0.60, 0.42), 0.0, 8) });
             at(19.8, 2.0, Camera(Pose::at(patch * 1.05, 0.34)));
             at(21.9, 0.0, Undo);
@@ -469,14 +469,14 @@ impl VolumeDemo {
             at(27.2, 0.0, FillMask(1.0));
             at(27.3, 0.0, Target(crate::volume_mode::Target::Detail));
             // A second, finer layer painted on, moved coarser and back.
-            at(27.5, 0.0, AddLayer(5));
-            at(27.5, 4.0, Caption("A level 5 layer painted on, held at level 4, then 5 again"));
+            at(27.5, 0.0, AddLayer(6));
+            at(27.5, 4.0, Caption("A level 6 layer painted on, held at level 5, then 6 again"));
             for k in 0..3 {
                 let x = 0.46 + 0.08 * k as f32;
                 at(27.7 + 0.8 * k as f32, 0.6, Stroke { tool: Tool::TrimDynamic, size: 12.0, strength: 1.0, path: line((x, 0.40), (x + 0.04, 0.66), 0.0, 10) });
             }
-            at(30.3, 0.0, LayerLevel(1, 4));
-            at(31.0, 0.0, LayerLevel(1, 5));
+            at(30.3, 0.0, LayerLevel(1, 5));
+            at(31.0, 0.0, LayerLevel(1, 6));
             // The form again under both, then a generator.
             at(31.5, 1.5, Camera(Pose::at(patch, 3.0)));
             at(31.5, 0.0, Target(crate::volume_mode::Target::Form));
@@ -503,13 +503,13 @@ impl VolumeDemo {
                 n.scale = 4.0;
                 n.octaves = 6;
             }));
-            at(44.2, 4.0, Caption("Surface noise hidden, painted in over a patch, baked there into a level 3 layer; saved and opened"));
-            // Baked over a patch only (over the whole surface a level 3 bake is millions of blocks).
+            at(44.2, 4.0, Caption("Surface noise hidden, painted in over a patch, baked there into a level 4 layer; saved and opened"));
+            // Baked over a patch only (over the whole surface a level 4 bake is millions of blocks).
             at(44.3, 0.0, FillMask(0.0));
             at(44.3, 0.0, Target(crate::volume_mode::Target::Mask { show: true }));
             at(44.4, 1.0, Stroke { tool: Tool::ClayBuildup, size: 120.0, strength: 1.0, path: line((0.45, 0.48), (0.55, 0.5), 0.0, 6) });
             at(45.6, 0.0, Target(crate::volume_mode::Target::Detail));
-            at(45.8, 0.0, BakeNoise(3));
+            at(45.8, 0.0, BakeNoise(4));
             at(47.3, 0.0, SaveOpen);
             // Near and far: the levels hand over.
             at(48.2, 2.0, Camera(Pose::at(patch, 0.6)));

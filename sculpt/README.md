@@ -28,8 +28,8 @@ drawn by the GPU), masks per layer, undo, and `.svol` files. The mesh engine and
 `sculpt-core` and `sculpt-cli`; the app no longer sculpts meshes.
 
 ```sh
-cargo run --release -p sculpt-app                          # a 1M-triangle ball
-cargo run --release -p sculpt-app -- --triangles 3         # a 3M-triangle ball
+cargo run --release -p sculpt-app                          # a ball of 250k triangles fresh (1M at level 1)
+cargo run --release -p sculpt-app -- --triangles 3         # 750k fresh (3M at level 1)
 cargo run --release -p sculpt-app -- path/to/rock.svol     # open a volume
 cargo run --release -p sculpt-app -- --screenshot out.png  # save the window once the volume settles, then close
 cargo run --release -p sculpt-app --features tablet        # + octotablet pen pressure (Windows Ink / Wayland)

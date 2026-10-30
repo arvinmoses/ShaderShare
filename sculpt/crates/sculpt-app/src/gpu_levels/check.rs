@@ -432,7 +432,7 @@ pub fn run(args: &[String]) -> Res<()> {
         let mut files: Vec<_> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "svol")).collect();
         files.sort();
         for f in files {
-            let mut vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(&f)?), crate::volume_mode::LEVELS)?;
+            let mut vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(&f)?), crate::volume_mode::OPEN_LEVELS)?;
             let cap = vol.levels() - 1;
             let mut gpu = GpuLevels::new(&device, &queue, &vol, cap);
             gpu.sync(&mut vol);
@@ -645,54 +645,64 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     Ok(())
 }
 
-/// `SCULPT_BENCH_FAR`: wide clay strokes at level 0 seen from far (a ball of radius 1 at about a million triangles'
-/// step, brushes of radius 0.45 and 0.7, 90 and 140 steps), a sync after each dab as the app does a frame: per stroke,
-/// the median dab and sync (CPU), the blocks a dab changed, and those sent and extracted.
+/// `SCULPT_BENCH_FAR`: wide clay strokes seen from far (a ball of radius 1, eye at 4, focal 1100 px; brushes of radius
+/// 0.45 and 0.7), a sync after each dab as the app does a frame, on a new ball (its coarse level 0 under the step of
+/// 1M triangles) and on one as balls were made before it (level 0 at that step, six levels): each stroke at the level
+/// the app picks for it. Per stroke: the median dab and sync (CPU), the blocks a dab changed, and those sent and
+/// extracted.
 fn bench_far(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
-    let voxel0 = (4.0 * std::f32::consts::PI / 5e5f32).sqrt();
-    let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel0, 6);
-    let mut gpu = GpuLevels::new(device, queue, &vol, 5);
-    gpu.set_eye(Vec3::new(0.0, 0.0, 4.0), 1100.0);
-    gpu.sync(&mut vol);
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
-    let (t1, t2) = patch.any_orthonormal_pair();
-    println!("| radius | dabs | dab ms CPU | sync ms CPU | sync to GPU done ms | blocks changed a dab | sent | extracted | stroke end ms |");
-    println!("|---|---|---|---|---|---|---|---|---|");
-    for (k, r) in [0.45f32, 0.7, 0.45, 0.7].into_iter().enumerate() {
-        let (mut dab_ms, mut sync_ms, mut gpu_ms, mut changed, mut sent, mut extracted) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let b = 0.05 * k as f32 - 0.05;
-        let steps = (0.4 / (0.15 * r)).ceil() as usize;
-        vol.begin_stroke();
-        let mut along = Vec3::ZERO;
-        for i in 0..=steps {
-            let a = -0.2 + 0.4 * i as f32 / steps as f32;
-            let d = (patch + t1 * if k % 2 == 0 { a } else { -a } + t2 * (b + 0.05 * a)).normalize();
-            let Some((hit, n)) = vol.raycast(d * 3.0, -d, 0, true) else { continue };
-            let t = Instant::now();
-            let rough = if along == Vec3::ZERO { n } else { along };
-            if let Some((n, s)) = vol.plane_dab(0, hit, rough, r, r * 0.095, 0.2, 0.4, false) {
-                along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
-                changed.push(s.changed + s.carried);
-            }
-            dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
-            let t = Instant::now();
-            let s = gpu.sync(&mut vol);
-            sync_ms.push(s.cpu_ms);
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            gpu_ms.push(t.elapsed().as_secs_f64() * 1e3);
-            sent.push(s.uploaded);
-            extracted.push(s.extracted);
-        }
-        let t = Instant::now();
-        vol.end_stroke();
-        let end_ms = t.elapsed().as_secs_f64() * 1e3;
-        while gpu.pending() > 0 {
-            gpu.sync(&mut vol);
-        }
+    let eye = Vec3::new(0.0, 0.0, 4.0);
+    let focal = 1100.0;
+    let old = (4.0 * std::f32::consts::PI / 5e5f32).sqrt();
+    for (name, voxel0, levels) in [("new ball (7 levels)", crate::volume_mode::ball_voxel0(1e6), crate::volume_mode::LEVELS), ("ball as before (6 levels)", old, crate::volume_mode::OPEN_LEVELS)] {
+        let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel0, levels);
+        let mut gpu = GpuLevels::new(device, queue, &vol, levels - 1);
+        gpu.set_eye(eye, focal);
         gpu.sync(&mut vol);
-        let med = |v: Vec<usize>| median(v.into_iter().map(|x| x as f64).collect());
-        println!("| {r} | {} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0} | {:.0} | {end_ms:.0} |", steps + 1, median(dab_ms), median(sync_ms), median(gpu_ms), med(changed), med(sent), med(extracted));
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
+        let (t1, t2) = patch.any_orthonormal_pair();
+        println!("{name}, level 0 step {voxel0:.4}:");
+        println!("| radius | level | dabs | dab ms CPU | sync ms CPU | sync to GPU done ms | blocks changed a dab | sent | extracted | stroke end ms |");
+        println!("|---|---|---|---|---|---|---|---|---|---|");
+        for (k, r) in [0.45f32, 0.7, 0.45, 0.7].into_iter().enumerate() {
+            let (mut dab_ms, mut sync_ms, mut gpu_ms, mut changed, mut sent, mut extracted) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let b = 0.05 * k as f32 - 0.05;
+            let steps = (0.4 / (0.15 * r)).ceil() as usize;
+            vol.begin_stroke();
+            let mut along = Vec3::ZERO;
+            let mut level = None;
+            for i in 0..=steps {
+                let a = -0.2 + 0.4 * i as f32 / steps as f32;
+                let d = (patch + t1 * if k % 2 == 0 { a } else { -a } + t2 * (b + 0.05 * a)).normalize();
+                let Some((hit, n)) = vol.raycast(d * 3.0, -d, vol.levels() - 1, true) else { continue };
+                // The level as the app picks it, on the stroke's first dab.
+                let l = *level.get_or_insert_with(|| crate::volume_mode::level_for(&vol, r, (hit - eye).length() / focal));
+                let t = Instant::now();
+                let rough = if along == Vec3::ZERO { n } else { along };
+                if let Some((n, s)) = vol.plane_dab(l, hit, rough, r, r * 0.095, 0.2, 0.4, false) {
+                    along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+                    changed.push(s.changed + s.carried);
+                }
+                dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                let t = Instant::now();
+                let s = gpu.sync(&mut vol);
+                sync_ms.push(s.cpu_ms);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                gpu_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                sent.push(s.uploaded);
+                extracted.push(s.extracted);
+            }
+            let t = Instant::now();
+            vol.end_stroke();
+            let end_ms = t.elapsed().as_secs_f64() * 1e3;
+            while gpu.pending() > 0 {
+                gpu.sync(&mut vol);
+            }
+            gpu.sync(&mut vol);
+            let med = |v: Vec<usize>| median(v.into_iter().map(|x| x as f64).collect());
+            println!("| {r} | {} | {} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0} | {:.0} | {end_ms:.0} |", level.unwrap_or(0), steps + 1, median(dab_ms), median(sync_ms), median(gpu_ms), med(changed), med(sent), med(extracted));
+        }
     }
     Ok(())
 }

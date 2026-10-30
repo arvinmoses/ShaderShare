@@ -83,7 +83,9 @@ fn target_text(app: &SculptApp) -> (String, Color32) {
 
 // ----------------------------------------------------------------- menu bar
 
-const BALLS: [(&str, f32); 3] = [("Ball, 1M triangles", 1e6), ("Ball, 3M triangles", 3e6), ("Ball, 5M triangles", 5e6)];
+/// The new balls: what a fresh one shows (its level 0), and the size given to [`VolumeMode::ball`] (its level 1, the
+/// step of the balls these labels once named).
+const BALLS: [(&str, f32); 3] = [("Ball, 250k triangles", 1e6), ("Ball, 750k triangles", 3e6), ("Ball, 1.25M triangles", 5e6)];
 
 pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
     egui::Panel::top("menu").frame(egui::Frame::side_top_panel(ui.style()).fill(app.theme.ui.window.0)).show(ui, |ui| {

@@ -7,7 +7,7 @@
 //!
 //! `cargo test --release --test stress` runs a short session; `cargo test --release --test stress -- --ignored`
 //! runs `SCULPT_STRESS_STEPS` steps (default 400) from seed `SCULPT_STRESS_SEED` (default 1), or every seed in
-//! `SCULPT_STRESS_SEEDS=a..b`.
+//! `SCULPT_STRESS_SEEDS=a..b`, at `SCULPT_STRESS_VOXEL` (default 0.04) with `SCULPT_STRESS_LEVELS` levels (default 6).
 
 use glam::{IVec3, Vec3};
 use sculpt_core::generator::density::Density;
@@ -19,7 +19,10 @@ use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::noise::NoiseKind;
 use sculpt_core::surface_noise::SurfaceNoise;
 
-const LEVELS: usize = 6;
+/// Levels in the session's volume: 6, or `SCULPT_STRESS_LEVELS` (7 as the app's new balls have).
+fn levels() -> usize {
+    std::env::var("SCULPT_STRESS_LEVELS").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
+}
 
 /// A small deterministic generator (xorshift64*).
 struct Rng(u64);
@@ -215,7 +218,7 @@ fn describe_difference(sa: &[(u8, [i32; 3], Vec<u32>)], b: &LevelVolume, l: Opti
     let only_a: Vec<_> = ka.difference(&kb).take(5).collect();
     let only_b: Vec<_> = kb.difference(&ka).take(5).collect();
     let mut worst = (0.0f32, (0u8, [0; 3]));
-    let mut differing = vec![0usize; LEVELS];
+    let mut differing = vec![0usize; levels()];
     let mb: std::collections::HashMap<_, _> = sb.iter().map(|y| ((y.0, y.1), &y.2)).collect();
     for x in sa {
         if let Some(y) = mb.get(&(x.0, x.1)) {
@@ -292,8 +295,8 @@ fn form_end(l: &mut Layered, s: &mut LevelVolume, f: &FormStroke) {
 
 impl World {
     fn new(seed: u64, voxel: f32) -> World {
-        let s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, LEVELS);
-        World { s, l: None, rng: Rng::new(seed), log: Vec::new(), drift: vec![0.0; LEVELS], steps: 0, nm: 0, fills: 0, reach: 0.0 }
+        let s = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, levels());
+        World { s, l: None, rng: Rng::new(seed), log: Vec::new(), drift: vec![0.0; levels()], steps: 0, nm: 0, fills: 0, reach: 0.0 }
     }
 
     fn note(&mut self, what: String) {
@@ -309,7 +312,7 @@ impl World {
         {
             // The surface's reach from the centre (a ball of radius 1 with what was sculpted on it), over the vertices
             // quads use: a transition cell has a vertex whether or not any crossing uses it.
-            let (mesh, _) = self.s.surface(LEVELS - 1);
+            let (mesh, _) = self.s.surface(levels() - 1);
             let mut used = vec![false; mesh.positions.len()];
             for f in &mesh.faces {
                 for &i in f.iter().filter(|i| **i != u32::MAX) {
@@ -346,7 +349,7 @@ impl World {
             let exact = l.composed_afresh();
             let mut report = Vec::new();
             let mut fills = 0;
-            for lv in 0..LEVELS {
+            for lv in 0..levels() {
                 let a: std::collections::BTreeSet<[i32; 3]> = s.level_keys(lv).into_iter().map(|v| v.to_array()).collect();
                 let b: std::collections::BTreeSet<[i32; 3]> = exact.level_keys(lv).into_iter().map(|v| v.to_array()).collect();
                 let only_live: Vec<_> = a.difference(&b).take(4).collect();
@@ -356,7 +359,7 @@ impl World {
                     for k in only_afresh.iter().take(2) {
                         let bc = IVec3::from_array(**k);
                         let holders: Vec<usize> = (0..l.layers().len()).filter(|&j| l.layer_holds(j, lv, bc)).collect();
-                        report.push(format!("   only afresh {k:?}: held by layers {holders:?}, in the form {}, children live {}, parent live {}", l.form().exists(lv, bc), (0..8).filter(|q| lv + 1 < LEVELS && s.exists(lv + 1, bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))).count(), lv > 0 && s.exists(lv - 1, bc.div_euclid(IVec3::splat(2)))));
+                        report.push(format!("   only afresh {k:?}: held by layers {holders:?}, in the form {}, children live {}, parent live {}", l.form().exists(lv, bc), (0..8).filter(|q| lv + 1 < levels() && s.exists(lv + 1, bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1))).count(), lv > 0 && s.exists(lv - 1, bc.div_euclid(IVec3::splat(2)))));
                     }
                 }
                 // (A checkerboard fill of this level, or of a coarser one: a block made again from the level below
@@ -375,7 +378,7 @@ impl World {
                         let cell = |j: usize| IVec3::new((j & 7) as i32, ((j >> 3) & 7) as i32, (j >> 6) as i32);
                         let worst = bad.iter().map(|&j| (x[j] - y[j]).abs()).fold(0.0f32, f32::max);
                         let holders: Vec<usize> = (0..l.layers().len()).filter(|&k| l.layer_holds(k, lv, bc)).collect();
-                        let children: Vec<IVec3> = (0..8).map(|q| bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)).filter(|c| lv + 1 < LEVELS && s.exists(lv + 1, *c)).collect();
+                        let children: Vec<IVec3> = (0..8).map(|q| bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)).filter(|c| lv + 1 < levels() && s.exists(lv + 1, *c)).collect();
                         let parent = (lv > 0).then(|| {
                             let pb = bc.div_euclid(IVec3::splat(2));
                             let (px, py) = (s.block((lv as u8 - 1, pb)).unwrap(), exact.block((lv as u8 - 1, pb)).unwrap());
@@ -391,7 +394,7 @@ impl World {
             }
             self.fills += fills;
             if !report.is_empty() {
-                let afresh: Vec<(usize, usize, usize)> = (0..LEVELS).map(|cap| closed(&exact, cap)).collect();
+                let afresh: Vec<(usize, usize, usize)> = (0..levels()).map(|cap| closed(&exact, cap)).collect();
                 report.push(format!("(open, non-manifold, dropped) per cap of the afresh composition: {afresh:?}"));
                 // Composed again live (every layer hidden and shown): if the difference goes, blocks were left stale.
                 let l = self.l.as_mut().unwrap();
@@ -402,7 +405,7 @@ impl World {
                     l.set_visible(&mut self.s, k, on);
                 }
                 let mut worst = 0.0f32;
-                for lv in 0..LEVELS {
+                for lv in 0..levels() {
                     for bc in self.s.level_keys(lv) {
                         if let Some(y) = exact.block((lv as u8, bc)) {
                             let x = self.s.block((lv as u8, bc)).unwrap();
@@ -414,7 +417,7 @@ impl World {
                 let again = self.l.as_ref().unwrap().composed_afresh();
                 let mut worst2 = 0.0f32;
                 let mut where2 = (0, IVec3::ZERO, 0);
-                for lv in 0..LEVELS {
+                for lv in 0..levels() {
                     for bc in again.level_keys(lv) {
                         if let Some(y) = exact.block((lv as u8, bc)) {
                             let x = again.block((lv as u8, bc)).unwrap();
@@ -436,14 +439,14 @@ impl World {
             // And through a file (the form at 16 bits), every few steps: the same blocks, values within a little of
             // the band.
             if self.steps % 5 != 0 {
-                eprintln!("   checks: closed {t_closed:.0} ms, afresh {t_afresh:.0} ms; shown blocks per level {:?}", (0..LEVELS).map(|l| self.s.level_len(l)).collect::<Vec<_>>());
+                eprintln!("   checks: closed {t_closed:.0} ms, afresh {t_afresh:.0} ms; shown blocks per level {:?}", (0..levels()).map(|l| self.s.level_len(l)).collect::<Vec<_>>());
                 return;
             }
             let mut buf = Vec::new();
             l.write_to(&mut buf).unwrap();
-            let (again, l2) = Layered::read_from(&mut &buf[..], LEVELS).unwrap();
+            let (again, l2) = Layered::read_from(&mut &buf[..], levels()).unwrap();
             assert!(l2.is_some());
-            for lv in 0..LEVELS {
+            for lv in 0..levels() {
                 let a: std::collections::BTreeSet<[i32; 3]> = s.level_keys(lv).into_iter().map(|v| v.to_array()).collect();
                 let b: std::collections::BTreeSet<[i32; 3]> = again.level_keys(lv).into_iter().map(|v| v.to_array()).collect();
                 assert!(a == b, "after {what}: opened from a file, level {lv} holds other blocks: only live {:?}, only opened {:?}", a.difference(&b).take(4).collect::<Vec<_>>(), b.difference(&a).take(4).collect::<Vec<_>>());
@@ -491,7 +494,7 @@ impl World {
                 }
             }
             let t_file = t0.elapsed().as_secs_f64() * 1e3;
-            eprintln!("   checks: closed {t_closed:.0} ms, afresh {t_afresh:.0} ms, file {t_file:.0} ms; shown blocks per level {:?}", (0..LEVELS).map(|l| self.s.level_len(l)).collect::<Vec<_>>());
+            eprintln!("   checks: closed {t_closed:.0} ms, afresh {t_afresh:.0} ms, file {t_file:.0} ms; shown blocks per level {:?}", (0..levels()).map(|l| self.s.level_len(l)).collect::<Vec<_>>());
         }
     }
 
@@ -508,7 +511,7 @@ impl World {
     /// when the follow lands).
     fn closed_everywhere_at(&mut self, what: &str, preview: bool) {
         let strict = std::env::var_os("SCULPT_STRESS_STRICT").is_some() && !preview;
-        for cap in 0..LEVELS {
+        for cap in 0..levels() {
             let (open, nm, dropped) = closed(&self.s, cap);
             if nm > 0 {
                 let where_ = non_manifold(&self.s, cap, self.l.as_ref().map(|l| l.form()));
@@ -530,7 +533,7 @@ impl World {
     }
 
     fn from(&self) -> usize {
-        self.l.as_ref().map_or(LEVELS, |l| l.from())
+        self.l.as_ref().map_or(levels(), |l| l.from())
     }
 
     /// A radius for a brush at `level`: from a few steps to many, up to very big (0.6 on a ball of radius 1, the most
@@ -542,7 +545,7 @@ impl World {
 
     /// A stroke without layers, on the volume alone: carrying in jobs or at once, the end in a job or at once.
     fn plain_stroke(&mut self) {
-        let level = self.rng.below(LEVELS);
+        let level = self.rng.below(levels());
         let r = self.radius(level);
         let trim = self.rng.chance(0.4);
         let d = self.rng.dir();
@@ -728,7 +731,7 @@ impl World {
     /// A stroke ended in a job (its carrying in jobs too), and the next drawn ahead on a copy before the end lands;
     /// then it lands and the next is done for real. The copy leaves the real volume exactly as it was.
     fn plain_drawn_ahead(&mut self, wait: bool) {
-        let level = self.rng.below(LEVELS);
+        let level = self.rng.below(levels());
         let r = self.radius(level);
         let d = self.rng.dir();
         let next = self.rng.dir();
@@ -845,7 +848,7 @@ impl World {
 
     /// A level for a generator of `size`: the coarsest giving about a dozen steps a radius (as the app picks).
     fn generator_level(&mut self, size: f32) -> usize {
-        (0..LEVELS).find(|&l| self.s.voxel(l) <= size / 12.0).unwrap_or(LEVELS - 1)
+        (0..levels()).find(|&l| self.s.voxel(l) <= size / 12.0).unwrap_or(levels() - 1)
     }
 
     fn add_generator(&mut self) {
@@ -973,7 +976,7 @@ impl World {
 
     fn add_layer(&mut self) {
         let from = self.from();
-        let level = from + self.rng.below(LEVELS - from);
+        let level = from + self.rng.below(levels() - from);
         let l = self.l.as_mut().unwrap();
         let k = l.add_layer(&mut self.s, "Layer", level);
         self.check(&format!("detail layer {k} added at level {level}"));
@@ -1018,7 +1021,7 @@ impl World {
         } else {
             // (A layer over the whole surface, finer: a wait, not a check.)
             let from = l.from();
-            let top = if layers[k].blocks > 1500 { (from + 1).min(LEVELS - 1) } else { LEVELS - 1 };
+            let top = if layers[k].blocks > 1500 { (from + 1).min(levels() - 1) } else { levels() - 1 };
             from + self.rng.below(top - from + 1)
         };
         let l = self.l.as_mut().unwrap();
@@ -1162,7 +1165,7 @@ impl World {
         let Some(l) = self.l.as_ref() else { return };
         let mut buf = Vec::new();
         l.write_to(&mut buf).unwrap();
-        let (s, l2) = Layered::read_from(&mut &buf[..], LEVELS).unwrap();
+        let (s, l2) = Layered::read_from(&mut &buf[..], levels()).unwrap();
         let mut l2 = l2.unwrap();
         l2.deferred = true;
         let mut buf2 = Vec::new();
@@ -1174,12 +1177,12 @@ impl World {
     }
 
     fn make_layer(&mut self) {
-        let from = 1 + self.rng.below(LEVELS - 1);
+        let from = 1 + self.rng.below(levels() - 1);
         let mut l = Layered::new(&mut self.s, from);
         l.deferred = true;
         // (With no work to take, the layer is made at the finest level: a level of its own instead, as a layer added
         // by hand would have, so strokes on it are not all composed at the finest level.)
-        let level = from + self.rng.below(LEVELS - from);
+        let level = from + self.rng.below(levels() - from);
         if l.layers()[0].blocks == 0 {
             l.set_level(&mut self.s, 0, level);
         }

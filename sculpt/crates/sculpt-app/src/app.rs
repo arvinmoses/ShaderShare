@@ -21,7 +21,7 @@ use crate::volume_mode::VolumeMode;
 pub struct Options {
     /// A `.svol` file to open instead of a new ball.
     pub file: Option<PathBuf>,
-    /// The new ball's size: about this many triangles at level 0.
+    /// The new ball's size: about this many triangles at level 1 (a fresh ball shows its level 0, a quarter as many).
     pub triangles: f32,
     pub theme: Option<String>,
     /// Multiply the initial framing distance (below 1 zooms in), for close-up screenshots.
@@ -51,7 +51,7 @@ struct Stroke {
 pub enum Dialog {
     Open(String),
     SaveAs(String),
-    /// Replace the volume with a new ball of about this many triangles.
+    /// Replace the volume with a new ball of about this many triangles at level 1 (a quarter as many shown fresh).
     New(f32),
 }
 
@@ -177,7 +177,7 @@ impl SculptApp {
             eprintln!("config: {e}");
         }
         app.frame_volume();
-        app.status = format!("{:.1}M-triangle ball. Clay Buildup adds, Trim Dynamic carves, Ctrl swaps them.", triangles / 1e6);
+        app.status = format!("{:.2}M-triangle ball. Clay Buildup adds, Trim Dynamic carves, Ctrl swaps them.", crate::volume_mode::ball_triangles(triangles) / 1e6);
         if let Some(p) = opts.file {
             app.open(p.display().to_string());
             app.frame_volume();
@@ -260,13 +260,13 @@ impl SculptApp {
         }
     }
 
-    /// A fresh ball of about `triangles` triangles in place of the volume.
+    /// A fresh ball of about `triangles` triangles at level 1 in place of the volume.
     pub fn new_volume(&mut self, triangles: f32) {
         let t = Instant::now();
         self.replace_volume(VolumeMode::ball(triangles));
         self.volume_path = None;
         self.frame_volume();
-        self.status = format!("New {:.1}M-triangle ball in {:.0} ms", triangles / 1e6, t.elapsed().as_secs_f64() * 1e3);
+        self.status = format!("New {:.2}M-triangle ball in {:.0} ms", crate::volume_mode::ball_triangles(triangles) / 1e6, t.elapsed().as_secs_f64() * 1e3);
     }
 
     pub fn open(&mut self, p: String) {

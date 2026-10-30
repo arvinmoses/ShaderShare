@@ -82,14 +82,40 @@ impl Ahead {
     }
 }
 
-/// Levels in a new volume: level 0 and five finer, the finest 32 times finer.
-pub const LEVELS: usize = 6;
+/// Levels in a new volume: level 0 and six finer, the finest 64 times finer. Level 0 is coarse, for wide brushes seen
+/// from far (a brush of radius 0.7 on the ball of radius 1 is about 70 of its steps); level 1 is the step a ball's
+/// triangle count names.
+pub const LEVELS: usize = 7;
+/// Levels a volume opened from a file has at least: files from before the coarse level 0 have six, and open as they
+/// were made (their level 0 is the step their triangle count named).
+pub const OPEN_LEVELS: usize = 6;
 /// The finest step a brush works at, in pixels on screen at the brush.
 const PIXELS_PER_STEP: f32 = 1.0;
 /// The most lattice steps across a brush's radius: bigger brushes work a level coarser.
 const MAX_STEPS_PER_RADIUS: f32 = 48.0;
 /// Finer blocks a carrying job takes at most: one job runs at a time, on its own threads, while the frames go on.
 const CARRY_JOB: usize = 384;
+
+/// Level 0's step for a ball of radius 1 whose level 1 alone would be about `triangles` triangles.
+pub fn ball_voxel0(triangles: f32) -> f32 {
+    2.0 * (4.0 * std::f32::consts::PI / (triangles / 2.0)).sqrt()
+}
+
+/// About how many triangles a fresh ball made for `triangles` shows: its level 0's.
+pub fn ball_triangles(triangles: f32) -> f32 {
+    triangles / 4.0
+}
+
+/// The level of `vol` a brush of `radius` (world units) works at, `px` world units being a pixel at the brush: the
+/// coarsest whose step is no coarser than a pixel nor than a 48th of the radius, else level 0.
+pub fn level_for(vol: &LevelVolume, radius: f32, px: f32) -> usize {
+    let want = (px * PIXELS_PER_STEP).max(radius / MAX_STEPS_PER_RADIUS);
+    let mut l = 0;
+    while l + 1 < vol.levels() && vol.voxel(l + 1) >= want {
+        l += 1;
+    }
+    l
+}
 
 /// What strokes work on once the volume has a detail layer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -195,10 +221,10 @@ pub struct VolumeMode {
 }
 
 impl VolumeMode {
-    /// A ball of radius 1 whose level 0 alone is about `triangles` triangles.
+    /// A ball of radius 1 whose level 1 alone would be about `triangles` triangles: its level 0, all a fresh ball
+    /// holds, has twice the step, a quarter as many (see [`ball_triangles`]).
     pub fn ball(triangles: f32) -> VolumeMode {
-        let voxel = (4.0 * std::f32::consts::PI / (triangles / 2.0)).sqrt();
-        VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, LEVELS))
+        VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(triangles), LEVELS))
     }
 
     pub fn new(mut vol: LevelVolume) -> VolumeMode {
@@ -270,12 +296,7 @@ impl VolumeMode {
 
     /// The level a brush of `radius` (world units) works at, `px` world units being a pixel at the brush.
     pub fn level_for(&self, radius: f32, px: f32) -> usize {
-        let want = (px * PIXELS_PER_STEP).max(radius / MAX_STEPS_PER_RADIUS);
-        let mut l = 0;
-        while l + 1 < self.vol.levels() && self.vol.voxel(l + 1) >= want {
-            l += 1;
-        }
-        l
+        level_for(&self.vol, radius, px)
     }
 
     /// One dab of Clay Buildup (or, with `carve`, Trim Dynamic) at surface point `at`: a plane brush whose plane
@@ -1021,7 +1042,7 @@ impl VolumeMode {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
         let mut cur = std::io::Cursor::new(&bytes[..]);
-        let (vol, layer) = Layered::read_from(&mut cur, LEVELS)?;
+        let (vol, layer) = Layered::read_from(&mut cur, OPEN_LEVELS)?;
         let pos = cur.position() as usize;
         let mut mode = VolumeMode::new(vol);
         if let Some(mut layer) = layer {
@@ -1100,7 +1121,7 @@ mod tests {
     #[test]
     #[ignore]
     fn big_form_strokes_under_a_layer_stay_cheap_a_frame() {
-        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, LEVELS));
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6));
         for j in 0..12 {
             for i in 0..60 {
                 let p = Vec3::new(-0.06 + 0.002 * i as f32, -0.06 + 0.01 * j as f32, 1.0).normalize();
@@ -1153,13 +1174,13 @@ mod tests {
         assert!(!mode.busy());
     }
 
-    /// Fine work at level 4 over the front of the ball (rows of small dots), as the demo's patch.
+    /// Fine work at level 5 over the front of the ball (rows of small dots), as the demo's patch.
     fn fine_patch(mode: &mut VolumeMode) {
         for j in 0..12 {
             for i in 0..60 {
                 let p = Vec3::new(-0.06 + 0.002 * i as f32, -0.06 + 0.01 * j as f32, 1.0).normalize();
                 mode.vol.begin_stroke();
-                mode.vol.ball_dab(4, p, 0.0015, 0.0004, true);
+                mode.vol.ball_dab(5, p, 0.0015, 0.0004, true);
                 mode.vol.end_stroke();
             }
         }
@@ -1229,7 +1250,7 @@ mod tests {
     }
 
     /// At the app's scale (a ball of 1M triangles), how long a new stroke waits for the last one's work: after a big
-    /// form stroke over a detail layer, after a generator edit at levels 2 and 3, after a big plain stroke carrying
+    /// form stroke over a detail layer, after a generator edit at levels 3 and 4, after a big plain stroke carrying
     /// detail.
     #[test]
     #[ignore]
@@ -1239,14 +1260,14 @@ mod tests {
         if run("form") {
             let mut mode = VolumeMode::ball(1e6);
             fine_patch(&mut mode);
-            mode.make_layer(4);
+            mode.make_layer(5);
             mode.target = Target::Form;
             mode.vol.drain_dirty();
             frames_stroke(&mut mode, Vec3::new(-0.1, 0.0, 1.0), Vec3::new(0.1, 0.0, 1.0), 0.5, 0.05, 24);
             let ms = next_stroke_wait(&mut mode, Vec3::new(0.05, 0.05, 1.0), 0.3, 0.05);
             eprintln!("after a big form stroke over a detail layer: {ms:.0} ms to the first dab");
         }
-        for level in [2usize, 3] {
+        for level in [3usize, 4] {
             if !run(&format!("generator{level}")) {
                 continue;
             }
@@ -1444,7 +1465,7 @@ mod tests {
     /// waits (`carrying_ends_as_its_jobs_land_whoever_waits`).
     fn ahead_lands_as_waiting_as(name: &str, setup: &dyn Fn(&mut VolumeMode), steps: &[Step], exact: bool) -> (Vec<bool>, usize) {
         let new = || {
-            let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, LEVELS));
+            let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 6));
             setup(&mut mode);
             mode.settle();
             mode
@@ -1538,7 +1559,7 @@ mod tests {
             big(Target::Detail, Vec3::new(0.1, 0.0, 1.0), Vec3::new(-0.1, 0.05, 1.0), 0.3),
         ];
         let new = || {
-            let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, LEVELS));
+            let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 6));
             patch(&mut mode);
             mode.vol.keep_detail = true;
             mode.settle();
@@ -1635,7 +1656,7 @@ mod tests {
     fn a_dab_on_the_copy_costs_what_a_dab_does() {
         let mut mode = VolumeMode::ball(1e6);
         fine_patch(&mut mode);
-        mode.make_layer(4);
+        mode.make_layer(5);
         mode.target = Target::Form;
         frames_stroke(&mut mode, Vec3::new(-0.1, 0.0, 1.0), Vec3::new(0.1, 0.0, 1.0), 0.5, 0.05, 24);
         mode.settle();
@@ -1755,10 +1776,10 @@ mod tests {
         let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "svol")).collect();
         files.sort();
         for f in files {
-            let vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(&f).unwrap()), LEVELS).unwrap();
+            let vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(&f).unwrap()), OPEN_LEVELS).unwrap();
             let (mesh, _) = vol.surface(vol.levels() - 1);
             let sp = spikes(&mesh, 0.6);
-            let lv: Vec<usize> = (0..LEVELS).map(|l| sp.iter().filter(|p| vol.level_of(**p) == l).count()).collect();
+            let lv: Vec<usize> = (0..vol.levels()).map(|l| sp.iter().filter(|p| vol.level_of(**p) == l).count()).collect();
             eprintln!("{}: {} vertices, {} spiky, by level {lv:?}; e.g. {:?}", f.file_name().unwrap().to_string_lossy(), mesh.positions.len(), sp.len(), &sp[..sp.len().min(4)]);
         }
     }
@@ -1862,7 +1883,7 @@ mod tests {
     fn replay_the_big_stroke() {
         let Ok(dir) = std::env::var("SCULPT_REPLAY_DIR") else { return };
         let dir = std::path::PathBuf::from(dir);
-        let vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(dir.join("dump_01604.svol")).unwrap()), LEVELS).unwrap();
+        let vol = LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(dir.join("dump_01604.svol")).unwrap()), OPEN_LEVELS).unwrap();
         let log = std::fs::read_to_string(dir.join("dabs.txt")).unwrap();
         let last = log.rfind("BEGIN").unwrap();
         let dabs: Vec<Vec<f32>> = log[last..].lines().filter(|l| l.starts_with("DAB")).map(|l| l.split_whitespace().skip(1).take(7).map(|x| x.parse().unwrap()).collect()).collect();
@@ -1912,7 +1933,7 @@ mod tests {
     #[test]
     #[ignore]
     fn a_big_stroke_mid_stroke_surface() {
-        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, LEVELS));
+        let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6));
         let stroke = |mode: &mut VolumeMode, a: Vec3, b: Vec3, r: f32, px: f32, carve: bool, dabs: usize, watch: bool| {
             mode.begin_stroke();
             for k in 0..=dabs {
@@ -1928,7 +1949,7 @@ mod tests {
                     sizes.sort_unstable();
                     let small = sizes.iter().filter(|&&s| s < sculpt_core::generator::level_volume::SPECK_VERTS).count();
                     let sp = spikes(&mesh, 0.6);
-                    let lv: Vec<usize> = (0..LEVELS).map(|l| sp.iter().filter(|p| mode.vol.level_of(**p) == l).count()).collect();
+                    let lv: Vec<usize> = (0..mode.vol.levels()).map(|l| sp.iter().filter(|p| mode.vol.level_of(**p) == l).count()).collect();
                     eprintln!("dab {k} at level {}: {} pieces ({small} small), open edges {open}, tangled {nm}; {} spiky vertices, by the finest level there {lv:?}", mode.level, sizes.len(), sp.len());
                 }
             }
@@ -2032,6 +2053,134 @@ mod tests {
         // A small brush zoomed in: as fine as a pixel.
         assert_eq!(mode.level_for(0.02, 0.0012), 4);
         assert_eq!(mode.level_for(0.004, 0.00001), LEVELS - 1);
+    }
+
+    /// A new ball as the menu makes it (its coarse level 0 under the step of a million triangles): fine bumps taken
+    /// into a detail layer, a generator layer of rocks over them, then a wide clay stroke on the form seen from far,
+    /// which works at the new level 0. What is shown is what opening the saved file composes afresh; undo and redo
+    /// bring back each side exactly; saving what was opened writes the same bytes; the bumps ride the form; the
+    /// surface stays closed.
+    #[test]
+    fn a_wide_far_stroke_at_the_new_coarse_level_keeps_the_layers_whole() {
+        wide_far_stroke_over_layers("new ball", VolumeMode::ball(1e6), 1);
+    }
+
+    /// [`a_wide_far_stroke_at_the_new_coarse_level_keeps_the_layers_whole`] on a ball as made before the coarse level
+    /// 0 (level 0 at the step of a million triangles, six levels), as files from then open.
+    #[test]
+    fn a_wide_far_stroke_on_a_ball_as_before_keeps_the_layers_whole() {
+        wide_far_stroke_over_layers("ball as before", VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(1e6) / 2.0, OPEN_LEVELS)), 0);
+    }
+
+    /// The bumps at level `4 + shift`, the layer from level `3 + shift`: the same steps on either ball.
+    fn wide_far_stroke_over_layers(name: &str, mut mode: VolumeMode, shift: usize) {
+        let levels = mode.vol.levels();
+        let xs: Vec<f32> = (0..5).map(|i| -0.04 + 0.02 * i as f32).collect();
+        for &x in &xs {
+            mode.vol.begin_stroke();
+            mode.vol.ball_dab(4 + shift, Vec3::new(x, 0.0, 1.0).normalize(), 0.004, 0.0015, false);
+            mode.vol.end_stroke();
+        }
+        mode.make_layer(3 + shift);
+        mode.add_generator();
+        mode.settle();
+        // How far the shown surface stands out of the form near each bump (the most a little either side).
+        let out_of = |m: &VolumeMode, x: f32| -> f32 {
+            let p = Vec3::new(x, 0.0, 1.0).normalize();
+            let f = m.layer.as_ref().unwrap().form();
+            let Some((q, n)) = f.raycast(p * 3.0, -p, f.levels() - 1, false) else { return f32::NAN };
+            m.vol.raycast(q + n * 0.02, -n, m.vol.levels() - 1, false).map_or(f32::NAN, |(r, _)| 0.02 - (q + n * 0.02 - r).length())
+        };
+        let relief = |m: &VolumeMode| -> f32 { xs.iter().map(|&x0| (0..9).map(|j| out_of(m, x0 - 0.002 + 0.0005 * j as f32)).fold(0.0f32, f32::max)).sum::<f32>() / xs.len() as f32 };
+        let ground = |m: &VolumeMode| m.vol.raycast(Vec3::new(0.0, 0.06, 1.0).normalize() * 3.0, -Vec3::new(0.0, 0.06, 1.0).normalize(), m.vol.levels() - 1, false).map_or(f32::NAN, |(p, _)| p.length());
+        let (bumps0, ground0) = (relief(&mode), ground(&mode));
+        let start = print(&mode);
+        let history = |m: &VolumeMode| m.layer.as_ref().map_or(0, |l| l.history_len());
+        let before = history(&mode);
+        let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
+        let open0 = sculpt_core::generator::levels::edge_counts(&mesh.faces);
+
+        // The stroke, seen from far (eye about 3 from the surface, focal 1100 px), a frame after each dab.
+        mode.target = Target::Form;
+        let (r, px) = (0.45f32, 3.0 / 1100.0);
+        let t = Instant::now();
+        mode.begin_stroke();
+        let mut dab_ms = Vec::new();
+        for k in 0..=12 {
+            let d = Vec3::new(-0.08 + 0.16 * k as f32 / 12.0, 0.01, 1.0).normalize();
+            let Some((hit, _)) = mode.raycast(d * 3.0, -d) else { continue };
+            let td = Instant::now();
+            mode.dab(hit, r, px, 1.0, 0.5, false);
+            dab_ms.push(td.elapsed().as_secs_f64() * 1e3);
+            mode.tick();
+        }
+        let level = mode.level;
+        let te = Instant::now();
+        mode.end_stroke();
+        mode.settle();
+        let (end_ms, all_ms) = (te.elapsed().as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3);
+        dab_ms.sort_by(f64::total_cmp);
+        eprintln!("{name}: the stroke at level {level} (step {:.4}): dabs {:.1} ms median, {:.1} at most; its end and the layers settling {end_ms:.0} ms; all {all_ms:.0} ms", mode.vol.voxel(level), dab_ms[dab_ms.len() / 2], dab_ms[dab_ms.len() - 1]);
+        assert_eq!(level, 0, "a wide brush from far did not work at the coarse level 0");
+        let end = print(&mode);
+        let (bumps1, ground1) = (relief(&mode), ground(&mode));
+        eprintln!("bumps out of the form {bumps0:.5} -> {bumps1:.5}; the form rose {:.4}", ground1 - ground0);
+        assert!(ground1 - ground0 > 0.01, "the stroke did not build");
+        assert!(bumps0 > 0.0008, "the layer does not hold the bumps");
+        assert!(bumps1 > 0.9 * bumps0 && bumps1 < 1.1 * bumps0, "the bumps did not ride the form whole");
+        let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
+        let open1 = sculpt_core::generator::levels::edge_counts(&mesh.faces);
+        eprintln!("open and tangled edges {open0:?} -> {open1:?}; {} pieces", pieces(&mesh).len());
+        assert_eq!(open1.0, 0, "the surface has open edges");
+
+        // Shown as opening the file composes it afresh (to the file's rounding), and saved again the same.
+        let mut file = Vec::new();
+        mode.write_to(&mut file).unwrap();
+        let mut opened = VolumeMode::read_from(&mut &file[..]).unwrap();
+        assert_eq!(opened.vol.levels(), levels);
+        let (mut live, mut afresh) = (mode.vol.keys(), opened.vol.keys());
+        live.sort_by_key(|k| (k.0, k.1.to_array()));
+        afresh.sort_by_key(|k| (k.0, k.1.to_array()));
+        assert!(live == afresh, "shown live holds other blocks than composing the file afresh: {} against {}", live.len(), afresh.len());
+        // Per level: the most a sample is apart (in steps), how many are apart by more than a thousandth of a step,
+        // and the block most apart.
+        let mut apart = vec![(0.0f32, 0usize, None); levels];
+        for &k in &live {
+            let vx = mode.vol.voxel(k.0 as usize);
+            for (a, b) in mode.vol.block(k).unwrap().iter().zip(opened.vol.block(k).unwrap().iter()) {
+                let d = (a - b).abs() / vx;
+                let e = &mut apart[k.0 as usize];
+                if d > 1e-3 {
+                    e.1 += 1;
+                }
+                if d > e.0 {
+                    *e = (d, e.1, Some((k, *a, *b)));
+                }
+            }
+        }
+        eprintln!("{name}: {} blocks shown, the same afresh; per level, values apart at most, samples apart by over 0.001 of a step, where: {apart:?}", live.len());
+        // The file keeps each level's samples in 16 bits of its band: level 0's band is 16 of its steps, so its
+        // rounding (a 65536th of 32 steps) carries into the finer levels composed from it, as a larger share of
+        // their finer steps. Within a hundredth of a step, or two of level 0's roundings.
+        let round0 = 2.0 * mode.vol.band(0) / 32767.0;
+        for (l, a) in apart.iter().enumerate() {
+            assert!(a.0 * mode.vol.voxel(l) < (0.01 * mode.vol.voxel(l)).max(round0), "{name}: at level {l} shown live differs from composing the file afresh by {} of a step", a.0);
+        }
+        let mut again = Vec::new();
+        opened.write_to(&mut again).unwrap();
+        assert!(again == file, "saving what was opened wrote other bytes");
+
+        // Undo every step the stroke made, then redo them.
+        let made = history(&mode) - before;
+        assert!(made >= 1);
+        for _ in 0..made {
+            assert!(mode.undo());
+        }
+        same(&start, &print(&mode)).unwrap_or_else(|e| panic!("undo did not bring back the start: {e}"));
+        for _ in 0..made {
+            assert!(mode.redo());
+        }
+        same(&end, &print(&mode)).unwrap_or_else(|e| panic!("redo did not bring back the stroke: {e}"));
     }
 
     /// Scrubbing a big brush back and forth over bumpy clay: the brush turns a little per dab, far less than the
