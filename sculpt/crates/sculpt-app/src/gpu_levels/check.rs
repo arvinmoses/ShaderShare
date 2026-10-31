@@ -354,13 +354,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
 /// surface agree but for the distance the CPU makes of steep joins again, and the surface built on the GPU drops
 /// nothing.
 fn join_check(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
+    // Rocks at level 2, and at level 1 (where a new generator goes on a new ball).
+    for level in [2, 1] {
+        println!("rocks at level {level}:");
+        join_check_at(device, queue, level)?;
+    }
+    Ok(())
+}
+
+fn join_check_at(device: &wgpu::Device, queue: &wgpu::Queue, level: usize) -> Res<()> {
     use sculpt_core::generator::detail_layer::Layered;
     use sculpt_core::generator::layer::GeneratorSpec;
     use sculpt_core::generator::{BoolOp, Primitive};
     let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 4);
     let mut layer = Layered::new(&mut vol, 2);
     let rocks = GeneratorSpec { primitive: Primitive::Sphere, op: BoolOp::Add, count: 12, seed: 3, size: 0.12, lift: 0.2, min_spacing: 0.4, blend: 0.3, rough: 0.2, stretch_var: 0.3, tilt: 20.0, ..GeneratorSpec::default() };
-    let k = layer.add_generator(&mut vol, "Rocks", 2, &rocks);
+    let k = layer.add_generator(&mut vol, "Rocks", level, &rocks);
     // Its mask painted away over the front, half way at its edge: the GPU fades the join as the CPU does.
     layer.set_active(k);
     layer.paint_mask(&mut vol, Vec3::new(0.0, 0.0, 1.0), 0.6, 0.0);

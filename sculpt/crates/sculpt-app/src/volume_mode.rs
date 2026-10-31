@@ -2134,7 +2134,7 @@ mod tests {
     /// A new ball's rocks at `size`, then a five-frame drag of their size: each frame's `set_generator` (ms), and the
     /// release's. Between frames no job composes the rocks at their own level; once the frames after the release
     /// have brought it in, what is shown is the stack composed afresh, and the drag undoes as one step.
-    fn drag_rocks(size: f32, level: Option<usize>) -> (Vec<f64>, f64) {
+    fn drag_rocks(size: f32, level: Option<usize>) -> (Vec<f64>, f64, usize) {
         let mut mode = VolumeMode::ball(1e6);
         mode.add_generator();
         let k = mode.layer.as_ref().unwrap().active();
@@ -2149,13 +2149,15 @@ mod tests {
         // Sent to the GPU, as the viewport takes them a frame at a time.
         mode.vol.drain_dirty();
         let before = mode.layer.as_ref().unwrap().history_len();
-        let mut frames = Vec::new();
+        let (mut frames, mut on_gpu) = (Vec::new(), 0);
         for i in 1..=5 {
             // (A slider's drag moves it a little a frame.)
             spec.size = size * (1.0 + 0.01 * i as f32);
             let t = Instant::now();
             mode.set_generator(k, &spec, true);
             frames.push(t.elapsed().as_secs_f64() * 1e3);
+            // (Taken by the viewport.)
+            on_gpu += mode.gpu_plan.take().is_some() as usize;
             mode.tick();
             mode.vol.drain_dirty();
             assert!(mode.gen_job.is_none(), "a generator job runs between the drag's frames");
@@ -2191,15 +2193,26 @@ mod tests {
         for (l, a) in apart.iter().enumerate() {
             assert!(*a < (0.01 * mode.vol.voxel(l)).max(round0), "size {size}: at level {l} shown differs from composed afresh by {a}");
         }
-        eprintln!("size {size} at level {level}: drag frames {frames:.1?} ms, release {release:.1} ms, landed {landed:.0} ms later; {} blocks", live.len());
-        (frames, release)
+        eprintln!("size {size} at level {level}: drag frames {frames:.1?} ms ({on_gpu} joined on the GPU), release {release:.1} ms, landed {landed:.0} ms later; {} blocks", live.len());
+        (frames, release, on_gpu)
     }
 
     /// A drag of the size of rocks shown by the GPU at their own level (2) does not wait each frame on composing an
     /// earlier frame's at their own level (it did: each frame about 3 s at size 0.2, against 0.2 s now).
     #[test]
     fn dragging_a_rock_slider_does_not_wait_each_frame() {
-        let (frames, release) = drag_rocks(0.2, Some(2));
+        let (frames, release, _) = drag_rocks(0.2, Some(2));
+        let worst = frames.iter().cloned().fold(0.0, f64::max);
+        assert!(worst < 600.0 && release < 200.0, "a drag frame took {worst:.0} ms, the release {release:.0}");
+    }
+
+    /// A new ball's rocks (at level 1) dragged big are shown by the GPU too: each frame was a full compose on the CPU
+    /// through every finer level, about 2.7 s at size 0.4, against about 80 ms now. (Every frame joined on the GPU;
+    /// the time's bar leaves room for the other tests running beside it.)
+    #[test]
+    fn dragging_big_new_rocks_stays_quick() {
+        let (frames, release, on_gpu) = drag_rocks(0.4, None);
+        assert_eq!(on_gpu, frames.len(), "not every drag frame was joined on the GPU");
         let worst = frames.iter().cloned().fold(0.0, f64::max);
         assert!(worst < 600.0 && release < 200.0, "a drag frame took {worst:.0} ms, the release {release:.0}");
     }

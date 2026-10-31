@@ -1775,8 +1775,9 @@ impl Layered {
     /// ([`Self::generator_take`]), as after a preview. `None` (and nothing changed) where the GPU cannot.
     pub fn gpu_generator(&mut self, shown: &mut LevelVolume, k: usize, spec: &GeneratorSpec) -> Option<GpuPlan> {
         let old = self.stack.get(k).and_then(|x| x.scatter.clone())?;
-        // At level 1 or coarser the CPU's preview is the layer at its own level already, and sooner.
-        if !self.gpu_can_join() || self.stack[k].level <= PREVIEW {
+        // (At level 1 or coarser too: the CPU's preview is the layer at its own level there, but composed through every
+        // finer level, seconds a frame for big rocks.)
+        if !self.gpu_can_join() {
             return None;
         }
         if self.edit.is_none() && old.g.spec != *spec {
