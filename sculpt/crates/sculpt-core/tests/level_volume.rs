@@ -1839,7 +1839,30 @@ fn smoothing_a_fresh_ball_leaves_a_ball() {
     let (m, h) = heights(&v, 1, patch, 0.2, 0.5 * voxel);
     let (b, pits) = bend(m, &h, 0.2 * voxel);
     eprintln!("smoothed ball: off the sphere by at most {:.3} steps; bend {:.5} steps, {pits} pits; dabs took {ms:.1} ms", worst / voxel, b / voxel);
-    assert!(worst < 0.25 * voxel, "the smoothed ball is off the sphere by {} steps", worst / voxel);
+    assert!(worst < 0.1 * voxel, "the smoothed ball is off the sphere by {} steps", worst / voxel);
+    // A brush half the ball's radius held over one place, at full strength: the ball neither rises nor sinks there
+    // (smoothing the heights by a blur alone, or by twice the blur less the blur twice, moved it 0.7 of a step).
+    let mut wide = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 2);
+    wide.begin_stroke();
+    let mut along = Vec3::ZERO;
+    for k in 0..=12 {
+        let d = Vec3::new(-0.08 + 0.16 * k as f32 / 12.0, 0.01, 1.0).normalize();
+        let Some((hit, n)) = wide.raycast(d * 3.0, -d, 0, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        if let Some((n, _)) = wide.smooth_dab(0, hit, rough, 0.45, 0.5, 0.7) {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    wide.end_stroke();
+    let mut off = 0.0f32;
+    for k in 0..400 {
+        let d = Vec3::new(-0.6 + 0.06 * (k % 20) as f32, -0.6 + 0.06 * (k / 20) as f32, 1.0).normalize();
+        if let Some((q, _)) = wide.raycast(d * 3.0, -d, 1, false) {
+            off = off.max((q.length() - 1.0).abs());
+        }
+    }
+    eprintln!("under a brush half the ball's radius: off the sphere by at most {:.3} steps", off / voxel);
+    assert!(off < 0.1 * voxel, "a wide smooth stroke moved the ball by {} steps", off / voxel);
     assert!(pits <= 3, "the smoothed ball is pitted: {pits} points");
     let (open, nm, dropped, _) = check(&v, 1);
     assert_eq!((open, nm, dropped), (0, 0, 0));

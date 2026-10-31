@@ -402,6 +402,38 @@ enum Was {
     Stored(Stored),
 }
 
+/// The terms of a polynomial in `a`, `b` up to the fourth degree.
+fn quartic_terms(a: f64, b: f64) -> [f64; 15] {
+    let (a2, b2) = (a * a, b * b);
+    [1.0, a, b, a2, a * b, b2, a2 * a, a2 * b, a * b2, b2 * b, a2 * a2, a2 * a * b, a2 * b2, a * b2 * b, b2 * b2]
+}
+
+/// `m x = v` by elimination with partial pivoting; `None` when `m` is (near) singular.
+fn solve<const K: usize>(mut m: [[f64; K]; K], mut v: [f64; K]) -> Option<[f64; K]> {
+    let scale = (0..K).map(|i| m[i][i].abs()).fold(0.0, f64::max).max(1e-300);
+    for c in 0..K {
+        let p = (c..K).max_by(|&a, &b| m[a][c].abs().total_cmp(&m[b][c].abs()))?;
+        if m[p][c].abs() < 1e-12 * scale {
+            return None;
+        }
+        m.swap(c, p);
+        v.swap(c, p);
+        for r in c + 1..K {
+            let f = m[r][c] / m[c][c];
+            for k in c..K {
+                m[r][k] -= f * m[c][k];
+            }
+            v[r] -= f * v[c];
+        }
+    }
+    let mut x = [0.0f64; K];
+    for c in (0..K).rev() {
+        let s: f64 = (c + 1..K).map(|k| m[c][k] * x[k]).sum();
+        x[c] = (v[c] - s) / m[c][c];
+    }
+    Some(x)
+}
+
 fn local(i: IVec3) -> usize {
     let l = i.rem_euclid(B3);
     (l.z * 64 + l.y * 8 + l.x) as usize
@@ -2592,9 +2624,11 @@ impl LevelVolume {
     /// One dab of the smooth brush at level `l`: the surface under the brush, as heights along its overall normal (see
     /// [`Ground`], read from the field as it is now, so scrubbing goes on smoothing), is smoothed at about a quarter
     /// of the radius, and each sample moves `alpha` of the way (with the falloff, as the plane brushes' does) to its
-    /// distance from that smoothed surface. The smoothing keeps the form at the brush's scale: twice the heights
-    /// blurred less the heights blurred twice keeps a quadric as it is (a fresh ball stays a ball, not flattened
-    /// under the brush) while bumps, ridges and terraces narrower than the blur go. Like the plane brushes it works
+    /// distance from that smoothed surface. The smoothing keeps the form at the brush's scale: the heights less what
+    /// three times taking away the blurred heights leaves (1 - (1 - blur)^3) keep any polynomial up to the fifth
+    /// degree as it is, so a fresh ball stays a ball (a blur alone flattens it under the brush, twice the blurred
+    /// heights less those blurred twice raised it by 0.7 of a step under a brush half its radius), while bumps,
+    /// ridges and terraces narrower than the blur go. Like the plane brushes it works
     /// on the surface facing along the normal, down to 0.35 of the radius under it; finer levels under it take the
     /// smoothed surface (their detail is buried, or carried with `keep_detail`). Returns the normal and what it did.
     pub fn smooth_dab(&mut self, l: usize, at: Vec3, along: Vec3, r: f32, hardness: f32, alpha: f32) -> Option<(Vec3, LevelDab)> {
@@ -2610,16 +2644,57 @@ impl LevelVolume {
         // Columns out past the radius by the blur's reach, so the blur inside it sees both sides.
         let heights = self.ground(l, on, n, 1.75 * r, depth + band, -(2.0 * depth + band), false);
         let rho = ((r / heights.step / 4.0).round() as i32).max(1);
-        let mut once = heights.clone();
+        // The form at the brush's scale, a quartic fitted to the heights, is kept as it is and only what departs from it
+        // is smoothed: columns that meet no surface (past a ball's horizon under a wide brush) leave the blur one-sided
+        // near them, and blurring the heights themselves there lifted the surface under the brush (a ball smoothed by a
+        // brush half its radius rose by 0.65 of a step).
+        let size = heights.size();
+        let fit = {
+            let (mut m, mut v) = ([[0.0f64; 15]; 15], [0.0f64; 15]);
+            let scale = 1.5 * r / heights.step;
+            for (i, &h) in heights.h.iter().enumerate() {
+                let (a, b) = (((i as i32 % size) - heights.half) as f64 / scale as f64, ((i as i32 / size) - heights.half) as f64 / scale as f64);
+                let d2 = a * a + b * b;
+                if !h.is_finite() || d2 >= 1.0 {
+                    continue;
+                }
+                let w = (1.0 - d2) * (1.0 - d2);
+                let f = quartic_terms(a, b);
+                for j in 0..15 {
+                    v[j] += w * f[j] * h as f64;
+                    for k in 0..15 {
+                        m[j][k] += w * f[j] * f[k];
+                    }
+                }
+            }
+            solve(m, v).map(|c| move |i: usize| {
+                let (a, b) = (((i as i32 % size) - heights.half) as f64 / scale as f64, ((i as i32 / size) - heights.half) as f64 / scale as f64);
+                quartic_terms(a, b).iter().zip(c.iter()).map(|(t, c)| t * c).sum::<f64>() as f32
+            })
+        };
+        let Some(fit) = fit else { return None };
+        // What departs from the fit, out to where it was fitted (fading to nothing over its last sixth), and nothing
+        // past it or where no surface was met: the blur near the grid's edge, or a horizon, then reads the fitted form
+        // going on rather than nothing (one-sided, it sank the middle of a ball by a tenth of a step).
+        let mut heights_off = heights.clone();
+        let scale = 1.5 * r / heights.step;
+        for (i, h) in heights_off.h.iter_mut().enumerate() {
+            let (a, b) = (((i as i32 % size) - heights.half) as f32 / scale, ((i as i32 / size) - heights.half) as f32 / scale);
+            let x = ((1.0 - (a * a + b * b).sqrt()) * 6.0).clamp(0.0, 1.0);
+            *h = if h.is_finite() { (*h - fit(i)) * x * x * (3.0 - 2.0 * x) } else { 0.0 };
+        }
+        let mut once = heights_off.clone();
         once.smooth(rho);
         let mut twice = once.clone();
         twice.smooth(rho);
+        let mut thrice = twice.clone();
+        thrice.smooth(rho);
         let mut target = heights.clone();
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for (i, t) in target.h.iter_mut().enumerate() {
             if t.is_finite() {
                 let h = *t;
-                *t = 2.0 * once.h[i] - twice.h[i];
+                *t = fit(i) + 3.0 * (once.h[i] - twice.h[i]) + thrice.h[i];
                 let (a, b) = ((i as i32 % heights.size() - heights.half) as f32, (i as i32 / heights.size() - heights.half) as f32);
                 if (a * a + b * b).sqrt() * heights.step <= r + 2.0 * heights.step {
                     lo = lo.min(h.min(*t));
