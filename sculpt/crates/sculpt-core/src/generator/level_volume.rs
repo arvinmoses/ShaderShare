@@ -1590,7 +1590,17 @@ impl LevelVolume {
                         if w <= 0.0 {
                             continue;
                         }
-                        let w = if set.is_some() { set_weight(shape(p), w) } else { w };
+                        // Smoothing: what a finer level holds past the dab's level is the finest detail under the
+                        // brush, which a smoothing takes away first. Moved only as far as the dab's level moves, it
+                        // lingered at a few tenths of a finer step after a stroke, enough for the view by distance to
+                        // show some of its blocks and leave out their neighbours, a lattice of seams; it goes twice as
+                        // fast (a dab's weight `w` taken twice over).
+                        let w = if set.is_some() {
+                            let w = set_weight(shape(p), w);
+                            w * (2.0 - w)
+                        } else {
+                            w
+                        };
                         if w <= 0.0 {
                             continue;
                         }
