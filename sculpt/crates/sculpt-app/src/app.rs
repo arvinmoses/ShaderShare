@@ -14,7 +14,7 @@ use crate::camera::Camera;
 use crate::keymap::{Command, Keymap};
 use crate::pen::Pen;
 use crate::theme::{Theme, ThemeLibrary};
-use crate::tools::{Tool, ToolBox};
+use crate::tools::{Brush, Tool, ToolBox};
 use crate::viewport::Viewport;
 use crate::volume_mode::VolumeMode;
 
@@ -40,7 +40,7 @@ pub struct Sample {
 
 /// A stroke in progress: dabs every `spacing` along the surface since `last`.
 struct Stroke {
-    carve: bool,
+    brush: Brush,
     size_px: f32,
     strength: f32,
     hardness: f32,
@@ -177,7 +177,7 @@ impl SculptApp {
             eprintln!("config: {e}");
         }
         app.frame_volume();
-        app.status = format!("{:.2}M-triangle ball. Clay Buildup adds, Trim Dynamic carves, Ctrl swaps them.", crate::volume_mode::ball_triangles(triangles) / 1e6);
+        app.status = format!("{:.2}M-triangle ball. Clay Buildup adds, Trim Dynamic carves, Ctrl swaps them, Shift smooths.", crate::volume_mode::ball_triangles(triangles) / 1e6);
         if let Some(p) = opts.file {
             app.open(p.display().to_string());
             app.frame_volume();
@@ -236,7 +236,7 @@ impl SculptApp {
                 self.hud = !self.hud;
                 self.save_settings();
             }
-            Command::ToolClayBuildup | Command::ToolTrimDynamic => {}
+            Command::ToolClayBuildup | Command::ToolTrimDynamic | Command::ToolSmooth => {}
         }
     }
 
@@ -320,7 +320,16 @@ impl SculptApp {
 
     fn begin_stroke(&mut self, pos: Pos2, modifiers: egui::Modifiers) {
         let p = self.tools.params(self.tool).clone();
-        self.stroke = Some(Stroke { carve: self.tool.carves(modifiers.command), size_px: p.size_px, strength: p.strength, hardness: p.hardness, last: None, carry: 0.0 });
+        // Shift smooths with any brush: at the brush's size, with the Smooth brush's strength and falloff.
+        let (brush, strength, hardness) = if self.tool == Tool::Smooth || modifiers.shift {
+            let s = self.tools.params(Tool::Smooth);
+            (Brush::Smooth, if self.tool == Tool::Smooth { p.strength } else { s.strength }, if self.tool == Tool::Smooth { p.hardness } else { s.hardness })
+        } else if self.tool.carves(modifiers.command) {
+            (Brush::Trim, p.strength, p.hardness)
+        } else {
+            (Brush::Clay, p.strength, p.hardness)
+        };
+        self.stroke = Some(Stroke { brush, size_px: p.size_px, strength, hardness, last: None, carry: 0.0 });
         self.volume.begin_stroke();
         self.pending.push_front(Sample { pos, pressure: self.pen.pressure });
     }
@@ -330,7 +339,7 @@ impl SculptApp {
         let mut dabs = 0;
         let size = self.viewport_rect.size();
         let camera = self.camera.clone();
-        let Some(Stroke { carve, size_px, strength, hardness, last, carry }) = self.stroke.as_mut() else {
+        let Some(Stroke { brush, size_px, strength, hardness, last, carry }) = self.stroke.as_mut() else {
             self.pending.clear();
             return 0;
         };
@@ -351,7 +360,7 @@ impl SculptApp {
                 // Re-entering the surface, or jumping across a gap, starts the spacing over.
                 Some(p) if p.distance(hit) < radius * 4.0 => p,
                 _ => {
-                    mode.dab(hit, radius, px, *strength * s.pressure, *hardness, *carve);
+                    mode.brush_dab(hit, radius, px, *strength * s.pressure, *hardness, *brush);
                     dabs += 1;
                     *last = Some(hit);
                     *carry = 0.0;
@@ -363,7 +372,7 @@ impl SculptApp {
             let mut along = spacing - *carry;
             while along <= gap {
                 let q = from.lerp(hit, along / gap);
-                mode.dab(q, radius, px, *strength * s.pressure, *hardness, *carve);
+                mode.brush_dab(q, radius, px, *strength * s.pressure, *hardness, *brush);
                 dabs += 1;
                 along += spacing;
             }
@@ -604,11 +613,11 @@ impl SculptApp {
         }
         if let Some((tool, size, strength, p)) = f.begin {
             self.select_tool(tool);
-            let params = self.tools.params_mut(tool);
-            params.size_px = size;
-            params.strength = strength;
+            self.tools.params_mut(tool).size_px = size;
+            // Held Shift: the strength is the Smooth brush's.
+            self.tools.params_mut(if f.shift { Tool::Smooth } else { tool }).strength = strength;
             self.pen.pressure = 1.0;
-            self.begin_stroke(p, egui::Modifiers::NONE);
+            self.begin_stroke(p, if f.shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE });
         }
         for p in f.samples {
             self.pending.push_back(Sample { pos: p, pressure: 1.0 });

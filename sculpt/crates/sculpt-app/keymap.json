@@ -6,6 +6,7 @@
   { "keys": "Ctrl+O", "command": "open" },
   { "keys": "1", "command": "tool_clay_buildup" },
   { "keys": "2", "command": "tool_trim_dynamic" },
+  { "keys": "3", "command": "tool_smooth" },
   { "keys": "CloseBracket", "command": "brush_size_up" },
   { "keys": "OpenBracket", "command": "brush_size_down" },
   { "keys": "Shift+CloseBracket", "command": "strength_up" },

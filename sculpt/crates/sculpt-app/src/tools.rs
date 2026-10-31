@@ -10,15 +10,18 @@ use crate::keymap::Command;
 pub enum Tool {
     ClayBuildup,
     TrimDynamic,
+    /// Smooths the surface under it (also Shift with any brush, at the Smooth brush's own strength).
+    Smooth,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 2] = [Tool::ClayBuildup, Tool::TrimDynamic];
+    pub const ALL: [Tool; 3] = [Tool::ClayBuildup, Tool::TrimDynamic, Tool::Smooth];
 
     pub fn label(self) -> &'static str {
         match self {
             Tool::ClayBuildup => "Clay Buildup",
             Tool::TrimDynamic => "Trim Dynamic",
+            Tool::Smooth => "Smooth",
         }
     }
 
@@ -26,13 +29,15 @@ impl Tool {
         match self {
             Tool::ClayBuildup => Command::ToolClayBuildup,
             Tool::TrimDynamic => Command::ToolTrimDynamic,
+            Tool::Smooth => Command::ToolSmooth,
         }
     }
 
     pub fn hint(self) -> &'static str {
         match self {
-            Tool::ClayBuildup => "Adds to the volume. Ctrl: carves.",
-            Tool::TrimDynamic => "Carves the volume. Ctrl: adds.",
+            Tool::ClayBuildup => "Adds to the volume. Ctrl: carves. Shift: smooths.",
+            Tool::TrimDynamic => "Carves the volume. Ctrl: adds. Shift: smooths.",
+            Tool::Smooth => "Smooths bumps, ridges and terraces away, keeping the broad form. Shift smooths with any brush.",
         }
     }
 
@@ -41,6 +46,7 @@ impl Tool {
         match self {
             Tool::ClayBuildup => ctrl,
             Tool::TrimDynamic => !ctrl,
+            Tool::Smooth => false,
         }
     }
 
@@ -61,8 +67,21 @@ impl Tool {
                 p.add(Shape::line(curve(&|t| (0.75 - 0.45 * (t * std::f32::consts::PI).sin()).max(0.5)), st));
                 p.line_segment([at(0.15, 0.5), at(0.85, 0.5)], Stroke::new(1.0, c));
             }
+            Tool::Smooth => {
+                // A bumpy surface, faint, and the smooth one over it.
+                p.add(Shape::line(curve(&|t| 0.62 - 0.14 * (t * 15.0).sin() * (t * std::f32::consts::PI).sin()), Stroke::new(1.2, c.gamma_multiply(0.5))));
+                p.add(Shape::line(curve(&|t| 0.62 - 0.1 * (t * std::f32::consts::PI).sin()), st));
+            }
         }
     }
+}
+
+/// What a stroke's dabs do to the volume (the tool, with Ctrl or Shift held as the stroke began).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Brush {
+    Clay,
+    Trim,
+    Smooth,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -81,7 +100,7 @@ pub struct ToolBox {
 impl Default for ToolBox {
     fn default() -> Self {
         let p = |size_px, strength, hardness| ToolParams { size_px, strength, hardness };
-        ToolBox { params: BTreeMap::from([(Tool::ClayBuildup, p(40.0, 0.6, 0.2)), (Tool::TrimDynamic, p(50.0, 0.7, 0.3))]) }
+        ToolBox { params: BTreeMap::from([(Tool::ClayBuildup, p(40.0, 0.6, 0.2)), (Tool::TrimDynamic, p(50.0, 0.7, 0.3)), (Tool::Smooth, p(60.0, 0.5, 0.3))]) }
     }
 }
 

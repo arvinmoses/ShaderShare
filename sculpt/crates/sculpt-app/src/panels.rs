@@ -237,6 +237,10 @@ pub fn context_bar(app: &mut SculptApp, ui: &mut Ui) {
             ui.add(egui::Slider::new(&mut p.strength, 0.0..=1.0).max_decimals(2));
             ui.label(RichText::new("Falloff").weak());
             ui.add(egui::Slider::new(&mut p.hardness, 0.0..=0.95).max_decimals(2)).on_hover_text("Hardness: 0 = soft, 1 = hard edge");
+            if tool != Tool::Smooth {
+                ui.label(RichText::new("Shift smooth").weak());
+                ui.add(egui::Slider::new(&mut app.tools.params_mut(Tool::Smooth).strength, 0.0..=1.0).max_decimals(2)).on_hover_text("Strength of the Smooth brush, which Shift gives with any brush");
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if icon_button(ui, Icon::Eye, 22.0, app.hud, "Engine readout (H)").clicked() {
                     let ctx = ui.ctx().clone();
@@ -660,6 +664,10 @@ fn brush_props(app: &mut SculptApp, ui: &mut Ui) {
         prop(ui, "Size", |ui| ui.add(egui::Slider::new(&mut p.size_px, 2.0..=600.0).logarithmic(true).suffix(" px").max_decimals(0)));
         prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut p.strength, 0.0..=1.0)));
         prop(ui, "Falloff", |ui| ui.add(egui::Slider::new(&mut p.hardness, 0.0..=0.95)));
+        if tool != Tool::Smooth {
+            let s = app.tools.params_mut(Tool::Smooth);
+            prop(ui, "Shift smooth", |ui| ui.add(egui::Slider::new(&mut s.strength, 0.0..=1.0))).on_hover_text("Strength of the Smooth brush, which Shift gives with any brush");
+        }
         ui.label(RichText::new(tool.hint()).small().color(weak));
     });
 }

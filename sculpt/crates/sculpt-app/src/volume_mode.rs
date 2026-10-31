@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
+use crate::tools::Brush;
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
 use sculpt_core::generator::layer::GeneratorSpec;
@@ -43,7 +44,7 @@ const CATCH_UP_MS: f64 = 24.0;
 enum Event {
     /// A stroke begun on this (routed) target, and when.
     Begin(Target, Instant),
-    Dab { at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, carve: bool },
+    Dab { at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush },
     End,
 }
 
@@ -302,16 +303,24 @@ impl VolumeMode {
     /// One dab of Clay Buildup (or, with `carve`, Trim Dynamic) at surface point `at`: a plane brush whose plane
     /// follows the surface the stroke began on. `px` is the size of a pixel at the brush, which (with the radius) picks
     /// the level the stroke works at, on its first dab.
+    /// (The app's strokes go through [`Self::brush_dab`]; the tests' clay and trim dabs through here.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, carve: bool) {
+        self.brush_dab(at, radius, px, strength, hardness, if carve { Brush::Trim } else { Brush::Clay });
+    }
+
+    /// One dab of `brush`: Clay Buildup and Trim Dynamic as [`Self::dab`], or Smooth (see `LevelVolume::smooth_dab`),
+    /// whose strength is how far each dab moves the surface toward its smoothed self.
+    pub fn brush_dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush) {
         // For replaying a session's strokes (`SCULPT_DAB_LOG`): every dab, as given.
         if std::env::var_os("SCULPT_DAB_LOG").is_some() {
-            eprintln!("DAB {} {} {} {radius} {px} {strength} {hardness} {carve}", at.x, at.y, at.z);
+            eprintln!("DAB {} {} {} {radius} {px} {strength} {hardness} {}{}", at.x, at.y, at.z, brush == Brush::Trim, if brush == Brush::Smooth { " smooth" } else { "" });
         }
         // Running ahead: kept for the real state, and drawn on the copy.
         if let Some(a) = self.ahead.as_mut() {
-            a.events.push(Event::Dab { at, radius, px, strength, hardness, carve });
+            a.events.push(Event::Dab { at, radius, px, strength, hardness, brush });
         }
-        self.dab_now(at, radius, px, strength, hardness, carve);
+        self.dab_now(at, radius, px, strength, hardness, brush);
         self.note_copy();
         if let Some(t) = self.begun.take() {
             self.first_dab_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -329,9 +338,14 @@ impl VolumeMode {
     }
 
     /// A dab on what `vol` and `layer` hold now: the real state, or while running ahead the copy.
-    fn dab_now(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, carve: bool) {
+    fn dab_now(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush) {
+        let carve = brush == Brush::Trim;
         let t = Instant::now();
         let target = self.layer.as_ref().map(|_| self.routed());
+        // Smoothing a mask or the painted density is not a thing yet: Shift there does nothing.
+        if brush == Brush::Smooth && matches!(target, Some(Target::Mask { .. } | Target::Density { .. })) {
+            return;
+        }
         if let (Some(Target::Mask { show }), Some(layer)) = (target, self.layer.as_mut()) {
             layer.paint_mask(&mut self.vol, at, radius, if show { 1.0 } else { 0.0 });
             return;
@@ -363,15 +377,19 @@ impl VolumeMode {
         }
         let s = strength.clamp(0.0, 1.0);
         let height = radius * if carve { 0.015 + 0.06 * s } else { 0.015 + 0.08 * s };
+        // Smooth: each dab moves the surface from a tenth to seven tenths of the way to its smoothed self.
+        let alpha = if brush == Brush::Smooth { 0.1 + 0.6 * s } else { 0.1 + 0.3 * s };
         let dabbed = match (form, self.layer.as_mut()) {
+            (true, Some(layer)) if brush == Brush::Smooth => layer.smooth_dab(&mut self.vol, self.level, at, along, radius, hardness, alpha),
+            (_, _) if brush == Brush::Smooth => self.vol.smooth_dab(self.level, at, along, radius, hardness, alpha),
             (true, Some(layer)) => {
-                let out = layer.plane_dab(&mut self.vol, self.level, at, along, radius, height, hardness, 0.1 + 0.3 * s, carve);
+                let out = layer.plane_dab(&mut self.vol, self.level, at, along, radius, height, hardness, alpha, carve);
                 if std::env::var_os("SCULPT_LAYER_LOG").is_some() {
                     eprintln!("form dab at level {} r {radius:.3}: {:.1} ms; layer {} blocks; follow {:?}", self.level, t.elapsed().as_secs_f64() * 1e3, layer.blocks(), layer.last);
                 }
                 out
             }
-            _ => self.vol.plane_dab(self.level, at, along, radius, height, hardness, 0.1 + 0.3 * s, carve),
+            _ => self.vol.plane_dab(self.level, at, along, radius, height, hardness, alpha, carve),
         };
         let Some((n, _)) = dabbed else { return };
         // The original surface's plane is steady already; easing it a little more smooths the turn over sharp forms.
@@ -462,8 +480,8 @@ impl VolumeMode {
                     m.lag_ms = at.elapsed().as_secs_f64() * 1e3;
                     true
                 }
-                Event::Dab { at, radius, px, strength, hardness, carve } => {
-                    m.dab_now(at, radius, px, strength, hardness, carve);
+                Event::Dab { at, radius, px, strength, hardness, brush } => {
+                    m.dab_now(at, radius, px, strength, hardness, brush);
                     true
                 }
                 Event::End => {
@@ -2315,18 +2333,25 @@ mod tests {
     /// surface stays closed.
     #[test]
     fn a_wide_far_stroke_at_the_new_coarse_level_keeps_the_layers_whole() {
-        wide_far_stroke_over_layers("new ball", VolumeMode::ball(1e6), 1);
+        wide_far_stroke_over_layers("new ball", VolumeMode::ball(1e6), 1, Brush::Clay);
+    }
+
+    /// [`a_wide_far_stroke_at_the_new_coarse_level_keeps_the_layers_whole`] with the Smooth brush: the form under
+    /// the layers is smoothed (not raised), and the same holds.
+    #[test]
+    fn a_wide_far_smooth_stroke_keeps_the_layers_whole() {
+        wide_far_stroke_over_layers("new ball, smooth", VolumeMode::ball(1e6), 1, Brush::Smooth);
     }
 
     /// [`a_wide_far_stroke_at_the_new_coarse_level_keeps_the_layers_whole`] on a ball as made before the coarse level
     /// 0 (level 0 at the step of a million triangles, six levels), as files from then open.
     #[test]
     fn a_wide_far_stroke_on_a_ball_as_before_keeps_the_layers_whole() {
-        wide_far_stroke_over_layers("ball as before", VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(1e6) / 2.0, OPEN_LEVELS)), 0);
+        wide_far_stroke_over_layers("ball as before", VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(1e6) / 2.0, OPEN_LEVELS)), 0, Brush::Clay);
     }
 
     /// The bumps at level `4 + shift`, the layer from level `3 + shift`: the same steps on either ball.
-    fn wide_far_stroke_over_layers(name: &str, mut mode: VolumeMode, shift: usize) {
+    fn wide_far_stroke_over_layers(name: &str, mut mode: VolumeMode, shift: usize, brush: Brush) {
         let levels = mode.vol.levels();
         let xs: Vec<f32> = (0..5).map(|i| -0.04 + 0.02 * i as f32).collect();
         for &x in &xs {
@@ -2363,7 +2388,7 @@ mod tests {
             let d = Vec3::new(-0.08 + 0.16 * k as f32 / 12.0, 0.01, 1.0).normalize();
             let Some((hit, _)) = mode.raycast(d * 3.0, -d) else { continue };
             let td = Instant::now();
-            mode.dab(hit, r, px, 1.0, 0.5, false);
+            mode.brush_dab(hit, r, px, 1.0, 0.5, brush);
             dab_ms.push(td.elapsed().as_secs_f64() * 1e3);
             mode.tick();
         }
@@ -2378,7 +2403,12 @@ mod tests {
         let end = print(&mode);
         let (bumps1, ground1) = (relief(&mode), ground(&mode));
         eprintln!("bumps out of the form {bumps0:.5} -> {bumps1:.5}; the form rose {:.4}", ground1 - ground0);
-        assert!(ground1 - ground0 > 0.01, "the stroke did not build");
+        if brush == Brush::Smooth {
+            // A ball smoothed stays the ball (within a tenth of level 0's step).
+            assert!((ground1 - ground0).abs() < 0.1 * mode.vol.voxel(0), "smoothing the ball moved it by {}", ground1 - ground0);
+        } else {
+            assert!(ground1 - ground0 > 0.01, "the stroke did not build");
+        }
         assert!(bumps0 > 0.0008, "the layer does not hold the bumps");
         assert!(bumps1 > 0.9 * bumps0 && bumps1 < 1.1 * bumps0, "the bumps did not ride the form whole");
         let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);

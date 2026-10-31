@@ -18,6 +18,7 @@ pub enum Command {
     Open,
     ToolClayBuildup,
     ToolTrimDynamic,
+    ToolSmooth,
     BrushSizeUp,
     BrushSizeDown,
     StrengthUp,
@@ -37,6 +38,7 @@ impl Command {
             Command::Open => "Open…",
             Command::ToolClayBuildup => "Clay Buildup",
             Command::ToolTrimDynamic => "Trim Dynamic",
+            Command::ToolSmooth => "Smooth",
             Command::BrushSizeUp => "Brush size +",
             Command::BrushSizeDown => "Brush size −",
             Command::StrengthUp => "Strength +",
@@ -154,7 +156,7 @@ mod tests {
                 assert!(prev == b.command, "{:?} and {:?} share {}", prev, b.command, b.keys);
             }
         }
-        for cmd in [Command::Undo, Command::Redo, Command::Save, Command::Open, Command::ToolClayBuildup, Command::ToolTrimDynamic, Command::Frame] {
+        for cmd in [Command::Undo, Command::Redo, Command::Save, Command::Open, Command::ToolClayBuildup, Command::ToolTrimDynamic, Command::ToolSmooth, Command::Frame] {
             assert!(km.bindings.iter().any(|(_, b)| b.command == cmd), "{cmd:?} has no default key");
         }
     }

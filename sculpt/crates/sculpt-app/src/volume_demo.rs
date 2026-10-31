@@ -53,6 +53,8 @@ enum Act {
     LevelEyeOff,
     /// A stroke along a polyline of viewport fractions over `dur` seconds.
     Stroke { tool: Tool, size: f32, strength: f32, path: Vec<(f32, f32)> },
+    /// The same with Shift held: it smooths, at the brush's size and `strength` for the Smooth brush's.
+    ShiftStroke { tool: Tool, size: f32, strength: f32, path: Vec<(f32, f32)> },
     Cap(usize),
     /// Sweep the level cap from one level to another over `dur`.
     CapSweep(usize, usize),
@@ -100,6 +102,8 @@ pub struct Frame {
     pub camera: Option<Camera>,
     /// A stroke starts: its tool, size in pixels, strength and first point.
     pub begin: Option<(Tool, f32, f32, Pos2)>,
+    /// The stroke begins with Shift held.
+    pub shift: bool,
     pub samples: Vec<Pos2>,
     pub end: bool,
     pub cap: Option<usize>,
@@ -423,6 +427,37 @@ impl VolumeDemo {
             at(t + 1.5, 1.0, Camera(Pose::at((patch + Vec3::new(0.25, 0.1, -0.1)).normalize(), 1.2)));
             end = t + 3.0;
         }
+        // `SCULPT_DEMO_SCRIPT=smooth`: bumpy clay and trim strokes, then the Smooth brush scrubbed over part of them, then
+        // Shift held with Clay Buildup smoothing another part, and a close look.
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("smooth") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::at(patch, 1.4)));
+            at(0.0, 3.5, Caption("Clay and trim strokes: ridges and terraces"));
+            for k in 0..5 {
+                let y = 0.34 + 0.08 * k as f32;
+                let tool = if k % 2 == 0 { Tool::ClayBuildup } else { Tool::TrimDynamic };
+                at(0.3 + 0.9 * k as f32, 0.7, Stroke { tool, size: 40.0, strength: 1.0, path: line((0.28, y), (0.72, y + 0.02), 0.02, 12) });
+            }
+            at(5.0, 1.0, Stroke { tool: Tool::ClayBuildup, size: 30.0, strength: 1.0, path: line((0.35, 0.30), (0.40, 0.72), 0.01, 12) });
+            at(6.5, 4.0, Caption("Smooth (3): scrubbed over the left half"));
+            let mut path = Vec::new();
+            for k in 0..5 {
+                let y = 0.32 + 0.1 * k as f32;
+                path.push(if k % 2 == 0 { (0.28, y) } else { (0.48, y) });
+            }
+            at(6.8, 3.0, Stroke { tool: Tool::Smooth, size: 90.0, strength: 0.6, path });
+            at(10.5, 4.0, Caption("Clay Buildup with Shift held smooths too, at the Smooth brush's strength"));
+            let mut path = Vec::new();
+            for k in 0..5 {
+                let y = 0.32 + 0.1 * k as f32;
+                path.push(if k % 2 == 0 { (0.55, y) } else { (0.72, y) });
+            }
+            at(10.8, 3.0, ShiftStroke { tool: Tool::ClayBuildup, size: 70.0, strength: 0.4, path });
+            at(14.0, 0.7, Stroke { tool: Tool::ClayBuildup, size: 40.0, strength: 1.0, path: line((0.55, 0.64), (0.72, 0.66), 0.0, 8) });
+            at(15.0, 2.0, Camera(Pose::at((patch + Vec3::new(0.08, -0.05, 0.0)).normalize(), 0.7)));
+            end = 18.0;
+        }
         // `SCULPT_DEMO_SCRIPT=stress`: the stress test's kinds of edits in the app, for looking at the frames: strokes
         // of every size at every level on the form and on layers, layers added, moved between levels, hidden and
         // removed, masks, a generator edited, noise baked, a file round trip, undo and redo, and the camera moving
@@ -604,10 +639,11 @@ impl VolumeDemo {
             let inside = t >= item.at && t < item.at + item.dur.max(dt);
             match &item.act {
                 Act::Caption(text) if inside => self.caption = Some((text.to_string(), ((t - item.at) / 0.4).min((item.at + item.dur - t) / 0.4).clamp(0.0, 1.0))),
-                Act::Stroke { tool, size, strength, path } => {
+                Act::Stroke { tool, size, strength, path } | Act::ShiftStroke { tool, size, strength, path } => {
                     if t >= item.at && !self.begun[i] {
                         self.begun[i] = true;
                         f.begin = Some((*tool, *size, *strength, at(path[0])));
+                        f.shift = matches!(item.act, Act::ShiftStroke { .. });
                     }
                     if self.begun[i] && !self.fired[i] {
                         // Samples along the path for this frame's slice of the stroke.
