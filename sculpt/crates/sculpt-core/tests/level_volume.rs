@@ -1941,3 +1941,70 @@ fn smoothing_a_bumpy_patch_flattens_it_without_pits() {
     let read = LevelVolume::read_from(&mut end.as_slice(), 3).unwrap();
     assert_eq!(bytes(&read), end, "a saved volume reads back differently");
 }
+
+/// A ball as the app makes a new one (level 1 alone about a million triangles), seven levels, only level 0 stored.
+fn app_ball() -> LevelVolume {
+    let voxel0 = 2.0 * (4.0 * std::f32::consts::PI / 5e5).sqrt();
+    LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel0, 7)
+}
+
+/// Every block of `a` and `b`, bit for bit.
+fn same_blocks(a: &LevelVolume, b: &LevelVolume) -> bool {
+    let (mut ka, mut kb) = (a.keys(), b.keys());
+    ka.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+    kb.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+    ka == kb && ka.iter().all(|&k| a.block(k).unwrap().iter().zip(b.block(k).unwrap().iter()).all(|(x, y)| x.to_bits() == y.to_bits()))
+}
+
+/// The app's close stroke: `dabs + 1` dabs at level 3 of radius `r` across the front of the ball, smooth or clay.
+/// Returns the mean dab's milliseconds and the quickest's.
+fn close_stroke(v: &mut LevelVolume, r: f32, dabs: usize, smooth: bool) -> (f64, f64) {
+    let (a, b) = (Vec3::new(-0.6 * r, 0.0, 1.0), Vec3::new(0.6 * r, 0.02, 1.0));
+    let mut along = Vec3::ZERO;
+    let (mut ms, mut least) = (0.0, f64::INFINITY);
+    v.begin_stroke();
+    for k in 0..=dabs {
+        let d = a.lerp(b, k as f32 / dabs as f32).normalize();
+        let Some((hit, n)) = v.raycast(d * 3.0, -d, 3, true) else { continue };
+        let rough = if along == Vec3::ZERO { n } else { along };
+        let t = std::time::Instant::now();
+        let out = if smooth { v.smooth_dab(3, hit, rough, r, 0.5, 0.4) } else { v.plane_dab(3, hit, rough, r, r * 0.055, 0.5, 0.25, false) };
+        let dt = t.elapsed().as_secs_f64() * 1e3;
+        ms += dt;
+        least = least.min(dt);
+        if let Some((n, _)) = out {
+            along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
+        }
+    }
+    v.end_stroke();
+    (ms / (dabs + 1) as f64, least)
+}
+
+/// Smoothing up close on a new ball is fast: the surface under the brush is read from its blocks made once a dab, not
+/// point by point through every coarser level (a dab took 90 ms, clay's under 1; now a little over 2). What it makes
+/// is what reading point by point made, bit for bit, over a scrubbed stroke, and under clay over it.
+#[test]
+fn smoothing_up_close_reads_the_surface_once_a_dab() {
+    let r = 0.05;
+    let mut clay = app_ball();
+    let (clay_ms, _) = close_stroke(&mut clay, r, 16, false);
+    let mut smooth = app_ball();
+    let (smooth_ms, smooth_least) = close_stroke(&mut smooth, r, 16, true);
+    let mut slow = app_ball();
+    slow.uncached_reads = true;
+    let (slow_ms, slow_least) = close_stroke(&mut slow, r, 16, true);
+    eprintln!("close r {r} at level 3, a dab: clay {clay_ms:.1} ms, smooth {smooth_ms:.1} ms (read point by point {slow_ms:.1} ms)");
+    assert!(same_blocks(&smooth, &slow), "smoothing read from blocks made once differs from reading point by point");
+    // Wall time under the tests running alongside is loose: the quickest dab of each (the one least held up), against
+    // the same stroke read point by point (the reads were 97% of a dab, so made once a dab is over ten times as fast).
+    assert!(10.0 * smooth_least < slow_least, "the quickest close smooth dab took {smooth_least:.1} ms, read point by point {slow_least:.1}");
+    // Scrubbed back and forth over what it made, then clay over that (its floor reads the surface as it began).
+    let (t1, t2) = Vec3::Z.any_orthonormal_pair();
+    let scrub = |v: &mut LevelVolume| {
+        smooth_stroke(v, 3, Vec3::Z, &[(-0.04, -0.01), (0.04, 0.01), (-0.04, 0.02), (0.04, -0.02)], r, 0.7);
+        stroke(v, 3, (Vec3::Z + t1 * -0.03 + t2 * 0.01).normalize(), (Vec3::Z + t1 * 0.03).normalize(), r, 0.5, false);
+    };
+    scrub(&mut smooth);
+    scrub(&mut slow);
+    assert!(same_blocks(&smooth, &slow), "a scrubbed stroke read from blocks made once differs from reading point by point");
+}

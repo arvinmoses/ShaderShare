@@ -523,6 +523,145 @@ pub fn piece_table() -> [u32; 256] {
     table
 }
 
+/// A block a [`Near`] read: stored, all one value (level 0's inside or outside), or made from the coarser level.
+enum Src<'a> {
+    Stored(&'a [f32; N]),
+    Fill(f32),
+    Made(Block),
+}
+
+impl Src<'_> {
+    fn values(&self) -> Option<&[f32; N]> {
+        match self {
+            Src::Stored(b) => Some(b),
+            Src::Made(b) => Some(b),
+            Src::Fill(_) => None,
+        }
+    }
+
+    fn at(&self, i: IVec3) -> f32 {
+        match self {
+            Src::Stored(b) => b[local(i)],
+            Src::Fill(v) => *v,
+            Src::Made(b) => b[local(i)],
+        }
+    }
+}
+
+/// Level `l`'s field over a box of blocks, read as [`LevelVolume::value_at`] reads it, bit for bit, for a lookup a
+/// read: where no block is stored at `l`, a read interpolates through every coarser level down to a stored one (eight
+/// corners a level, hundreds of lookups a read). Here each block in the box (and each coarser one under it) is made
+/// once, the first time it is read, from the level below's as [`LevelVolume::sample`] makes each sample. Outside the
+/// box, reads go to the volume.
+struct Near<'a> {
+    vol: &'a LevelVolume,
+    l: usize,
+    base: bool,
+    /// Per level up to `l`: the first block of its box, the box's size, and a slot a block.
+    boxes: Vec<(IVec3, IVec3, Vec<std::sync::OnceLock<Src<'a>>>)>,
+}
+
+impl<'a> Near<'a> {
+    /// Over level `l`'s blocks `lo..=hi` (as the volume was when the stroke began, with `base`); with `on` false, no
+    /// box: every read goes to the volume.
+    fn new(vol: &'a LevelVolume, l: usize, lo: IVec3, hi: IVec3, base: bool, on: bool) -> Near<'a> {
+        let mut boxes = Vec::new();
+        if on {
+            let (mut lo, mut hi) = (lo, hi);
+            for _ in 0..=l {
+                let n = hi - lo + IVec3::ONE;
+                boxes.push((lo, n, (0..n.x * n.y * n.z).map(|_| std::sync::OnceLock::new()).collect()));
+                // The blocks below read level `m - 1`'s points `4 bc ..= 4 bc + 4`.
+                (lo, hi) = ((lo * 4).div_euclid(B3), (hi * 4 + IVec3::splat(4)).div_euclid(B3));
+            }
+            boxes.reverse();
+        }
+        Near { vol, l, base, boxes }
+    }
+
+    /// Level `m`'s block `bc`, when it is in the box.
+    fn block(&self, m: usize, bc: IVec3) -> Option<&Src<'a>> {
+        let (lo, n, slots) = self.boxes.get(m)?;
+        let d = bc - *lo;
+        if d.cmplt(IVec3::ZERO).any() || d.cmpge(*n).any() {
+            return None;
+        }
+        Some(slots[((d.z * n.y + d.y) * n.x + d.x) as usize].get_or_init(|| self.make(m, bc)))
+    }
+
+    fn sample_at(&self, m: usize, i: IVec3) -> f32 {
+        match self.block(m, i.div_euclid(B3)) {
+            Some(b) => b.at(i),
+            None => self.vol.sample(m, i, self.base),
+        }
+    }
+
+    fn make(&self, m: usize, bc: IVec3) -> Src<'a> {
+        if let Some(b) = self.vol.stored(m, bc, self.base) {
+            return Src::Stored(b);
+        }
+        if m == 0 {
+            let band = self.vol.band(0);
+            return Src::Fill(if self.vol.inside0_at(bc, self.base) { -band } else { band });
+        }
+        // Level `m - 1`'s 5x5x5 points under the block, from the (up to) eight blocks holding them.
+        let o = bc * 4;
+        let lo = o.div_euclid(B3);
+        let src: [Option<&Src>; 8] = std::array::from_fn(|q| self.block(m - 1, lo + IVec3::new((q & 1) as i32, ((q >> 1) & 1) as i32, ((q >> 2) & 1) as i32)));
+        let mut c = [0.0f32; 125];
+        for z in 0..5 {
+            for y in 0..5 {
+                for x in 0..5 {
+                    let p = o + IVec3::new(x, y, z);
+                    let d = p.div_euclid(B3) - lo;
+                    c[(25 * z + 5 * y + x) as usize] = match src[(d.x + 2 * d.y + 4 * d.z) as usize] {
+                        Some(b) => b.at(p),
+                        None => self.vol.sample(m - 1, p, self.base),
+                    };
+                }
+            }
+        }
+        // As `sample` makes them: a point on the coarser lattice takes its value, any other the trilinear one.
+        let band = self.vol.band(m);
+        let mut out = Box::new([0.0f32; N]);
+        for z in 0..B {
+            for y in 0..B {
+                for x in 0..B {
+                    let i = bc * B + IVec3::new(x, y, z);
+                    let v = if i.x & 1 == 0 && i.y & 1 == 0 && i.z & 1 == 0 {
+                        c[(25 * (z / 2) + 5 * (y / 2) + x / 2) as usize]
+                    } else {
+                        let g = i.as_vec3() * 0.5;
+                        let gi = g.floor().as_ivec3();
+                        let f = g - gi.as_vec3();
+                        let d = gi - o;
+                        trilinear(f, std::array::from_fn(|k| c[(25 * (d.z + ((k >> 2) & 1) as i32) + 5 * (d.y + ((k >> 1) & 1) as i32) + d.x + (k & 1) as i32) as usize]))
+                    };
+                    out[local(i)] = v.clamp(-band, band);
+                }
+            }
+        }
+        Src::Made(out)
+    }
+
+    /// Level `l`'s field at lattice coordinates `g`.
+    fn value_at(&self, g: Vec3) -> f32 {
+        if self.boxes.is_empty() {
+            return self.vol.value_at(self.l, g, self.base);
+        }
+        let i = g.floor().as_ivec3();
+        let f = g - i.as_vec3();
+        // The cell within one block (most cells): look it up once.
+        if i.rem_euclid(B3).cmplt(IVec3::splat(B - 1)).all()
+            && let Some(b) = self.block(self.l, i.div_euclid(B3)).and_then(Src::values)
+        {
+            let at = local(i);
+            return trilinear(f, std::array::from_fn(|k| b[at + (k & 1) + 8 * ((k >> 1) & 1) + 64 * ((k >> 2) & 1)]));
+        }
+        trilinear(f, std::array::from_fn(|k| self.sample_at(self.l, i + IVec3::new((k & 1) as i32, ((k >> 1) & 1) as i32, ((k >> 2) & 1) as i32))))
+    }
+}
+
 /// Samples of one level over a box of lattice points, read once so that hot loops index an array instead of hashing.
 struct Grid {
     lo: IVec3,
@@ -743,6 +882,10 @@ pub struct LevelVolume {
     /// lower subdivision level does). Off by default: the stroke works on the finer levels under it as it does on its
     /// own, as clay on one surface does, filling grooves and covering bumps wherever it builds over them.
     pub keep_detail: bool,
+    /// Plane and smooth brushes read the surface under them point by point through the coarser levels, as before
+    /// their blocks were made once a dab (see [`Near`]): the same values, many times slower. For tests that compare.
+    #[doc(hidden)]
+    pub uncached_reads: bool,
 }
 
 /// Queued detail to carry on another thread: a copy of the volume (see [`LevelVolume::carry_take`]) and, per level,
@@ -813,7 +956,7 @@ impl LevelVolume {
     pub fn from_field<F: Fn(Vec3) -> f32 + Sync>(field: &F, half: f32, voxel0: f32, levels: usize) -> LevelVolume {
         let levels = levels.clamp(1, MAX_LEVELS);
         let origin = Vec3::ZERO;
-        let mut v = LevelVolume { voxel0, origin, blocks: vec![Shared::default(); levels], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false };
+        let mut v = LevelVolume { voxel0, origin, blocks: vec![Shared::default(); levels], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false, uncached_reads: false };
         let band = v.band(0);
         let step = voxel0 * B as f32;
         let lo = ((Vec3::splat(-half) - origin) / step).floor().as_ivec3() - IVec3::ONE;
@@ -951,6 +1094,7 @@ impl LevelVolume {
         let mut out = self.snapshot();
         out.carry_budget = self.carry_budget;
         out.keep_detail = self.keep_detail;
+        out.uncached_reads = self.uncached_reads;
         out
     }
 
@@ -1776,6 +1920,7 @@ impl LevelVolume {
             carried: vec![HashSet::default(); MAX_LEVELS],
             carry_budget: None,
             keep_detail: self.keep_detail,
+            uncached_reads: self.uncached_reads,
         }
     }
 
@@ -2428,7 +2573,23 @@ impl LevelVolume {
         let half = (r / step).ceil() as i32 + 1;
         let size = 2 * half + 1;
         let (t1, t2) = n.any_orthonormal_pair();
-        let f = |a: i32, b: i32, u: f32| self.value_at(l, (on + t1 * ((a - half) as f32 * step) + t2 * ((b - half) as f32 * step) + n * u - self.origin) / vx, base);
+        // Where no block is stored at `l`, a read interpolates through every coarser level down to a stored one (eight
+        // corners a level: hundreds of lookups a read), and a column takes some twenty reads. The blocks the columns
+        // cross are made once instead, each the first time one reads it, exactly as those reads make each sample.
+        let near = {
+            let w = half as f32 * step + vx;
+            let (ulo, uhi) = (bottom - vx, top + 2.0 * band + vx);
+            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for k in 0..8 {
+                let p = on + t1 * if k & 1 == 0 { -w } else { w } + t2 * if k & 2 == 0 { -w } else { w } + n * if k & 4 == 0 { ulo } else { uhi };
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            let bs = vx * B as f32;
+            let cached = l > 0 && !self.uncached_reads;
+            Near::new(self, l, ((lo - self.origin) / bs).floor().as_ivec3(), ((hi - self.origin) / bs).floor().as_ivec3(), base, cached)
+        };
+        let f = |a: i32, b: i32, u: f32| near.value_at((on + t1 * ((a - half) as f32 * step) + t2 * ((b - half) as f32 * step) + n * u - self.origin) / vx);
         let h: Vec<f32> = (0..size * size)
             .into_par_iter()
             .map(|k| {
@@ -4516,7 +4677,7 @@ impl LevelVolume {
             r.read_exact(&mut b)?;
             Ok(IVec3::new(i32::from_le_bytes(b[0..4].try_into().unwrap()), i32::from_le_bytes(b[4..8].try_into().unwrap()), i32::from_le_bytes(b[8..12].try_into().unwrap())))
         };
-        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![Shared::default(); n.max(levels.min(MAX_LEVELS))], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false };
+        let mut v = LevelVolume { voxel0: f[0], origin: Vec3::new(f[1], f[2], f[3]), blocks: vec![Shared::default(); n.max(levels.min(MAX_LEVELS))], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false, uncached_reads: false };
         for _ in 0..u32_(r)? {
             v.inside0.insert(ivec(r)?);
         }
@@ -4551,7 +4712,7 @@ impl LevelVolume {
     /// A single-resolution volume as level 0 of a new one with `levels` levels.
     pub fn from_volume(old: &super::volume::Volume, levels: usize) -> LevelVolume {
         let (origin, dims) = old.grid();
-        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![Shared::default(); levels.clamp(1, MAX_LEVELS)], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false };
+        let mut v = LevelVolume { voxel0: old.voxel, origin, blocks: vec![Shared::default(); levels.clamp(1, MAX_LEVELS)], inside0: SharedSet::default(), stroke: None, history: Vec::new(), redo: Vec::new(), dirty: HashSet::default(), carry: Shared::default(), carry_push: Vec::new(), recent: HashSet::default(), carry_level: 0, pending: vec![HashSet::default(); MAX_LEVELS], moved: HashMap::default(), carried: vec![HashSet::default(); MAX_LEVELS], carry_budget: None, keep_detail: false, uncached_reads: false };
         let band = v.band(0);
         let stored: HashMap<u32, &[f32; N]> = old.stored().collect();
         for (b, &sign) in old.signs().iter().enumerate() {
