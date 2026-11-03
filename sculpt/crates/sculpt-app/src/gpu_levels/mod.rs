@@ -436,11 +436,11 @@ impl GpuLevels {
         }
     }
 
-    /// Size the table for the blocks there are (at most half full, counting removed entries) and fill it afresh.
-    /// True if it was rebuilt (and must be sent whole).
-    fn hash_fit(&mut self) -> bool {
+    /// Size the table for the blocks there are (at most half full, counting removed entries and `coming` blocks
+    /// with slots not in it yet) and fill it afresh. True if it was rebuilt (and must be sent whole).
+    fn hash_fit(&mut self, coming: usize) -> bool {
         let want = ((self.slot_of.len() + 64) * 2).next_power_of_two().max(1024);
-        if self.hash.len() >= want && (self.hash_live + self.hash_dead) * 2 <= self.hash.len() {
+        if self.hash.len() >= want && (self.hash_live + self.hash_dead + coming) * 2 <= self.hash.len() {
             return false;
         }
         self.hash = vec![[0, 0, 0, -1]; want.max(self.hash.len())];
@@ -550,7 +550,7 @@ impl GpuLevels {
             self.take_slot(*k);
         }
         self.hash.clear();
-        self.hash_fit();
+        self.hash_fit(0);
         self.send_hash_whole();
         // All pages free, every slot without pages.
         let free: Vec<u32> = (0..self.buf.pages).rev().chain((0..self.buf.vpages).rev()).collect();
@@ -1068,9 +1068,18 @@ impl GpuLevels {
         let mut placed = Vec::with_capacity(coming);
         for k in &uploads {
             if !self.slot_of.contains_key(k) {
-                let s = self.take_slot(*k).expect("room was made");
-                self.hash_insert(*k, s);
+                self.take_slot(*k).expect("room was made");
                 placed.push(*k);
+            }
+        }
+        // The table sized for them before they go in: more blocks coming at once than it had room for (a big
+        // generator's blocks, over a hundred thousand on a table of a few thousand) filled it, and the next insert
+        // looked for a free entry for ever.
+        let refit = self.hash_fit(placed.len());
+        if !refit {
+            for k in &placed {
+                let s = self.slot_of[k];
+                self.hash_insert(*k, s);
             }
         }
         // A slot freed here and handed straight to a new block is released with that block's extraction: listing it
@@ -1078,7 +1087,7 @@ impl GpuLevels {
         released.retain(|&s| self.key_of[s as usize].is_none());
         lap("place");
         // Many changed entries (thousands of blocks that came or went) go up as the whole table: far fewer writes.
-        if self.hash_fit() || self.hash_dirty.len() > 2048 {
+        if refit || self.hash_dirty.len() > 2048 {
             self.send_hash_whole();
             lap("hash whole");
         } else {
