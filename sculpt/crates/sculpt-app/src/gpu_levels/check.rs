@@ -3,7 +3,9 @@
 //! A ball is sculpted with plane brushes at every level, undone and redone, and shown at every level cap; after each
 //! step the GPU's surface is read back and compared with `LevelVolume::extract` block by block: the word per cell
 //! (vertex numbering, pieces, corner signs, transition) and the quads (corner by corner, in order) must be identical,
-//! and the vertices must agree to within the 16-bit samples' rounding. With `--bench`, a larger ball is timed: a full
+//! and the vertices must agree to within the 16-bit samples' rounding. A new ball's big rough rocks, set and dragged,
+//! must land as the reference, and the cull pass must never leave out a cluster with a quad facing the eye (`--rocks`
+//! tries more cases). With `--bench`, a larger ball is timed: a full
 //! extraction, and a sync per dab of strokes at each level.
 
 use std::time::Instant;
@@ -424,12 +426,202 @@ fn join_check_at(device: &wgpu::Device, queue: &wgpu::Queue, level: usize) -> Re
     Ok(())
 }
 
+/// A quad's two triangles' unit normals, as drawn ((0, 1, 2) and (0, 2, 3)), facing out as their winding does.
+fn triangle_normals(p: &[(Vec3, Vec3)]) -> Vec<Vec3> {
+    [(p[1].0 - p[0].0).cross(p[2].0 - p[0].0), (p[2].0 - p[0].0).cross(p[3].0 - p[0].0)].into_iter().filter(|n| n.length_squared() > 1e-20).map(|n| n.normalize()).collect()
+}
+
+/// Quads the cull pass would leave out as facing away though they face the eye, from eyes all round at two distances:
+/// (eyes tried, quads wrongly left out, blocks with any).
+fn wrongly_culled(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &GpuLevels, vol: &LevelVolume) -> (usize, usize, usize) {
+    let show = gpu.show();
+    let keys: Vec<Key> = vol.keys().into_iter().filter(|k| !show.hides(*k)).collect();
+    let (surf, _) = vol.extract_in(&keys, &show);
+    let cl: Vec<f32> = read(device, queue, &gpu.buf.clusters).into_iter().map(f32::from_bits).collect();
+    let (mut eyes, mut bad, mut blocks) = (0, 0, std::collections::HashSet::new());
+    // How far below each block's cone its quads' own normals reach (the cone's cosine less the least cosine).
+    let mut under: Vec<f32> = Vec::new();
+    for k in &keys {
+        let s = gpu.slot_of[k] as usize;
+        let cone = glam::Vec4::new(cl[s * 12 + 8], cl[s * 12 + 9], cl[s * 12 + 10], cl[s * 12 + 11]);
+        if cone.w < -1.5 || surf[k].quads.is_empty() {
+            continue;
+        }
+        let mut least = 1.0f32;
+        for q in &surf[k].quads {
+            let Some(p): Option<Vec<(Vec3, Vec3)>> = q.iter().map(|(b, c, pc)| surf.get(b).and_then(|sb| sb.vertex(*c, *pc).map(|v| (sb.verts[v as usize], sb.normals[v as usize])))).collect() else { continue };
+            for n in triangle_normals(&p) {
+                least = least.min(n.dot(cone.truncate()));
+            }
+        }
+        under.push(cone.w - least);
+    }
+    let cullable = keys.iter().filter(|k| cl[gpu.slot_of[*k] as usize * 12 + 11] > 0.1).count();
+    under.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |f: f32| if under.is_empty() { 0.0 } else { under[((under.len() - 1) as f32 * f) as usize] };
+    println!("cones: {cullable} of {} blocks can be culled as facing away; the quads' normals reach past the cone by at most {:.3} (99.9%: {:.3}) in cosine", keys.len(), pct(1.0), pct(0.999));
+    for dist in [1.6f32, 3.0] {
+        for i in 0..64 {
+            let z = 1.0 - 2.0 * (i as f32 + 0.5) / 64.0;
+            let a = i as f32 * 2.399963;
+            let r = (1.0 - z * z).sqrt();
+            let eye = Vec3::new(r * a.cos(), r * a.sin(), z) * dist;
+            eyes += 1;
+            for k in &keys {
+                let s = gpu.slot_of[k] as usize;
+                let vx = vol.voxel(k.0 as usize);
+                let corner = vol.origin() + (k.1 * 8).as_vec3() * vx;
+                let lo = corner + Vec3::new(cl[s * 12], cl[s * 12 + 1], cl[s * 12 + 2]) * vx;
+                let hi = corner + Vec3::new(cl[s * 12 + 4], cl[s * 12 + 5], cl[s * 12 + 6]) * vx;
+                let cone = glam::Vec4::new(cl[s * 12 + 8], cl[s * 12 + 9], cl[s * 12 + 10], cl[s * 12 + 11]);
+                if cone.w <= 0.1 {
+                    continue;
+                }
+                let (centre, radius) = (0.5 * (lo + hi), 0.5 * (hi - lo).length());
+                let to = centre - eye;
+                let dist = to.length();
+                if dist <= radius {
+                    continue;
+                }
+                let sin_cone = (1.0 - cone.w * cone.w).max(0.0).sqrt();
+                let sin_view = radius / dist;
+                let c = cone.truncate().dot(to / dist);
+                let cos_view = (1.0 - sin_view * sin_view).max(0.0).sqrt();
+                let cos_sum = cone.w * cos_view - sin_cone * sin_view;
+                let sin_sum = sin_cone * cos_view + cone.w * sin_view;
+                if !(cos_sum > 0.1 && c > sin_sum + 0.1) {
+                    continue;
+                }
+                // Culled: does any of its quads face the eye?
+                for q in &surf[k].quads {
+                    let Some(p): Option<Vec<(Vec3, Vec3)>> = q.iter().map(|(b, c, pc)| surf.get(b).and_then(|sb| sb.vertex(*c, *pc).map(|v| (sb.verts[v as usize], sb.normals[v as usize])))).collect() else { continue };
+                    let mid = (p[0].0 + p[1].0 + p[2].0 + p[3].0) * 0.25;
+                    if triangle_normals(&p).iter().any(|n| n.dot((eye - mid).normalize()) > 0.05) {
+                        bad += 1;
+                        blocks.insert(*k);
+                    }
+                }
+            }
+        }
+    }
+    (eyes, bad, blocks.len())
+}
+
+/// A frame as the viewport has it: a generator edit's plan joined on the GPU, else a plain sync; then the tick. True
+/// if the frame changed nothing on the GPU.
+fn rocks_frame(gpu: &mut GpuLevels, mode: &mut crate::volume_mode::VolumeMode) -> bool {
+    let plan = mode.gpu_plan.take();
+    let idle = plan.is_none();
+    let s = match &plan {
+        Some(plan) => gpu.sync_for_join(&mut mode.vol, plan),
+        None => gpu.sync(&mut mode.vol),
+    };
+    if let (Some(plan), Some(layer)) = (plan, mode.layer.as_ref()) {
+        gpu.join(plan, &|k| layer.base_samples(k));
+    }
+    mode.tick();
+    // Nothing joined, sent or rebuilt, and nothing left to land.
+    idle && s.uploaded == 0 && s.extracted == 0 && gpu.pending() == 0
+}
+
+/// A new ball's rocks made big and rough (a few drag frames, or set at once), the views by distance or not: once
+/// landed and idle, the GPU's surface is the CPU's reference exactly.
+#[allow(clippy::too_many_arguments)]
+fn big_rocks_check(device: &wgpu::Device, queue: &wgpu::Queue, triangles: f32, size: f32, rough: f32, drag: bool, by_distance: bool, level: Option<usize>, seeds: bool) -> Res<()> {
+    let when = format!("rocks size {size} rough {rough} drag {drag} by distance {by_distance} level {level:?} seeds {seeds}");
+    let mut mode = crate::volume_mode::VolumeMode::ball(triangles);
+    mode.add_generator();
+    if let Some(l) = level {
+        let k = mode.layer.as_ref().unwrap().active();
+        let vol = &mut mode.vol;
+        mode.layer.as_mut().unwrap().set_level(vol, k, l);
+        while let Some(job) = mode.layer.as_mut().unwrap().generator_take() {
+            let done = job.run();
+            mode.layer.as_mut().unwrap().generator_apply(&mut mode.vol, done);
+        }
+    }
+    let mut gpu = GpuLevels::new(device, queue, &mode.vol, mode.vol.levels() - 1);
+    gpu.view.on = by_distance;
+    if by_distance {
+        gpu.set_eye(Vec3::new(0.3, 0.4, 2.2), 1000.0);
+    }
+    rocks_frame(&mut gpu, &mut mode);
+    let k = mode.layer.as_ref().unwrap().active();
+    let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+    spec.rough = rough;
+    if drag {
+        spec.blend = 0.6;
+        for i in 0..=6 {
+            spec.size = size * (0.7 + 0.05 * i as f32);
+            if seeds {
+                spec.seed = 1 + i as u64;
+            }
+            mode.set_generator(k, &spec, true);
+            rocks_frame(&mut gpu, &mut mode);
+        }
+        mode.end_generator_edit();
+        // A second drag while the first lands.
+        rocks_frame(&mut gpu, &mut mode);
+        for i in 0..=4 {
+            spec.rough = rough * (0.8 + 0.05 * i as f32);
+            if seeds {
+                spec.seed = 20 + i as u64;
+            }
+            mode.set_generator(k, &spec, true);
+            rocks_frame(&mut gpu, &mut mode);
+        }
+        mode.end_generator_edit();
+    } else {
+        spec.size = size;
+        mode.set_generator(k, &spec, false);
+    }
+    let start = Instant::now();
+    loop {
+        let quiet = rocks_frame(&mut gpu, &mut mode);
+        if quiet && !mode.busy() && mode.vol.dirty_keys().is_empty() {
+            break;
+        }
+        if start.elapsed().as_secs() > 300 {
+            return Err(format!("{when}: never landed").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    rocks_frame(&mut gpu, &mut mode);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    // The samples the GPU holds against those the CPU would send.
+    let samples = read(device, queue, &gpu.buf.samples);
+    let stale: Vec<Key> = mode.vol.keys().into_iter().filter(|k| gpu.slot_of.get(k).is_some_and(|&sl| samples[sl as usize * 365..sl as usize * 365 + 365] != packed_samples(&mode.vol, *k, Some(gpu.view.hidden()))[..])).collect();
+    if !stale.is_empty() {
+        return Err(format!("{when}: once landed, {} blocks on the GPU hold other samples than the CPU's", stale.len()).into());
+    }
+    let (eyes, bad, blocks) = wrongly_culled(device, queue, &gpu, &mode.vol);
+    println!("{when}: from {eyes} eyes, {bad} quads facing the eye left out as facing away");
+    if bad > 0 {
+        return Err(format!("{when}: the cull pass leaves out {bad} quads facing the eye, in {blocks} blocks (holes)").into());
+    }
+    // Quads dropped while the edit's frames joined its preview (whose blocks' neighbours differ from it a little) are
+    // counted on the way; once landed, every quad is compared with the reference below.
+    queue.write_buffer(&gpu.buf.status, 12, bytemuck::bytes_of(&0i32));
+    compare(device, queue, &gpu, &mode.vol, &when)?;
+    Ok(())
+}
+
 pub fn run(args: &[String]) -> Res<()> {
     let (device, queue, adapter) = device()?;
     println!("adapter: {adapter}");
     let off = surface_noise_check(&device, &queue)?;
     let gen_off = generator_check(&device, &queue)?;
     join_check(&device, &queue)?;
+    // Big rough rocks on a new ball: set at once (over a hundred thousand blocks coming at once on a small slot table),
+    // and dragged at level 2 with their seed changing, seen by distance. With `--rocks`, more: by distance or not, on
+    // the app's ball, at level 1 and 2.
+    let mut rocks = vec![(2e5f32, 0.3f32, 0.6f32, false, false, None, false), (2e5, 0.15, 0.5, true, true, Some(2), true)];
+    if args.iter().any(|a| a == "--rocks") {
+        rocks.extend([(2e5f32, 0.15f32, 0.5f32, true, false, Some(2), true), (1e6, 0.2, 0.5, true, true, None, true), (1e6, 0.12, 0.5, true, true, Some(2), true)]);
+    }
+    for (tri, size, rough, drag, dist, level, seeds) in rocks {
+        big_rocks_check(&device, &queue, tri, size, rough, drag, dist, level, seeds)?;
+    }
     if gen_off > 1e-3 {
         return Err(format!("the shader's generator joining differs from the CPU's by {gen_off} of the instances' size").into());
     }

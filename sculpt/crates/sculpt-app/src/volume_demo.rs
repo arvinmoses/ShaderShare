@@ -65,6 +65,9 @@ enum Act {
     /// A new generator layer (rocks), and a change of its parameters (applied to the active generator's).
     AddGenerator,
     Generator(fn(&mut sculpt_core::generator::layer::GeneratorSpec)),
+    /// The same as a frame of a slider's drag, and the drag's release.
+    GeneratorDrag(fn(&mut sculpt_core::generator::layer::GeneratorSpec)),
+    GeneratorRelease,
     /// A change of the surface noise.
     Noise(fn(&mut sculpt_core::surface_noise::SurfaceNoise)),
     /// Move the work at this level and finer into a detail layer.
@@ -124,6 +127,9 @@ pub struct Frame {
     pub add_generator: bool,
     pub noise: Option<fn(&mut sculpt_core::surface_noise::SurfaceNoise)>,
     pub generator: Option<fn(&mut sculpt_core::generator::layer::GeneratorSpec)>,
+    /// The generator's change is a frame of a drag; the drag is released.
+    pub generator_dragging: bool,
+    pub generator_release: bool,
     pub undo: bool,
     pub redo: bool,
 }
@@ -298,6 +304,28 @@ impl VolumeDemo {
             at(8.5, 2.5, Camera(Pose::at(patch, 0.4)));
             at(8.5, 3.0, Caption("Close up: octaves finer than any level, as shading"));
             end = 12.0;
+        }
+        // `SCULPT_DEMO_SCRIPT=rocks`: clay strokes on the ball, then a new generator's rocks made rough and dragged big
+        // (a frame of a slider's drag at a time), released, and looked at from around while idle.
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("rocks") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::whole(5.5, 0.35, 0.25)));
+            at(0.3, 1.5, Stroke { tool: Tool::ClayBuildup, size: 220.0, strength: 1.0, path: line((0.35, 0.40), (0.65, 0.45), 0.0, 10) });
+            at(2.0, 1.5, Stroke { tool: Tool::ClayBuildup, size: 220.0, strength: 1.0, path: line((0.65, 0.55), (0.35, 0.52), 0.0, 10) });
+            at(3.8, 0.0, AddGenerator);
+            at(4.2, 0.0, Generator(|s| s.rough = 0.5));
+            for k in 0..30 {
+                at(5.0 + k as f32 / FPS, 0.0, GeneratorDrag(|s| s.size = (s.size * 1.1).min(0.22)));
+            }
+            at(6.2, 0.0, GeneratorRelease);
+            for k in 0..20 {
+                at(7.0 + k as f32 / FPS, 0.0, GeneratorDrag(|s| s.rough = (s.rough + 0.01).min(0.6)));
+            }
+            at(7.8, 0.0, GeneratorRelease);
+            at(10.0, 6.0, Camera(Pose::whole(5.0, 2.4, 0.4)));
+            at(16.0, 4.0, Camera(Pose::whole(4.2, 3.6, -0.2)));
+            end = 21.0;
         }
         // `SCULPT_DEMO_SCRIPT=gens`: only a generator and its edits, on the plain ball (a quick look).
         if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("gens") {
@@ -687,6 +715,11 @@ impl VolumeDemo {
                         Act::ByDistance(on) => f.by_distance = Some(on),
                         Act::AddGenerator => f.add_generator = true,
                         Act::Generator(edit) => f.generator = Some(edit),
+                        Act::GeneratorDrag(edit) => {
+                            f.generator = Some(edit);
+                            f.generator_dragging = true;
+                        }
+                        Act::GeneratorRelease => f.generator_release = true,
                         Act::Noise(edit) => f.noise = Some(edit),
                         Act::Undo => f.undo = true,
                         Act::Redo => f.redo = true,

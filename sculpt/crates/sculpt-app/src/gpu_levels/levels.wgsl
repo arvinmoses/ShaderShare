@@ -223,7 +223,8 @@ fn oct_decode(w: u32) -> vec3<f32> {
 //   the block: slot, level, coordinates;
 //   whether a block of the next level covers each group of 4x4x4 cells around it (groups -1..2 per axis);
 //   the slots of the blocks around at the same level (-1..1 per axis);
-//   prefix sums; the pages taken; bounds (min, max), normal sum (i32 bits), cone (offset by 32768), vertex count.
+//   prefix sums; the pages taken; bounds (min, max), normal sum (i32 bits), cone (offset by 32768), vertex count;
+//   then (faces) the cone over the quads' own normals (offset by 32768) and the quads' bounds (min, max, over -8..16).
 const W_SLOT: u32 = 0u;
 const W_LEVEL: u32 = 1u;
 const W_BC: u32 = 2u;
@@ -233,7 +234,7 @@ const W_SCAN: u32 = 96u;
 const W_TOT: u32 = 352u;
 const W_PAGES: u32 = 368u;
 const W_ATOM: u32 = 392u;
-var<workgroup> wg: array<atomic<u32>, 404>;
+var<workgroup> wg: array<atomic<u32>, 410>;
 
 fn wget(i: u32) -> u32 {
     return atomicLoad(&wg[i]);
@@ -335,11 +336,14 @@ fn load_block_1(t: u32, w: u32) {
         }
         atomicStore(&wg[W_ATOM + 10], 0u);
         atomicStore(&wg[W_ATOM + 9], 65535u);
+        atomicStore(&wg[W_ATOM + 11], 65535u);
     }
     if (t < 3u) {
         atomicStore(&wg[W_ATOM + t], 0xFFFFFFFFu);
         atomicStore(&wg[W_ATOM + 3u + t], 0u);
         atomicStore(&wg[W_ATOM + 6u + t], 0u);
+        atomicStore(&wg[W_ATOM + 12u + t], 0xFFFFFFFFu);
+        atomicStore(&wg[W_ATOM + 15u + t], 0u);
     }
 }
 
@@ -707,6 +711,51 @@ fn quad_corner(l: u32, q: vec3<i32>, start: vec3<i32>, axis: u32) -> u32 {
     return 0xFFFFFFFFu;
 }
 
+// Where the viewport draws quad corner `x` (slot << 11 | piece << 9 | cell, as `quad_corner` gives it), unfaded, in
+// steps from the corner of block `bc` of level `l`.
+fn corner_at(x: u32, l: u32, bc: vec3<i32>) -> vec3<f32> {
+    let s = x >> 11u;
+    let info = cells[s * 512u + (x & 511u)];
+    let count = max((info >> 10u) & 7u, 1u);
+    let vi = (info & 1023u) + min((x >> 9u) & 3u, count - 1u);
+    let v = verts[slot_pages[s * SLOT_WORDS + VP_AT + (vi >> 6u)] * VPAGE + (vi & 63u)].x;
+    let m = slot_meta[s];
+    let local = vec3<f32>(f32(v & 1023u), f32((v >> 10u) & 1023u), f32((v >> 20u) & 1023u)) / 1023.0 * 8.0;
+    // Its level's steps from its block's corner, as this level's from this block's.
+    let scale = exp2(f32(i32(l) - max(m.w, 0)));
+    return (vec3<f32>(m.xyz * 8) + local) * scale - vec3<f32>(bc * 8);
+}
+
+// A quad's corners `c` (as drawn, the outside on the side its winding faces) into the block's cluster: the least cosine
+// of its two triangles' normals against the axis the vertices pass found, and its bounds. A quad reaches into the
+// cells of the blocks around, and on a rough surface its faces can turn far from the field's gradient at the vertices
+// (the cone was those alone): the cull pass left out clusters with faces towards the eye, holes in the surface.
+fn quad_cluster(slot: u32, l: u32, bc: vec3<i32>, c0: u32, c1: u32, c2: u32, c3: u32) {
+    let p0 = corner_at(c0, l, bc);
+    let p1 = corner_at(c1, l, bc);
+    let p2 = corner_at(c2, l, bc);
+    let p3 = corner_at(c3, l, bc);
+    let axis = clusters[slot * 3u + 2u].xyz;
+    let n1 = cross(p1 - p0, p2 - p0);
+    let n2 = cross(p2 - p0, p3 - p0);
+    var least = 1.0;
+    if (dot(n1, n1) > 1e-12) {
+        least = min(least, dot(axis, normalize(n1)));
+    }
+    if (dot(n2, n2) > 1e-12) {
+        least = min(least, dot(axis, normalize(n2)));
+    }
+    atomicMin(&wg[W_ATOM + 11], u32(floor(clamp(least, -1.0, 1.0) * 32767.0) + 32768.0));
+    let lo = (clamp(min(min(p0, p1), min(p2, p3)), vec3<f32>(-8.0), vec3<f32>(16.0)) + 8.0) / 24.0 * 65535.0;
+    let hi = (clamp(max(max(p0, p1), max(p2, p3)), vec3<f32>(-8.0), vec3<f32>(16.0)) + 8.0) / 24.0 * 65535.0;
+    atomicMin(&wg[W_ATOM + 12], u32(lo.x));
+    atomicMin(&wg[W_ATOM + 13], u32(lo.y));
+    atomicMin(&wg[W_ATOM + 14], u32(lo.z));
+    atomicMax(&wg[W_ATOM + 15], u32(ceil(hi.x)));
+    atomicMax(&wg[W_ATOM + 16], u32(ceil(hi.y)));
+    atomicMax(&wg[W_ATOM + 17], u32(ceil(hi.z)));
+}
+
 // The quads cell `ci` owns; with `write`, stored from quad number `base` on. Returns how many.
 fn cell_quads(l: u32, slot: u32, bc: vec3<i32>, ci: u32, write: bool, base: u32) -> u32 {
     if (l > P.cap) {
@@ -761,7 +810,8 @@ fn cell_quads(l: u32, slot: u32, bc: vec3<i32>, ci: u32, write: bool, base: u32)
             var c1 = quad_corner(l, a1, start, axis);
             var c2 = quad_corner(l, a2, start, axis);
             var c3 = quad_corner(l, a3, start, axis);
-            if (c0 == 0xFFFFFFFFu || c1 == 0xFFFFFFFFu || c2 == 0xFFFFFFFFu || c3 == 0xFFFFFFFFu) {
+            let dropped = c0 == 0xFFFFFFFFu || c1 == 0xFFFFFFFFu || c2 == 0xFFFFFFFFu || c3 == 0xFFFFFFFFu;
+            if (dropped) {
                 // Counted as written, but drawn as nothing.
                 c0 = 0u;
                 c1 = 0u;
@@ -773,6 +823,9 @@ fn cell_quads(l: u32, slot: u32, bc: vec3<i32>, ci: u32, write: bool, base: u32)
                 let t1 = c1;
                 c1 = c3;
                 c3 = t1;
+            }
+            if (!dropped && slot != 0xFFFFFFFFu) {
+                quad_cluster(slot, l, wg_bc(), c0, c1, c2, c3);
             }
             let q = base + n;
             if (q < MAX_PAGES * PAGE_QUADS) {
@@ -840,6 +893,25 @@ fn faces(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wid: ve
     workgroupBarrier();
     cell_quads(l, slot, bc, 2u * t, true, sc.x);
     cell_quads(l, slot, bc, 2u * t + 1u, true, sc.x + na);
+    workgroupBarrier();
+    // The cluster as drawn: its cone and bounds widened to take in its quads.
+    if (t == 0u && live && sc.y > 0u) {
+        let cone = clusters[slot * 3u + 2u];
+        let own_lo = clusters[slot * 3u].xyz;
+        let own_hi = clusters[slot * 3u + 1u].xyz;
+        let qlo = vec3<f32>(f32(atomicLoad(&wg[W_ATOM + 12])), f32(atomicLoad(&wg[W_ATOM + 13])), f32(atomicLoad(&wg[W_ATOM + 14]))) / 65535.0 * 24.0 - 8.0;
+        let qhi = vec3<f32>(f32(atomicLoad(&wg[W_ATOM + 15])), f32(atomicLoad(&wg[W_ATOM + 16])), f32(atomicLoad(&wg[W_ATOM + 17]))) / 65535.0 * 24.0 - 8.0;
+        let quads_cone = (f32(atomicLoad(&wg[W_ATOM + 11])) - 32768.0) / 32767.0;
+        if (cone.w < -1.5) {
+            // No vertices of its own: no cone, and the quads' bounds.
+            clusters[slot * 3u] = vec4<f32>(qlo, 1.0);
+            clusters[slot * 3u + 1u] = vec4<f32>(qhi, 1.0);
+        } else {
+            clusters[slot * 3u] = vec4<f32>(min(own_lo, qlo), 1.0);
+            clusters[slot * 3u + 1u] = vec4<f32>(max(own_hi, qhi), 1.0);
+            clusters[slot * 3u + 2u] = vec4<f32>(cone.xyz, min(cone.w, quads_cone));
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------ cull

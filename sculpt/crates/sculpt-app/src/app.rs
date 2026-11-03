@@ -591,8 +591,11 @@ impl SculptApp {
             let k = layer.active();
             if let Some(mut spec) = layer.generator(k).cloned() {
                 edit(&mut spec);
-                m.set_generator(k, &spec, false);
+                m.set_generator(k, &spec, f.generator_dragging);
             }
+        }
+        if f.generator_release {
+            m.end_generator_edit();
         }
         if f.save_open {
             // Through a file in the frames' folder: what is shown afterwards is what the file holds.
