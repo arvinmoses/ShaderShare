@@ -129,6 +129,12 @@ impl<K: Sharded, V: Clone> Shared<K, V> {
         self.len
     }
 
+    /// Whether this map is still `other`, a copy of it, shard for shard: neither written since (a write copies the
+    /// shard it writes while the other still holds it).
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.len == other.len && self.shards.len() == other.shards.len() && self.shards.iter().zip(&other.shards).all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1096,6 +1102,22 @@ impl LevelVolume {
         out.keep_detail = self.keep_detail;
         out.uncached_reads = self.uncached_reads;
         out
+    }
+
+    /// Whether the blocks (and level 0's inside blocks) are still those of `other`, a snapshot of this volume: nothing
+    /// written to either since, in a moment whatever their number.
+    pub(crate) fn same_blocks(&self, other: &LevelVolume) -> bool {
+        self.blocks.len() == other.blocks.len() && self.blocks.iter().zip(&other.blocks).all(|(a, b)| a.same_as(b)) && self.inside0.0.same_as(&other.inside0.0)
+    }
+
+    /// Take `other`'s blocks (and level 0's inside blocks) in place of these, and count its changed blocks as changed
+    /// here too; the rest (history, a stroke under way, the blocks still to send) stays. Returns `other`, holding
+    /// what this volume held.
+    pub(crate) fn take_blocks(&mut self, mut other: LevelVolume) -> LevelVolume {
+        std::mem::swap(&mut self.blocks, &mut other.blocks);
+        std::mem::swap(&mut self.inside0, &mut other.inside0);
+        self.dirty.extend(other.dirty.drain());
+        other
     }
 
     pub fn drain_dirty(&mut self) -> Vec<Key> {
