@@ -393,7 +393,7 @@ fn join_check_at(device: &wgpu::Device, queue: &wgpu::Queue, level: usize) -> Re
         let got: Vec<(Key, Vec<u32>)> = keys.iter().filter_map(|k| gpu.slot_of.get(k).map(|&sl| (*k, samples[sl as usize * 365..sl as usize * 365 + 365].to_vec()))).collect();
         // The exact field.
         let tj = Instant::now();
-        while let Some(job) = layer.generator_take() {
+        while let Some(job) = layer.generator_take_landing(&vol) {
             layer.generator_apply(&mut vol, job.run());
         }
         let job_ms = tj.elapsed().as_secs_f64() * 1e3;
@@ -810,7 +810,7 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
             let tj = Instant::now();
             let mut apply_ms = 0.0;
-            while let Some(job) = layer.generator_take() {
+            while let Some(job) = layer.generator_take_landing(&vol) {
                 let done = job.run();
                 let ta = Instant::now();
                 layer.generator_apply(&mut vol, done);

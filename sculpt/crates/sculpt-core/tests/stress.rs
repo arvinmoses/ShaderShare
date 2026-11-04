@@ -298,6 +298,10 @@ fn form_end(l: &mut Layered, s: &mut LevelVolume, f: &FormStroke) {
     } else {
         l.end_stroke(s);
     }
+    // The last follow as the app takes it: what is shown after it worked out with it.
+    while let Some(job) = l.follow_take_landing(s) {
+        l.follow_apply(s, job.run());
+    }
     l.settle(s);
 }
 
@@ -664,7 +668,7 @@ impl World {
             l.preview_generator(&mut self.s, k, &spec);
         }
         assert!(l.previewing(), "the edit was not previewed");
-        let job = l.generator_take();
+        let job = l.generator_take_landing(&self.s);
         let mut stale = None;
         if wait {
             if let Some(job) = job {
@@ -912,7 +916,7 @@ impl World {
             }
             if self.rng.chance(0.5) && drag {
                 // The job for the first preview, landing after a newer one: dropped.
-                if let Some(job) = l.generator_take() {
+                if let Some(job) = l.generator_take_landing(&self.s) {
                     let done = job.run();
                     spec.blend = (spec.blend + 0.05).min(0.7);
                     l.preview_generator(&mut self.s, k, &spec);
@@ -920,7 +924,7 @@ impl World {
                     assert!(!taken, "a stale generator job was taken");
                 }
             }
-            while let Some(job) = l.generator_take() {
+            while let Some(job) = l.generator_take_landing(&self.s) {
                 let done = job.run();
                 assert!(l.generator_apply(&mut self.s, done), "a current generator job was dropped");
             }
@@ -930,7 +934,7 @@ impl World {
         if drag {
             l.end_edit_in(&mut self.s);
         }
-        while let Some(job) = l.generator_take() {
+        while let Some(job) = l.generator_take_landing(&self.s) {
             let done = job.run();
             l.generator_apply(&mut self.s, done);
         }
@@ -952,7 +956,7 @@ impl World {
         let Some((at, _)) = l.form().raycast(d * 3.0, -d, 0, false) else { return };
         assert!(l.paint_density(at, r, to));
         l.end_density_stroke(&mut self.s);
-        while let Some(job) = l.generator_take() {
+        while let Some(job) = l.generator_take_landing(&self.s) {
             let done = job.run();
             l.generator_apply(&mut self.s, done);
         }

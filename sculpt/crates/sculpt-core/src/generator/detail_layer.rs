@@ -159,6 +159,10 @@ pub struct GenJob {
     targets: Vec<(usize, IVec3)>,
     /// Set when its result is no longer wanted: it stops at the next batch of blocks.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What is shown as it was taken, to work out what is shown after (see [`Layered::generator_take_landing`]).
+    land: Option<Landing>,
+    /// Whether the generator was shown by the GPU (see [`Layered::gpu_generator`]).
+    joined: bool,
 }
 
 /// What a [`GenJob`] composed.
@@ -167,6 +171,7 @@ pub struct GenDone {
     part: GenPart,
     preview: std::sync::Arc<Vec<HashSet<IVec3>>>,
     blocks: Vec<(usize, IVec3, Option<Stored>)>,
+    after: Option<ShownAfter>,
     cancelled: bool,
     pub ms: f64,
 }
@@ -186,12 +191,28 @@ impl GenJob {
             }
             blocks.extend(compose_all(&self.form, &self.stack, self.from - 1, batch));
         }
-        GenDone { k: self.k, part: self.part, preview: self.preview, blocks, cancelled, ms: t.elapsed().as_secs_f64() * 1e3 }
+        let after = match self.land {
+            Some(land) if !cancelled => {
+                // Joined on the GPU meanwhile, its blocks are sent again whatever they hold here.
+                let force: Vec<Key> = if self.joined { blocks.iter().map(|b| (b.0 as u8, b.1)).collect() } else { Vec::new() };
+                Some(land.work(&force, |vol| put_shown_in(&self.stack, vol, blocks.clone(), &self.form)))
+            }
+            _ => None,
+        };
+        GenDone { k: self.k, part: self.part, preview: self.preview, blocks, after, cancelled, ms: t.elapsed().as_secs_f64() * 1e3 }
     }
 
     /// A flag that stops the job (its result is then never taken).
     pub fn canceller(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.cancel.clone()
+    }
+}
+
+impl GenDone {
+    /// Of what is shown once it goes in, if worked out with it: the blocks it touches, and of those the ones it
+    /// changes.
+    pub fn landing(&self) -> Option<(usize, usize)> {
+        self.after.as_ref().map(|a| (a.touched, a.changed))
     }
 }
 
@@ -1092,6 +1113,10 @@ pub struct Layered {
     pub last: FollowStats,
     /// Follows taken in, this stroke.
     pub follows: usize,
+    /// Jobs' results (generators', strokes' last follows) taken whole, what is shown after worked out with them (see
+    /// [`ShownAfter`]); and blocks of jobs' results put into what is shown on the frame instead.
+    pub taken_whole: usize,
+    pub put_on_frame: usize,
     /// Whether dabs leave following to [`Self::follow_take`] (jobs on other threads) rather than doing it at once.
     pub deferred: bool,
     /// Blocks of the form dabs changed over the layers, waiting for a follow; the pen up, waiting for the last one; a
@@ -1135,6 +1160,9 @@ pub struct FollowJob {
     also: Vec<(usize, IVec3)>,
     /// Blocks shown to compose besides (at the end: see [`Layered::adopt_generators`]).
     recompose: Vec<(usize, IVec3)>,
+    /// What is shown as it was taken, to work out what is shown after (a stroke's last: see
+    /// [`Layered::follow_take_landing`]).
+    land: Option<Landing>,
 }
 
 /// One layer's new blocks (heights and mask; `None` where it holds nothing any more).
@@ -1150,7 +1178,16 @@ pub struct FollowDone {
     gens: Vec<(usize, GenPart)>,
     shown: Vec<(usize, IVec3, Option<Stored>)>,
     used: Vec<((usize, IVec3), Corners)>,
+    after: Option<ShownAfter>,
     stats: FollowStats,
+}
+
+impl FollowDone {
+    /// Of what is shown once it goes in, if worked out with it: the blocks it touches, and of those the ones it
+    /// changes.
+    pub fn landing(&self) -> Option<(usize, usize)> {
+        self.after.as_ref().map(|a| (a.touched, a.changed))
+    }
 }
 
 impl FollowJob {
@@ -1175,6 +1212,10 @@ impl FollowJob {
         let mut used = Vec::new();
         let mut changes = Vec::new();
         let mut gens = Vec::new();
+        // (The stack as taken, for what is shown after: see `Layered::follow_apply`.)
+        let taken = self.land.as_ref().filter(|_| self.end).map(|_| self.stack.clone());
+        // (Blocks of generators a form stroke took at their own level: perhaps joined on the GPU, so sent again.)
+        let force: Vec<Key> = self.recompose.iter().map(|&(l, bc)| (l as u8, bc)).collect();
         for k in 0..self.stack.len() {
             if let Some(part) = self.stack[k].scatter.clone() {
                 let own = self.stack[k].level;
@@ -1247,8 +1288,34 @@ impl FollowJob {
         }
         let shown = compose_all(&self.form, &self.stack, self.from - 1, &targets);
         stats.parts_ms[3] = t3.elapsed().as_secs_f64() * 1e3;
+        // What is shown after, as `Layered::follow_apply` puts it: the region mirrored where no layer is composed (the
+        // generators as now, the heights as taken), the composed blocks put, the stale parents tidied.
+        let after = match (self.land.take(), taken) {
+            (Some(land), Some(mut mid)) => {
+                for (k, part) in &gens {
+                    if let Some(x) = mid.get_mut(*k).filter(|x| x.scatter.is_some()) {
+                        x.scatter = Some(part.clone());
+                    }
+                }
+                let (form, stack, region, blocks) = (&self.form, &self.stack, &self.region, shown.clone());
+                Some(land.work(&force, |vol| {
+                    let mut sorted = region.clone();
+                    sorted.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+                    for &key in &sorted {
+                        if !composed(&mid, key.0 as usize, key.1) {
+                            vol.mirror(form, key);
+                        }
+                    }
+                    put_shown_in(stack, vol, blocks, form);
+                    let stale = stale_under_in(stack, vol, region, form);
+                    tidy_in(stack, vol, stale, form);
+                    settle_shown_in(stack, vol, form);
+                }))
+            }
+            _ => None,
+        };
         stats.ms = t.elapsed().as_secs_f64() * 1e3;
-        FollowDone { form: self.form, region: self.region, end: self.end, layers, gens, shown, used, stats }
+        FollowDone { form: self.form, region: self.region, end: self.end, layers, gens, shown, used, after, stats }
     }
 }
 
@@ -1467,6 +1534,195 @@ fn follow_heights(job: &FollowJob, k: usize) -> (LayerBlocks, Vec<(IVec3, Corner
     (built, used, stats)
 }
 
+/// Blocks shown holds only as parents (neither the form's nor a layer's) under the form's blocks `region`: they read
+/// the form as it was when made, whatever the layers do there. And the region's own blocks the form dropped:
+/// mirrored coarsest first, each is kept as a parent while finer ones still hang from it, and those go right after.
+fn stale_under_in(stack: &[Layer], shown: &LevelVolume, region: &[Key], form: &LevelVolume) -> Vec<Key> {
+    let top = form.levels() - 1;
+    let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); top + 1];
+    let mut out: HashSet<Key> = HashSet::default();
+    for &(m, bc) in region {
+        per[m as usize].insert(bc);
+        if shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(stack, m as usize, bc) {
+            out.insert((m, bc));
+        }
+    }
+    // Such blocks are parents of the layers' (read through their blocks, not every block shown).
+    for x in stack.iter().filter(|x| x.scatter.is_none()) {
+        let l = x.level;
+        for &bc in x.h.keys() {
+            for m in 0..l {
+                let a = bc >> (l - m) as i32;
+                if !out.contains(&(m as u8, a)) && !form.exists(m, a) && !composed(stack, m, a) && shown.exists(m, a) && (0..=m).any(|k| per[k].contains(&(a >> (m - k) as i32))) {
+                    out.insert((m as u8, a));
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Blocks `keys` that shown holds only as parents of finer ones (neither the form's nor a layer's): dropped where
+/// they hold none any more (finest first, so a parent left with none goes too), else made again from the level
+/// below (coarsest first, so each reads the one below as it is now).
+fn tidy_in(stack: &[Layer], shown: &mut LevelVolume, keys: Vec<Key>, form: &LevelVolume) {
+    // Each once (the blocks of a level name few parents between them), finest first.
+    let mut keys = keys;
+    keys.sort_unstable_by_key(|k| (std::cmp::Reverse(k.0), k.1.z, k.1.y, k.1.x));
+    keys.dedup();
+    keys.retain(|&(m, bc)| shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(stack, m as usize, bc));
+    let mut kept = Vec::with_capacity(keys.len());
+    for (m, bc) in keys {
+        let mu = m as usize;
+        let children = mu + 1 < shown.levels() && (0..8).any(|q| shown.exists(mu + 1, bc * 2 + corner_offset(q)));
+        if children {
+            kept.push((m, bc));
+        } else {
+            shown.mirror(form, (m, bc));
+        }
+    }
+    kept.reverse();
+    for (m, bc) in kept {
+        shown.refill(m as usize, bc);
+    }
+}
+
+/// Put composed blocks into `shown` (or take its own away where no layer is composed there), coarsest first, clear
+/// the checkerboard faces composing can leave (as a stroke does after its dabs: the extractor's pieces cannot
+/// represent one, and it shows as an edge shared by four quads), and tidy their parents.
+fn put_shown_in(stack: &[Layer], shown: &mut LevelVolume, mut blocks: Vec<(usize, IVec3, Option<Stored>)>, form: &LevelVolume) {
+    blocks.sort_unstable_by_key(|b| (b.0, b.1.z, b.1.y, b.1.x));
+    let mut parents = Vec::new();
+    for (l, bc, s) in blocks {
+        match s {
+            Some(s) => shown.put_stored(l, bc, s),
+            None => shown.mirror(form, (l as u8, bc)),
+        }
+        // (Level 0's too: a level 0 block made as a parent and left behind would hold a slot for nothing.)
+        parents.extend((0..l).map(|m| (m as u8, bc >> (l - m) as i32)));
+    }
+    tidy_in(stack, shown, parents, form);
+    settle_shown_in(stack, shown, form);
+}
+
+/// After blocks of `shown` changed (composed, mirrored from the form, or made or filled again as parents): the
+/// blocks held only as parents over any that changed read it, so they are made again from it, coarsest first;
+/// then every block changed is cleared of checkerboard faces (the interpolated ones can hold them too).
+fn settle_shown_in(stack: &[Layer], shown: &mut LevelVolume, form: &LevelVolume) {
+    let mut changed: Vec<(usize, IVec3)> = shown.dirty_keys().into_iter().filter(|k| shown.exists(k.0 as usize, k.1)).map(|k| (k.0 as usize, k.1)).collect();
+    changed.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
+    let mut done: HashSet<(usize, IVec3)> = HashSet::default();
+    while let Some((l, bc)) = changed.pop() {
+        if l + 1 >= shown.levels() {
+            continue;
+        }
+        // A block reads the level below one sample past its parent: the children of the blocks before it along
+        // each axis read this one too.
+        for q in 0..8 {
+            let p = bc - corner_offset(q);
+            for r in 0..8 {
+                let c = p * 2 + corner_offset(r);
+                if shown.exists(l + 1, c) && !form.exists(l + 1, c) && !composed(stack, l + 1, c) && done.insert((l + 1, c)) {
+                    shown.refill(l + 1, c);
+                    changed.push((l + 1, c));
+                }
+            }
+        }
+    }
+    let mut per: Vec<Vec<IVec3>> = vec![Vec::new(); shown.levels()];
+    for (l, bc) in shown.dirty_keys() {
+        if shown.exists(l as usize, bc) {
+            per[l as usize].push(bc);
+        }
+    }
+    for (l, bcs) in per.iter().enumerate() {
+        shown.clear_checkerboards_at(l, bcs);
+    }
+}
+
+/// What a layer stack looks like, cheaply: each layer's level, whether shown, how many blocks its heights and mask
+/// hold, and its generator's blocks (by address). A job's result is put in whole only on a stack that still looks as
+/// it did when the job was taken.
+fn stack_print(stack: &[Layer]) -> Vec<(usize, bool, usize, usize, usize)> {
+    stack.iter().map(|x| (x.level, x.visible, x.h.len(), x.m.len(), x.scatter.as_ref().map_or(0, |g| std::sync::Arc::as_ptr(&g.blocks) as usize))).collect()
+}
+
+/// What is shown as a job is taken, for the job to work out on its own thread what is shown once its result goes in
+/// (see [`ShownAfter`]).
+struct Landing {
+    base: LevelVolume,
+    dirty: Vec<Key>,
+    print: Vec<(usize, bool, usize, usize, usize)>,
+}
+
+/// What is shown once a job's result goes in, worked out on the job's thread: putting the result in (the blocks, their
+/// parents, the checkerboards cleared) took the frame up to a few hundred milliseconds for a big generator's. Only
+/// the blocks whose samples or existence changed are marked (a stroke's last follow composes every block of every
+/// generator again, most of them as they were). The frame takes it whole, in a moment, while what is shown and the
+/// stack are as the job was taken; else the result goes in on the frame, as before.
+pub struct ShownAfter {
+    base: LevelVolume,
+    vol: LevelVolume,
+    print: Vec<(usize, bool, usize, usize, usize)>,
+    /// Blocks the result touched, and those to send again (what it changed, and what the GPU joined).
+    pub touched: usize,
+    pub changed: usize,
+}
+
+impl Landing {
+    fn of(shown: &LevelVolume, stack: &[Layer]) -> Landing {
+        Landing { base: shown.snapshot(), dirty: shown.dirty_keys(), print: stack_print(stack) }
+    }
+
+    /// `put` done on a copy of what is shown (its blocks not yet sent counted as changed, as the frame's would be).
+    /// Blocks `force` count as changed whatever their samples: the GPU holds what it joined for them, not what is
+    /// shown here.
+    fn work(self, force: &[Key], put: impl FnOnce(&mut LevelVolume)) -> ShownAfter {
+        let mut vol = self.base.snapshot();
+        vol.mark_dirty(self.dirty);
+        put(&mut vol);
+        let touched = vol.drain_dirty();
+        let (base, now) = (&self.base, &vol);
+        let changed: Vec<Key> = touched
+            .par_iter()
+            .copied()
+            .filter(|&k| match (base.block(k), now.block(k)) {
+                (Some(a), Some(b)) => !std::ptr::eq(a, b) && a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits()),
+                // (Level 0's may have gone from outside to inside, or back.)
+                (None, None) => k.0 == 0,
+                _ => true,
+            })
+            .collect();
+        vol.mark_dirty(changed);
+        vol.mark_dirty(force.iter().copied());
+        let n = vol.dirty_keys().len();
+        ShownAfter { base: self.base, vol, print: self.print, touched: touched.len(), changed: n }
+    }
+}
+
+impl ShownAfter {
+    /// Whether `shown` and `stack` are still as the job was taken (and `shown` is not under a stroke, whose undo would
+    /// read blocks taken away).
+    fn fits(&self, shown: &LevelVolume, stack: &[Layer]) -> bool {
+        let t = Instant::now();
+        let out = self.print == stack_print(stack) && !shown.in_stroke() && shown.same_blocks(&self.base);
+        if std::env::var_os("SCULPT_LAND_LOG").is_some() {
+            eprintln!("landing: taken whole {out} ({:.1} ms to check); {} blocks touched, {} changed", t.elapsed().as_secs_f64() * 1e3, self.touched, self.changed);
+        }
+        out
+    }
+}
+
+/// Make `shown` what `after` holds (worked out from a snapshot of it, which it still is: see
+/// [`LevelVolume::same_blocks`]). What it held, the snapshot and `rest` are let go of on another thread: each of a few
+/// hundred thousand blocks let go of reads memory long untouched, tens of milliseconds in all.
+fn take_whole(shown: &mut LevelVolume, after: ShownAfter, rest: impl Send + 'static) {
+    let ShownAfter { base, vol, .. } = after;
+    let was = shown.take_blocks(vol);
+    // (On a thread of its own: in a pool, it would hold up the work the frame waits on.)
+    std::thread::spawn(move || drop((was, base, rest)));
+}
+
 impl Layered {
     /// Put the work `shown` holds at levels `from` and finer in a layer of its own over the rest, at the finest level
     /// that work reaches. `shown` becomes what is drawn: the form with the layer on it.
@@ -1503,6 +1759,8 @@ impl Layered {
             redo: Vec::new(),
             last: FollowStats::default(),
             follows: 0,
+            taken_whole: 0,
+            put_on_frame: 0,
             deferred: false,
             pending: HashSet::default(),
             ending: false,
@@ -2276,7 +2534,19 @@ impl Layered {
             used: if end { HashMap::default() } else { self.used.clone() },
             also: if end { self.changed.iter().copied().collect() } else { Vec::new() },
             recompose: if end { std::mem::take(&mut self.recompose) } else { Vec::new() },
+            land: None,
         })
+    }
+
+    /// [`Self::follow_take`], a stroke's last also working out what is shown once its result goes in, from `shown` as
+    /// it is now: the frame then only takes it (see [`ShownAfter`]). Earlier follows go in on the frame (they are
+    /// small, and the stroke's dabs change what is shown meanwhile).
+    pub fn follow_take_landing(&mut self, shown: &LevelVolume) -> Option<FollowJob> {
+        let mut job = self.follow_take()?;
+        if job.end {
+            job.land = Some(Landing::of(shown, &self.stack));
+        }
+        Some(job)
     }
 
     /// Take what a follow worked out: the layers' blocks, and what is shown over the blocks it covered (the form as the
@@ -2285,7 +2555,9 @@ impl Layered {
         self.base_epoch += 1;
         let t = Instant::now();
         self.running = false;
-        let FollowDone { form, region, end, layers, gens, shown: blocks, used, mut stats } = done;
+        let FollowDone { form, region, end, layers, gens, shown: blocks, used, after, mut stats } = done;
+        // Worked out with the job, and what is shown and the stack still as it was taken: taken whole below.
+        let after = after.filter(|a| a.fits(shown, &self.stack));
         for (k, part) in gens {
             if let Some(x) = self.stack.get_mut(k).filter(|x| x.scatter.is_some()) {
                 // Only the blocks it did not have are covered anew (the rest are already).
@@ -2306,9 +2578,11 @@ impl Layered {
         let mut sorted = region.clone();
         sorted.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
         // (The layers' levels only where no layer is composed: their blocks there are composed below, or stay.)
-        for &key in &sorted {
-            if !composed(&self.stack, key.0 as usize, key.1) {
-                shown.mirror(&form, key);
+        if after.is_none() {
+            for &key in &sorted {
+                if !composed(&self.stack, key.0 as usize, key.1) {
+                    shown.mirror(&form, key);
+                }
             }
         }
         for (k, built) in layers {
@@ -2334,10 +2608,19 @@ impl Layered {
             self.cover(level, &made);
         }
         self.used.extend(used);
-        self.put_shown(shown, blocks, &form);
-        let stale = self.stale_under(shown, &region, &form);
-        self.tidy(shown, stale, Some(&form));
-        self.settle_shown(shown, &form);
+        match after {
+            Some(a) => {
+                self.taken_whole += 1;
+                take_whole(shown, a, blocks);
+            }
+            None => {
+                self.put_on_frame += blocks.len();
+                self.put_shown(shown, blocks, &form);
+                let stale = self.stale_under(shown, &region, &form);
+                self.tidy(shown, stale, Some(&form));
+                self.settle_shown(shown, &form);
+            }
+        }
         stats.ms += t.elapsed().as_secs_f64() * 1e3;
         self.last = stats;
         self.follows += 1;
@@ -2685,7 +2968,8 @@ impl Layered {
         let preview = self.stack[k].scatter.clone()?;
         let own = self.stack[k].level;
         let mut stack = self.stack.clone();
-        let (part, targets) = if preview.upto == usize::MAX {
+        let joined = preview.upto == usize::MAX;
+        let (part, targets) = if joined {
             // Shown by the GPU at its own level: its blocks are found already (see `gpu_generator`).
             let part = GenPart { g: preview.g.clone(), blocks: preview.blocks.clone(), upto: own };
             (part, affected_generator(&stack, k, None).0)
@@ -2698,24 +2982,42 @@ impl Layered {
         };
         stack[k].scatter = Some(part.clone());
         self.taken = Some((k, preview.blocks.clone(), part.clone(), targets.clone()));
-        Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets, cancel: Default::default() })
+        Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets, cancel: Default::default(), land: None, joined })
     }
 
     /// Take what a [`GenJob`] composed, unless the layer changed meanwhile (then a later job brings it), or a form
     /// stroke took the generator at its own level (see [`Self::adopt_generators`]). True if taken.
     pub fn generator_apply(&mut self, shown: &mut LevelVolume, done: GenDone) -> bool {
-        let GenDone { k, part, preview, blocks, cancelled, .. } = done;
+        let GenDone { k, part, preview, blocks, after, cancelled, .. } = done;
         if cancelled {
             return false;
         }
-        let Some(x) = self.stack.get_mut(k) else { return false };
+        let Some(x) = self.stack.get(k) else { return false };
         let level = x.level;
         if !x.scatter.as_ref().is_some_and(|p| std::sync::Arc::ptr_eq(&p.blocks, &preview) && p.upto != level) {
             return false;
         }
-        x.scatter = Some(part);
-        self.put_shown(shown, blocks, &self.form);
+        let after = after.filter(|a| a.fits(shown, &self.stack));
+        self.stack[k].scatter = Some(part);
+        match after {
+            Some(a) => {
+                self.taken_whole += 1;
+                take_whole(shown, a, blocks);
+            }
+            None => {
+                self.put_on_frame += blocks.len();
+                self.put_shown(shown, blocks, &self.form);
+            }
+        }
         true
+    }
+
+    /// [`Self::generator_take`], the job also working out what is shown once its result goes in, from `shown` as it
+    /// is now: the frame then only takes it (see [`ShownAfter`]).
+    pub fn generator_take_landing(&mut self, shown: &LevelVolume) -> Option<GenJob> {
+        let mut job = self.generator_take()?;
+        job.land = Some(Landing::of(shown, &self.stack));
+        Some(job)
     }
 
     pub fn end_edit_in(&mut self, shown: &mut LevelVolume) {
@@ -2816,111 +3118,20 @@ impl Layered {
         if form { Undo::Form(old, old_active) } else { Undo::Layers(old, old_active) }
     }
 
-    /// Blocks shown holds only as parents (neither the form's nor a layer's) under the form's blocks `region`: they read
-    /// the form as it was when made, whatever the layers do there. And the region's own blocks the form dropped:
-    /// mirrored coarsest first, each is kept as a parent while finer ones still hang from it, and those go right after.
     fn stale_under(&self, shown: &LevelVolume, region: &[Key], form: &LevelVolume) -> Vec<Key> {
-        let top = self.form.levels() - 1;
-        let mut per: Vec<HashSet<IVec3>> = vec![HashSet::default(); top + 1];
-        let mut out: HashSet<Key> = HashSet::default();
-        for &(m, bc) in region {
-            per[m as usize].insert(bc);
-            if shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(&self.stack, m as usize, bc) {
-                out.insert((m, bc));
-            }
-        }
-        // Such blocks are parents of the layers' (read through their blocks, not every block shown).
-        for x in self.stack.iter().filter(|x| x.scatter.is_none()) {
-            let l = x.level;
-            for &bc in x.h.keys() {
-                for m in 0..l {
-                    let a = bc >> (l - m) as i32;
-                    if !out.contains(&(m as u8, a)) && !form.exists(m, a) && !composed(&self.stack, m, a) && shown.exists(m, a) && (0..=m).any(|k| per[k].contains(&(a >> (m - k) as i32))) {
-                        out.insert((m as u8, a));
-                    }
-                }
-            }
-        }
-        out.into_iter().collect()
+        stale_under_in(&self.stack, shown, region, form)
     }
 
-    /// Blocks `keys` that shown holds only as parents of finer ones (neither the form's nor a layer's): dropped where
-    /// they hold none any more (finest first, so a parent left with none goes too), else made again from the level
-    /// below (coarsest first, so each reads the one below as it is now).
     fn tidy(&self, shown: &mut LevelVolume, keys: Vec<Key>, form: Option<&LevelVolume>) {
-        let form = form.unwrap_or(&self.form);
-        // Each once (the blocks of a level name few parents between them), finest first.
-        let mut keys = keys;
-        keys.sort_unstable_by_key(|k| (std::cmp::Reverse(k.0), k.1.z, k.1.y, k.1.x));
-        keys.dedup();
-        keys.retain(|&(m, bc)| shown.exists(m as usize, bc) && !form.exists(m as usize, bc) && !composed(&self.stack, m as usize, bc));
-        let mut kept = Vec::with_capacity(keys.len());
-        for (m, bc) in keys {
-            let mu = m as usize;
-            let children = mu + 1 < shown.levels() && (0..8).any(|q| shown.exists(mu + 1, bc * 2 + corner_offset(q)));
-            if children {
-                kept.push((m, bc));
-            } else {
-                shown.mirror(form, (m, bc));
-            }
-        }
-        kept.reverse();
-        for (m, bc) in kept {
-            shown.refill(m as usize, bc);
-        }
+        tidy_in(&self.stack, shown, keys, form.unwrap_or(&self.form))
     }
 
-    /// Put composed blocks into `shown` (or take its own away where no layer is composed there), coarsest first, clear
-    /// the checkerboard faces composing can leave (as a stroke does after its dabs: the extractor's pieces cannot
-    /// represent one, and it shows as an edge shared by four quads), and tidy their parents.
-    fn put_shown(&self, shown: &mut LevelVolume, mut blocks: Vec<(usize, IVec3, Option<Stored>)>, form: &LevelVolume) {
-        blocks.sort_unstable_by_key(|b| (b.0, b.1.z, b.1.y, b.1.x));
-        let mut parents = Vec::new();
-        for (l, bc, s) in blocks {
-            match s {
-                Some(s) => shown.put_stored(l, bc, s),
-                None => shown.mirror(form, (l as u8, bc)),
-            }
-            // (Level 0's too: a level 0 block made as a parent and left behind would hold a slot for nothing.)
-            parents.extend((0..l).map(|m| (m as u8, bc >> (l - m) as i32)));
-        }
-        self.tidy(shown, parents, Some(form));
-        self.settle_shown(shown, form);
+    fn put_shown(&self, shown: &mut LevelVolume, blocks: Vec<(usize, IVec3, Option<Stored>)>, form: &LevelVolume) {
+        put_shown_in(&self.stack, shown, blocks, form)
     }
 
-    /// After blocks of `shown` changed (composed, mirrored from the form, or made or filled again as parents): the
-    /// blocks held only as parents over any that changed read it, so they are made again from it, coarsest first;
-    /// then every block changed is cleared of checkerboard faces (the interpolated ones can hold them too).
     fn settle_shown(&self, shown: &mut LevelVolume, form: &LevelVolume) {
-        let mut changed: Vec<(usize, IVec3)> = shown.dirty_keys().into_iter().filter(|k| shown.exists(k.0 as usize, k.1)).map(|k| (k.0 as usize, k.1)).collect();
-        changed.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
-        let mut done: HashSet<(usize, IVec3)> = HashSet::default();
-        while let Some((l, bc)) = changed.pop() {
-            if l + 1 >= shown.levels() {
-                continue;
-            }
-            // A block reads the level below one sample past its parent: the children of the blocks before it along
-            // each axis read this one too.
-            for q in 0..8 {
-                let p = bc - corner_offset(q);
-                for r in 0..8 {
-                    let c = p * 2 + corner_offset(r);
-                    if shown.exists(l + 1, c) && !form.exists(l + 1, c) && !composed(&self.stack, l + 1, c) && done.insert((l + 1, c)) {
-                        shown.refill(l + 1, c);
-                        changed.push((l + 1, c));
-                    }
-                }
-            }
-        }
-        let mut per: Vec<Vec<IVec3>> = vec![Vec::new(); shown.levels()];
-        for (l, bc) in shown.dirty_keys() {
-            if shown.exists(l as usize, bc) {
-                per[l as usize].push(bc);
-            }
-        }
-        for (l, bcs) in per.iter().enumerate() {
-            shown.clear_checkerboards_at(l, bcs);
-        }
+        settle_shown_in(&self.stack, shown, form)
     }
 
     /// Write what is shown for layer changes `changes` (level, block): those blocks, and the finer layers' over them.
@@ -3197,5 +3408,46 @@ impl Layered {
         out.compose(&mut shown, &changes);
         shown.clear_history();
         Ok((shown, Some(out)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A generator job's result, with what is shown after it worked out with it, is taken whole while what is shown is
+    /// as the job was taken (shown then as composed afresh), and put in on the frame as before once it is not.
+    #[test]
+    fn a_result_is_taken_whole_only_on_what_it_was_worked_out_from() {
+        let mut shown = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.05, 4);
+        let mut layered = Layered::new(&mut shown, 3);
+        let mut spec = GeneratorSpec { size: 0.15, count: 12, rough: 0.15, ..GeneratorSpec::default() };
+        let k = layered.add_generator(&mut shown, "g", 2, &spec);
+        for (step, touch) in [(0, false), (1, true)] {
+            spec.size = 0.2 + 0.05 * step as f32;
+            layered.preview_generator(&mut shown, k, &spec);
+            let job = layered.generator_take_landing(&shown).expect("a preview to compose");
+            let done = job.run();
+            assert!(done.landing().is_some_and(|(touched, changed)| changed > 0 && changed <= touched));
+            let (whole, put) = (layered.taken_whole, layered.put_on_frame);
+            if touch {
+                // What is shown changes meanwhile: a block written again (the same samples, another copy).
+                let key = shown.keys().into_iter().find(|k| k.0 > 0).unwrap();
+                shown.put_stored(key.0 as usize, key.1, Stored::from(*shown.block(key).unwrap()));
+            }
+            assert!(layered.generator_apply(&mut shown, done));
+            if touch {
+                assert_eq!(layered.taken_whole, whole, "taken whole over what changed since");
+                assert!(layered.put_on_frame > put);
+            } else {
+                assert_eq!(layered.taken_whole, whole + 1, "not taken whole");
+                assert_eq!(layered.put_on_frame, put);
+            }
+            let afresh = layered.composed_afresh();
+            assert_eq!(shown.keys(), afresh.keys());
+            for key in shown.keys() {
+                assert_eq!(shown.block(key), afresh.block(key), "block {key:?} not as composed afresh");
+            }
+        }
     }
 }

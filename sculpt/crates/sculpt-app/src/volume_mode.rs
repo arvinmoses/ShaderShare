@@ -562,8 +562,9 @@ impl VolumeMode {
                     Err(TryRecvError::Disconnected) => self.follow_job = None,
                 }
             }
+            // (A stroke's last also works out what is shown after it, so the frame only takes that.)
             if self.follow_job.is_none()
-                && let Some(job) = layer.follow_take()
+                && let Some(job) = layer.follow_take_landing(&self.vol)
             {
                 // On the carrying threads (a quarter of the cores), so the dabs and the sync keep the rest: the
                 // stroke's last too, as the next stroke's dabs may run beside it (on all the cores it slowed them
@@ -940,7 +941,9 @@ impl VolumeMode {
         if self.gen_job.is_some() || self.generator_edit {
             return;
         }
-        let Some(job) = self.layer.as_mut().and_then(|l| l.generator_take()) else { return };
+        // (It also works out what is shown once its result goes in, so the frame only takes that.)
+        let vol = &self.vol;
+        let Some(job) = self.layer.as_mut().and_then(|l| l.generator_take_landing(vol)) else { return };
         self.gen_cancel = Some(job.canceller());
         let (tx, rx) = channel();
         let t = Instant::now();
@@ -2152,7 +2155,12 @@ mod tests {
     /// A new ball's rocks at `size`, then a five-frame drag of their size: each frame's `set_generator` (ms), and the
     /// release's. Between frames no job composes the rocks at their own level; once the frames after the release
     /// have brought it in, what is shown is the stack composed afresh, and the drag undoes as one step.
+    /// Held by the tests making a new ball's rocks big (a few hundred thousand blocks, composed on every core): one at
+    /// a time, as several at once slowed each other's frames several times over.
+    static BIG_ROCKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn drag_rocks(size: f32, level: Option<usize>) -> (Vec<f64>, f64, usize) {
+        let _one = BIG_ROCKS.lock().unwrap_or_else(|e| e.into_inner());
         let mut mode = VolumeMode::ball(1e6);
         mode.add_generator();
         let k = mode.layer.as_ref().unwrap().active();
@@ -2244,6 +2252,123 @@ mod tests {
         for size in [0.05, 0.2, 0.4] {
             drag_rocks(size, level);
         }
+    }
+
+    /// Blocks of jobs' results a frame may put into what is shown itself (the rest worked out off the frame).
+    const FRAME_PUTS: usize = 20_000;
+
+    /// Frames until nothing is busy, as the app runs them: the slowest tick, how long in all, and the most blocks of
+    /// jobs' results a tick put into what is shown itself.
+    fn frames_until_settled(mode: &mut VolumeMode) -> (f64, f64, usize) {
+        let start = Instant::now();
+        let (mut worst, mut most) = (0.0f64, 0usize);
+        while mode.busy() && start.elapsed().as_secs() < 120 {
+            let put = mode.layer.as_ref().map_or(0, |l| l.put_on_frame);
+            let t = Instant::now();
+            mode.tick();
+            worst = worst.max(t.elapsed().as_secs_f64() * 1e3);
+            most = most.max(mode.layer.as_ref().map_or(0, |l| l.put_on_frame) - put);
+            mode.vol.drain_dirty();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!mode.busy(), "never settled");
+        (worst, start.elapsed().as_secs_f64() * 1e3, most)
+    }
+
+    /// What is shown is the stack composed afresh (to the tolerance `drag_rocks` holds it to).
+    fn shown_as_afresh(mode: &VolumeMode, what: &str) {
+        let afresh = mode.layer.as_ref().unwrap().composed_afresh();
+        let (mut live, mut fresh) = (mode.vol.keys(), afresh.keys());
+        live.sort_by_key(|k| (k.0, k.1.to_array()));
+        fresh.sort_by_key(|k| (k.0, k.1.to_array()));
+        assert!(live == fresh, "{what}: shown holds other blocks than composed afresh: {} against {}", live.len(), fresh.len());
+        let round0 = 2.0 * mode.vol.band(0) / 32767.0;
+        for &key in &live {
+            let a = mode.vol.block(key).unwrap().iter().zip(afresh.block(key).unwrap().iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(a < (0.01 * mode.vol.voxel(key.0 as usize)).max(round0), "{what}: block {key:?} differs from composed afresh by {a}");
+        }
+    }
+
+    /// A new ball's rocks dragged to size 0.4 (a frame's drag, joined on the GPU) and released.
+    fn released_big_rocks() -> (VolumeMode, usize, GeneratorSpec) {
+        let mut mode = VolumeMode::ball(1e6);
+        mode.add_generator();
+        mode.settle();
+        mode.vol.drain_dirty();
+        let k = mode.layer.as_ref().unwrap().active();
+        let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+        spec.size = 0.4;
+        mode.set_generator(k, &spec, true);
+        assert!(mode.gpu_plan.take().is_some(), "the drag was not joined on the GPU");
+        mode.tick();
+        mode.vol.drain_dirty();
+        mode.end_generator_edit();
+        (mode, k, spec)
+    }
+
+    /// Big results land without a long frame: a rock slider released at size 0.4 (about 230 thousand blocks composed
+    /// off the frame) and a small clay stroke under those rocks (whose last follow composes them all again). Each is
+    /// put into what is shown off the frame, the frame only taking it (it took 300 to 600 ms a frame); shown is as
+    /// composed afresh after, and the release undoes as one step. Times are printed (`--nocapture`); the bar on them
+    /// leaves room for the other tests running beside it.
+    #[test]
+    fn big_results_land_without_a_long_frame() {
+        let _one = BIG_ROCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut mode, k, spec) = released_big_rocks();
+        let before = mode.layer.as_ref().unwrap().history_len();
+        let whole = mode.layer.as_ref().unwrap().taken_whole;
+        let (worst, landed, most) = frames_until_settled(&mut mode);
+        let layer = mode.layer.as_ref().unwrap();
+        eprintln!("release at size 0.4: worst tick {worst:.1} ms, landed {landed:.0} ms after the release, at most {most} blocks put on a frame; {} blocks", mode.vol.keys().len());
+        assert_eq!(layer.taken_whole, whole + 1, "the rocks were not taken whole");
+        assert!(most <= FRAME_PUTS, "a frame put {most} blocks");
+        assert!(worst < 150.0, "a frame took {worst:.0} ms");
+        assert_eq!(layer.generator(k), Some(&spec));
+        shown_as_afresh(&mode, "released");
+        // A small clay stroke on the form under the rocks.
+        mode.target = Target::Form;
+        let whole = mode.layer.as_ref().unwrap().taken_whole;
+        frames_stroke(&mut mode, Vec3::new(-0.03, 0.0, 1.0), Vec3::new(0.03, 0.01, 1.0), 0.05, 0.0002, 16);
+        let (worst, settled, most) = frames_until_settled(&mut mode);
+        eprintln!("clay stroke under them: worst tick {worst:.1} ms, settled {settled:.0} ms after the pen up, at most {most} blocks put on a frame");
+        assert_eq!(mode.layer.as_ref().unwrap().taken_whole, whole + 1, "the stroke's last follow was not taken whole");
+        assert!(most <= FRAME_PUTS, "a frame put {most} blocks");
+        assert!(worst < 150.0, "a frame took {worst:.0} ms");
+        shown_as_afresh(&mode, "stroked");
+        // Undone: the stroke, then the release.
+        assert!(mode.undo() && mode.undo());
+        assert_eq!(mode.layer.as_ref().unwrap().history_len(), before - 1);
+        assert_ne!(mode.layer.as_ref().unwrap().generator(k), Some(&spec));
+        shown_as_afresh(&mode, "undone");
+    }
+
+    /// Edits arriving while a big release's result is still being worked out: a form stroke (which takes the rocks at
+    /// their own level and leaves the job's result stale), and another drag and release of the slider. What is shown
+    /// ends as composed afresh.
+    #[test]
+    fn edits_during_a_big_release_land_as_composed_afresh() {
+        let _one = BIG_ROCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut mode, k, mut spec) = released_big_rocks();
+        assert!(mode.gen_job.is_some());
+        mode.target = Target::Form;
+        frames_stroke(&mut mode, Vec3::new(-0.03, 0.0, 1.0), Vec3::new(0.03, 0.01, 1.0), 0.05, 0.0002, 8);
+        frames_until_settled(&mut mode);
+        shown_as_afresh(&mode, "stroke during the release");
+        mode.target = Target::Detail;
+        mode.layer.as_mut().unwrap().set_active(k);
+        spec.size = 0.35;
+        mode.set_generator(k, &spec, true);
+        mode.gpu_plan.take();
+        mode.end_generator_edit();
+        assert!(mode.gen_job.is_some());
+        mode.tick();
+        spec.size = 0.3;
+        mode.set_generator(k, &spec, true);
+        mode.gpu_plan.take();
+        mode.end_generator_edit();
+        frames_until_settled(&mut mode);
+        assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&spec));
+        shown_as_afresh(&mode, "released twice");
     }
 
     /// With a detail layer, a mask stroke hides the layer where it passes, and undo brings it back.
