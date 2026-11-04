@@ -46,6 +46,8 @@ struct Stroke {
     hardness: f32,
     last: Option<Vec3>,
     carry: f32,
+    /// The pen sample the stroke last reached, on screen.
+    last_px: Option<Sample>,
 }
 
 pub enum Dialog {
@@ -329,7 +331,7 @@ impl SculptApp {
         } else {
             (Brush::Clay, p.strength, p.hardness)
         };
-        self.stroke = Some(Stroke { brush, size_px: p.size_px, strength, hardness, last: None, carry: 0.0 });
+        self.stroke = Some(Stroke { brush, size_px: p.size_px, strength, hardness, last: None, carry: 0.0, last_px: None });
         self.volume.begin_stroke();
         self.pending.push_front(Sample { pos, pressure: self.pen.pressure });
     }
@@ -339,14 +341,29 @@ impl SculptApp {
         let mut dabs = 0;
         let size = self.viewport_rect.size();
         let camera = self.camera.clone();
-        let Some(Stroke { brush, size_px, strength, hardness, last, carry }) = self.stroke.as_mut() else {
+        let Some(Stroke { brush, size_px, strength, hardness, last, carry, last_px }) = self.stroke.as_mut() else {
             self.pending.clear();
             return 0;
         };
         let mode = &mut self.volume;
         mode.last_ms = 0.0;
         mode.last_dabs = 0;
+        // A fast drag moves the pen far between two samples. Steps of half the brush on screen keep each step
+        // a short way along the surface, so the dabs fill it in, and only a real gap (a ray that misses) breaks the stroke.
+        let step_px = (0.5 * *size_px).max(1.0);
+        let mut samples = Vec::new();
         while let Some(s) = self.pending.pop_front() {
+            if let Some(p) = *last_px {
+                let n = (p.pos.distance(s.pos) / step_px).ceil().min(256.0) as usize;
+                for i in 1..n {
+                    let t = i as f32 / n as f32;
+                    samples.push(Sample { pos: p.pos.lerp(s.pos, t), pressure: p.pressure + (s.pressure - p.pressure) * t });
+                }
+            }
+            *last_px = Some(s);
+            samples.push(s);
+        }
+        for s in samples {
             let local = s.pos - self.viewport_rect.min;
             let ray = camera.ray(GVec2::new(local.x, local.y), GVec2::new(size.x, size.y));
             let Some((hit, _)) = mode.raycast(ray.origin, ray.dir) else {
