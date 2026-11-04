@@ -284,6 +284,50 @@ impl VolumeDemo {
         at(153.0, 2.5, Camera(Pose::whole(4.4, 0.0, 0.12)));
         at(153.0, 3.0, Caption("Next: generators of other kinds (noise, edges), and the layers' work on the GPU"));
         let mut end = 156.5;
+        // `SCULPT_DEMO_SCRIPT=look`: an opened file seen from around (yaw steps of 45 degrees, two pitches), a view
+        // every 0.2 s, to find what is in it.
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("look") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            let d: f32 = std::env::var("SCULPT_LOOK_DISTANCE").ok().and_then(|v| v.parse().ok()).unwrap_or(3.4);
+            // `SCULPT_LOOK_AT=x,y,z`: instead, close views of the surface in that direction from the ball's centre,
+            // nearer each 0.2 s, and around it.
+            let near: Option<Vec<f32>> = std::env::var("SCULPT_LOOK_AT").ok().map(|v| v.split(',').filter_map(|c| c.trim().parse().ok()).collect());
+            // `SCULPT_LOOK_BYDIST=0`: the levels not chosen by distance (every block at its finest).
+            if std::env::var("SCULPT_LOOK_BYDIST").as_deref() == Ok("0") {
+                at(0.0, 0.0, ByDistance(false));
+            }
+            if let Some(c) = near.filter(|c| c.len() == 3) {
+                let dir = Vec3::new(c[0], c[1], c[2]);
+                let side = dir.cross(Vec3::Y).normalize() * 0.08;
+                let up = side.cross(dir.normalize());
+                let views = [(dir, 1.0), (dir, 0.6), (dir, 0.4), (dir, 0.25), (dir + side, 0.4), (dir - side, 0.4), (dir + up, 0.4), (dir - up, 0.4)];
+                for (k, (v, dist)) in views.into_iter().enumerate() {
+                    at(0.2 * k as f32, 0.0, Camera(Pose::at(v, dist)));
+                }
+                end = 1.7;
+                // `SCULPT_LOOK_STROKE=tool,size,seconds`: then, at the third view, a stroke across the middle in that
+                // many seconds (a brisk drag), and the views again.
+                let stroke: Option<Vec<f32>> = std::env::var("SCULPT_LOOK_STROKE").ok().map(|v| v.split(',').filter_map(|c| c.trim().parse().ok()).collect());
+                if let Some(st) = stroke.filter(|c| c.len() == 3) {
+                    let tool = [Tool::ClayBuildup, Tool::TrimDynamic, Tool::Smooth][st[0] as usize % 3];
+                    at(1.7, 0.0, Camera(Pose::at(dir, 0.4)));
+                    at(1.8, st[2], Stroke { tool, size: st[1], strength: 0.8, path: line((0.2, 0.62), (0.8, 0.58), 0.02, 12) });
+                    let t0 = 2.0 + st[2];
+                    for (k, (v, dist)) in views.into_iter().enumerate() {
+                        at(t0 + 0.2 * k as f32, 0.0, Camera(Pose::at(v, dist)));
+                    }
+                    end = t0 + 1.7;
+                }
+            } else {
+                for k in 0..16 {
+                    let yaw = (k % 8) as f32 * std::f32::consts::FRAC_PI_4;
+                    let pitch = if k < 8 { 0.15 } else { 0.8 };
+                    at(0.2 * k as f32, 0.0, Camera(Pose::whole(d, yaw, pitch)));
+                }
+                end = 3.3;
+            }
+        }
         // `SCULPT_DEMO_SCRIPT=noise`: only the surface noise, on the plain ball (a quick look).
         if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("noise") {
             items.clear();
