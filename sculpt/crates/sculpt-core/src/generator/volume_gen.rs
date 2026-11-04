@@ -332,7 +332,8 @@ fn scatter(form: &LevelVolume, spec: &GeneratorSpec, painted: Option<&Shared<IVe
         return (0..count as u64).into_par_iter().filter_map(draw).collect();
     }
     // Candidates in batches. Spaced, as on a mesh, dart throwing: candidates in a random order, kept when none kept is
-    // within the spacing. Filtered (to edges or by a density), batches grow as fewer candidates pass, up to a limit.
+    // within the spacing. The batches' sizes do not depend on the count (each twice the last, up to a limit), so a
+    // bigger count draws the same points first and only adds to them: dragging the count adds rocks, not reshuffles.
     let spaced = spec.min_spacing > 0.0;
     let cell = spec.min_spacing.max(1e-6);
     let key = |p: Vec3| (p / cell).floor().as_ivec3();
@@ -340,8 +341,8 @@ fn scatter(form: &LevelVolume, spec: &GeneratorSpec, painted: Option<&Shared<IVe
     let mut kept: Vec<Anchor> = Vec::with_capacity(count);
     let min2 = spec.min_spacing * spec.min_spacing;
     let mut dry = 0;
-    let (mut start, mut n) = (0u64, (count * 3).max(256) as u64);
-    for batch in 0u64..24 {
+    let (mut start, mut n) = (0u64, 256u64);
+    for batch in 0u64..32 {
         let mut cands: Vec<(f32, Anchor)> = (0..n).into_par_iter().filter_map(|j| candidate(start + j).map(|a| (unit_random(spec.seed ^ ORDER_STREAM ^ batch, j), a))).collect();
         let passed = cands.len();
         if spaced {
@@ -366,16 +367,17 @@ fn scatter(form: &LevelVolume, spec: &GeneratorSpec, painted: Option<&Shared<IVe
         if kept.len() >= count {
             break;
         }
-        dry = if kept.len() - before < count / 50 + 1 { dry + 1 } else { 0 };
+        // Dry: few of the candidates that passed found room (the surface is full at this spacing), or none passed of
+        // the biggest batches (few places take them). Neither depends on the count.
+        let added = kept.len() - before;
+        let full = passed > 0 && added < passed / 50 + 1;
+        let barren = passed == 0 && n >= MOST_CANDIDATES;
+        dry = if full || barren { dry + 1 } else { 0 };
         if dry >= 2 {
             break;
         }
         start += n;
-        if filtered {
-            // Enough candidates next time for three times what is still wanted, at the share that passed.
-            let share = (passed as f64 / n as f64).max(1.0 / MOST_CANDIDATES as f64);
-            n = ((3.0 * (count - kept.len()) as f64 / share) as u64).clamp(256, MOST_CANDIDATES);
-        }
+        n = (2 * n).min(MOST_CANDIDATES);
     }
     kept
 }

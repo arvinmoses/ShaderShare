@@ -830,7 +830,6 @@ impl VolumeMode {
         // Rocks a few hundredths of the object across, at the coarsest level giving them about a dozen steps a radius.
         let (lo, hi) = self.vol.bounds();
         let size = 0.03 * (hi - lo).max_element();
-        // (Roughness keeps the octaves that level holds; a finer level shows more of it, at more cost.)
         let level = (0..=top).find(|&l| self.vol.voxel(l) <= size / 12.0).unwrap_or(top);
         let spec = GeneratorSpec {
             primitive: Primitive::Sphere,
@@ -845,7 +844,8 @@ impl VolumeMode {
             stretch_var: 0.35,
             tilt: 25.0,
             blend: 0.3,
-            rough: 0.15,
+            // Plain primitives to start with: Roughness turns them to stones when wanted.
+            rough: 0.0,
             ..GeneratorSpec::default()
         };
         let t = Instant::now();
@@ -2160,6 +2160,11 @@ mod tests {
     static BIG_ROCKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn drag_rocks(size: f32, level: Option<usize>) -> (Vec<f64>, f64, usize) {
+        drag_rocks_by(size, level, |s, i| s.size = size * (1.0 + 0.01 * i as f32))
+    }
+
+    /// [`drag_rocks`], each frame's spec changed by `step` (the frame's number from 1).
+    fn drag_rocks_by(size: f32, level: Option<usize>, step: impl Fn(&mut GeneratorSpec, usize)) -> (Vec<f64>, f64, usize) {
         let _one = BIG_ROCKS.lock().unwrap_or_else(|e| e.into_inner());
         let mut mode = VolumeMode::ball(1e6);
         mode.add_generator();
@@ -2178,7 +2183,7 @@ mod tests {
         let (mut frames, mut on_gpu) = (Vec::new(), 0);
         for i in 1..=5 {
             // (A slider's drag moves it a little a frame.)
-            spec.size = size * (1.0 + 0.01 * i as f32);
+            step(&mut spec, i);
             let t = Instant::now();
             mode.set_generator(k, &spec, true);
             frames.push(t.elapsed().as_secs_f64() * 1e3);
@@ -2251,6 +2256,19 @@ mod tests {
         let level = std::env::var("SCULPT_GEN_LEVEL").ok().and_then(|s| s.parse().ok());
         for size in [0.05, 0.2, 0.4] {
             drag_rocks(size, level);
+        }
+    }
+
+    /// [`drag_rocks_by`] dragging the count (by 5 a frame), for the times.
+    #[test]
+    #[ignore]
+    fn rock_count_drag_times() {
+        for size in [0.05, 0.2] {
+            drag_rocks_by(size, None, |s, i| s.count = 12 + 5 * i as u32);
+        }
+        for base in [100u32, 400, 1500] {
+            eprintln!("count from {base}:");
+            drag_rocks_by(0.05, None, move |s, i| s.count = base + base / 10 * i as u32);
         }
     }
 
