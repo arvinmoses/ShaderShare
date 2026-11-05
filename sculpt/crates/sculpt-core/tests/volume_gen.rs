@@ -926,8 +926,16 @@ fn ridges_and_creases_are_told_apart() {
     for (a, i) in creases.anchors().iter().zip(creases.instances()) {
         let up = i.rotation * Vec3::Y;
         let out = Vec3::new(a.p.x, 0.0, a.p.z);
-        let out = if out.x.abs() > out.z.abs() { Vec3::X * out.x.signum() } else { Vec3::Z * out.z.signum() };
-        assert!(up.dot((out + Vec3::Y).normalize()) > 0.9, "rubble in the crease stands {up:?}");
+        // Out from the face it lies by, or at a corner (by both faces) out along the corner's diagonal.
+        let corner = (out.x.abs() - 0.25).abs() < 0.04 && (out.z.abs() - 0.25).abs() < 0.04;
+        let out = if corner {
+            Vec3::new(out.x.signum(), 0.0, out.z.signum()).normalize()
+        } else if out.x.abs() > out.z.abs() {
+            Vec3::X * out.x.signum()
+        } else {
+            Vec3::Z * out.z.signum()
+        };
+        assert!(up.dot((out + Vec3::Y).normalize()) > 0.9, "rubble in the crease at {:?} stands {up:?}", a.p);
     }
 }
 

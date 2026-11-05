@@ -1638,7 +1638,7 @@ impl LevelVolume {
         let origin = self.origin;
         let fill = if carve { band } else { -band };
         let me = &*self;
-        let built: Vec<(IVec3, Stored, Stored, SignMask)> = cand
+        let built: Vec<(IVec3, Stored, Stored, SignMask, Block)> = cand
             .par_iter()
             .filter_map(|&bc| {
                 // A sample at the band on the side the dab pushes toward (inside for clay) stays there: the dab moves
@@ -1710,7 +1710,10 @@ impl LevelVolume {
                     }
                 }
                 // Made shared here, in parallel: a wide dab at level 0 changes thousands of blocks.
-                any.then(|| (bc, Stored::from(s), Stored::from(d), flips))
+                any.then(|| {
+                    let moved: Block = Box::new(std::array::from_fn(|i| s[i] - old[i]));
+                    (bc, Stored::from(s), Stored::from(d), flips, moved)
+                })
             })
             .collect();
         // Unless the finer detail is kept (carried), the finer levels under the dab take it as their own: each of their
@@ -1718,6 +1721,17 @@ impl LevelVolume {
         let finer: Vec<(usize, IVec3, Block)> = if self.keep_detail || l + 1 >= self.levels() {
             Vec::new()
         } else {
+            // How far the dab moves level `l`'s field at lattice coordinates `g` (its samples' moves, interpolated).
+            let moved: HashMap<IVec3, &Block> = built.iter().map(|(bc, _, _, _, m)| (*bc, m)).collect();
+            let moved = &moved;
+            let moved_at = move |g: Vec3| -> f32 {
+                let i = g.floor().as_ivec3();
+                let f = g - i.as_vec3();
+                trilinear(f, std::array::from_fn(|k| {
+                    let c = i + IVec3::new((k & 1) as i32, ((k >> 1) & 1) as i32, ((k >> 2) & 1) as i32);
+                    moved.get(&c.div_euclid(B3)).map_or(0.0, |b| b[local(c)])
+                }))
+            };
             let under: HashSet<IVec3> = cand.iter().copied().collect();
             let under = &under;
             let blocks: Vec<(usize, IVec3)> = (l + 1..self.levels())
@@ -1804,7 +1818,22 @@ impl LevelVolume {
                         } else {
                             was.min(blob)
                         };
-                        let next = (was + w * (full - was)).clamp(-fband, fband);
+                        let mut next = (was + w * (full - was)).clamp(-fband, fband);
+                        // Where the dab reshapes the surface here, the finer level also moves toward level `l`'s new
+                        // field: the dab's own surface, at the level it works at. Each dab of a plane brush moves part of
+                        // the way, so finer work it passes over fades only by that part a dab, and a stroke left some
+                        // of it (a twentieth of a clay ridge it trimmed); where the dab moved the surface out of the
+                        // finer level's blocks, level `l` showed instead, without it, and the rest stood as a step at
+                        // every block edge, a stair along the trim. Taken twice over, it fades to nothing under the
+                        // stroke, and the blocks holding nothing more than level `l` are dropped as it ends. (Not
+                        // where level `l` holds only its bound: finer work standing that far off it.)
+                        if set.is_none() && full != was {
+                            let g = (bc * B + cell_of(i)).as_vec3() / (1 << (m - l)) as f32;
+                            let coarse = below[l].trilinear(g) + moved_at(g);
+                            if coarse.abs() < 0.999 * plateaus[l] {
+                                next = (next + w * (coarse - next)).clamp(-fband, fband);
+                            }
+                        }
                         if next != *v {
                             *v = next;
                             any = true;
@@ -1829,7 +1858,7 @@ impl LevelVolume {
         }
         let mut flipped: HashMap<IVec3, SignMask> = HashMap::default();
         let mut changed = Vec::with_capacity(built.len());
-        for (bc, s, d, flips) in built {
+        for (bc, s, d, flips, _) in built {
             if !self.blocks[l].contains_key(&bc) {
                 stats.created += 1;
             }
@@ -2668,7 +2697,9 @@ impl LevelVolume {
 
     /// The surface's overall normal under a brush of radius `r` at `c` (as it was when the stroke began): the plane
     /// through rings of surface points around `c`, found along `n`.
-    fn area_normal(&self, l: usize, c: Vec3, n: Vec3, r: f32) -> Vec3 {
+    /// With `wide`, when no ring meets the surface along `n`, they are looked for again along the brush's own scale's
+    /// normal (see below).
+    fn area_normal(&self, l: usize, c: Vec3, n: Vec3, r: f32, wide: bool) -> Vec3 {
         let (t1, t2) = n.any_orthonormal_pair();
         let mut sum = Vec3::ZERO;
         for (ring, weight) in [(0.5, 0.6), (0.8, 1.0), (1.0, 0.8)] {
@@ -2688,7 +2719,24 @@ impl LevelVolume {
                 sum += u * weight;
             }
         }
-        sum.try_normalize().filter(|u| u.dot(n) > 0.3).unwrap_or(n)
+        match sum.try_normalize().filter(|u| u.dot(n) > 0.3) {
+            Some(u) => u,
+            // No ring met the surface along `n`: tilted that far from the area's (the normal at a point on a bump, some
+            // 50 degrees off, as a stroke's first dab takes it), no ring point's line along it meets the surface near.
+            // Given back as it came, the brush kept that tilt from dab to dab until a ring met the surface, and then
+            // turned some 20 degrees in one. On a stroke's first dab they are looked for again along the normal at the
+            // brush's own scale: level 0's field differenced half the brush either way (within its band), which bumps
+            // smaller than the brush hardly turn. (Not later in a stroke, whose brush already lies along the area.)
+            None if wide && sum == Vec3::ZERO => {
+                let h = (0.5 * r).min(0.8 * self.band(0));
+                let d = |o: Vec3| self.value_upto(c + o, 0, true) - self.value_upto(c - o, 0, true);
+                match Vec3::new(d(Vec3::X * h), d(Vec3::Y * h), d(Vec3::Z * h)).try_normalize() {
+                    Some(w) if w.dot(n) < 10f32.to_radians().cos() => self.area_normal(l, c, w, r, false),
+                    _ => n,
+                }
+            }
+            None => n,
+        }
     }
 
     /// `p` moved onto the surface of levels up to `l` as it was when the stroke began, along that surface's normal.
@@ -2721,8 +2769,10 @@ impl LevelVolume {
         if self.normal_upto(on, l, true) == Vec3::ZERO {
             return None;
         }
-        let first = self.area_normal(l, on, along, r);
-        let n = self.area_normal(l, on, first, r);
+        // (On a stroke's first dab, its rings looked for farther when none meets the surface: see `area_normal`.)
+        let first = self.stroke.as_ref().is_none_or(|s| s.is_empty());
+        let rough = self.area_normal(l, on, along, r, first);
+        let n = self.area_normal(l, on, rough, r, first);
         let (t1, t2) = n.any_orthonormal_pair();
         let (mut base_sum, mut added_sum, mut weight) = (0.0, 0.0, 0.0);
         for (ring, w, count) in [(0.0, 1.0, 1), (0.5, 0.8, 8), (0.9, 0.5, 12)] {
@@ -2750,20 +2800,53 @@ impl LevelVolume {
             alpha * (1.0 - x * x * (3.0 - 2.0 * x))
         };
         let k = (0.5 * h).max(self.voxel(l));
-        let reach = 1.1 * r + depth;
+        // The surface as the stroke found it, seen from above the brush (see [`Ground`]): a dab's slab reaches `depth`
+        // past the plane's level, and also down to that surface (up to it, trimming) and `margin` past it wherever it
+        // lies farther. Held to the slab alone, a dab whose surface fell away under part of it (the end of a stroke
+        // where the form curves off, a valley between earlier strokes) laid a slab floating over it: one row of
+        // samples left in the air between, a hidden fold that later strokes broke into as dents and rows of dots (and
+        // a trim, over a ridge higher than its slab, left a shell). The surface seen from above, not the field:
+        // whatever lies behind a thin part (the back of a fin) is as far as before.
+        let (vx, band) = (self.voxel(l), self.band(l));
+        let margin = 5.0 * vx;
+        // Looked for only as far as half the radius past where the slab ends (farther, the slab stops where it did):
+        // the columns' blocks are made for the box they span.
+        // (A clay dab wide enough to follow the surface, below, lays its clay on that surface already.)
+        let follows = !trim && -base / r > 0.14;
+        let (top, bottom) = if trim { (level + depth + 0.5 * r, plane - band) } else { (plane + band, level - depth - 0.5 * r) };
+        let front = if follows { Ground { on, n, t1: n, t2: n, step: 1.0, half: 0, h: vec![f32::NAN] } } else { self.ground(l, on, n, r + 4.0 * vx, top, bottom, true) };
+        let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+        for (i, &h) in front.h.iter().enumerate() {
+            let (a, b) = ((i as i32 % front.size() - front.half) as f32, (i as i32 / front.size() - front.half) as f32);
+            if h.is_finite() && (a * a + b * b).sqrt() * front.step <= r + 2.0 * front.step {
+                low = low.min(h);
+                high = high.max(h);
+            }
+        }
+        let deepest = if low.is_finite() { depth.max(level - low + margin).max(high + margin - level) } else { depth };
+        let reach = 1.1 * r + deepest.min(2.0 * r);
         let dab = if trim {
+            let top = (level + depth).max(high + margin);
             let shape = move |p: Vec3| {
                 let q = p - on;
                 let u = q.dot(n);
-                (plane - u).max(u - (level + depth)).max((q - n * u).length() - r)
+                let ceiling = match front.distance(p) {
+                    Some(d) => (u - (level + depth)).min(d - margin),
+                    None => u - (level + depth),
+                };
+                (plane - u).max(ceiling).max((q - n * u).length() - r)
             };
-            self.modify(l, on, reach, k, true, (n, plane, level + depth), Some(Push { on, n, r, hard }), None, &weight, &shape)
+            self.modify(l, on, reach, k, true, (n, plane, top), Some(Push { on, n, r, hard }), None, &weight, &shape)
         } else {
-            let band = self.band(l);
+            let bottom = (level - depth).min(low - margin);
             let flat = move |p: Vec3| {
                 let q = p - on;
                 let u = q.dot(n);
-                (u - plane).max((level - depth) - u).max((q - n * u).length() - r)
+                let floor = match front.distance(p) {
+                    Some(d) => ((level - depth) - u).min(-d - margin),
+                    None => (level - depth) - u,
+                };
+                (u - plane).max(floor).max((q - n * u).length() - r)
             };
             // Under a brush wide enough for the form to curve away from the plane under it (by more than a band, and
             // the brush's rings lie more than 0.14 of its radius below its centre on average, where the dab's slab,
@@ -2789,7 +2872,7 @@ impl LevelVolume {
             let x = x.min(((high - low - band) / band).clamp(0.0, 1.0));
             let follow = x * x * (3.0 - 2.0 * x);
             if follow <= 0.0 {
-                self.modify(l, on, reach, k, false, (n, level - depth, plane), Some(Push { on, n, r, hard }), None, &weight, &flat)
+                self.modify(l, on, reach, k, false, (n, bottom, plane), Some(Push { on, n, r, hard }), None, &weight, &flat)
             } else {
                 let mut floor = floor.unwrap();
                 floor.smooth((floor.half / 8).max(1));
@@ -2830,8 +2913,8 @@ impl LevelVolume {
         if self.normal_upto(on, l, true) == Vec3::ZERO {
             return None;
         }
-        let first = self.area_normal(l, on, along, r);
-        let n = self.area_normal(l, on, first, r);
+        let first = self.area_normal(l, on, along, r, false);
+        let n = self.area_normal(l, on, first, r, false);
         let (vx, band) = (self.voxel(l), self.band(l));
         let depth = 0.35 * r;
         // Columns out past the radius by the blur's reach, so the blur inside it sees both sides.
@@ -2959,6 +3042,19 @@ impl LevelVolume {
         let rebased = self.rebase(&touched);
         out.rebased = rebased.len();
         self.redistance(&rebased, true);
+        // And the blocks beside them: a coarser block moved toward the finer surface beside one that was not, with
+        // only the moved one measured again, left samples inside the solid shallower than any distance (a phantom
+        // surface beneath the real one, where the finer level's blocks end), which a later stroke cutting down to it
+        // showed as dents and steps a block wide. Their surface stays where it is.
+        let rebased_set: HashSet<Key> = rebased.iter().copied().collect();
+        let mut beside: Vec<Key> = rebased
+            .iter()
+            .flat_map(|&(l, bc)| (0..27).map(move |k| (l, bc + IVec3::new(k % 3 - 1, (k / 3) % 3 - 1, k / 9 - 1))))
+            .filter(|k| !rebased_set.contains(k) && self.blocks[k.0 as usize].contains_key(&k.1))
+            .collect();
+        beside.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        beside.dedup();
+        self.redistance(&beside, false);
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
         out.specks = self.remove_specks(&touched, SPECK_VERTS);
         out

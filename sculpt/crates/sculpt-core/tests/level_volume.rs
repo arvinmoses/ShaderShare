@@ -2008,3 +2008,74 @@ fn smoothing_up_close_reads_the_surface_once_a_dab() {
     scrub(&mut slow);
     assert!(same_blocks(&smooth, &slow), "a scrubbed stroke read from blocks made once differs from reading point by point");
 }
+
+/// Samples of level `l` inside the solid, away from the surface, that stand shallower than both their neighbours along
+/// an axis by more than a distance field can: a stroke cutting down to one shows a dent there.
+fn phantoms(v: &LevelVolume, l: usize) -> usize {
+    let (vx, band) = (v.voxel(l), v.band(l));
+    let mut count = 0;
+    for bc in v.level_keys(l) {
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    let i = bc * 8 + glam::IVec3::new(x, y, z);
+                    let s = v.sample(l, i, false);
+                    if s >= 0.0 || s <= -0.999 * band {
+                        continue;
+                    }
+                    // Only away from the surface: every neighbour inside too.
+                    let axes = [glam::IVec3::X, glam::IVec3::Y, glam::IVec3::Z];
+                    if axes.iter().any(|&d| v.sample(l, i - d, false) >= 0.0 || v.sample(l, i + d, false) >= 0.0) {
+                        continue;
+                    }
+                    // Under a crease the surface comes nearest a sample `d` steps deep, and its neighbours either side
+                    // lie at most sqrt(d^2 + 1) from it: shallower than that by over 0.15 of a step is no distance.
+                    let d0 = -s / vx;
+                    let most = (d0 * d0 + 1.0).sqrt() - d0 + 0.15;
+                    for d in axes {
+                        let (a, b) = (v.sample(l, i - d, false), v.sample(l, i + d, false));
+                        if s > a.max(b) + most * vx {
+                            count += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Form built up at a fine level, moved down a level as its strokes end, leaves the level below a distance field:
+/// no samples inside the solid standing shallower than their neighbours (the target the form is moved toward, smoothed
+/// from the finer level's samples, came out too shallow where they held only their bound, and each of the passes
+/// raised the coarser samples there by that much again, a phantom surface a trim later cut down to).
+#[test]
+fn form_moved_down_a_level_leaves_no_phantom_surface() {
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 5);
+    v.keep_detail = false;
+    // Clay at level 3 as the app strokes it up close (a radius of 25 steps), rows over one another, scrubbed.
+    let r = 25.0 * v.voxel(3);
+    for k in 0..4 {
+        for pass in 0..3 {
+            let y = -0.15 + 0.08 * k as f32 + 0.01 * pass as f32;
+            stroke(&mut v, 3, Vec3::new(-0.3, y, 1.0), Vec3::new(0.3, y + 0.02, 1.0), r, 1.0, false);
+        }
+    }
+    let counts: Vec<usize> = (1..4).map(|l| phantoms(&v, l)).collect();
+    eprintln!("phantom samples at levels 1-3: {counts:?}; blocks per level {:?}", v.memory().0);
+    // Some 3200 before (60, 450 and 2700 by level); what is left are single samples by a speck.
+    assert!(counts[0] + counts[1] <= 10 && counts[2] <= 100, "{counts:?}");
+}
+
+/// Phantom samples (see [`phantoms`]) per level in a saved file (`SCULPT_PHANTOM_FILE`).
+#[test]
+#[ignore]
+fn phantoms_in_a_file() {
+    let Ok(path) = std::env::var("SCULPT_PHANTOM_FILE") else { return };
+    let (v, _) = sculpt_core::generator::detail_layer::Layered::read_from(&mut std::fs::File::open(path).unwrap(), 7).unwrap();
+    for l in 1..v.levels() {
+        eprintln!("level {l}: {} blocks, {} phantom samples", v.level_len(l), phantoms(&v, l));
+    }
+}
+
