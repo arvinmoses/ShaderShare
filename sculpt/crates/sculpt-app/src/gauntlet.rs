@@ -270,7 +270,7 @@ fn gauntlet() {
     if let Some(d) = &out {
         std::fs::create_dir_all(d).unwrap();
     }
-    let mut table = format!("{:<24} {:>7} {:>6} {:>6} {:>8} {:>7} {:>7} {:>7} {:>7}\n", "scene", "ripple", "worst", "marks", "phantom", "dab ms", "dab max", "frame", "end");
+    let mut table = format!("{:<24} {:>7} {:>6} {:>6} {:>6} {:>6} {:>8} {:>7} {:>7} {:>7} {:>7}\n", "scene", "ripple", "worst", "marks", "shade", "turns", "phantom", "dab ms", "dab max", "frame", "end");
     for scene in scenes() {
         if pick.as_ref().is_some_and(|p| !p.iter().any(|n| n == scene.name)) {
             continue;
