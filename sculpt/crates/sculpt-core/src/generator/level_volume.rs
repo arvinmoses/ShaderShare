@@ -1596,12 +1596,15 @@ impl LevelVolume {
                 }
             }
         }
-        // A plane brush's dab blends each sample part of the way, so it needs the samples' distances; at level 0,
-        // those at its band (only a bound) read theirs from the surface under the brush. (A finer level's sample at
-        // its band reads the levels below.)
+        // A plane brush's dab blends each sample part of the way, so it needs the samples' distances; those at its
+        // band (only a bound) read theirs from the surface under the brush. (A finer level's sample at its band reads
+        // the levels below.) Above level 0 too: there the band is two and a half steps, less than a close trim cuts
+        // (three), and blended from the bound, a sample held there moved less than its neighbours just inside it, so
+        // the new surface rippled along the line between them, where the lattice's planes crossed the surface the
+        // stroke began on: stripes every few steps, a tenth of a step deep, across a trim on a slope.
         let plateaus: Vec<f32> = (0..self.levels()).map(|k| self.plateau(k)).collect();
         let plateau = plateaus[l];
-        let ground = if l > 0 || set.is_some() { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band, false)) };
+        let ground = if set.is_some() { None } else { push.map(|p| self.ground(l, c, n, p.r, s_hi + band, s_lo - 2.0 * band, false)) };
         let ground = ground.as_ref();
         // A sample's distance to the surface for the dab to blend from: its value, unless that is only a bound and the
         // ground under the brush says how far the surface is (on the same side, and farther than the bound: a bound
@@ -1801,7 +1804,7 @@ impl LevelVolume {
                             let farther = |a: f32, b: f32| if (b < 0.0) == (a < 0.0) && b.abs() > a.abs() { b } else { a };
                             let at = |k: usize| below[k].trilinear((bc * B + cell_of(i)).as_vec3() / (1 << (m - k)) as f32);
                             let mut deep = at(0);
-                            if deep.abs() >= 0.999 * plateaus[0] && w < 1.0 {
+                            if l == 0 && deep.abs() >= 0.999 * plateaus[0] && w < 1.0 {
                                 deep = from_ground(p, deep);
                             }
                             for k in 1..m {

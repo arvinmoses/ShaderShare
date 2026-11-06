@@ -2870,4 +2870,71 @@ mod tests {
         eprintln!("blocks per level {:?}", mode.vol.memory().0);
         mode.write_to(&mut std::fs::File::create(&out).unwrap()).unwrap();
     }
+
+    /// A close trim over clay rows and a wider trim a level coarser leaves no stripes across it: where it cut past its
+    /// level's band (two and a half steps; a close trim cuts three), the samples it found at the band, only a bound on
+    /// their distance, read their distance from the surface under the brush. Blended from the bound, they moved less
+    /// than their neighbours, and the new surface rippled every few steps where the lattice's planes crossed the old.
+    #[test]
+    fn a_close_trim_leaves_no_stripes() {
+        let mut mode = VolumeMode::ball(1e6);
+        let centre = Vec3::new(0.3, -0.05, 0.95).normalize();
+        let (t1, t2) = (Vec3::Y.cross(centre).normalize(), centre.cross(Vec3::Y.cross(centre).normalize()));
+        let line = |mode: &mut VolumeMode, a: (f32, f32), b: (f32, f32), r: f32, px: f32, trim: bool| {
+            let (pa, pb) = (centre + t1 * a.0 + t2 * a.1, centre + t1 * b.0 + t2 * b.1);
+            let steps = ((pa - pb).length() / (0.15 * r)).ceil() as usize;
+            mode.begin_stroke();
+            for k in 0..=steps {
+                let d = pa.lerp(pb, k as f32 / steps as f32).normalize();
+                if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
+                    mode.dab(hit, r, px, 0.8, 0.3, trim);
+                }
+                mode.tick();
+            }
+            mode.end_stroke();
+            mode.settle();
+        };
+        for row in 0..5 {
+            for pass in 0..2 {
+                let y = -0.03 + 0.014 * row as f32 + 0.003 * pass as f32;
+                line(&mut mode, (-0.06, y), (0.06, y + 0.004), 0.016, 0.0004, false);
+            }
+        }
+        line(&mut mode, (-0.07, 0.0), (0.07, 0.01), 0.038, 0.000476, true);
+        line(&mut mode, (-0.03, -0.05), (0.0, 0.06), 0.03, 0.000476, true);
+        // Over the close trim's far end (past the rows), heights along the ball's normal less their mean over a
+        // window four and a half of its steps across (the ripple's length), in steps.
+        let vx = mode.vol.voxel(4);
+        let (u1, u2) = centre.any_orthonormal_pair();
+        let (g, k, half) = (0.0004, 3usize, 0.08);
+        let top = mode.vol.levels() - 1;
+        let (rows, cols) = (20..90usize, 90..190usize);
+        let at = |i: usize, j: usize| {
+            let p = centre * 4.0 + u1 * (-half + g * i as f32) + u2 * (-half + g * j as f32);
+            mode.vol.raycast(p, -centre, top, false).map_or(f32::NAN, |(q, _)| q.dot(centre))
+        };
+        let (w, hgt) = (cols.len() + 2 * k, rows.len() + 2 * k);
+        let h: Vec<f32> = (0..w * hgt).map(|q| at(cols.start - k + q % w, rows.start - k + q / w)).collect();
+        let (mut sum, mut cnt) = (0.0f64, 0usize);
+        for j in k..hgt - k {
+            for i in k..w - k {
+                let mut mean = 0.0;
+                for b in j - k..=j + k {
+                    for a in i - k..=i + k {
+                        mean += h[b * w + a];
+                    }
+                }
+                let d = (h[j * w + i] - mean / ((2 * k + 1) * (2 * k + 1)) as f32) / vx;
+                if d.is_finite() {
+                    sum += (d * d) as f64;
+                    cnt += 1;
+                }
+            }
+        }
+        let rms = (sum / cnt.max(1) as f64).sqrt();
+        eprintln!("ripple over the close trim's end: {rms:.4} of a step (rms, {cnt} points)");
+        // 0.013 blended from the bound.
+        assert!(rms < 0.009, "the close trim's surface ripples by {rms:.4} of a step");
+    }
+
 }

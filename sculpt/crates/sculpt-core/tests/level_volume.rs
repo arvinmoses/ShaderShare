@@ -2079,3 +2079,18 @@ fn phantoms_in_a_file() {
     }
 }
 
+
+/// Heights of a saved file's surface over a square patch (`SCULPT_H_FILE`, `SCULPT_H_AT=x,y,z`, `SCULPT_H_HALF`,
+/// `SCULPT_H_STEP`), written raw as f32 to `SCULPT_H_OUT` (rows along the patch's second axis).
+#[test]
+#[ignore]
+fn heights_of_a_file() {
+    let (Ok(path), Ok(at), Ok(out)) = (std::env::var("SCULPT_H_FILE"), std::env::var("SCULPT_H_AT"), std::env::var("SCULPT_H_OUT")) else { return };
+    let (v, _) = sculpt_core::generator::detail_layer::Layered::read_from(&mut std::fs::File::open(path).unwrap(), 7).unwrap();
+    let a: Vec<f32> = at.split(',').map(|w| w.parse().unwrap()).collect();
+    let half: f32 = std::env::var("SCULPT_H_HALF").ok().and_then(|w| w.parse().ok()).unwrap_or(0.08);
+    let g: f32 = std::env::var("SCULPT_H_STEP").ok().and_then(|w| w.parse().ok()).unwrap_or(0.0004);
+    let (m, h) = heights(&v, v.levels() - 1, Vec3::new(a[0], a[1], a[2]).normalize(), half, g);
+    std::fs::write(out, h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    eprintln!("{m} x {m}");
+}
