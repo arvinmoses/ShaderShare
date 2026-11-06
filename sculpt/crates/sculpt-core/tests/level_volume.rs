@@ -7,6 +7,10 @@ use glam::Vec3;
 use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
 use sculpt_core::generator::levels::edge_counts;
 
+/// Held alone by the test that times dabs (they are measured against each other, and the tests alongside, many of
+/// them on every core, slowed its quickest dab several times over); shared by every other.
+static ALONE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// A ball whose coarse strokes keep the finer detail under them (the tests of carrying it want that; burying it is
 /// tested on its own).
 fn ball(levels: usize) -> LevelVolume {
@@ -42,6 +46,7 @@ fn check(v: &LevelVolume, cap: usize) -> (usize, usize, usize, usize) {
 
 #[test]
 fn a_fresh_ball_is_closed_at_every_cap() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let v = ball(4);
     for cap in 0..4 {
         let (open, nm, dropped, faces) = check(&v, cap);
@@ -52,6 +57,7 @@ fn a_fresh_ball_is_closed_at_every_cap() {
 
 #[test]
 fn plane_brushes_at_every_level_keep_the_surface_closed() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = ball(4);
     let front = Vec3::new(0.0, 0.0, 1.0);
     // Level 0: broad clay and a trim; level 1: ridges; level 2: a trimmed flat; level 3: small clay.
@@ -84,6 +90,7 @@ fn height(v: &LevelVolume, a: f32) -> f32 {
 
 #[test]
 fn fine_detail_rides_a_coarse_clay_stroke() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = ball(3);
     // A groove along y at the finest level.
     v.begin_stroke();
@@ -110,6 +117,7 @@ fn fine_detail_rides_a_coarse_clay_stroke() {
 
 #[test]
 fn form_built_at_a_fine_level_moves_down_a_level() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = ball(3);
     // A tall ridge of clay at level 2, built over many passes: far more than level 2's band above the level below.
     let top = |v: &LevelVolume, cap: usize| v.raycast(Vec3::new(0.0, 0.0, 3.0), -Vec3::Z, cap, false).map_or(f32::NAN, |(h, _)| h.z - 1.0);
@@ -130,6 +138,7 @@ fn form_built_at_a_fine_level_moves_down_a_level() {
 
 #[test]
 fn extracting_only_what_changed_matches_a_full_extraction() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = ball(4);
     let cap = 3;
     let all = v.keys();
@@ -173,6 +182,7 @@ fn fingerprint(s: &HashMap<Key, BlockSurface>) -> (usize, Vec<[i64; 3]>) {
 
 #[test]
 fn strokes_undo_redo_and_save_exactly() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = ball(4);
     let bytes = |v: &LevelVolume| {
         let mut out = Vec::new();
@@ -196,6 +206,7 @@ fn strokes_undo_redo_and_save_exactly() {
 
 #[test]
 fn specks_go_and_real_pieces_stay() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = ball(3);
     let pieces = |v: &LevelVolume| {
         let (mesh, _) = v.surface(2);
@@ -238,6 +249,7 @@ fn specks_go_and_real_pieces_stay() {
 
 #[test]
 fn fine_detail_rides_a_big_rise_without_spawning_blocks() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     // A groove at level 4 (16 times finer than level 0), then broad clay at level 0 raising the area by many level 4
     // steps.
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
@@ -267,6 +279,7 @@ fn fine_detail_rides_a_big_rise_without_spawning_blocks() {
 
 #[test]
 fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut results = Vec::new();
     // Bumps 4 thousandths across: at least a couple of steps of the level they are made at.
     // The last: many strokes, raising the area far more than the band of any finer level.
@@ -365,6 +378,7 @@ fn fine_bumps_survive_a_level_0_stroke_carried_a_little_at_a_time() {
 /// does, and undoes the same.
 #[test]
 fn a_stroke_ended_in_a_job_is_the_same_stroke() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let make = || {
         let mut v = ball(4);
         // Fine work, broad clay over it, then a ridge at level 2 built tall enough to move form down a level; the last
@@ -445,6 +459,7 @@ fn groove_profile(v: &LevelVolume, level: usize, patch: Vec3, along: Vec3, acros
 /// late). Each groove stays whole, as deep along its length as it was, where they used to break into stepped pieces.
 #[test]
 fn trim_grooves_ride_a_big_stroke_carried_in_jobs() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
     v.keep_detail = true;
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
@@ -522,6 +537,7 @@ fn trim_grooves_ride_a_big_stroke_carried_in_jobs() {
 /// its length as it was and without jumping sideways, where it used to break into pieces cut off at block faces.
 #[test]
 fn a_groove_on_a_big_strokes_rim_rides_along_whole() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     // The rim close to the groove (it rises 0.05 over two passes), and nearer the stroke's line (steeper).
     for (off, passes) in [(0.12f32, 1usize), (0.15, 2)] {
         let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
@@ -598,6 +614,7 @@ fn a_groove_on_a_big_strokes_rim_rides_along_whole() {
 /// keep their shape, every groove and dot keeps its depth, and the surface between them is as smooth as before.
 #[test]
 fn the_review_sessions_patch_rides_its_big_stroke() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 6);
     v.keep_detail = true;
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
@@ -875,6 +892,7 @@ fn the_review_sessions_patch_rides_its_big_stroke() {
 /// about their height, stay.
 #[test]
 fn big_clay_buries_the_fine_detail_under_it() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5);
     assert!(!v.keep_detail, "burying is the default");
     // Two rows of bumps at level 4: one under the strokes' line (y = 0), one out on their falloff.
@@ -962,6 +980,7 @@ fn slope_histogram(v: &LevelVolume, at: Vec3, half: f32) -> [usize; 8] {
 /// field near the new surface must keep its unit slope.
 #[test]
 fn a_big_clay_stroke_keeps_unit_slope_beyond_level_zeros_measured_distances() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.005, 4);
     // Out on the big brush's falloff: 0.33 from the front, where the ball falls 0.056 below the brush's plane and the
     // brush still moves the surface a quarter of the way per dab.
@@ -1009,6 +1028,7 @@ fn a_big_clay_stroke_keeps_unit_slope_beyond_level_zeros_measured_distances() {
 #[test]
 #[ignore]
 fn measure_steps_under_a_big_stroke() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     for keep in [false, true] {
         for trim in [true, false] {
             let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 6);
@@ -1066,6 +1086,7 @@ fn measure_steps_under_a_big_stroke() {
 #[test]
 #[ignore]
 fn picture_a_wide_clay_stroke_on_a_fresh_ball() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let Ok(path) = std::env::var("SCULPT_PICTURE") else { return };
     let voxel = (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 6);
@@ -1129,6 +1150,7 @@ fn picture_a_wide_clay_stroke_on_a_fresh_ball() {
 /// (0.088 steps along the wall here, against 0.026 reading the ground once).
 #[test]
 fn a_densely_scrubbed_clay_stroke_leaves_no_lattice_on_its_wall() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let voxel = 0.01f32;
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 3);
     let r = 0.7f32;
@@ -1174,6 +1196,7 @@ fn a_densely_scrubbed_clay_stroke_leaves_no_lattice_on_its_wall() {
 /// ball curving away 0.4 under its rim: the dabs stacked as terraces, with block-sized stairs where they met the ball.
 #[test]
 fn a_clay_stroke_as_wide_as_the_ball_lays_a_shell_that_follows_it() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let voxel = 0.01f32;
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 3);
     let r = 0.9f32;
@@ -1225,6 +1248,7 @@ fn a_clay_stroke_as_wide_as_the_ball_lays_a_shell_that_follows_it() {
 #[test]
 #[ignore]
 fn far_mixed_strokes_over_fine_work() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let voxel = (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 6);
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
@@ -1327,6 +1351,7 @@ fn far_mixed_strokes_over_fine_work() {
 /// this window, against none now).
 #[test]
 fn a_wide_clay_strokes_falloff_leaves_no_pits() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let voxel = 0.005f32;
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 2);
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
@@ -1422,6 +1447,7 @@ fn far_clay_stroke(v: &mut LevelVolume, patch: Vec3, path: &[(f32, f32)], r: f32
 /// the second stroke here, against 3 now). `SCULPT_PICTURE` writes the surface, flat shaded.
 #[test]
 fn a_clay_stroke_over_earlier_clay_brings_up_no_grain() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 2);
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
     far_clay_stroke(&mut v, patch, &[(-0.3, -0.1), (0.3, 0.1)], 0.5, 0.5);
@@ -1449,6 +1475,7 @@ fn a_clay_stroke_over_earlier_clay_brings_up_no_grain() {
 /// ground under the brush), none of 30679 now that it holds them out to its band.
 #[test]
 fn a_sample_the_stroke_blended_onto_the_bound_keeps_its_own_distance() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     use glam::IVec3;
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 2);
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
@@ -1516,6 +1543,7 @@ fn a_sample_the_stroke_blended_onto_the_bound_keeps_its_own_distance() {
 /// the guess (4 past a tenth of a step), 5 now (none).
 #[test]
 fn a_wide_stroke_over_earlier_ones_shows_no_crease_where_they_met() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     // The app's new ball: level 0 at twice the step a million-triangle ball names.
     let voxel = 2.0 * (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 7);
@@ -1613,6 +1641,7 @@ fn mesh_picture(v: &LevelVolume, cap: usize, w: Vec3, half: f32, n: usize, path:
 #[test]
 #[ignore]
 fn far_scrubbed_clay_strokes() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
     // `SCULPT_LEVELS=7`: the app's new ball (a coarser level 0, twice the step).
     let levels = env("SCULPT_LEVELS", 6.0) as usize;
@@ -1691,6 +1720,7 @@ fn sent0(v: &LevelVolume, bc: glam::IVec3) -> Vec<i16> {
 /// and extracted again (all of them were).
 #[test]
 fn a_wide_far_dab_sends_only_the_blocks_it_changes_near_the_surface() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.01, 2);
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
     // An earlier stroke, ended: what a later one works over.
@@ -1727,6 +1757,7 @@ fn a_wide_far_dab_sends_only_the_blocks_it_changes_near_the_surface() {
 #[test]
 #[ignore]
 fn far_crossing_strokes_on_the_new_ball() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let path = std::env::var("SCULPT_PICTURE").ok();
     let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(d);
     let voxel = 2.0 * (4.0 * std::f32::consts::PI / (1e6f32 / 2.0)).sqrt();
@@ -1824,6 +1855,7 @@ fn bend(m: usize, h: &[f32], pit: f32) -> (f32, usize) {
 /// step of the sphere, closed, with no pits.
 #[test]
 fn smoothing_a_fresh_ball_leaves_a_ball() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let voxel = 0.01f32;
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 2);
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
@@ -1890,6 +1922,7 @@ fn smoothing_a_fresh_ball_leaves_a_ball() {
 /// leaves no pits, keeps the surface closed, and undoes and saves exactly.
 #[test]
 fn smoothing_a_bumpy_patch_flattens_it_without_pits() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let voxel = 0.01f32;
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, voxel, 3);
     let patch = Vec3::new(0.30, 0.34, 0.89).normalize();
@@ -1985,6 +2018,7 @@ fn close_stroke(v: &mut LevelVolume, r: f32, dabs: usize, smooth: bool) -> (f64,
 /// is what reading point by point made, bit for bit, over a scrubbed stroke, and under clay over it.
 #[test]
 fn smoothing_up_close_reads_the_surface_once_a_dab() {
+    let _alone = ALONE.write().unwrap_or_else(|e| e.into_inner());
     let r = 0.05;
     let mut clay = app_ball();
     let (clay_ms, _) = close_stroke(&mut clay, r, 16, false);
@@ -2052,6 +2086,7 @@ fn phantoms(v: &LevelVolume, l: usize) -> usize {
 /// raised the coarser samples there by that much again, a phantom surface a trim later cut down to).
 #[test]
 fn form_moved_down_a_level_leaves_no_phantom_surface() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.03, 5);
     v.keep_detail = false;
     // Clay at level 3 as the app strokes it up close (a radius of 25 steps), rows over one another, scrubbed.
@@ -2072,6 +2107,7 @@ fn form_moved_down_a_level_leaves_no_phantom_surface() {
 #[test]
 #[ignore]
 fn phantoms_in_a_file() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let Ok(path) = std::env::var("SCULPT_PHANTOM_FILE") else { return };
     let (v, _) = sculpt_core::generator::detail_layer::Layered::read_from(&mut std::fs::File::open(path).unwrap(), 7).unwrap();
     for l in 1..v.levels() {
@@ -2085,6 +2121,7 @@ fn phantoms_in_a_file() {
 #[test]
 #[ignore]
 fn heights_of_a_file() {
+    let _shared = ALONE.read().unwrap_or_else(|e| e.into_inner());
     let (Ok(path), Ok(at), Ok(out)) = (std::env::var("SCULPT_H_FILE"), std::env::var("SCULPT_H_AT"), std::env::var("SCULPT_H_OUT")) else { return };
     let (v, _) = sculpt_core::generator::detail_layer::Layered::read_from(&mut std::fs::File::open(path).unwrap(), 7).unwrap();
     let a: Vec<f32> = at.split(',').map(|w| w.parse().unwrap()).collect();

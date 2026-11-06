@@ -56,6 +56,7 @@ fn scenes() -> Vec<Scene> {
     out.push(Scene { name: "clay_close_scrubbed", half: 0.06, lines: vec![Line { passes: 6, ..line(Brush::Clay, 0.016, 0.0004, (-0.04, 0.0), (0.04, 0.005)) }] });
     out.push(Scene { name: "clay_very_close", half: 0.03, lines: (0..3).map(|k| line(Brush::Clay, 0.008, 0.0002, (-0.02, -0.008 + 0.008 * k as f32), (0.02, -0.006 + 0.008 * k as f32))).collect() });
     out.push(Scene { name: "clay_mid_crossed", half: 0.2, lines: vec![line(Brush::Clay, 0.08, 0.0015, (-0.15, -0.03), (0.15, 0.03)), line(Brush::Clay, 0.08, 0.0015, (-0.03, -0.15), (0.03, 0.15))] });
+    out.push(Scene { name: "clay_far_single", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1))] });
     out.push(Scene { name: "clay_far_crossed", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1)), line(Brush::Clay, 0.25, 0.003, (-0.1, -0.4), (0.1, 0.4))] });
     out.push(Scene { name: "trim_close_fresh", half: 0.08, lines: vec![line(Brush::Trim, 0.038, 0.000476, (-0.07, 0.0), (0.07, 0.01)), line(Brush::Trim, 0.03, 0.000476, (-0.03, -0.05), (0.0, 0.06))] });
     let mut l = Vec::new();

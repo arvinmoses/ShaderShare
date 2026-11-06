@@ -2682,11 +2682,11 @@ impl LevelVolume {
 
     /// Where the line through `p` along `n` meets the surface of levels up to `l` (as it was when the stroke began,
     /// with `base`), within `limit` of `p`.
-    fn along_onto(&self, l: usize, mut p: Vec3, n: Vec3, limit: f32, base: bool) -> Option<Vec3> {
+    fn along_onto(&self, read: &Near, mut p: Vec3, n: Vec3, limit: f32) -> Option<Vec3> {
         let start = p;
-        let vx = self.voxel(l);
+        let vx = self.voxel(read.l);
         for _ in 0..48 {
-            let v = self.value_upto(p, l, base);
+            let v = read.value_at((p - self.origin) / vx);
             if v.abs() < 0.01 * vx {
                 break;
             }
@@ -2702,14 +2702,23 @@ impl LevelVolume {
     /// through rings of surface points around `c`, found along `n`.
     /// With `wide`, when no ring meets the surface along `n`, they are looked for again along the brush's own scale's
     /// normal (see below).
-    fn area_normal(&self, l: usize, c: Vec3, n: Vec3, r: f32, wide: bool) -> Vec3 {
+    /// Level `l`'s field (as the stroke began, with `base`) over what a brush of radius `r` at `c` reads to place
+    /// itself, its blocks made once (see [`Near`]): read point by point through every coarser level where `l` holds
+    /// none, the rings that set a close dab's normal and height took up to 25 ms a dab.
+    fn brush_reads(&self, l: usize, c: Vec3, r: f32, base: bool) -> Near<'_> {
+        let (vx, bs) = (self.voxel(l), self.voxel(l) * B as f32);
+        let w = Vec3::splat(2.2 * r + 2.0 * self.band(l) + vx);
+        Near::new(self, l, ((c - w - self.origin) / bs).floor().as_ivec3(), ((c + w - self.origin) / bs).floor().as_ivec3(), base, l > 0 && !self.uncached_reads)
+    }
+
+    fn area_normal(&self, read: &Near, c: Vec3, n: Vec3, r: f32, wide: bool) -> Vec3 {
         let (t1, t2) = n.any_orthonormal_pair();
         let mut sum = Vec3::ZERO;
         for (ring, weight) in [(0.5, 0.6), (0.8, 1.0), (1.0, 0.8)] {
             let pts: Option<Vec<Vec3>> = (0..12)
                 .map(|k| {
                     let a = k as f32 * std::f32::consts::TAU / 12.0;
-                    self.along_onto(l, c + (t1 * a.cos() + t2 * a.sin()) * ring * r, n, r, true)
+                    self.along_onto(read, c + (t1 * a.cos() + t2 * a.sin()) * ring * r, n, r)
                 })
                 .collect();
             let Some(pts) = pts else { continue };
@@ -2734,7 +2743,7 @@ impl LevelVolume {
                 let h = (0.5 * r).min(0.8 * self.band(0));
                 let d = |o: Vec3| self.value_upto(c + o, 0, true) - self.value_upto(c - o, 0, true);
                 match Vec3::new(d(Vec3::X * h), d(Vec3::Y * h), d(Vec3::Z * h)).try_normalize() {
-                    Some(w) if w.dot(n) < 10f32.to_radians().cos() => self.area_normal(l, c, w, r, false),
+                    Some(w) if w.dot(n) < 10f32.to_radians().cos() => self.area_normal(read, c, w, r, false),
                     _ => n,
                 }
             }
@@ -2742,21 +2751,26 @@ impl LevelVolume {
         }
     }
 
-    /// `p` moved onto the surface of levels up to `l` as it was when the stroke began, along that surface's normal.
-    fn onto_base(&self, l: usize, mut p: Vec3, dir: Vec3) -> Vec3 {
-        let band = self.band(self.level_at(p, l, true));
+    /// `p` moved onto the surface of `read`'s level as it was when the stroke began, along that surface's normal; and
+    /// that normal (zero where the field has none).
+    fn onto_base(&self, read: &Near, mut p: Vec3, dir: Vec3) -> (Vec3, Vec3) {
+        let (vx, band) = (self.voxel(read.l), self.band(read.l));
+        let v = |p: Vec3| read.value_at((p - self.origin) / vx);
+        let normal = |p: Vec3| {
+            let d = |o: Vec3| v(p + o) - v(p - o);
+            Vec3::new(d(Vec3::X * vx), d(Vec3::Y * vx), d(Vec3::Z * vx)).normalize_or_zero()
+        };
         for _ in 0..32 {
-            let v = self.value_upto(p, l, true);
-            if v.abs() < band * 0.95 {
+            let x = v(p);
+            if x.abs() < band * 0.95 {
                 break;
             }
-            p -= dir * v;
+            p -= dir * x;
         }
         for _ in 0..3 {
-            let v = self.value_upto(p, l, true);
-            p -= self.normal_upto(p, l, true) * v;
+            p -= normal(p) * v(p);
         }
-        p
+        (p, normal(p))
     }
 
     /// One dab of a plane brush at level `l`, the way the clay and trim brushes of mesh sculpting work (see
@@ -2768,21 +2782,22 @@ impl LevelVolume {
     #[allow(clippy::too_many_arguments)]
     pub fn plane_dab(&mut self, l: usize, at: Vec3, along: Vec3, r: f32, h: f32, hardness: f32, alpha: f32, trim: bool) -> Option<(Vec3, LevelDab)> {
         let l = l.min(self.levels() - 1);
-        let on = self.onto_base(l, at, along);
-        if self.normal_upto(on, l, true) == Vec3::ZERO {
+        let (was, now) = (self.brush_reads(l, at, r, true), self.brush_reads(l, at, r, false));
+        let (on, normal) = self.onto_base(&was, at, along);
+        if normal == Vec3::ZERO {
             return None;
         }
         // (On a stroke's first dab, its rings looked for farther when none meets the surface: see `area_normal`.)
         let first = self.stroke.as_ref().is_none_or(|s| s.is_empty());
-        let rough = self.area_normal(l, on, along, r, first);
-        let n = self.area_normal(l, on, rough, r, first);
+        let rough = self.area_normal(&was, on, along, r, first);
+        let n = self.area_normal(&was, on, rough, r, first);
         let (t1, t2) = n.any_orthonormal_pair();
         let (mut base_sum, mut added_sum, mut weight) = (0.0, 0.0, 0.0);
         for (ring, w, count) in [(0.0, 1.0, 1), (0.5, 0.8, 8), (0.9, 0.5, 12)] {
             for k in 0..count {
                 let a = k as f32 * std::f32::consts::TAU / count as f32;
                 let p = on + (t1 * a.cos() + t2 * a.sin()) * ring * r;
-                if let (Some(b), Some(c)) = (self.along_onto(l, p, n, r, true), self.along_onto(l, p, n, r, false)) {
+                if let (Some(b), Some(c)) = (self.along_onto(&was, p, n, r), self.along_onto(&now, p, n, r)) {
                     base_sum += (b - on).dot(n) * w;
                     added_sum += (c - b).dot(n) * w;
                     weight += w;
@@ -2912,12 +2927,14 @@ impl LevelVolume {
     /// smoothed surface (their detail is buried, or carried with `keep_detail`). Returns the normal and what it did.
     pub fn smooth_dab(&mut self, l: usize, at: Vec3, along: Vec3, r: f32, hardness: f32, alpha: f32) -> Option<(Vec3, LevelDab)> {
         let l = l.min(self.levels() - 1);
-        let on = self.onto_base(l, at, along);
-        if self.normal_upto(on, l, true) == Vec3::ZERO {
+        let was = self.brush_reads(l, at, r, true);
+        let (on, normal) = self.onto_base(&was, at, along);
+        if normal == Vec3::ZERO {
             return None;
         }
-        let first = self.area_normal(l, on, along, r, false);
-        let n = self.area_normal(l, on, first, r, false);
+        let first = self.area_normal(&was, on, along, r, false);
+        let n = self.area_normal(&was, on, first, r, false);
+        drop(was);
         let (vx, band) = (self.voxel(l), self.band(l));
         let depth = 0.35 * r;
         // Columns out past the radius by the blur's reach, so the blur inside it sees both sides.
