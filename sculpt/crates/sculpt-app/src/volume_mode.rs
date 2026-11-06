@@ -1148,6 +1148,10 @@ impl VolumeMode {
 }
 
 #[cfg(test)]
+#[path = "gauntlet.rs"]
+mod gauntlet;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

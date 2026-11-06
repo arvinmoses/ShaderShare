@@ -301,7 +301,9 @@ impl VolumeDemo {
                 let dir = Vec3::new(c[0], c[1], c[2]);
                 let side = dir.cross(Vec3::Y).normalize() * 0.08;
                 let up = side.cross(dir.normalize());
-                let views = [(dir, 1.0), (dir, 0.6), (dir, 0.4), (dir, 0.25), (dir + side, 0.4), (dir - side, 0.4), (dir + up, 0.4), (dir - up, 0.4)];
+                // `SCULPT_LOOK_SCALE`: every view that much farther (a wider patch).
+                let sc: f32 = std::env::var("SCULPT_LOOK_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                let views = [(dir, 1.0), (dir, 0.6), (dir, 0.4), (dir, 0.25), (dir + side, 0.4), (dir - side, 0.4), (dir + up, 0.4), (dir - up, 0.4)].map(|(v, d)| (v, d * sc));
                 for (k, (v, dist)) in views.into_iter().enumerate() {
                     at(0.2 * k as f32, 0.0, Camera(Pose::at(v, dist)));
                 }
