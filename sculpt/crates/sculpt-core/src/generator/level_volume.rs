@@ -1547,6 +1547,16 @@ impl LevelVolume {
         self.dirty.insert(k);
     }
 
+    /// [`Self::end_stroke_plain`], kept as a step even when it changed nothing (`keep`): something kept beside the
+    /// volume changed.
+    pub fn end_stroke_marked(&mut self, keep: bool) -> bool {
+        if keep && self.stroke.is_some() {
+            self.keep_stroke();
+            return true;
+        }
+        self.end_stroke_plain()
+    }
+
     /// End a stroke as it is (none of [`Self::end_stroke`]'s work on the field): kept for undo, if it changed
     /// anything. Returns whether it did.
     pub fn end_stroke_plain(&mut self) -> bool {

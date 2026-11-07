@@ -234,6 +234,11 @@ impl SculptApp {
                 p.strength = (p.strength + if cmd == Command::StrengthUp { 0.05 } else { -0.05 }).clamp(0.0, 1.0);
             }
             Command::Frame => self.frame_volume(),
+            Command::SwapMaskPaint => {
+                if let crate::volume_mode::Target::Mask { show } = self.volume.target {
+                    self.volume.target = crate::volume_mode::Target::Mask { show: !show };
+                }
+            }
             Command::ToggleHud => {
                 self.hud = !self.hud;
                 self.save_settings();
@@ -847,6 +852,10 @@ impl eframe::App for SculptApp {
         crate::panels::keymap_window(self, &ctx);
 
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport_ui(ui, frame));
+        // A slider let go: what it changed is one undo.
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.volume.close_sculpt_edit();
+        }
 
         self.stats.frame_ms = t0.elapsed().as_secs_f32() * 1e3;
     }

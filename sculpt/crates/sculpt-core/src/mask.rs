@@ -177,6 +177,32 @@ pub enum BlendMode {
 }
 
 impl BlendMode {
+    pub const ALL: [BlendMode; 9] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Add,
+        BlendMode::Subtract,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Max,
+        BlendMode::Min,
+        BlendMode::Difference,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Add => "Add",
+            BlendMode::Subtract => "Subtract",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::Max => "Lighten",
+            BlendMode::Min => "Darken",
+            BlendMode::Difference => "Difference",
+        }
+    }
+
     #[inline]
     pub fn blend(self, a: f32, b: f32) -> f32 {
         match self {

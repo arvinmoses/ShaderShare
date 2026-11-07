@@ -27,6 +27,8 @@ pub enum Command {
     #[serde(rename = "frame_mesh")]
     Frame,
     ToggleHud,
+    /// Painting a mask: swap black (hide) and white (show).
+    SwapMaskPaint,
 }
 
 impl Command {
@@ -45,6 +47,7 @@ impl Command {
             Command::StrengthDown => "Strength −",
             Command::Frame => "Frame volume",
             Command::ToggleHud => "Toggle readout",
+            Command::SwapMaskPaint => "Swap mask black / white",
         }
     }
 }

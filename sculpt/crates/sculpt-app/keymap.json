@@ -12,5 +12,6 @@
   { "keys": "Shift+CloseBracket", "command": "strength_up" },
   { "keys": "Shift+OpenBracket", "command": "strength_down" },
   { "keys": "F", "command": "frame_mesh" },
-  { "keys": "H", "command": "toggle_hud" }
+  { "keys": "H", "command": "toggle_hud" },
+  { "keys": "X", "command": "swap_mask_paint" }
 ]

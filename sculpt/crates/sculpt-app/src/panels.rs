@@ -14,6 +14,9 @@ use crate::keymap::Command;
 use crate::theme::{Hex, bold};
 use crate::tools::Tool;
 use crate::volume_mode::{Target, VolumeMode};
+use sculpt_core::generator::sculpt_layer::{MaskInfo, MaskKind, NoiseMask};
+use sculpt_core::mask::BlendMode;
+use sculpt_core::noise::NoiseKind;
 
 const ROW_H: f32 = 26.0;
 
@@ -70,11 +73,16 @@ fn target_text(app: &SculptApp) -> (String, Color32) {
     let ui = &app.theme.ui;
     let Some(layer) = m.layer.as_ref() else {
         let Some((active, layers)) = m.sculpt_layers() else { return ("Strokes edit the volume".into(), ui.accent.0) };
-        let name = layers.get(active).map_or(String::new(), |l| l.name.clone());
-        return match m.target {
-            Target::Form => ("Strokes edit the base (under every layer)".into(), ui.accent.0),
-            Target::Mask { show: false } => (format!("Strokes hide {name} (its mask)"), ui.target_mask()),
-            Target::Mask { show: true } => (format!("Strokes show {name} again (its mask)"), ui.target_mask()),
+        let Some(info) = layers.get(active) else { return ("Strokes edit the volume".into(), ui.accent.0) };
+        let name = &info.name;
+        let mask = info.active_mask.and_then(|i| info.masks.get(i));
+        return match (m.target, mask) {
+            (Target::Form, _) => ("Strokes edit the base (under every layer)".into(), ui.accent.0),
+            (Target::Mask { .. }, Some(mk)) if matches!(mk.kind, MaskKind::Noise(_)) => (format!("{} is noise: set it in Properties (strokes do nothing)", mk.name), ui.target_mask()),
+            (Target::Mask { show }, mk) => {
+                let mk = mk.map_or("its mask".to_string(), |mk| mk.name.clone());
+                (format!("Strokes paint {mk} {} ({} {name}; X swaps)", if show { "white" } else { "black" }, if show { "showing" } else { "hiding" }), ui.target_mask())
+            }
             _ => (format!("Strokes edit {name}"), ui.target_delta()),
         };
     };
@@ -177,7 +185,7 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
     });
 }
 
-const SCULPT_HOVER: &str = "An empty layer on top to sculpt on, at full brush speed and any detail: it keeps what its strokes change, and its mask (paint Hide and Show) fades that anywhere. Sculpting the base under it does not carry it along.";
+const SCULPT_HOVER: &str = "An empty layer on top to sculpt on, at full brush speed and any detail: it keeps what its strokes change. Its opacity and masks (painted or noise, blended like a paint program's) fade it anywhere. Sculpting the base under it does not carry it along.";
 const NOISE_HOVER: &str = "A layer of noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Its mask fades it. Brushes work on the surface under it.";
 const GENERATOR_HOVER: &str = "A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with. Its settings are under Properties; sculpting the form carries it along.";
 
@@ -437,6 +445,21 @@ struct RowActions {
     visible: Option<(usize, bool)>,
     remove: Option<usize>,
     target: Option<Target>,
+    /// A sculpt layer, and its mask or the layer itself, picked.
+    pick: Option<(usize, Option<usize>)>,
+    mask_set: Option<(usize, usize, MaskInfo)>,
+    mask_remove: Option<(usize, usize)>,
+    add_mask: Option<MaskKind>,
+}
+
+fn noise_label(k: NoiseKind) -> &'static str {
+    match k {
+        NoiseKind::Perlin => "Smooth",
+        NoiseKind::Fbm => "Clouds",
+        NoiseKind::Ridged => "Ridged",
+        NoiseKind::Turbulence => "Turbulence",
+        NoiseKind::Cellular => "Cells",
+    }
 }
 
 /// The volume's stack: its layers top first, then the form under them; the selected row is what strokes edit.
@@ -452,11 +475,11 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         match m.layer.as_ref() {
             None if m.sculpt_layers().is_some() => {
                 let (active, layers) = m.sculpt_layers().unwrap();
+                let on_mask = matches!(m.target, Target::Mask { .. });
                 for k in (0..layers.len()).rev() {
                     let info = &layers[k];
-                    let selected = active == k && m.target != Target::Form;
-                    let bar = if matches!(m.target, Target::Mask { .. }) { mask } else { detail };
-                    let (resp, mut row) = row_frame(ui, app, 0.0, selected, bar);
+                    let selected = active == k && m.target != Target::Form && !(on_mask && info.active_mask.is_some());
+                    let (resp, mut row) = row_frame(ui, app, 0.0, selected, detail);
                     if icon_button(&mut row, if info.visible { Icon::Eye } else { Icon::EyeOff }, 20.0, false, "Show or hide this layer").clicked() {
                         act.visible = Some((k, !info.visible));
                     }
@@ -468,18 +491,58 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                         if icon_button(ui, Icon::Trash, 20.0, false, "Remove this layer and what it shows (undo brings it back)").clicked() {
                             act.remove = Some(k);
                         }
-                        ui.label(RichText::new(format!("{} blocks", fmt_count(info.blocks))).size(fs * 0.85).color(weak));
+                        let mut text = format!("{} blocks", fmt_count(info.blocks));
+                        if info.opacity < 1.0 {
+                            text = format!("{:.0}%  ·  {text}", info.opacity * 100.0);
+                        }
+                        ui.label(RichText::new(text).size(fs * 0.85).color(weak));
                     });
                     if resp.clicked() {
-                        act.select = Some(k);
+                        act.pick = Some((k, None));
+                    }
+                    // Its masks, top first.
+                    for mi in (0..info.masks.len()).rev() {
+                        let mk = &info.masks[mi];
+                        let sel = active == k && on_mask && info.active_mask == Some(mi);
+                        let (resp, mut row) = row_frame(ui, app, 26.0, sel, mask);
+                        if icon_button(&mut row, if mk.visible { Icon::Eye } else { Icon::EyeOff }, 20.0, false, "Show or hide this mask").clicked() {
+                            act.mask_set = Some((k, mi, MaskInfo { visible: !mk.visible, ..mk.clone() }));
+                        }
+                        let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                        let icon = if matches!(mk.kind, MaskKind::Noise(_)) { Icon::Noise } else { Icon::Mask };
+                        icon.paint(row.painter(), r, mask);
+                        let name = RichText::new(&mk.name);
+                        row.label(if mk.visible { name } else { name.color(weak) });
+                        row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, Icon::Trash, 20.0, false, "Remove this mask").clicked() {
+                                act.mask_remove = Some((k, mi));
+                            }
+                            let mut text = mk.blend.label().to_string();
+                            if mk.opacity < 1.0 {
+                                text = format!("{text} {:.0}%", mk.opacity * 100.0);
+                            }
+                            ui.label(RichText::new(text).size(fs * 0.85).color(weak));
+                        });
+                        if resp.clicked() {
+                            act.pick = Some((k, Some(mi)));
+                        }
                     }
                     if active == k {
                         let (_, mut row) = row_frame(ui, app, 26.0, false, mask);
-                        let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                        Icon::Mask.paint(row.painter(), r, mask);
-                        for (show, label, hover) in [(false, "Hide", "Strokes hide this layer where they go."), (true, "Show", "Strokes show it again.")] {
-                            if row.selectable_label(m.target == Target::Mask { show }, label).on_hover_text(hover).clicked() {
-                                act.target = Some(Target::Mask { show });
+                        if row.small_button("+ Paint mask").on_hover_text("A mask to paint, white to start (the layer looks the same). Strokes paint it at once.").clicked() {
+                            act.add_mask = Some(MaskKind::Paint { fill: 1.0 });
+                        }
+                        if row.small_button("+ Noise mask").on_hover_text("Noise that fades the layer: set its look in Properties.").clicked() {
+                            act.add_mask = Some(MaskKind::Noise(NoiseMask::default()));
+                        }
+                        let painted = info.active_mask.and_then(|i| info.masks.get(i)).is_some_and(|mk| matches!(mk.kind, MaskKind::Paint { .. }));
+                        if on_mask && painted {
+                            let (_, mut row) = row_frame(ui, app, 26.0, false, mask);
+                            row.label(RichText::new("Paint").color(weak));
+                            for (show, label, hover) in [(false, "Black", "Strokes hide the layer where they go (X swaps)."), (true, "White", "Strokes show it again (X swaps).")] {
+                                if row.selectable_label(m.target == Target::Mask { show }, label).on_hover_text(hover).clicked() {
+                                    act.target = Some(Target::Mask { show });
+                                }
                             }
                         }
                     }
@@ -493,7 +556,7 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                     act.target = Some(Target::Form);
                 }
                 ui.add_space(8.0);
-                note(ui, "Each layer keeps what its strokes change, at any detail; its mask fades it. Sculpting where a layer is hidden shows it there again. The base is what no layer holds.", weak);
+                note(ui, "Each layer keeps what its strokes change, at any detail. Its opacity and masks fade it: masks stack bottom to top, each blended onto those under it. Pick a painted mask to paint it. The base is what no layer holds.", weak);
             }
             None => {
                 let (_, mut row) = row_frame(ui, app, 0.0, true, accent);
@@ -586,6 +649,18 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         m.set_active_layer(k);
         m.target = Target::Detail;
     }
+    if let Some((k, mi)) = act.pick {
+        m.select_mask(k, mi);
+    }
+    if let Some(kind) = act.add_mask {
+        m.add_mask(kind);
+    }
+    if let Some((k, mi, x)) = act.mask_set {
+        m.set_mask(k, mi, x);
+    }
+    if let Some((k, mi)) = act.mask_remove {
+        m.remove_mask(k, mi);
+    }
     if let Some(t) = act.target {
         m.target = t;
     }
@@ -614,6 +689,113 @@ fn properties_panel(app: &mut SculptApp, ui: &mut Ui) {
     });
 }
 
+/// A name to edit: what it was changed to, once the field is left.
+fn name_field(ui: &mut Ui, salt: (&str, usize, usize), name: &str) -> Option<String> {
+    let id = ui.id().with(salt);
+    let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(name.to_string());
+    let r = prop(ui, "Name", |ui| ui.text_edit_singleline(&mut text));
+    if r.lost_focus() {
+        ui.data_mut(|d| d.remove_temp::<String>(id));
+        if text != name && !text.trim().is_empty() {
+            return Some(text);
+        }
+    } else if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, text));
+    }
+    None
+}
+
+/// A sculpt layer's mask: its blend, opacity, and what it is (painted, or noise and its look).
+#[allow(clippy::too_many_arguments)]
+fn mask_props(m: &mut VolumeMode, ui: &mut Ui, fs: f32, weak: Color32, k: usize, mi: usize, mk: MaskInfo, count: usize) {
+    let mut x = mk.clone();
+    let (mut fill, mut remove, mut moved, mut show) = (None, false, None, None);
+    let title = if matches!(mk.kind, MaskKind::Noise(_)) { "NOISE MASK" } else { "PAINTED MASK" };
+    section(ui, fs, "mask", title, |ui| {
+        if let Some(name) = name_field(ui, ("mask_name", k, mi), &mk.name) {
+            x.name = name;
+        }
+        prop(ui, "", |ui| ui.checkbox(&mut x.visible, "Visible"));
+        let mut pct = x.opacity * 100.0;
+        if prop(ui, "Opacity", |ui| ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").fixed_decimals(0))).changed() {
+            x.opacity = pct / 100.0;
+        }
+        prop(ui, "Blend", |ui| {
+            egui::ComboBox::from_id_salt(("mask_blend", k, mi)).selected_text(x.blend.label()).show_ui(ui, |ui| {
+                for b in BlendMode::ALL {
+                    ui.selectable_value(&mut x.blend, b, b.label());
+                }
+            })
+        });
+        match &mut x.kind {
+            MaskKind::Paint { .. } => {
+                prop(ui, "Paint", |ui| {
+                    for (s, label) in [(false, "Black"), (true, "White")] {
+                        if ui.selectable_label(m.target == Target::Mask { show: s }, label).clicked() {
+                            show = Some(s);
+                        }
+                    }
+                });
+                prop(ui, "Fill", |ui| {
+                    if ui.button("Black").on_hover_text("Fill it black: what was painted on it goes. One undo.").clicked() {
+                        fill = Some(0.0);
+                    }
+                    if ui.button("White").on_hover_text("Fill it white: what was painted on it goes. One undo.").clicked() {
+                        fill = Some(1.0);
+                    }
+                });
+                ui.label(RichText::new("Strokes paint this mask (X swaps black and white).").small().color(weak));
+            }
+            MaskKind::Noise(n) => {
+                prop(ui, "Kind", |ui| {
+                    egui::ComboBox::from_id_salt(("mask_noise", k, mi)).selected_text(noise_label(n.params.kind)).show_ui(ui, |ui| {
+                        for kind in [NoiseKind::Fbm, NoiseKind::Perlin, NoiseKind::Ridged, NoiseKind::Turbulence, NoiseKind::Cellular] {
+                            ui.selectable_value(&mut n.params.kind, kind, noise_label(kind));
+                        }
+                    })
+                });
+                prop(ui, "Scale", |ui| ui.add(egui::Slider::new(&mut n.params.scale, 0.5..=200.0).logarithmic(true)));
+                prop(ui, "Detail", |ui| ui.add(egui::Slider::new(&mut n.params.octaves, 1..=8)));
+                prop(ui, "Balance", |ui| ui.add(egui::Slider::new(&mut n.balance, 0.0..=1.0)));
+                prop(ui, "Contrast", |ui| ui.add(egui::Slider::new(&mut n.contrast, 0.0..=0.99)));
+                prop(ui, "Seed", |ui| ui.add(egui::DragValue::new(&mut n.params.seed)));
+                prop(ui, "", |ui| ui.checkbox(&mut n.invert, "Invert"));
+            }
+        }
+        prop(ui, "Order", |ui| {
+            if ui.add_enabled(mi + 1 < count, egui::Button::new("Up")).clicked() {
+                moved = Some(true);
+            }
+            if ui.add_enabled(mi > 0, egui::Button::new("Down")).clicked() {
+                moved = Some(false);
+            }
+            if ui.button("Remove").clicked() {
+                remove = true;
+            }
+        });
+        ui.label(RichText::new("Masks stack bottom to top from white, each blended onto those under it.").small().color(weak));
+        if !m.live_edits(k) {
+            ui.label(RichText::new("A big layer: sliders apply when let go.").small().color(weak));
+        }
+    });
+    if x != mk {
+        m.set_mask(k, mi, x);
+    }
+    if let Some(s) = show {
+        m.target = Target::Mask { show: s };
+    }
+    if let Some(to) = fill {
+        m.fill_mask(to);
+        m.target = Target::Mask { show: to < 0.5 };
+    }
+    if let Some(up) = moved {
+        m.move_mask(k, mi, up);
+    }
+    if remove {
+        m.remove_mask(k, mi);
+    }
+}
+
 /// The selected layer's own settings: its name, resolution, visibility and mask; or the form's, or the whole volume's.
 fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
     let fs = app.theme.metrics.font_size;
@@ -626,29 +808,44 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
         && let Some((k, layers)) = m.sculpt_layers()
     {
         let Some(info) = layers.get(k).cloned() else { return };
-        let (mut rename, mut visible, mut fill) = (None, None, None);
+        if matches!(m.target, Target::Mask { .. })
+            && let Some(mi) = info.active_mask
+            && let Some(mk) = info.masks.get(mi).cloned()
+        {
+            mask_props(m, ui, fs, weak, k, mi, mk, info.masks.len());
+            return;
+        }
+        let live = m.live_edits(k);
+        let (mut rename, mut visible, mut fill, mut opacity, mut add) = (None, None, None, None, None);
         section(ui, fs, "layer", "SCULPT LAYER", |ui| {
-            let id = ui.id().with(("layer_name", k));
-            let mut name = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(info.name.clone());
-            let r = prop(ui, "Name", |ui| ui.text_edit_singleline(&mut name));
-            if r.lost_focus() {
-                ui.data_mut(|d| d.remove_temp::<String>(id));
-                if name != info.name && !name.trim().is_empty() {
-                    rename = Some(name);
-                }
-            } else if r.has_focus() {
-                ui.data_mut(|d| d.insert_temp(id, name));
+            if let Some(name) = name_field(ui, ("layer_name", k, 0), &info.name) {
+                rename = Some(name);
             }
             let mut on = info.visible;
             if prop(ui, "", |ui| ui.checkbox(&mut on, "Visible")).changed() {
                 visible = Some(on);
             }
+            let mut pct = info.opacity * 100.0;
+            if prop(ui, "Opacity", |ui| ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").fixed_decimals(0))).changed() {
+                opacity = Some(pct / 100.0);
+            }
             prop(ui, "Blocks", |ui| ui.label(fmt_count(info.blocks)));
-            prop(ui, "Mask", |ui| {
-                if ui.button("Hide all").on_hover_text("Hide this layer everywhere, then paint it in where wanted. One undo.").clicked() {
+            if !live {
+                ui.label(RichText::new("A big layer: its sliders apply when let go.").small().color(weak));
+            }
+            prop(ui, "Masks", |ui| {
+                if ui.button("+ Paint").on_hover_text("A mask to paint, white to start. Strokes paint it at once.").clicked() {
+                    add = Some(MaskKind::Paint { fill: 1.0 });
+                }
+                if ui.button("+ Noise").on_hover_text("Noise that fades the layer.").clicked() {
+                    add = Some(MaskKind::Noise(NoiseMask::default()));
+                }
+            });
+            prop(ui, "", |ui| {
+                if ui.button("Hide all").on_hover_text("Fill the top painted mask black (one is made if there is none), then paint the layer in where wanted. One undo.").clicked() {
                     fill = Some(0.0);
                 }
-                if ui.button("Show all").on_hover_text("Clear this layer's mask: it shows everywhere again. One undo.").clicked() {
+                if ui.button("Show all").on_hover_text("Fill the top painted mask white. One undo.").clicked() {
                     fill = Some(1.0);
                 }
             });
@@ -659,11 +856,18 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
         if let Some(on) = visible {
             m.set_layer_visible(k, on);
         }
+        if let Some(o) = opacity {
+            m.set_layer_opacity(k, o);
+        }
+        if let Some(kind) = add {
+            m.add_mask(kind);
+        }
         if let Some(to) = fill {
+            m.select_mask(k, None);
             m.fill_mask(to);
-            if to < 1.0 {
-                m.target = Target::Mask { show: true };
-            }
+            let mi = m.sculpt.as_ref().and_then(|s| s.active_mask(k));
+            m.select_mask(k, mi);
+            m.target = Target::Mask { show: to < 0.5 };
         }
         return;
     }

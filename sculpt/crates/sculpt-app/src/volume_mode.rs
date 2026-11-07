@@ -16,7 +16,7 @@ use std::time::Instant;
 use crate::tools::Brush;
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
-use sculpt_core::generator::sculpt_layer::{SculptInfo, SculptLayers};
+use sculpt_core::generator::sculpt_layer::{MaskInfo, MaskKind, SculptInfo, SculptLayers};
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::surface_noise::SurfaceNoise;
 use sculpt_core::generator::{BoolOp, Primitive};
@@ -127,6 +127,16 @@ pub fn level_for(vol: &LevelVolume, radius: f32, px: f32) -> usize {
     l
 }
 
+/// Layers holding more blocks than this move when a slider is let go, not every frame (some 80 ms and a big upload
+/// per move at 100k blocks).
+const LIVE_BLOCKS: usize = 20_000;
+
+/// A change put off till the pointer lets go.
+enum Later {
+    Opacity(usize, f32),
+    Mask(usize, usize, MaskInfo),
+}
+
 /// What strokes work on once the volume has a detail layer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
@@ -160,6 +170,10 @@ pub struct VolumeMode {
     /// redo ended.
     sculpt_undo: Vec<(u64, SculptLayers)>,
     sculpt_redo: Vec<(u64, SculptLayers)>,
+    /// The sculpt layers as a change going on over frames began (a slider dragged; see [`Self::sculpt_edit`]).
+    sculpt_open: Option<SculptLayers>,
+    /// A slider's change to a layer too big to move every frame: done when the pointer lets go.
+    sculpt_later: Option<Later>,
     /// The detail layer following the form, off the frame (see `Layered::follow_take`), and the end of a stroke on the
     /// form under it.
     follow_job: Option<Receiver<FollowDone>>,
@@ -270,6 +284,8 @@ impl VolumeMode {
             sculpt_was: None,
             sculpt_undo: Vec::new(),
             sculpt_redo: Vec::new(),
+            sculpt_open: None,
+            sculpt_later: None,
             follow_job: None,
             form_end: None,
             generation: 1,
@@ -411,6 +427,7 @@ impl VolumeMode {
             return;
         }
         if let (Some(Target::Mask { show }), Some(s)) = (target, self.sculpt.as_mut()) {
+            // (A noise mask picked: nothing to paint.)
             let k = s.active();
             s.paint_mask(&mut self.vol, k, at, radius, if show { 1.0 } else { 0.0 });
             return;
@@ -730,6 +747,7 @@ impl VolumeMode {
     /// Finish everything still being worked out, now (strokes run ahead done for real, a stroke's end, the layers'
     /// following, generator jobs): before anything that needs the volume settled (undo, saving, editing the layers).
     pub fn settle(&mut self) {
+        self.close_sculpt_edit();
         while self.ahead.is_some() {
             self.with_real(|m| m.settle_now());
             // (Everything has landed: a begin that would still wait is a bug, and goes ahead rather than hang.)
@@ -799,6 +817,7 @@ impl VolumeMode {
     /// Begin a stroke. Its first dab shows at once: if work it must come after is still landing (the last stroke's
     /// end, the layers' following, a generator's job), it runs ahead on a copy until that work is in (see [`Ahead`]).
     pub fn begin_stroke(&mut self) {
+        self.close_sculpt_edit();
         while self.run_dabs(f64::INFINITY) > 0 {}
         if std::env::var_os("SCULPT_DAB_LOG").is_some() {
             eprintln!("BEGIN");
@@ -1128,9 +1147,23 @@ impl VolumeMode {
         self.target = Target::Detail;
     }
 
-    /// The sculpt layers, if any: the active one, and each.
+    /// The sculpt layers, if any: the active one, and each (with a change put off shown as done).
     pub fn sculpt_layers(&self) -> Option<(usize, Vec<SculptInfo>)> {
-        self.sculpt.as_ref().filter(|s| !s.is_empty()).map(|s| (s.active(), s.layers()))
+        let mut out = self.sculpt.as_ref().filter(|s| !s.is_empty()).map(|s| (s.active(), s.layers()))?;
+        match &self.sculpt_later {
+            Some(Later::Opacity(k, o)) => {
+                if let Some(x) = out.1.get_mut(*k) {
+                    x.opacity = *o;
+                }
+            }
+            Some(Later::Mask(k, mi, info)) => {
+                if let Some(m) = out.1.get_mut(*k).and_then(|x| x.masks.get_mut(*mi)) {
+                    *m = info.clone();
+                }
+            }
+            None => {}
+        }
+        Some(out)
     }
 
     /// Drop the sculpt layers' records: the volume stays as shown, one volume again.
@@ -1169,13 +1202,45 @@ impl VolumeMode {
         }
     }
 
+    /// A change to the sculpt layers that may go on over frames (a slider dragged): one undo for all of it, kept
+    /// when [`Self::close_sculpt_edit`] is called (the pointer let go, or anything else done).
+    fn sculpt_edit(&mut self, f: impl FnOnce(&mut SculptLayers, &mut LevelVolume)) {
+        if self.sculpt_open.is_none() {
+            self.settle();
+            let Some(s) = self.sculpt.as_ref() else { return };
+            self.sculpt_open = Some(s.clone());
+            self.vol.begin_stroke();
+        }
+        if let Some(s) = self.sculpt.as_mut() {
+            f(s, &mut self.vol);
+        }
+    }
+
+    /// Keep the change going on over frames, if any, as one undo (a change put off till now done first).
+    pub fn close_sculpt_edit(&mut self) {
+        match self.sculpt_later.take() {
+            Some(Later::Opacity(k, o)) => self.sculpt_edit(|s, vol| s.set_opacity(vol, k, o)),
+            Some(Later::Mask(k, mi, info)) => self.sculpt_edit(|s, vol| s.set_mask(vol, k, mi, info)),
+            None => {}
+        }
+        if let Some(was) = self.sculpt_open.take() {
+            let changed = self.sculpt.as_ref().map(|s| s.layers()) != Some(was.layers());
+            if !self.vol.end_stroke_marked(changed) {
+                return;
+            }
+            self.sculpt_kept(was);
+        }
+    }
+
     /// One step on the sculpt layers outside strokes (showing, hiding, a mask filled, a layer removed): one undo.
     fn sculpt_step(&mut self, f: impl FnOnce(&mut SculptLayers, &mut LevelVolume)) {
+        self.close_sculpt_edit();
         let Some(s) = self.sculpt.as_mut() else { return };
         let was = s.clone();
         self.vol.begin_stroke();
         f(s, &mut self.vol);
-        if self.vol.end_stroke_plain() {
+        let changed = s.layers() != was.layers();
+        if self.vol.end_stroke_marked(changed) {
             self.sculpt_kept(was);
         }
     }
@@ -1193,6 +1258,66 @@ impl VolumeMode {
                 self.sculpt_undo.remove(0);
             }
         }
+    }
+
+    /// Set sculpt layer `k`'s opacity (a drag is one undo).
+    pub fn set_layer_opacity(&mut self, k: usize, opacity: f32) {
+        if !self.live_edits(k) {
+            self.sculpt_later = Some(Later::Opacity(k, opacity));
+            return;
+        }
+        self.sculpt_edit(|s, vol| s.set_opacity(vol, k, opacity));
+    }
+
+    /// Whether sculpt layer `k` is small enough for a slider to move it every frame (else it moves when let go).
+    pub fn live_edits(&self, k: usize) -> bool {
+        self.sculpt.as_ref().and_then(|s| s.layers().get(k).map(|x| x.blocks)).is_none_or(|n| n <= LIVE_BLOCKS)
+    }
+
+    /// Pick sculpt layer `k`, and its mask `mi` or (`None`) the layer itself, as what strokes work on: a painted mask
+    /// picked makes strokes paint it (the colour it is not filled with first).
+    pub fn select_mask(&mut self, k: usize, mi: Option<usize>) {
+        self.settle();
+        let Some(s) = self.sculpt.as_mut() else { return };
+        s.set_active(k);
+        s.set_active_mask(k, mi);
+        let fill = mi.and_then(|i| s.layers().get(k)?.masks.get(i).cloned()).map(|m| match m.kind {
+            MaskKind::Paint { fill } => fill,
+            MaskKind::Noise(_) => 1.0,
+        });
+        self.target = match (fill, self.target) {
+            (None, _) => Target::Detail,
+            (Some(_), Target::Mask { show }) => Target::Mask { show },
+            (Some(f), _) => Target::Mask { show: f < 0.5 },
+        };
+    }
+
+    /// Add a mask on top of the active sculpt layer's, picked (strokes paint a painted one).
+    pub fn add_mask(&mut self, kind: MaskKind) {
+        let Some(k) = self.sculpt.as_ref().filter(|s| !s.is_empty()).map(|s| s.active()) else { return };
+        let mut mi = None;
+        self.sculpt_step(|s, vol| mi = s.add_mask(vol, k, kind));
+        self.select_mask(k, mi);
+    }
+
+    pub fn remove_mask(&mut self, k: usize, mi: usize) {
+        self.sculpt_step(|s, vol| s.remove_mask(vol, k, mi));
+        if self.sculpt.as_ref().is_some_and(|s| s.active() == k && s.active_mask(k).is_none()) && matches!(self.target, Target::Mask { .. }) {
+            self.target = Target::Detail;
+        }
+    }
+
+    pub fn move_mask(&mut self, k: usize, mi: usize, up: bool) {
+        self.sculpt_step(|s, vol| s.move_mask(vol, k, mi, up));
+    }
+
+    /// Change mask `mi` of sculpt layer `k` (a drag is one undo).
+    pub fn set_mask(&mut self, k: usize, mi: usize, info: MaskInfo) {
+        if !self.live_edits(k) {
+            self.sculpt_later = Some(Later::Mask(k, mi, info));
+            return;
+        }
+        self.sculpt_edit(|s, vol| s.set_mask(vol, k, mi, info));
     }
 
     /// A new empty layer at `level` on top, made what strokes work on.
@@ -1615,6 +1740,32 @@ mod tests {
         same_surface(&mode.vol, &both, 0.02).unwrap();
         assert!(mode.undo() && mode.undo());
         same_field(&mode.vol, &both, 0.0).unwrap();
+
+        // An opacity dragged over frames and a noise mask's look: one undo each; picking a mask paints it.
+        for o in [0.8, 0.5, 0.2] {
+            mode.set_layer_opacity(0, o);
+        }
+        mode.close_sculpt_edit();
+        assert!(same_surface(&mode.vol, &both, 0.02).is_err(), "the opacity fades the layer");
+        mode.add_mask(MaskKind::Noise(Default::default()));
+        let mut info = mode.sculpt_layers().unwrap().1[0].masks[0].clone();
+        info.blend = sculpt_core::mask::BlendMode::Subtract;
+        mode.set_mask(0, 0, info);
+        mode.close_sculpt_edit();
+        mode.add_mask(MaskKind::Paint { fill: 1.0 });
+        assert_eq!(mode.sculpt_layers().unwrap().1[0].masks.len(), 2);
+        mode.select_mask(0, Some(1));
+        assert_eq!(mode.target, Target::Mask { show: false });
+        mode.select_mask(0, None);
+        assert_eq!(mode.target, Target::Detail);
+        // Saved and read back with its masks.
+        let mut bytes = Vec::new();
+        mode.write_to(&mut bytes).unwrap();
+        let back = VolumeMode::read_from(&mut &bytes[..]).unwrap();
+        assert_eq!(back.sculpt_layers().unwrap().1[0].masks, mode.sculpt_layers().unwrap().1[0].masks);
+        assert!(mode.undo() && mode.undo() && mode.undo() && mode.undo());
+        same_field(&mode.vol, &both, 0.0).unwrap();
+        assert_eq!(mode.sculpt_layers().unwrap().1[0].opacity, 1.0);
 
         let mut bytes = Vec::new();
         mode.write_to(&mut bytes).unwrap();
