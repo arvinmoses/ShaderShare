@@ -142,31 +142,37 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
         let (pa, pb) = (centre + t1 * ln.from.0 + t2 * ln.from.1, centre + t1 * ln.to.0 + t2 * ln.to.1);
         let steps = ((pa - pb).length() / (0.15 * ln.r)).ceil() as usize;
         mode.begin_stroke();
-        let mut in_frame = 0.0f64;
         let mut n = 0;
         for pass in 0..ln.passes {
             for k in 0..=steps {
                 let t = k as f32 / steps as f32;
                 let d = (if pass % 2 == 0 { pa.lerp(pb, t) } else { pb.lerp(pa, t) }).normalize();
                 let Some((hit, _)) = mode.raycast(d * 3.0, -d) else { continue };
-                let t0 = Instant::now();
-                mode.brush_dab(hit, ln.r, ln.px, 0.8, 0.3, ln.brush);
-                let ms = t0.elapsed().as_secs_f64() * 1e3;
-                s.dab_mean += ms;
-                s.dab_worst = s.dab_worst.max(ms);
-                dabs += 1;
-                in_frame += ms;
+                // As the app does: the frame's dabs queued, a frame's share of them done, then the frame's tick.
+                mode.queue_dab(hit, ln.r, ln.px, 0.8, 0.3, ln.brush);
                 n += 1;
                 if n % ln.per_frame == 0 {
                     let t0 = Instant::now();
+                    let k = mode.run_frame_dabs();
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    s.dab_mean += ms;
+                    s.dab_worst = s.dab_worst.max(ms / k.max(1) as f64);
+                    dabs += k;
                     mode.tick();
-                    s.frame_worst = s.frame_worst.max(in_frame + t0.elapsed().as_secs_f64() * 1e3);
-                    in_frame = 0.0;
+                    s.frame_worst = s.frame_worst.max(t0.elapsed().as_secs_f64() * 1e3);
                 }
             }
         }
         finest = finest.max(mode.level);
-        // The pen up, then frames until the stroke's end is all in.
+        // The pen up: the frames that do what is queued, then those until the stroke's end is all in.
+        while mode.dabs_queued() {
+            let t0 = Instant::now();
+            let k = mode.run_frame_dabs();
+            s.dab_mean += t0.elapsed().as_secs_f64() * 1e3;
+            dabs += k;
+            mode.tick();
+            s.frame_worst = s.frame_worst.max(t0.elapsed().as_secs_f64() * 1e3);
+        }
         let t0 = Instant::now();
         mode.end_stroke();
         let mut worst = t0.elapsed().as_secs_f64() * 1e3;

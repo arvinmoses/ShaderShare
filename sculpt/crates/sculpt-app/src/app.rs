@@ -377,8 +377,7 @@ impl SculptApp {
                 // Re-entering the surface, or jumping across a gap, starts the spacing over.
                 Some(p) if p.distance(hit) < radius * 4.0 => p,
                 _ => {
-                    mode.brush_dab(hit, radius, px, *strength * s.pressure, *hardness, *brush);
-                    dabs += 1;
+                    mode.queue_dab(hit, radius, px, *strength * s.pressure, *hardness, *brush);
                     *last = Some(hit);
                     *carry = 0.0;
                     continue;
@@ -389,13 +388,14 @@ impl SculptApp {
             let mut along = spacing - *carry;
             while along <= gap {
                 let q = from.lerp(hit, along / gap);
-                mode.brush_dab(q, radius, px, *strength * s.pressure, *hardness, *brush);
-                dabs += 1;
+                mode.queue_dab(q, radius, px, *strength * s.pressure, *hardness, *brush);
                 along += spacing;
             }
             *carry = gap - (along - spacing);
             *last = Some(hit);
         }
+        // A fast drag's dabs spread over the next frames rather than holding this one.
+        dabs += mode.run_frame_dabs();
         if dabs > 0 {
             self.status = format!("{dabs} dabs this frame at level {} (step {:.5}), {:.2} ms ({:.2} ms each)", mode.level, mode.voxel(), mode.last_ms, mode.last_ms / dabs as f64);
         }
@@ -494,7 +494,7 @@ impl SculptApp {
             }
         }
         self.paint_hud(ui, rect);
-        if self.stroke.is_some() || !self.pending.is_empty() || self.shot.is_some() {
+        if self.stroke.is_some() || !self.pending.is_empty() || self.volume.dabs_queued() || self.shot.is_some() {
             ctx.request_repaint();
         }
     }

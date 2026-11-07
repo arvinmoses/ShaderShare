@@ -38,6 +38,8 @@ fn lower_priority() {
 
 /// While strokes run ahead of the work still landing: the most a frame spends doing them for real.
 const CATCH_UP_MS: f64 = 24.0;
+/// The least time a frame spends on queued dabs (see [`VolumeMode::run_frame_dabs`]).
+const DAB_FRAME_MS: f64 = 9.0;
 
 /// What a stroke was given, kept to do it again.
 #[derive(Clone, Copy, Debug)]
@@ -183,6 +185,8 @@ pub struct VolumeMode {
     /// The last stroke's level and time per dab, for the readout.
     pub stroke_level: usize,
     pub dab_ms: f64,
+    /// Dabs given but not done yet: (at, radius, px, strength, hardness, brush).
+    queued: std::collections::VecDeque<(Vec3, f32, f32, f32, f32, Brush)>,
     /// GPU time of the last surface rebuild.
     pub gpu_ms: f64,
     /// The brush normal of the stroke's last dab, which the next one leans toward.
@@ -268,6 +272,7 @@ impl VolumeMode {
             pages_used: 0,
             stroke_level: 0,
             dab_ms: 0.0,
+            queued: Default::default(),
             gpu_ms: 0.0,
             stroke_n: Vec3::ZERO,
             chosen: false,
@@ -328,6 +333,38 @@ impl VolumeMode {
                 eprintln!("first dab {:.1} ms after the stroke began{}", self.first_dab_ms, if self.ahead.is_some() { " (ahead of work still landing)" } else { "" });
             }
         }
+    }
+
+    /// A dab for [`Self::run_dabs`] to do: the app's strokes queue theirs, so a fast drag's many dabs spread over
+    /// frames instead of holding one.
+    pub fn queue_dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush) {
+        self.queued.push_back((at, radius, px, strength, hardness, brush));
+    }
+
+    /// Whether dabs are queued.
+    pub fn dabs_queued(&self) -> bool {
+        !self.queued.is_empty()
+    }
+
+    /// Queued dabs, in order, for about `budget_ms` (at least one). Returns how many were done.
+    pub fn run_dabs(&mut self, budget_ms: f64) -> usize {
+        let t = Instant::now();
+        let mut n = 0;
+        while let Some((at, radius, px, strength, hardness, brush)) = self.queued.pop_front() {
+            self.brush_dab(at, radius, px, strength, hardness, brush);
+            n += 1;
+            if t.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                break;
+            }
+        }
+        n
+    }
+
+    /// One frame's share of queued dabs: `DAB_FRAME_MS` of them, or half the time all would take if that is more,
+    /// so a burst spreads over a few frames and the stroke never trails the pen by much more than two frames' work.
+    pub fn run_frame_dabs(&mut self) -> usize {
+        let all = self.queued.len() as f64 * self.dab_ms.max(0.05);
+        self.run_dabs(DAB_FRAME_MS.max(0.5 * all))
     }
 
     /// Blocks the copy changed, while running ahead (see [`Ahead`]).
@@ -716,6 +753,7 @@ impl VolumeMode {
     /// Begin a stroke. Its first dab shows at once: if work it must come after is still landing (the last stroke's
     /// end, the layers' following, a generator's job), it runs ahead on a copy until that work is in (see [`Ahead`]).
     pub fn begin_stroke(&mut self) {
+        while self.run_dabs(f64::INFINITY) > 0 {}
         if std::env::var_os("SCULPT_DAB_LOG").is_some() {
             eprintln!("BEGIN");
         }
@@ -767,6 +805,8 @@ impl VolumeMode {
     /// The pen is up: the stroke ends off the frame, once the detail it queued is all carried, frames going on
     /// meanwhile (see [`Self::take_specks`]).
     pub fn end_stroke(&mut self) {
+        // Every dab given is done first.
+        while self.run_dabs(f64::INFINITY) > 0 {}
         if let Some(a) = self.ahead.as_mut() {
             // Ended for real once its dabs are; the copy's stroke is simply left.
             a.events.push(Event::End);
@@ -1286,6 +1326,42 @@ mod tests {
         }
         eprintln!("   first dab {first:.1} ms; slowest frame of the stroke after it {worst:.0} ms, after the pen up {after:.0} ms; the stroke began for real {:.0} ms after, ran ahead {ahead_frames} frames, caught up {:.0} ms after", mode.lag_ms, mode.catch_up_ms);
         first
+    }
+
+    /// A fast drag's dabs, queued and done a frame's share at a time, leave exactly what doing each at once leaves,
+    /// and a frame takes no more than its share while a burst lasts.
+    #[test]
+    fn queued_dabs_land_as_done_at_once() {
+        let dabs: Vec<Vec3> = (0..48).map(|k| Vec3::new(-0.3 + 0.0125 * k as f32, 0.02 * (k as f32 * 0.4).sin(), 1.0).normalize()).collect();
+        let mut at_once = VolumeMode::ball(2e5);
+        let mut queued = VolumeMode::ball(2e5);
+        for (k, mode) in [&mut at_once, &mut queued].into_iter().enumerate() {
+            mode.begin_stroke();
+            for (i, d) in dabs.iter().enumerate() {
+                let (hit, _) = mode.raycast(*d * 3.0, -*d).unwrap();
+                if k == 0 {
+                    mode.brush_dab(hit, 0.08, 0.002, 0.8, 0.3, Brush::Trim);
+                } else {
+                    mode.queue_dab(hit, 0.08, 0.002, 0.8, 0.3, Brush::Trim);
+                    // Frames that keep up with only some of what is queued: a dab, or a frame's share.
+                    if i % 4 == 3 {
+                        assert_eq!(mode.run_dabs(0.0), 1);
+                    }
+                    if i == 40 {
+                        let before = mode.queued.len();
+                        let n = mode.run_frame_dabs();
+                        assert!(n >= 1 && n <= before);
+                    }
+                }
+            }
+            if k == 1 {
+                assert!(mode.dabs_queued(), "a burst leaves dabs for the next frames");
+            }
+            mode.end_stroke();
+            assert!(!mode.dabs_queued());
+            mode.settle();
+        }
+        same_field(&at_once.vol, &queued.vol, 0.0).unwrap();
     }
 
     /// At the app's scale (a ball of 1M triangles), how long a new stroke waits for the last one's work: after a big
