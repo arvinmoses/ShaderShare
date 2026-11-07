@@ -42,6 +42,7 @@ pub mod levels;
 pub mod mapping;
 pub mod place;
 pub mod refine;
+pub mod sculpt_layer;
 pub mod remesh;
 pub mod schedule;
 pub mod sdf;

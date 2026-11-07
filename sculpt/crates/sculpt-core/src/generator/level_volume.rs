@@ -1517,6 +1517,47 @@ impl LevelVolume {
         self.redo.clear();
     }
 
+    /// What names the last step in the history (and the next to redo): another record kept beside the history can
+    /// tell its steps by it. A step undone and redone gets a new name each time.
+    pub fn last_id(&self) -> Option<u64> {
+        self.history.last().map(|h| h.stamp())
+    }
+
+    pub fn redo_id(&self) -> Option<u64> {
+        self.redo.last().map(|h| h.stamp())
+    }
+
+    /// The field as it was before the last step in the history.
+    pub(crate) fn before_last(&self) -> Option<LevelVolume> {
+        let entry = self.history.last()?.clone();
+        let mut out = self.snapshot();
+        out.stroke = None;
+        out.swap_in(entry);
+        Some(out)
+    }
+
+    /// During a stroke, set block `bc` of level `l`'s samples outright (kept for undo as any change is).
+    pub fn set_block(&mut self, l: usize, bc: IVec3, s: Block) {
+        let k = (l as u8, bc);
+        self.keep(k);
+        if l == 0 {
+            self.inside0.remove(&bc);
+        }
+        self.blocks[l].insert(bc, Stored::from(s));
+        self.dirty.insert(k);
+    }
+
+    /// End a stroke as it is (none of [`Self::end_stroke`]'s work on the field): kept for undo, if it changed
+    /// anything. Returns whether it did.
+    pub fn end_stroke_plain(&mut self) -> bool {
+        if self.stroke.as_ref().is_none_or(|s| s.is_empty()) {
+            self.stroke = None;
+            return false;
+        }
+        self.keep_stroke();
+        true
+    }
+
 
     /// Block `bc` of level `l`'s 512 samples, stored or interpolated from coarser levels.
     pub(crate) fn block_values(&self, l: usize, bc: IVec3, base: bool) -> Block {

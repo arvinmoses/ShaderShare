@@ -16,6 +16,7 @@ use std::time::Instant;
 use crate::tools::Brush;
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
+use sculpt_core::generator::sculpt_layer::{SculptInfo, SculptLayers};
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::surface_noise::SurfaceNoise;
 use sculpt_core::generator::{BoolOp, Primitive};
@@ -64,6 +65,9 @@ struct Ahead {
     stroke_n: Vec3,
     target: Target,
     on_layer: bool,
+    sculpt: Option<SculptLayers>,
+    sculpt_take: Option<Option<usize>>,
+    sculpt_was: Option<SculptLayers>,
     /// Blocks either side changed since the copy was made: drawn again from the real state when it comes back.
     changed: std::collections::HashSet<Key>,
     /// The strokes as given, and how many of their events the real state has done.
@@ -82,6 +86,9 @@ impl Ahead {
         std::mem::swap(&mut self.stroke_n, &mut m.stroke_n);
         std::mem::swap(&mut self.target, &mut m.target);
         std::mem::swap(&mut self.on_layer, &mut m.on_layer);
+        std::mem::swap(&mut self.sculpt, &mut m.sculpt);
+        std::mem::swap(&mut self.sculpt_take, &mut m.sculpt_take);
+        std::mem::swap(&mut self.sculpt_was, &mut m.sculpt_was);
     }
 }
 
@@ -142,6 +149,17 @@ pub struct VolumeMode {
     pub target: Target,
     /// The stroke under way works on the detail layer (taken into it when it ends).
     on_layer: bool,
+    /// Sculpt layers (with no detail layer stack): what each layer's strokes changed, and its mask (see
+    /// `SculptLayers`). Strokes sculpt `vol` itself; a stroke's change goes into the active layer when it ends.
+    pub sculpt: Option<SculptLayers>,
+    /// The stroke under way, taken into the sculpt layers when it ends: on layer `Some(k)`, or the base (`None`).
+    sculpt_take: Option<Option<usize>>,
+    /// The sculpt layers as a mask stroke under way began.
+    sculpt_was: Option<SculptLayers>,
+    /// The sculpt layers as each step of `vol`'s history (named by `LevelVolume::last_id`) began, and as each step to
+    /// redo ended.
+    sculpt_undo: Vec<(u64, SculptLayers)>,
+    sculpt_redo: Vec<(u64, SculptLayers)>,
     /// The detail layer following the form, off the frame (see `Layered::follow_take`), and the end of a stroke on the
     /// form under it.
     follow_job: Option<Receiver<FollowDone>>,
@@ -247,6 +265,11 @@ impl VolumeMode {
             layer: None,
             target: Target::Detail,
             on_layer: false,
+            sculpt: None,
+            sculpt_take: None,
+            sculpt_was: None,
+            sculpt_undo: Vec::new(),
+            sculpt_redo: Vec::new(),
             follow_job: None,
             form_end: None,
             generation: 1,
@@ -378,13 +401,18 @@ impl VolumeMode {
     fn dab_now(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush) {
         let carve = brush == Brush::Trim;
         let t = Instant::now();
-        let target = self.layer.as_ref().map(|_| self.routed());
+        let target = (self.layer.is_some() || self.sculpt.is_some()).then(|| self.routed());
         // Smoothing a mask or the painted density is not a thing yet: Shift there does nothing.
         if brush == Brush::Smooth && matches!(target, Some(Target::Mask { .. } | Target::Density { .. })) {
             return;
         }
         if let (Some(Target::Mask { show }), Some(layer)) = (target, self.layer.as_mut()) {
             layer.paint_mask(&mut self.vol, at, radius, if show { 1.0 } else { 0.0 });
+            return;
+        }
+        if let (Some(Target::Mask { show }), Some(s)) = (target, self.sculpt.as_mut()) {
+            let k = s.active();
+            s.paint_mask(&mut self.vol, k, at, radius, if show { 1.0 } else { 0.0 });
             return;
         }
         if let (Some(Target::Density { more }), Some(layer)) = (target, self.layer.as_mut()) {
@@ -394,9 +422,17 @@ impl VolumeMode {
         if !self.chosen {
             self.level = self.level_for(radius, px);
             // The form is the levels under the layer's; the layer, its own.
-            match (target, self.layer.as_ref()) {
+            match (target, self.layer.as_mut()) {
                 (Some(Target::Form), Some(layer)) => self.level = self.level.min(layer.from() - 1),
-                (Some(Target::Detail), Some(layer)) => self.level = self.level.clamp(layer.from(), layer.level()),
+                // A layer's own resolution follows the work: a stroke finer than it raises it first.
+                (Some(Target::Detail), Some(layer)) => {
+                    self.level = self.level.max(layer.from());
+                    if self.level > layer.level() {
+                        let k = layer.active();
+                        layer.raise_level(&mut self.vol, k, self.level);
+                    }
+                    self.level = self.level.min(layer.level());
+                }
                 _ => {}
             }
             self.chosen = true;
@@ -481,6 +517,9 @@ impl VolumeMode {
             stroke_n: self.stroke_n,
             target: self.target,
             on_layer: self.on_layer,
+            sculpt: self.sculpt.clone(),
+            sculpt_take: self.sculpt_take,
+            sculpt_was: self.sculpt_was.clone(),
             changed: Default::default(),
             events: Vec::new(),
             done: 0,
@@ -670,6 +709,13 @@ impl VolumeMode {
 
     fn take_end(&mut self, done: EndDone) {
         let end = self.vol.end_stroke_apply(done);
+        if let Some(on) = self.sculpt_take.take()
+            && let Some(s) = self.sculpt.as_mut()
+        {
+            let was = s.clone();
+            s.take_stroke(&self.vol, on);
+            self.sculpt_kept(was);
+        }
         if std::mem::take(&mut self.on_layer)
             && let Some(layer) = self.layer.as_mut()
         {
@@ -795,6 +841,9 @@ impl VolumeMode {
             (Some(layer), Target::Mask { .. } | Target::Density { .. }) => layer.begin_edit(),
             (layer, _) => {
                 self.on_layer = layer.is_some();
+                if !self.on_layer && self.sculpt.is_some() {
+                    self.sculpt_begin(target, real);
+                }
                 self.vol.begin_stroke();
             }
         }
@@ -821,6 +870,13 @@ impl VolumeMode {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
         let target = self.routed();
+        if let Some(was) = self.sculpt_was.take() {
+            // A mask stroke: its change is all there is (none of a sculpting stroke's end).
+            if self.vol.end_stroke_plain() {
+                self.sculpt_kept(was);
+            }
+            return;
+        }
         match (self.layer.as_mut(), target) {
             (Some(layer), Target::Form) => {
                 // The form's end off the frame too; the layer's last follow comes after it (see `tick`).
@@ -1047,12 +1103,96 @@ impl VolumeMode {
     /// Move the work at levels `from` and finer into a detail layer over the rest (the form).
     pub fn make_layer(&mut self, from: usize) {
         self.settle();
+        // (Sculpt layers are kept apart from such a stack: they stay as they show, merged.)
+        self.merge_sculpt_layers();
         let from = from.clamp(1, self.vol.levels() - 1);
         let mut layer = Layered::new(&mut self.vol, from);
         // Dabs on the form only queue the layer's following: jobs off the frame do it.
         layer.deferred = true;
         self.layer = Some(layer);
         self.target = Target::Detail;
+    }
+
+    /// A new empty sculpt layer on top, made what strokes work on: it keeps what strokes on it change, at whatever
+    /// level they work, and fades by its mask. Over a detail layer stack (generators, surface noise), a detail layer.
+    pub fn new_sculpt_layer(&mut self) {
+        self.settle();
+        if let Some(from) = self.layer.as_ref().map(|l| l.from()) {
+            self.add_layer(from);
+            return;
+        }
+        let levels = self.vol.levels();
+        let s = self.sculpt.get_or_insert_with(SculptLayers::default);
+        let n = s.len();
+        s.add(&format!("Layer {}", n + 1), levels);
+        self.target = Target::Detail;
+    }
+
+    /// The sculpt layers, if any: the active one, and each.
+    pub fn sculpt_layers(&self) -> Option<(usize, Vec<SculptInfo>)> {
+        self.sculpt.as_ref().filter(|s| !s.is_empty()).map(|s| (s.active(), s.layers()))
+    }
+
+    /// Drop the sculpt layers' records: the volume stays as shown, one volume again.
+    pub fn merge_sculpt_layers(&mut self) {
+        self.settle();
+        self.sculpt = None;
+        self.sculpt_undo.clear();
+        self.sculpt_redo.clear();
+    }
+
+    pub fn rename_layer(&mut self, k: usize, name: &str) {
+        self.settle();
+        if let Some(layer) = self.layer.as_mut() {
+            layer.rename(k, name);
+        } else if let Some(s) = self.sculpt.as_mut() {
+            s.rename(k, name);
+        }
+    }
+
+    /// A stroke on the sculpt layers begins (before `vol`'s): what it is taken into when it ends; a mask stroke keeps
+    /// the layers as they were. A hidden layer sculpted on shows again first (a step of its own).
+    fn sculpt_begin(&mut self, target: Target, real: bool) {
+        let Some(s) = self.sculpt.as_ref() else { return };
+        self.sculpt_take = None;
+        self.sculpt_was = None;
+        match target {
+            Target::Mask { .. } if !s.is_empty() => self.sculpt_was = Some(s.clone()),
+            Target::Detail if !s.is_empty() => {
+                let k = s.active();
+                if real && !s.visible(k) {
+                    self.sculpt_step(|s, vol| s.set_visible(vol, k, true));
+                }
+                self.sculpt_take = Some(Some(k));
+            }
+            _ => self.sculpt_take = Some(None),
+        }
+    }
+
+    /// One step on the sculpt layers outside strokes (showing, hiding, a mask filled, a layer removed): one undo.
+    fn sculpt_step(&mut self, f: impl FnOnce(&mut SculptLayers, &mut LevelVolume)) {
+        let Some(s) = self.sculpt.as_mut() else { return };
+        let was = s.clone();
+        self.vol.begin_stroke();
+        f(s, &mut self.vol);
+        if self.vol.end_stroke_plain() {
+            self.sculpt_kept(was);
+        }
+    }
+
+    /// `vol` has just kept a step: the sculpt layers as it began go beside it, for undo.
+    fn sculpt_kept(&mut self, was: SculptLayers) {
+        // (On the copy run ahead, nothing is kept: the real state does it all again.)
+        if self.ahead.is_some() {
+            return;
+        }
+        if let Some(id) = self.vol.last_id() {
+            self.sculpt_undo.push((id, was));
+            self.sculpt_redo.clear();
+            if self.sculpt_undo.len() > 512 {
+                self.sculpt_undo.remove(0);
+            }
+        }
     }
 
     /// A new empty layer at `level` on top, made what strokes work on.
@@ -1069,6 +1209,8 @@ impl VolumeMode {
         self.settle();
         if let Some(layer) = self.layer.as_mut() {
             layer.remove_layer(&mut self.vol, k);
+        } else {
+            self.sculpt_step(|s, vol| s.remove(vol, k));
         }
     }
 
@@ -1076,6 +1218,8 @@ impl VolumeMode {
         self.settle();
         if let Some(layer) = self.layer.as_mut() {
             layer.set_visible(&mut self.vol, k, on);
+        } else {
+            self.sculpt_step(|s, vol| s.set_visible(vol, k, on));
         }
     }
 
@@ -1084,6 +1228,8 @@ impl VolumeMode {
         self.settle();
         if let Some(layer) = self.layer.as_mut() {
             layer.fill_mask(&mut self.vol, to);
+        } else if let Some(k) = self.sculpt.as_ref().map(|s| s.active()) {
+            self.sculpt_step(|s, vol| s.fill_mask(vol, k, to));
         }
     }
 
@@ -1099,6 +1245,8 @@ impl VolumeMode {
         self.settle();
         if let Some(layer) = self.layer.as_mut() {
             layer.set_active(k);
+        } else if let Some(s) = self.sculpt.as_mut() {
+            s.set_active(k);
         }
     }
 
@@ -1108,6 +1256,14 @@ impl VolumeMode {
         match &self.layer {
             Some(layer) => layer.write_to(w)?,
             None => self.vol.write_to(w)?,
+        }
+        // Sculpt layers after the volume, marked, their length first (a reader that knows none stops before them).
+        if let Some(s) = self.sculpt.as_ref().filter(|s| !s.is_empty() && self.layer.is_none()) {
+            let mut bytes = Vec::new();
+            s.write_to(&mut bytes)?;
+            w.write_all(b"SCLY")?;
+            w.write_all(&(bytes.len() as u64).to_le_bytes())?;
+            w.write_all(&bytes)?;
         }
         Ok(())
     }
@@ -1123,6 +1279,13 @@ impl VolumeMode {
         if let Some(mut layer) = layer {
             layer.deferred = true;
             mode.layer = Some(layer);
+        }
+        // (The layers' reader took the mark already.)
+        if mode.layer.is_none() && pos >= 4 && &bytes[pos - 4..pos] == b"SCLY" && bytes.len() >= pos + 8 {
+            let len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+            if let Some(mut data) = bytes.get(pos + 8..pos + 8 + len) {
+                mode.sculpt = Some(SculptLayers::read_from(&mut data)?);
+            }
         }
         // Surface noise as files before it was a layer kept it: after the layers, or in their place (its mark read
         // already, then). It becomes a layer.
@@ -1151,6 +1314,7 @@ impl VolumeMode {
     pub fn merge_layer(&mut self) {
         self.settle();
         self.layer = None;
+        self.merge_sculpt_layers();
         self.vol.clear_history();
     }
 
@@ -1159,7 +1323,19 @@ impl VolumeMode {
         self.stroke_n = Vec3::ZERO;
         match self.layer.as_mut() {
             Some(layer) => layer.undo(&mut self.vol),
-            None => self.vol.undo(),
+            None => {
+                let id = self.vol.last_id();
+                if !self.vol.undo() {
+                    return false;
+                }
+                if id.is_some() && self.sculpt_undo.last().map(|e| e.0) == id {
+                    let (_, was) = self.sculpt_undo.pop().unwrap();
+                    if let (Some(now), Some(back)) = (self.sculpt.replace(was), self.vol.redo_id()) {
+                        self.sculpt_redo.push((back, now));
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -1168,7 +1344,19 @@ impl VolumeMode {
         self.stroke_n = Vec3::ZERO;
         match self.layer.as_mut() {
             Some(layer) => layer.redo(&mut self.vol),
-            None => self.vol.redo(),
+            None => {
+                let id = self.vol.redo_id();
+                if !self.vol.redo() {
+                    return false;
+                }
+                if id.is_some() && self.sculpt_redo.last().map(|e| e.0) == id {
+                    let (_, then) = self.sculpt_redo.pop().unwrap();
+                    if let (Some(now), Some(back)) = (self.sculpt.replace(then), self.vol.last_id()) {
+                        self.sculpt_undo.push((back, now));
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -1362,6 +1550,78 @@ mod tests {
             mode.settle();
         }
         same_field(&at_once.vol, &queued.vol, 0.0).unwrap();
+    }
+
+    /// Whether two fields show one surface: no sample on the other side of it, and samples near it (within half
+    /// the band, where they are not clipped) within `tol` steps.
+    fn same_surface(a: &LevelVolume, b: &LevelVolume, tol: f32) -> Result<(), String> {
+        let mut keys = a.keys();
+        keys.extend(b.keys());
+        for (l, bc) in keys {
+            let l = l as usize;
+            let half = 0.5 * a.band(l);
+            for q in 0..512 {
+                let i = bc * 8 + glam::IVec3::new(q & 7, (q >> 3) & 7, q >> 6);
+                let (x, y) = (a.sample(l, i, false), b.sample(l, i, false));
+                let flip = (x < 0.0) != (y < 0.0) && x.abs().max(y.abs()) > 1e-4 * a.voxel(l);
+                if flip || ((x.abs() < half || y.abs() < half) && (x - y).abs() > tol * a.voxel(l)) {
+                    return Err(format!("level {l} block {bc:?} cell {q}: {x} against {y}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sculpt layers through the app: a stroke on a layer and one on the base beside it; hiding the layer leaves the
+    /// base's alone; undo and redo step the layers with the volume; a mask stroke and Show all; saved and read back.
+    #[test]
+    fn sculpt_layers_hide_undo_mask_save() {
+        let stroke = |mode: &mut VolumeMode, x: f32, r: f32| {
+            mode.begin_stroke();
+            for k in 0..12 {
+                let d = Vec3::new(x + 0.01 * k as f32, 0.05, 1.0).normalize();
+                let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
+                mode.brush_dab(hit, r, 0.002, 0.8, 0.3, Brush::Clay);
+            }
+            mode.end_stroke();
+            mode.settle();
+        };
+        let mut mode = VolumeMode::ball(2e5);
+        let mut base_only = VolumeMode::ball(2e5);
+        mode.new_sculpt_layer();
+        stroke(&mut mode, -0.3, 0.08);
+        mode.target = Target::Form;
+        stroke(&mut mode, 0.3, 0.08);
+        base_only.target = Target::Form;
+        stroke(&mut base_only, 0.3, 0.08);
+        let both = mode.vol.preview_copy();
+        assert!(mode.sculpt_layers().unwrap().1[0].blocks > 0);
+
+        mode.set_layer_visible(0, false);
+        same_surface(&mode.vol, &base_only.vol, 0.02).unwrap();
+        assert!(mode.undo());
+        same_field(&mode.vol, &both, 0.0).unwrap();
+        assert!(mode.sculpt_layers().unwrap().1[0].visible);
+        assert!(mode.redo());
+        assert!(!mode.sculpt_layers().unwrap().1[0].visible);
+        same_surface(&mode.vol, &base_only.vol, 0.02).unwrap();
+        assert!(mode.undo());
+
+        // Hidden by a mask stroke over it, then shown everywhere again.
+        mode.target = Target::Mask { show: false };
+        stroke(&mut mode, -0.3, 0.2);
+        assert!(same_surface(&mode.vol, &both, 0.02).is_err(), "the mask stroke hides some of the layer");
+        mode.fill_mask(1.0);
+        same_surface(&mode.vol, &both, 0.02).unwrap();
+        assert!(mode.undo() && mode.undo());
+        same_field(&mode.vol, &both, 0.0).unwrap();
+
+        let mut bytes = Vec::new();
+        mode.write_to(&mut bytes).unwrap();
+        let mut back = VolumeMode::read_from(&mut &bytes[..]).unwrap();
+        assert_eq!(back.sculpt_layers().map(|s| s.1[0].blocks), mode.sculpt_layers().map(|s| s.1[0].blocks));
+        back.set_layer_visible(0, false);
+        same_surface(&back.vol, &base_only.vol, 0.02).unwrap();
     }
 
     /// At the app's scale (a ball of 1M triangles), how long a new stroke waits for the last one's work: after a big

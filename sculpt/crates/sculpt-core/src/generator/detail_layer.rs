@@ -2248,6 +2248,12 @@ impl Layered {
         self.compose(shown, &changes);
     }
 
+    /// Forget the layers' undo steps (a stack just made, its first steps not worth undoing one by one).
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.redo.clear();
+    }
+
     pub fn rename(&mut self, k: usize, name: &str) {
         if let Some(x) = self.stack.get_mut(k) {
             x.name = name.to_string();
@@ -2270,6 +2276,19 @@ impl Layered {
     /// Hold layer `k` at another level: finer keeps its detail on a denser lattice; coarser keeps what that lattice
     /// can hold (averaged over each new step).
     pub fn set_level(&mut self, shown: &mut LevelVolume, k: usize, level: usize) {
+        self.set_level_as(shown, k, level, true);
+    }
+
+    /// Raise height layer `k` to the finer `level` for a stroke about to work there, with no undo step of its own:
+    /// the heights are resampled finer (the same surface, within the resampling), and the stroke's own step,
+    /// undone, leaves them so. A layer starts coarse and cheap and gains resolution where work needs it.
+    pub fn raise_level(&mut self, shown: &mut LevelVolume, k: usize, level: usize) {
+        if self.stack.get(k).is_some_and(|x| x.scatter.is_none() && x.noise.is_none() && x.level < level) {
+            self.set_level_as(shown, k, level, false);
+        }
+    }
+
+    fn set_level_as(&mut self, shown: &mut LevelVolume, k: usize, level: usize, history: bool) {
         self.base_epoch += 1;
         if self.stack.get(k).is_some_and(|x| x.noise.is_some()) {
             return;
@@ -2295,8 +2314,10 @@ impl Layered {
         if old.level == level {
             return;
         }
-        self.history.push(Undo::Layers(self.stack.clone(), self.active));
-        self.redo.clear();
+        if history {
+            self.history.push(Undo::Layers(self.stack.clone(), self.active));
+            self.redo.clear();
+        }
         let mut targets: HashSet<IVec3> = HashSet::default();
         for bc in old.h.keys() {
             if level > old.level {
@@ -3266,7 +3287,7 @@ impl Layered {
         }
         let bad = |m: &str| Error::new(ErrorKind::InvalidData, m.to_string());
         // A section after the volume that is not ours (the app's surface noise): no layers; the caller reads on.
-        if &magic == b"SNOI" {
+        if &magic == b"SNOI" || &magic == b"SCLY" {
             return Ok((form, None));
         }
         if &magic != b"SLAY" {

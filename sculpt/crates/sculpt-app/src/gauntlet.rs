@@ -18,10 +18,12 @@ struct Line {
     to: (f32, f32),
     passes: usize,
     per_frame: usize,
+    /// On a scene with a sculpt layer: whether the stroke works on the form under it rather than the layer.
+    form: bool,
 }
 
 fn line(brush: Brush, r: f32, px: f32, from: (f32, f32), to: (f32, f32)) -> Line {
-    Line { brush, r, px, from, to, passes: 1, per_frame: 2 }
+    Line { brush, r, px, from, to, passes: 1, per_frame: 2, form: false }
 }
 
 /// Clay rows across the patch, close (level 4): five rows, two passes each, a little apart.
@@ -39,48 +41,64 @@ struct Scene {
     /// What is scored: a square of this half-width on the patch.
     half: f32,
     lines: Vec<Line>,
+    /// Strokes on a new sculpt layer (see `VolumeMode::new_sculpt_layer`) rather than on the volume.
+    layer: bool,
 }
 
 fn scenes() -> Vec<Scene> {
     let mut out = Vec::new();
     let mut l = Vec::new();
     rows(&mut l, 0.016, 0.0004);
-    out.push(Scene { name: "clay_close_rows", half: 0.08, lines: l });
+    out.push(Scene { layer: false, name: "clay_close_rows", half: 0.08, lines: l });
     let mut l = Vec::new();
     rows(&mut l, 0.016, 0.0004);
     for k in 0..3 {
         let x = -0.03 + 0.03 * k as f32;
         l.push(line(Brush::Clay, 0.016, 0.0004, (x, -0.05), (x + 0.005, 0.05)));
     }
-    out.push(Scene { name: "clay_close_crossed", half: 0.08, lines: l });
-    out.push(Scene { name: "clay_close_scrubbed", half: 0.06, lines: vec![Line { passes: 6, ..line(Brush::Clay, 0.016, 0.0004, (-0.04, 0.0), (0.04, 0.005)) }] });
-    out.push(Scene { name: "clay_very_close", half: 0.03, lines: (0..3).map(|k| line(Brush::Clay, 0.008, 0.0002, (-0.02, -0.008 + 0.008 * k as f32), (0.02, -0.006 + 0.008 * k as f32))).collect() });
-    out.push(Scene { name: "clay_mid_crossed", half: 0.2, lines: vec![line(Brush::Clay, 0.08, 0.0015, (-0.15, -0.03), (0.15, 0.03)), line(Brush::Clay, 0.08, 0.0015, (-0.03, -0.15), (0.03, 0.15))] });
-    out.push(Scene { name: "clay_far_single", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1))] });
-    out.push(Scene { name: "clay_far_crossed", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1)), line(Brush::Clay, 0.25, 0.003, (-0.1, -0.4), (0.1, 0.4))] });
-    out.push(Scene { name: "trim_close_fresh", half: 0.08, lines: vec![line(Brush::Trim, 0.038, 0.000476, (-0.07, 0.0), (0.07, 0.01)), line(Brush::Trim, 0.03, 0.000476, (-0.03, -0.05), (0.0, 0.06))] });
+    out.push(Scene { layer: false, name: "clay_close_crossed", half: 0.08, lines: l });
+    out.push(Scene { layer: false, name: "clay_close_scrubbed", half: 0.06, lines: vec![Line { passes: 6, ..line(Brush::Clay, 0.016, 0.0004, (-0.04, 0.0), (0.04, 0.005)) }] });
+    out.push(Scene { layer: false, name: "clay_very_close", half: 0.03, lines: (0..3).map(|k| line(Brush::Clay, 0.008, 0.0002, (-0.02, -0.008 + 0.008 * k as f32), (0.02, -0.006 + 0.008 * k as f32))).collect() });
+    out.push(Scene { layer: false, name: "clay_mid_crossed", half: 0.2, lines: vec![line(Brush::Clay, 0.08, 0.0015, (-0.15, -0.03), (0.15, 0.03)), line(Brush::Clay, 0.08, 0.0015, (-0.03, -0.15), (0.03, 0.15))] });
+    out.push(Scene { layer: false, name: "clay_far_single", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1))] });
+    out.push(Scene { layer: false, name: "clay_far_crossed", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1)), line(Brush::Clay, 0.25, 0.003, (-0.1, -0.4), (0.1, 0.4))] });
+    out.push(Scene { layer: false, name: "trim_close_fresh", half: 0.08, lines: vec![line(Brush::Trim, 0.038, 0.000476, (-0.07, 0.0), (0.07, 0.01)), line(Brush::Trim, 0.03, 0.000476, (-0.03, -0.05), (0.0, 0.06))] });
     let mut l = Vec::new();
     rows(&mut l, 0.016, 0.0004);
     l.push(line(Brush::Trim, 0.02, 0.0004, (-0.07, -0.01), (0.07, 0.0)));
     l.push(line(Brush::Trim, 0.02, 0.0004, (0.0, -0.05), (0.01, 0.05)));
-    out.push(Scene { name: "trim_close_over_rows", half: 0.08, lines: l });
+    out.push(Scene { layer: false, name: "trim_close_over_rows", half: 0.08, lines: l });
     let mut l = Vec::new();
     rows(&mut l, 0.016, 0.0004);
     l.push(line(Brush::Trim, 0.038, 0.000476, (-0.07, 0.0), (0.07, 0.01)));
     l.push(line(Brush::Trim, 0.03, 0.000476, (-0.03, -0.05), (0.0, 0.06)));
-    out.push(Scene { name: "trim_coarser_over_rows", half: 0.08, lines: l });
+    out.push(Scene { layer: false, name: "trim_coarser_over_rows", half: 0.08, lines: l });
     let mut l = Vec::new();
     rows(&mut l, 0.016, 0.0004);
     l.push(Line { passes: 2, ..line(Brush::Smooth, 0.02, 0.0004, (-0.07, -0.01), (0.07, 0.0)) });
-    out.push(Scene { name: "smooth_close_over_rows", half: 0.08, lines: l });
-    out.push(Scene { name: "smooth_far_over_clay", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1)), Line { passes: 2, ..line(Brush::Smooth, 0.25, 0.003, (-0.4, 0.05), (0.4, -0.05)) }] });
+    out.push(Scene { layer: false, name: "smooth_close_over_rows", half: 0.08, lines: l });
+    out.push(Scene { layer: false, name: "smooth_far_over_clay", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1)), Line { passes: 2, ..line(Brush::Smooth, 0.25, 0.003, (-0.4, 0.05), (0.4, -0.05)) }] });
     let mut l = Vec::new();
     rows(&mut l, 0.016, 0.0004);
     for x in &mut l {
         x.per_frame = 8;
     }
     l.push(Line { per_frame: 8, ..line(Brush::Trim, 0.038, 0.000476, (-0.07, 0.0), (0.07, 0.01)) });
-    out.push(Scene { name: "fast_drags", half: 0.08, lines: l });
+    out.push(Scene { layer: false, name: "fast_drags", half: 0.08, lines: l });
+    // On a sculpt layer: close rows, big strokes, and the form moved under the rows by a big stroke.
+    let mut l = Vec::new();
+    rows(&mut l, 0.016, 0.0004);
+    out.push(Scene { layer: true, name: "layer_clay_close_rows", half: 0.08, lines: l });
+    out.push(Scene { layer: true, name: "layer_clay_far_crossed", half: 0.45, lines: vec![line(Brush::Clay, 0.25, 0.003, (-0.4, -0.1), (0.4, 0.1)), line(Brush::Clay, 0.25, 0.003, (-0.1, -0.4), (0.1, 0.4))] });
+    let mut l = Vec::new();
+    rows(&mut l, 0.016, 0.0004);
+    l.push(line(Brush::Clay, 0.25, 0.003, (-0.4, -0.05), (0.4, 0.05)));
+    l.push(line(Brush::Trim, 0.038, 0.000476, (-0.07, 0.0), (0.07, 0.01)));
+    out.push(Scene { layer: true, name: "layer_rows_then_big", half: 0.08, lines: l });
+    let mut l = Vec::new();
+    rows(&mut l, 0.016, 0.0004);
+    l.push(Line { form: true, ..line(Brush::Clay, 0.25, 0.003, (-0.4, -0.05), (0.4, 0.05)) });
+    out.push(Scene { layer: true, name: "layer_form_under_rows", half: 0.08, lines: l });
     out
 }
 
@@ -134,6 +152,9 @@ fn phantoms(v: &LevelVolume, l: usize) -> usize {
 
 fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
     let mut mode = VolumeMode::ball(1e6);
+    if scene.layer {
+        mode.new_sculpt_layer();
+    }
     let centre = Vec3::new(0.3, -0.05, 0.95).normalize();
     let (t1, t2) = (Vec3::Y.cross(centre).normalize(), centre.cross(Vec3::Y.cross(centre).normalize()));
     let mut s = Scores::default();
@@ -141,6 +162,9 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
     for ln in &scene.lines {
         let (pa, pb) = (centre + t1 * ln.from.0 + t2 * ln.from.1, centre + t1 * ln.to.0 + t2 * ln.to.1);
         let steps = ((pa - pb).length() / (0.15 * ln.r)).ceil() as usize;
+        if scene.layer {
+            mode.target = if ln.form { Target::Form } else { Target::Detail };
+        }
         mode.begin_stroke();
         let mut n = 0;
         for pass in 0..ln.passes {

@@ -68,7 +68,16 @@ pub(crate) fn prop<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) 
 fn target_text(app: &SculptApp) -> (String, Color32) {
     let m = &app.volume;
     let ui = &app.theme.ui;
-    let Some(layer) = m.layer.as_ref() else { return ("Strokes edit the volume".into(), ui.accent.0) };
+    let Some(layer) = m.layer.as_ref() else {
+        let Some((active, layers)) = m.sculpt_layers() else { return ("Strokes edit the volume".into(), ui.accent.0) };
+        let name = layers.get(active).map_or(String::new(), |l| l.name.clone());
+        return match m.target {
+            Target::Form => ("Strokes edit the base (under every layer)".into(), ui.accent.0),
+            Target::Mask { show: false } => (format!("Strokes hide {name} (its mask)"), ui.target_mask()),
+            Target::Mask { show: true } => (format!("Strokes show {name} again (its mask)"), ui.target_mask()),
+            _ => (format!("Strokes edit {name}"), ui.target_delta()),
+        };
+    };
     let name = layer.layers().get(layer.active()).map_or(String::new(), |l| l.name.clone());
     match m.routed() {
         // A generator or noise layer holds no sculpting: strokes go to the form under it.
@@ -168,6 +177,7 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
     });
 }
 
+const SCULPT_HOVER: &str = "An empty layer on top to sculpt on, at full brush speed and any detail: it keeps what its strokes change, and its mask (paint Hide and Show) fades that anywhere. Sculpting the base under it does not carry it along.";
 const NOISE_HOVER: &str = "A layer of noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Its mask fades it. Brushes work on the surface under it.";
 const GENERATOR_HOVER: &str = "A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with. Its settings are under Properties; sculpting the form carries it along.";
 
@@ -175,6 +185,10 @@ const GENERATOR_HOVER: &str = "A layer that scatters a primitive over the form a
 fn volume_menu(app: &mut SculptApp, ui: &mut Ui) {
     let m = &mut app.volume;
     let top = m.vol.levels() - 1;
+    if ui.button("New sculpt layer").on_hover_text(SCULPT_HOVER).clicked() {
+        m.new_sculpt_layer();
+        ui.close();
+    }
     if ui.button("New generator layer").on_hover_text(GENERATOR_HOVER).clicked() {
         m.add_generator();
         ui.close();
@@ -184,6 +198,12 @@ fn volume_menu(app: &mut SculptApp, ui: &mut Ui) {
         ui.close();
     }
     match m.layer.as_ref().map(|l| l.from()) {
+        None if m.sculpt_layers().is_some() => {
+            if ui.button("Merge the layers").on_hover_text("One volume again, as shown. Undo starts afresh.").clicked() {
+                m.merge_layer();
+                ui.close();
+            }
+        }
         None => {
             ui.menu_button("Move detail to a layer", |ui| {
                 ui.label(RichText::new("The work at this level and finer goes into a detail layer over the form.").small());
@@ -195,15 +215,7 @@ fn volume_menu(app: &mut SculptApp, ui: &mut Ui) {
                 }
             });
         }
-        Some(from) => {
-            ui.menu_button("New detail layer", |ui| {
-                for l in from..=top {
-                    if ui.button(format!("At level {l}  (step {:.5})", m.vol.voxel(l))).clicked() {
-                        m.add_layer(l);
-                        ui.close();
-                    }
-                }
-            });
+        Some(_) => {
             if ui.button("Merge the layers into the form").on_hover_text("One volume again, as shown. Undo starts afresh.").clicked() {
                 m.merge_layer();
                 ui.close();
@@ -438,6 +450,51 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.y = 0.0;
         let m = &app.volume;
         match m.layer.as_ref() {
+            None if m.sculpt_layers().is_some() => {
+                let (active, layers) = m.sculpt_layers().unwrap();
+                for k in (0..layers.len()).rev() {
+                    let info = &layers[k];
+                    let selected = active == k && m.target != Target::Form;
+                    let bar = if matches!(m.target, Target::Mask { .. }) { mask } else { detail };
+                    let (resp, mut row) = row_frame(ui, app, 0.0, selected, bar);
+                    if icon_button(&mut row, if info.visible { Icon::Eye } else { Icon::EyeOff }, 20.0, false, "Show or hide this layer").clicked() {
+                        act.visible = Some((k, !info.visible));
+                    }
+                    let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    Icon::Paint.paint(row.painter(), r, row.visuals().text_color());
+                    let name = RichText::new(&info.name);
+                    row.label(if info.visible { name } else { name.color(weak) });
+                    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, Icon::Trash, 20.0, false, "Remove this layer and what it shows (undo brings it back)").clicked() {
+                            act.remove = Some(k);
+                        }
+                        ui.label(RichText::new(format!("{} blocks", fmt_count(info.blocks))).size(fs * 0.85).color(weak));
+                    });
+                    if resp.clicked() {
+                        act.select = Some(k);
+                    }
+                    if active == k {
+                        let (_, mut row) = row_frame(ui, app, 26.0, false, mask);
+                        let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                        Icon::Mask.paint(row.painter(), r, mask);
+                        for (show, label, hover) in [(false, "Hide", "Strokes hide this layer where they go."), (true, "Show", "Strokes show it again.")] {
+                            if row.selectable_label(m.target == Target::Mask { show }, label).on_hover_text(hover).clicked() {
+                                act.target = Some(Target::Mask { show });
+                            }
+                        }
+                    }
+                }
+                let (resp, mut row) = row_frame(ui, app, 0.0, m.target == Target::Form, accent);
+                row.add_space(24.0);
+                let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                Icon::Base.paint(row.painter(), r, app.theme.viewport.clay.0);
+                row.label("Base");
+                if resp.clicked() {
+                    act.target = Some(Target::Form);
+                }
+                ui.add_space(8.0);
+                note(ui, "Each layer keeps what its strokes change, at any detail; its mask fades it. Sculpting where a layer is hidden shows it there again. The base is what no layer holds.", weak);
+            }
             None => {
                 let (_, mut row) = row_frame(ui, app, 0.0, true, accent);
                 let (r, _) = row.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
@@ -445,7 +502,7 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                 row.label("Volume");
                 row.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format!("{} levels", m.vol.levels())).size(fs * 0.85).color(weak)));
                 ui.add_space(8.0);
-                note(ui, "One volume: strokes work on all of it. Add a generator or surface noise layer, or move the finer detail to a layer, to work in layers.", weak);
+                note(ui, "One volume: strokes work on all of it. + Layer adds a sculpt layer (maskable, its resolution growing with the work on it), a generator or surface noise.", weak);
             }
             Some(layer) => {
                 let (active, layers) = (layer.active(), layer.layers());
@@ -564,6 +621,52 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
     let m = &mut app.volume;
     let top = m.vol.levels() - 1;
     let level_text = |m: &VolumeMode, l: usize| format!("level {l}  (step {:.5})", m.vol.voxel(l));
+    if m.layer.is_none()
+        && m.target != Target::Form
+        && let Some((k, layers)) = m.sculpt_layers()
+    {
+        let Some(info) = layers.get(k).cloned() else { return };
+        let (mut rename, mut visible, mut fill) = (None, None, None);
+        section(ui, fs, "layer", "SCULPT LAYER", |ui| {
+            let id = ui.id().with(("layer_name", k));
+            let mut name = ui.data(|d| d.get_temp::<String>(id)).unwrap_or(info.name.clone());
+            let r = prop(ui, "Name", |ui| ui.text_edit_singleline(&mut name));
+            if r.lost_focus() {
+                ui.data_mut(|d| d.remove_temp::<String>(id));
+                if name != info.name && !name.trim().is_empty() {
+                    rename = Some(name);
+                }
+            } else if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(id, name));
+            }
+            let mut on = info.visible;
+            if prop(ui, "", |ui| ui.checkbox(&mut on, "Visible")).changed() {
+                visible = Some(on);
+            }
+            prop(ui, "Blocks", |ui| ui.label(fmt_count(info.blocks)));
+            prop(ui, "Mask", |ui| {
+                if ui.button("Hide all").on_hover_text("Hide this layer everywhere, then paint it in where wanted. One undo.").clicked() {
+                    fill = Some(0.0);
+                }
+                if ui.button("Show all").on_hover_text("Clear this layer's mask: it shows everywhere again. One undo.").clicked() {
+                    fill = Some(1.0);
+                }
+            });
+        });
+        if let Some(name) = rename {
+            m.rename_layer(k, &name);
+        }
+        if let Some(on) = visible {
+            m.set_layer_visible(k, on);
+        }
+        if let Some(to) = fill {
+            m.fill_mask(to);
+            if to < 1.0 {
+                m.target = Target::Mask { show: true };
+            }
+        }
+        return;
+    }
     let Some(layer) = m.layer.as_ref() else {
         section(ui, fs, "volume", "VOLUME", |ui| {
             let (counts, bytes) = m.vol.memory();
