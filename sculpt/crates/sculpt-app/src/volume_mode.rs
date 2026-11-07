@@ -16,7 +16,7 @@ use std::time::Instant;
 use crate::tools::Brush;
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
-use sculpt_core::generator::sculpt_layer::{MaskInfo, MaskKind, SculptInfo, SculptLayers};
+use sculpt_core::generator::sculpt_layer::{LayerBlend, MaskInfo, MaskKind, SculptInfo, SculptLayers};
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::surface_noise::SurfaceNoise;
 use sculpt_core::generator::{BoolOp, Primitive};
@@ -1269,6 +1269,11 @@ impl VolumeMode {
         self.sculpt_edit(|s, vol| s.set_opacity(vol, k, opacity));
     }
 
+    /// Set how sculpt layer `k`'s strokes show (one undo).
+    pub fn set_layer_blend(&mut self, k: usize, blend: LayerBlend) {
+        self.sculpt_step(|s, vol| s.set_blend(vol, k, blend));
+    }
+
     /// Whether sculpt layer `k` is small enough for a slider to move it every frame (else it moves when let go).
     pub fn live_edits(&self, k: usize) -> bool {
         self.sculpt.as_ref().and_then(|s| s.layers().get(k).map(|x| x.blocks)).is_none_or(|n| n <= LIVE_BLOCKS)
@@ -1766,6 +1771,11 @@ mod tests {
         assert!(mode.undo() && mode.undo() && mode.undo() && mode.undo());
         same_field(&mode.vol, &both, 0.0).unwrap();
         assert_eq!(mode.sculpt_layers().unwrap().1[0].opacity, 1.0);
+        // A blend is one undo.
+        mode.set_layer_blend(0, LayerBlend::Subtract);
+        assert!(same_surface(&mode.vol, &both, 0.02).is_err(), "the turned layer differs");
+        assert!(mode.undo());
+        same_field(&mode.vol, &both, 0.0).unwrap();
 
         let mut bytes = Vec::new();
         mode.write_to(&mut bytes).unwrap();

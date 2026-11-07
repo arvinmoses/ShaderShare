@@ -4,7 +4,9 @@
 //! * **What is shown is the truth.** Strokes on a layer sculpt the volume itself, at full speed and at whatever level
 //!   the brush picks. When one ends, the layer takes the stroke's change (the field after it less the field before,
 //!   block by block, at every level it reached) into its own: `shown = base + Σ w Δ`, `w` the layer's weight (0 to 1):
-//!   its opacity times its masks, 0 where it is hidden.
+//!   its opacity (up to 2, exaggerated) times its masks, 0 where it is hidden.
+//! * **A layer's blend** shapes what shows of its change: as sculpted, turned over, only its raises, or only its
+//!   carves. Strokes on it move what shows by what they did, as far as the blend shows it; the rest is the base's.
 //! * **Masks** stack as in a paint program: each is painted (starting from a fill) or noise, blended onto what is
 //!   under it (multiply, add, subtract, ...) at its own opacity, starting from white. Any change to a layer's weight
 //!   moves the volume by the change times `Δ`, only where the layer holds any.
@@ -209,6 +211,60 @@ fn set_paint(m: &mut Shared<IVec3, Stored>, fill: f32, bc: IVec3, v: Box<[f32; N
     }
 }
 
+/// How a layer's change shows (the field is a distance: below 0 is inside, so raising makes it smaller).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerBlend {
+    /// As sculpted.
+    #[default]
+    Add,
+    /// Turned over: what was raised is carved, and what was carved is raised.
+    Subtract,
+    /// Only what the layer raises shows.
+    Raise,
+    /// Only what the layer carves shows.
+    Carve,
+}
+
+impl LayerBlend {
+    pub const ALL: [LayerBlend; 4] = [LayerBlend::Add, LayerBlend::Subtract, LayerBlend::Raise, LayerBlend::Carve];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LayerBlend::Add => "Add",
+            LayerBlend::Subtract => "Subtract",
+            LayerBlend::Raise => "Raise only",
+            LayerBlend::Carve => "Carve only",
+        }
+    }
+
+    /// What shows of a held change `d` (unweighted).
+    fn shape(self, d: f32) -> f32 {
+        match self {
+            LayerBlend::Add => d,
+            LayerBlend::Subtract => -d,
+            LayerBlend::Raise => d.min(0.0),
+            LayerBlend::Carve => d.max(0.0),
+        }
+    }
+
+    /// What shows, kept within what this blend can show.
+    fn clip(self, s: f32) -> f32 {
+        match self {
+            LayerBlend::Raise => s.min(0.0),
+            LayerBlend::Carve => s.max(0.0),
+            _ => s,
+        }
+    }
+
+    /// A change to hold that shows `s` (a value `clip` keeps).
+    fn unshape(self, s: f32) -> f32 {
+        if self == LayerBlend::Subtract { -s } else { s }
+    }
+}
+
+/// The most a layer's opacity goes to: over 1 it shows its change exaggerated.
+pub const MAX_OPACITY: f32 = 2.0;
+
 /// How much of a stroke's change a layer at weight `w` takes, unweighted (`w` times it is what shows of it).
 fn gain(w: f32) -> f32 {
     if w <= 0.0 { 0.0 } else { w / (w.max(LOW) * w.max(LOW)) }
@@ -219,6 +275,7 @@ pub struct SculptLayer {
     pub name: String,
     pub visible: bool,
     opacity: f32,
+    blend: LayerBlend,
     /// Per level, the change the layer's strokes made, per block.
     d: Vec<Shared<IVec3, Stored>>,
     /// Bottom first.
@@ -228,7 +285,7 @@ pub struct SculptLayer {
 
 impl SculptLayer {
     fn new(name: &str, levels: usize) -> SculptLayer {
-        SculptLayer { name: name.to_string(), visible: true, opacity: 1.0, d: vec![Shared::default(); levels], masks: Vec::new(), active_mask: None }
+        SculptLayer { name: name.to_string(), visible: true, opacity: 1.0, blend: LayerBlend::Add, d: vec![Shared::default(); levels], masks: Vec::new(), active_mask: None }
     }
 
     fn fit(&mut self, levels: usize) {
@@ -331,7 +388,7 @@ impl SculptLayer {
                 Some(d) => {
                     let w = self.weight(frame, l, bc);
                     for i in 0..N {
-                        out[i] = b[i] - w[i] * d[i];
+                        out[i] = b[i] - w[i] * self.blend.shape(d[i]);
                     }
                 }
                 None => out.copy_from_slice(&b[..]),
@@ -388,7 +445,7 @@ impl SculptLayer {
         for i in 0..N {
             let shown = with[i] - without[i];
             // Stored unweighted, as every change is; where the layer barely shows, as the coarser levels hold it.
-            d[i] = if w[i] > 0.01 { shown / w[i] } else { self.d_value_at(l - 1, (bc * B + cell(i)).as_vec3() * 0.5) };
+            d[i] = if w[i] > 0.01 { self.blend.unshape(self.blend.clip(shown / w[i])) } else { self.d_value_at(l - 1, (bc * B + cell(i)).as_vec3() * 0.5) };
         }
         self.d[l].insert(bc, Stored::from(d));
     }
@@ -417,6 +474,7 @@ pub struct SculptInfo {
     pub name: String,
     pub visible: bool,
     pub opacity: f32,
+    pub blend: LayerBlend,
     pub blocks: usize,
     /// Bottom first.
     pub masks: Vec<MaskInfo>,
@@ -446,6 +504,7 @@ impl SculptLayers {
                 name: x.name.clone(),
                 visible: x.visible,
                 opacity: x.opacity,
+                blend: x.blend,
                 blocks: x.blocks(),
                 masks: x.masks.iter().map(|m| m.info()).collect(),
                 active_mask: x.active_mask,
@@ -507,6 +566,7 @@ impl SculptLayers {
         // A block the volume does not hold follows the coarser levels, moved already.
         keys.retain(|&(l, bc)| l == 0 || vol.exists(l as usize, bc));
         let w0: Vec<Box<[f32; N]>> = keys.par_iter().map(|&(l, bc)| layer.weight(&frame, l as usize, bc)).collect();
+        let was = layer.blend;
         edit(layer);
         let (layer, read) = (&*layer, &*vol);
         let moved: Vec<(usize, IVec3, Box<[f32; N]>)> = keys
@@ -516,12 +576,12 @@ impl SculptLayers {
                 let l = l8 as usize;
                 let d = layer.d[l].get(&bc)?;
                 let b = layer.weight(&frame, l, bc);
-                if b == *a {
+                if b == *a && layer.blend == was {
                     return None;
                 }
                 let mut v = read.block_values(l, bc, false);
                 for i in 0..N {
-                    v[i] += (b[i] - a[i]) * d[i];
+                    v[i] += b[i] * layer.blend.shape(d[i]) - a[i] * was.shape(d[i]);
                 }
                 Some((l, bc, v))
             })
@@ -574,9 +634,16 @@ impl SculptLayers {
                 Some(od) => Box::new(**od),
                 None => Box::new([0.0; N]),
             };
+            let blend = layer.blend;
             for i in 0..N {
                 if d[i] != 0.0 {
-                    nd[i] += d[i] * gain(w[i]);
+                    // What shows of it moves by the stroke's share, as far as the blend shows it (the rest is the
+                    // base's); where that is nothing, the held change stays.
+                    let was = blend.shape(nd[i]);
+                    let to = blend.clip(was + d[i] * gain(w[i]));
+                    if to != was {
+                        nd[i] = blend.unshape(to);
+                    }
                 }
             }
             layer.d[l].insert(bc, Stored::from(nd));
@@ -591,9 +658,17 @@ impl SculptLayers {
         self.reweigh(vol, k, None, |x| x.visible = on);
     }
 
+    /// Set how layer `k`'s change shows (inside a stroke of `vol`).
+    pub fn set_blend(&mut self, vol: &mut LevelVolume, k: usize, blend: LayerBlend) {
+        if self.stack.get(k).is_none_or(|x| x.blend == blend) {
+            return;
+        }
+        self.reweigh(vol, k, None, |x| x.blend = blend);
+    }
+
     /// Set layer `k`'s opacity (inside a stroke of `vol`).
     pub fn set_opacity(&mut self, vol: &mut LevelVolume, k: usize, opacity: f32) {
-        let opacity = opacity.clamp(0.0, 1.0);
+        let opacity = opacity.clamp(0.0, MAX_OPACITY);
         if self.stack.get(k).is_none_or(|x| x.opacity == opacity) {
             return;
         }
@@ -822,7 +897,7 @@ impl SculptLayers {
             }
             Ok(())
         };
-        u32w(w, V2)?;
+        u32w(w, V3)?;
         u32w(w, self.stack.len() as u32)?;
         u32w(w, self.active as u32)?;
         for x in &self.stack {
@@ -830,6 +905,7 @@ impl SculptLayers {
             w.write_all(x.name.as_bytes())?;
             w.write_all(&[x.visible as u8])?;
             f32w(w, x.opacity)?;
+            w.write_all(&[LayerBlend::ALL.iter().position(|&b| b == x.blend).unwrap_or(0) as u8])?;
             u32w(w, x.d.len() as u32)?;
             maps(w, &x.d)?;
             u32w(w, x.masks.len() as u32)?;
@@ -911,7 +987,8 @@ impl SculptLayers {
             std::io::Error::new(std::io::ErrorKind::InvalidData, s.to_string())
         }
         let first = u32r(r)?;
-        let v2 = first == V2;
+        let v3 = first == V3;
+        let v2 = first == V2 || v3;
         let n = if v2 { u32r(r)? } else { first } as usize;
         let active = u32r(r)? as usize;
         if n > 4096 {
@@ -922,10 +999,12 @@ impl SculptLayers {
             let nm = name(r)?;
             let visible = bytes(r, 1)?[0] != 0;
             let opacity = if v2 { f32r(r)? } else { 1.0 };
+            let blend = if v3 { LayerBlend::ALL.get(bytes(r, 1)?[0] as usize).copied().unwrap_or_default() } else { LayerBlend::Add };
             let lv = levels(r)?;
             let mut x = SculptLayer::new(&nm, lv);
             x.visible = visible;
             x.opacity = opacity;
+            x.blend = blend;
             maps(r, &mut x.d)?;
             if !v2 {
                 // One mask then, held with the change: a painted one, white where nothing was painted.
@@ -985,6 +1064,8 @@ impl SculptLayers {
 
 /// Marks the layers' second form (with opacity and mask stacks); the first began with the count of layers.
 const V2: u32 = 0x3253_4C59;
+/// The third adds each layer's blend.
+const V3: u32 = 0x3353_4C59;
 const KINDS: [NoiseKind; 5] = [NoiseKind::Perlin, NoiseKind::Fbm, NoiseKind::Ridged, NoiseKind::Turbulence, NoiseKind::Cellular];
 
 #[cfg(test)]
@@ -1126,6 +1207,80 @@ mod tests {
         step(&mut vol, |v| layers.set_visible(v, k, true));
         step(&mut vol, |v| layers.set_visible(v, k, false));
         same(&vol, &hidden, 0.01);
+    }
+
+    /// Every sample of `a` on one side of `b`'s (`below`: a no more than b), within `tol` of a step.
+    fn side(a: &LevelVolume, b: &LevelVolume, below: bool, tol: f32) {
+        let mut worst = 0.0f32;
+        for l in 0..a.levels() {
+            for bc in a.level_keys(l) {
+                let (x, y) = (a.block_values(l, bc, false), b.block_values(l, bc, false));
+                for i in 0..N {
+                    let over = if below { x[i] - y[i] } else { y[i] - x[i] };
+                    worst = worst.max(over / a.voxel(l));
+                }
+            }
+        }
+        assert!(worst <= tol, "off the side by {worst} steps");
+    }
+
+    fn trim(vol: &mut LevelVolume, l: usize, at: Vec3) {
+        vol.begin_stroke();
+        for i in 0..6 {
+            let p = at + Vec3::new(0.0, 0.02 * i as f32, 0.0);
+            vol.plane_dab(l, p, p.normalize(), 0.1, 0.03, 0.5, 1.0, true);
+        }
+        vol.end_stroke();
+    }
+
+    /// A layer's blend: turned over, only its raises, only its carves, and back as sculpted; strokes on a turned layer
+    /// show as sculpted; hiding is exact in every blend.
+    #[test]
+    fn layer_blends() {
+        let mut vol = ball();
+        let start = vol.snapshot();
+        let mut layers = SculptLayers::default();
+        let k = layers.add("Layer 1", vol.levels());
+        stroke(&mut vol, 2, Vec3::new(0.0, 0.0, 0.5));
+        layers.take_stroke(&vol, Some(k));
+        trim(&mut vol, 3, Vec3::new(0.0, 0.25, 0.43));
+        layers.take_stroke(&vol, Some(k));
+        let sculpted = vol.snapshot();
+
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Raise));
+        side(&vol, &start, true, 1e-3);
+        assert!(differs(&vol, &sculpted) && differs(&vol, &start));
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Carve));
+        side(&vol, &start, false, 1e-3);
+        step(&mut vol, |v| layers.set_visible(v, k, false));
+        same(&vol, &start, 0.01);
+        step(&mut vol, |v| layers.set_visible(v, k, true));
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Subtract));
+        assert!(differs(&vol, &sculpted));
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Add));
+        same(&vol, &sculpted, 0.01);
+        step(&mut vol, |v| layers.set_opacity(v, k, 2.0));
+        assert!(differs(&vol, &sculpted));
+        step(&mut vol, |v| layers.set_opacity(v, k, 1.0));
+        same(&vol, &sculpted, 0.01);
+
+        // A stroke on the turned layer shows as sculpted, and turning it back shows it turned.
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Subtract));
+        let turned = vol.snapshot();
+        stroke(&mut vol, 3, Vec3::new(0.05, 0.03, 0.5));
+        layers.take_stroke(&vol, Some(k));
+        let more = vol.snapshot();
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Add));
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Subtract));
+        same(&vol, &more, 0.01);
+        assert!(differs(&vol, &turned));
+        step(&mut vol, |v| layers.set_visible(v, k, false));
+        same(&vol, &start, 0.01);
+
+        let mut bytes = Vec::new();
+        layers.write_to(&mut bytes).unwrap();
+        let back = SculptLayers::read_from(&mut &bytes[..]).unwrap();
+        assert_eq!(back.layers(), layers.layers());
     }
 
     fn step_ret<T>(vol: &mut LevelVolume, f: impl FnOnce(&mut LevelVolume) -> T) -> T {

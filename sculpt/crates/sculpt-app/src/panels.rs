@@ -14,7 +14,7 @@ use crate::keymap::Command;
 use crate::theme::{Hex, bold};
 use crate::tools::Tool;
 use crate::volume_mode::{Target, VolumeMode};
-use sculpt_core::generator::sculpt_layer::{MaskInfo, MaskKind, NoiseMask};
+use sculpt_core::generator::sculpt_layer::{LayerBlend, MAX_OPACITY, MaskInfo, MaskKind, NoiseMask};
 use sculpt_core::mask::BlendMode;
 use sculpt_core::noise::NoiseKind;
 
@@ -492,8 +492,11 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                             act.remove = Some(k);
                         }
                         let mut text = format!("{} blocks", fmt_count(info.blocks));
-                        if info.opacity < 1.0 {
+                        if info.opacity != 1.0 {
                             text = format!("{:.0}%  ·  {text}", info.opacity * 100.0);
+                        }
+                        if info.blend != LayerBlend::Add {
+                            text = format!("{}  ·  {text}", info.blend.label());
                         }
                         ui.label(RichText::new(text).size(fs * 0.85).color(weak));
                     });
@@ -816,7 +819,7 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
             return;
         }
         let live = m.live_edits(k);
-        let (mut rename, mut visible, mut fill, mut opacity, mut add) = (None, None, None, None, None);
+        let (mut rename, mut visible, mut fill, mut opacity, mut add, mut blend) = (None, None, None, None, None, None);
         section(ui, fs, "layer", "SCULPT LAYER", |ui| {
             if let Some(name) = name_field(ui, ("layer_name", k, 0), &info.name) {
                 rename = Some(name);
@@ -826,9 +829,25 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
                 visible = Some(on);
             }
             let mut pct = info.opacity * 100.0;
-            if prop(ui, "Opacity", |ui| ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").fixed_decimals(0))).changed() {
+            let slider = egui::Slider::new(&mut pct, 0.0..=MAX_OPACITY * 100.0).suffix("%").fixed_decimals(0);
+            if prop(ui, "Opacity", |ui| ui.add(slider).on_hover_text("Over 100% shows the layer's strokes exaggerated.")).changed() {
                 opacity = Some(pct / 100.0);
             }
+            prop(ui, "Blend", |ui| {
+                egui::ComboBox::from_id_salt(("layer_blend", k)).selected_text(info.blend.label()).show_ui(ui, |ui| {
+                    for b in LayerBlend::ALL {
+                        let hover = match b {
+                            LayerBlend::Add => "The layer's strokes as sculpted.",
+                            LayerBlend::Subtract => "Turned over: what the layer raised is carved, and what it carved is raised.",
+                            LayerBlend::Raise => "Only what the layer raises shows; its carving is hidden.",
+                            LayerBlend::Carve => "Only what the layer carves shows; its build-up is hidden.",
+                        };
+                        if ui.selectable_label(info.blend == b, b.label()).on_hover_text(hover).clicked() && info.blend != b {
+                            blend = Some(b);
+                        }
+                    }
+                })
+            });
             prop(ui, "Blocks", |ui| ui.label(fmt_count(info.blocks)));
             if !live {
                 ui.label(RichText::new("A big layer: its sliders apply when let go.").small().color(weak));
@@ -858,6 +877,9 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
         }
         if let Some(o) = opacity {
             m.set_layer_opacity(k, o);
+        }
+        if let Some(b) = blend {
+            m.set_layer_blend(k, b);
         }
         if let Some(kind) = add {
             m.add_mask(kind);
