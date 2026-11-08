@@ -219,9 +219,9 @@ pub enum LayerBlend {
     Add,
     /// Turned over: what was raised is carved, and what was carved is raised.
     Subtract,
-    /// Only what the layer raises shows.
+    /// Only what the layer raises shows: the higher of the surface with it and without it ("Max").
     Raise,
-    /// Only what the layer carves shows.
+    /// Only what the layer carves shows: the lower of the surface with it and without it ("Min").
     Carve,
 }
 
@@ -232,8 +232,8 @@ impl LayerBlend {
         match self {
             LayerBlend::Add => "Add",
             LayerBlend::Subtract => "Subtract",
-            LayerBlend::Raise => "Raise only",
-            LayerBlend::Carve => "Carve only",
+            LayerBlend::Raise => "Max",
+            LayerBlend::Carve => "Min",
         }
     }
 

@@ -839,8 +839,8 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
                         let hover = match b {
                             LayerBlend::Add => "The layer's strokes as sculpted.",
                             LayerBlend::Subtract => "Turned over: what the layer raised is carved, and what it carved is raised.",
-                            LayerBlend::Raise => "Only what the layer raises shows; its carving is hidden.",
-                            LayerBlend::Carve => "Only what the layer carves shows; its build-up is hidden.",
+                            LayerBlend::Raise => "The higher surface of the base with the layer and without it: only what the layer raises shows.",
+                            LayerBlend::Carve => "The lower surface of the base with the layer and without it: only what the layer carves shows.",
                         };
                         if ui.selectable_label(info.blend == b, b.label()).on_hover_text(hover).clicked() && info.blend != b {
                             blend = Some(b);
