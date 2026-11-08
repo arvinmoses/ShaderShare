@@ -316,7 +316,7 @@ impl SculptLayer {
                 acc[i] += mk.opacity * (b - acc[i]);
             }
         }
-        if self.opacity < 1.0 {
+        if self.opacity != 1.0 {
             acc.iter_mut().for_each(|x| *x *= self.opacity);
         }
         acc
@@ -1312,5 +1312,42 @@ mod tests {
         for (l, bc) in layers.stack[0].keys() {
             assert_eq!(layers.stack[0].weight(&frame, l as usize, bc), back.stack[0].weight(&frame, l as usize, bc));
         }
+    }
+
+    fn top(vol: &LevelVolume, x: f32) -> f32 {
+        let hit = vol.raycast(Vec3::new(x, 0.0, 2.0), -Vec3::Z, 3, false).map_or(f32::NAN, |h| h.0.z);
+        (hit - (0.25 - x * x).sqrt()) / vol.voxel(3)
+    }
+
+    /// A tall lift turned over, doubled or masked away: how far the surface moves, in finest steps.
+    #[test]
+    #[ignore]
+    fn deep_probe() {
+        let mut vol = ball();
+        let mut layers = SculptLayers::default();
+        let k = layers.add("Layer 1", vol.levels());
+        for _ in 0..12 {
+            stroke(&mut vol, 3, Vec3::new(-0.05, 0.0, 0.5));
+            layers.take_stroke(&vol, Some(k));
+        }
+        let xs = [0.0f32, 0.05, 0.1, 0.15];
+        let row = |vol: &LevelVolume| xs.map(|x| format!("{:6.1}", top(vol, x))).join(" ");
+        println!("add      {}", row(&vol));
+        let sculpted = vol.snapshot();
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Subtract));
+        println!("subtract {}", row(&vol));
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Add));
+        step(&mut vol, |v| layers.set_opacity(v, k, 2.0));
+        println!("200%     {}", row(&vol));
+        step(&mut vol, |v| layers.set_opacity(v, k, 1.0));
+        same(&vol, &sculpted, 0.01);
+        step(&mut vol, |v| layers.set_opacity(v, k, 0.5));
+        println!("50%      {}", row(&vol));
+        let half_shells = (0..vol.levels()).map(|l| vol.level_keys(l).into_iter().filter(|&bc| { let (a, b) = (vol.block_values(l, bc, false), sculpted.block_values(l, bc, false)); (0..N).any(|i| a[i].abs() < 0.3 * vol.band(l) && b[i].abs() >= 0.999 * vol.band(l)) }).count()).sum::<usize>();
+        println!("50% blocks with a surface far from any: {half_shells}");
+        step(&mut vol, |v| layers.set_opacity(v, k, 1.0));
+        step(&mut vol, |v| layers.paint_mask(v, k, Vec3::new(0.0, 0.0, 0.95), 0.15, 0.0));
+        println!("black    {}", row(&vol));
+        side(&vol, &sculpted, false, 1e-3);
     }
 }

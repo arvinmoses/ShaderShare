@@ -450,6 +450,41 @@ struct RowActions {
     mask_set: Option<(usize, usize, MaskInfo)>,
     mask_remove: Option<(usize, usize)>,
     add_mask: Option<MaskKind>,
+    opacity: Option<(usize, f32)>,
+    blend: Option<(usize, LayerBlend)>,
+}
+
+/// A row's opacity, as a percentage to drag (or click and type), `max` the most.
+fn row_opacity(ui: &mut Ui, opacity: f32, max: f32, hover: &str) -> Option<f32> {
+    let mut pct = opacity * 100.0;
+    let r = ui.add(egui::DragValue::new(&mut pct).range(0.0..=max * 100.0).speed(0.5).suffix("%").fixed_decimals(0).custom_formatter(|v, _| format!("{v:.0}")));
+    let r = r.on_hover_text(hover);
+    (r.changed() && (pct / 100.0 - opacity).abs() > 1e-6).then_some(pct / 100.0)
+}
+
+/// A row's blend, picked from `all`.
+fn row_blend<T: Copy + PartialEq>(ui: &mut Ui, fs: f32, id: impl std::hash::Hash + std::fmt::Debug, now: T, all: &[T], label: impl Fn(T) -> &'static str, hover: impl Fn(T) -> &'static str) -> Option<T> {
+    let mut out = None;
+    egui::ComboBox::from_id_salt(id).width(fs * 5.2).selected_text(RichText::new(label(now)).size(fs * 0.85)).show_ui(ui, |ui| {
+        for &b in all {
+            let r = ui.selectable_label(now == b, label(b));
+            let h = hover(b);
+            let r = if h.is_empty() { r } else { r.on_hover_text(h) };
+            if r.clicked() && now != b {
+                out = Some(b);
+            }
+        }
+    });
+    out
+}
+
+fn layer_blend_hover(b: LayerBlend) -> &'static str {
+    match b {
+        LayerBlend::Add => "The layer's strokes as sculpted.",
+        LayerBlend::Subtract => "Turned over: what the layer raised is carved, and what it carved is raised.",
+        LayerBlend::Raise => "The higher surface of the base with the layer and without it: only what the layer raises shows.",
+        LayerBlend::Carve => "The lower surface of the base with the layer and without it: only what the layer carves shows.",
+    }
 }
 
 fn noise_label(k: NoiseKind) -> &'static str {
@@ -486,19 +521,17 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                     let (r, _) = row.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                     Icon::Paint.paint(row.painter(), r, row.visuals().text_color());
                     let name = RichText::new(&info.name);
-                    row.label(if info.visible { name } else { name.color(weak) });
+                    row.label(if info.visible { name } else { name.color(weak) }).on_hover_text(format!("{} blocks", fmt_count(info.blocks)));
                     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icon_button(ui, Icon::Trash, 20.0, false, "Remove this layer and what it shows (undo brings it back)").clicked() {
                             act.remove = Some(k);
                         }
-                        let mut text = format!("{} blocks", fmt_count(info.blocks));
-                        if info.opacity != 1.0 {
-                            text = format!("{:.0}%  ·  {text}", info.opacity * 100.0);
+                        if let Some(o) = row_opacity(ui, info.opacity, MAX_OPACITY, "The layer's opacity: drag, or click to type. Over 100% exaggerates it.") {
+                            act.opacity = Some((k, o));
                         }
-                        if info.blend != LayerBlend::Add {
-                            text = format!("{}  ·  {text}", info.blend.label());
+                        if let Some(b) = row_blend(ui, fs, ("row_layer_blend", k), info.blend, &LayerBlend::ALL, LayerBlend::label, layer_blend_hover) {
+                            act.blend = Some((k, b));
                         }
-                        ui.label(RichText::new(text).size(fs * 0.85).color(weak));
                     });
                     if resp.clicked() {
                         act.pick = Some((k, None));
@@ -520,11 +553,12 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                             if icon_button(ui, Icon::Trash, 20.0, false, "Remove this mask").clicked() {
                                 act.mask_remove = Some((k, mi));
                             }
-                            let mut text = mk.blend.label().to_string();
-                            if mk.opacity < 1.0 {
-                                text = format!("{text} {:.0}%", mk.opacity * 100.0);
+                            if let Some(o) = row_opacity(ui, mk.opacity, 1.0, "The mask's opacity: drag, or click to type.") {
+                                act.mask_set = Some((k, mi, MaskInfo { opacity: o, ..mk.clone() }));
                             }
-                            ui.label(RichText::new(text).size(fs * 0.85).color(weak));
+                            if let Some(b) = row_blend(ui, fs, ("row_mask_blend", k, mi), mk.blend, &BlendMode::ALL, BlendMode::label, |_| "How this mask goes onto the masks under it.") {
+                                act.mask_set = Some((k, mi, MaskInfo { blend: b, ..mk.clone() }));
+                            }
                         });
                         if resp.clicked() {
                             act.pick = Some((k, Some(mi)));
@@ -669,6 +703,12 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
     }
     if let Some((k, on)) = act.visible {
         m.set_layer_visible(k, on);
+    }
+    if let Some((k, o)) = act.opacity {
+        m.set_layer_opacity(k, o);
+    }
+    if let Some((k, b)) = act.blend {
+        m.set_layer_blend(k, b);
     }
     if let Some(k) = act.remove {
         m.remove_layer(k);
@@ -836,12 +876,7 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
             prop(ui, "Blend", |ui| {
                 egui::ComboBox::from_id_salt(("layer_blend", k)).selected_text(info.blend.label()).show_ui(ui, |ui| {
                     for b in LayerBlend::ALL {
-                        let hover = match b {
-                            LayerBlend::Add => "The layer's strokes as sculpted.",
-                            LayerBlend::Subtract => "Turned over: what the layer raised is carved, and what it carved is raised.",
-                            LayerBlend::Raise => "The higher surface of the base with the layer and without it: only what the layer raises shows.",
-                            LayerBlend::Carve => "The lower surface of the base with the layer and without it: only what the layer carves shows.",
-                        };
+                        let hover = layer_blend_hover(b);
                         if ui.selectable_label(info.blend == b, b.label()).on_hover_text(hover).clicked() && info.blend != b {
                             blend = Some(b);
                         }
