@@ -131,7 +131,7 @@ pub fn level_for(vol: &LevelVolume, radius: f32, px: f32) -> usize {
 /// per move at 100k blocks).
 const LIVE_BLOCKS: usize = 20_000;
 /// The same for a layer taller than the band somewhere.
-const LIVE_TALL_BLOCKS: usize = 600;
+const LIVE_TALL_BLOCKS: usize = 1500;
 
 /// A change put off till the pointer lets go.
 enum Later {
@@ -1280,7 +1280,7 @@ impl VolumeMode {
     pub fn live_edits(&self, k: usize) -> bool {
         let Some(s) = self.sculpt.as_ref() else { return true };
         let n = s.layers().get(k).map_or(0, |x| x.blocks);
-        // A tall layer is built at part weights and turned over: about 80 ms per thousand blocks.
+        // A tall layer is built at part weights and turned over: about 35 ms per thousand blocks.
         n <= if s.tall(k, &self.vol) { LIVE_TALL_BLOCKS } else { LIVE_BLOCKS }
     }
 

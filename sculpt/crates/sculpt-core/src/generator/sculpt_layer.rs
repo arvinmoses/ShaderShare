@@ -446,44 +446,61 @@ fn p_scale(q: Vec3, n: Vec3, t: f32, k: f32) -> Vec3 {
 impl<'a> ColField<'a> {
     fn new(frame: &Frame, vx: f32, band: f32, mv: &'a [Moving]) -> ColField<'a> {
         let bs = vx * B as f32;
-        let hits: Vec<(IVec3, usize)> = (0..mv.len())
+        let mut hits: Vec<(IVec3, usize)> = (0..mv.len())
             .into_par_iter()
             .flat_map_iter(|k| {
                 let m = &mv[k];
+                // The blocks whose middles lie near enough its stretch, out of the box about it.
                 let side = band + side_reach(vx, m.lo.abs().max(m.hi.abs()));
-                let steps = ((2.0 * side) / bs).ceil() as i32 + 1;
-                let mut out: Vec<IVec3> = Vec::new();
-                let mut t = m.lo;
-                loop {
-                    let c = m.s + m.n * t;
-                    for z in 0..=steps {
-                        for y in 0..=steps {
-                            for x in 0..=steps {
-                                let o = IVec3::new(x, y, z).as_vec3() / steps as f32 * 2.0 * side - Vec3::splat(side);
-                                out.push(((c + o - frame.origin) / bs).floor().as_ivec3());
+                let r = side + 0.5 * 3f32.sqrt() * bs;
+                let (e0, e1) = (m.s + m.n * m.lo - frame.origin, m.s + m.n * m.hi - frame.origin);
+                let (a, b) = (((e0.min(e1) - Vec3::splat(side)) / bs).floor().as_ivec3(), ((e0.max(e1) + Vec3::splat(side)) / bs).floor().as_ivec3());
+                let mut out: Vec<(IVec3, usize)> = Vec::new();
+                for z in a.z..=b.z {
+                    for y in a.y..=b.y {
+                        for x in a.x..=b.x {
+                            let bc = IVec3::new(x, y, z);
+                            let o = frame.origin + (bc.as_vec3() + 0.5) * bs - m.s;
+                            let t = o.dot(m.n).clamp(m.lo, m.hi);
+                            if (o - m.n * t).length_squared() <= r * r {
+                                out.push((bc, k));
                             }
                         }
                     }
-                    if t >= m.hi {
-                        break;
-                    }
-                    t = (t + 2.0 * vx).min(m.hi);
                 }
-                out.sort_unstable_by_key(|v| (v.z, v.y, v.x));
-                out.dedup();
-                out.into_iter().map(move |bc| (bc, k))
+                out
             })
             .collect();
+        hits.par_sort_unstable_by_key(|(bc, k)| (bc.z, bc.y, bc.x, *k));
         let mut blocks: HashMap<IVec3, Vec<usize>> = HashMap::default();
-        for (bc, k) in hits {
-            blocks.entry(bc).or_default().push(k);
+        blocks.reserve(hits.len() / 64);
+        for run in hits.chunk_by(|a, b| a.0 == b.0) {
+            blocks.insert(run[0].0, run.iter().map(|h| h.1).collect());
         }
         ColField { mv, blocks, vx }
     }
 
     /// The columns about `p` (in block `bc`), if any reaches it.
     fn at(&self, bc: IVec3, p: Vec3) -> Option<Along> {
-        let ks = self.blocks.get(&bc)?;
+        self.at_among(self.blocks.get(&bc)?, p)
+    }
+
+    /// Of `ks`, those that can reach within `slack` of `c`.
+    fn near(&self, ks: &[usize], c: Vec3, slack: f32) -> Vec<usize> {
+        ks.iter()
+            .copied()
+            .filter(|&k| {
+                let m = &self.mv[k];
+                let o = c - m.s;
+                let t = o.dot(m.n).clamp(m.lo, m.hi);
+                let r = side_reach(self.vx, m.lo.abs().max(m.hi.abs())) + slack;
+                (o - m.n * t).length_squared() <= r * r
+            })
+            .collect()
+    }
+
+    /// The columns of `ks` about `p`, if any reaches it.
+    fn at_among(&self, ks: &[usize], p: Vec3) -> Option<Along> {
         let (mut wsum, mut foot, mut normal, mut kw) = (0.0f32, Vec3::ZERO, Vec3::ZERO, 0.0f32);
         let mut best: Option<(f32, usize)> = None;
         let mut tall = false;
@@ -539,6 +556,22 @@ fn build_tall(read: &LevelVolume, frame: &Frame, l: usize, mv: &[Moving], full: 
         let g = (q - frame.origin) / vx;
         let i = g.floor().as_ivec3();
         let f = g - i.as_vec3();
+        let bc = i.div_euclid(IVec3::splat(B));
+        let li = i - bc * B;
+        if li.cmplt(IVec3::splat(B - 1)).all() {
+            let blk: Option<&[f32; N]> = full.get(&bc).map(|b| &**b).or_else(|| lin.and_then(|m| m.get(&bc)).filter(|x| !x[0].is_nan()).map(|b| &**b));
+            if let Some(b) = blk {
+                let mut v = 0.0;
+                for c in 0..8 {
+                    let o = IVec3::new(c & 1, (c >> 1) & 1, (c >> 2) & 1);
+                    let w = corner_weight(o, f);
+                    if w > 0.0 {
+                        v += w * b[local(i + o)];
+                    }
+                }
+                return v;
+            }
+        }
         let mut v = 0.0;
         for c in 0..8 {
             let o = IVec3::new(c & 1, (c >> 1) & 1, (c >> 2) & 1);
@@ -557,9 +590,67 @@ fn build_tall(read: &LevelVolume, frame: &Frame, l: usize, mv: &[Moving], full: 
             let mut v = read.block_values(l, bc, false);
             // 1: built; 2: no column reaches it (as where a layer's top is wider than its base).
             let mut set = Box::new([0u8; N]);
+            // The columns' say every other sample (it changes smoothly); between, it is interpolated where the eight
+            // about agree that the layer is built there, and asked again where they do not.
+            const C: i32 = B / 2 + 1;
+            // The columns that can reach each two-sample cell (and its far corner), found by quarters first.
+            let all = &field.blocks[&bc];
+            let lat = |g: IVec3| frame.pos(l, bc * B) + g.as_vec3() * vx;
+            let quarters: Vec<Vec<usize>> = (0..8).map(|q| field.near(all, lat(IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1) * 4 + IVec3::splat(2)), 2.0 * 3f32.sqrt() * vx + 0.01 * vx)).collect();
+            let cells: Vec<Vec<usize>> = (0..64)
+                .map(|j| {
+                    let c = IVec3::new(j % 4, (j / 4) % 4, j / 16);
+                    let q = c / 2;
+                    field.near(&quarters[(q.x + 2 * (q.y + 2 * q.z)) as usize], lat(c * 2 + IVec3::ONE), 3f32.sqrt() * vx + 0.01 * vx)
+                })
+                .collect();
+            let cell_of = |g: IVec3| -> &[usize] {
+                let c = (g / 2).min(IVec3::splat(3));
+                &cells[(c.x + 4 * (c.y + 4 * c.z)) as usize]
+            };
+            let coarse: Vec<Option<Along>> = (0..C * C * C)
+                .map(|j| {
+                    let c = IVec3::new(j % C, (j / C) % C, j / (C * C)) * 2;
+                    let g = bc * B + c;
+                    if c.cmplt(IVec3::splat(B)).all() {
+                        field.at_among(cell_of(c), frame.pos(l, g))
+                    } else {
+                        field.at(g.div_euclid(IVec3::splat(B)), frame.pos(l, g))
+                    }
+                })
+                .collect();
+            let built = |a: &Option<Along>| a.as_ref().is_some_and(|a| a.tall && !a.pure);
             for i in 0..N {
-                let p = frame.pos(l, bc * B + cell(i));
-                match field.at(bc, p) {
+                let c = cell(i);
+                let p = frame.pos(l, bc * B + c);
+                let lo = c / 2;
+                let odd = c - lo * 2;
+                let mut mixed: Option<Along> = None;
+                if (0..8).all(|q| {
+                    let o = IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1) * odd;
+                    let g = lo + o;
+                    built(&coarse[(g.x + C * (g.y + C * g.z)) as usize])
+                }) {
+                    let (mut s, mut n, mut k, mut wsum) = (Vec3::ZERO, Vec3::ZERO, 0.0f32, 0.0f32);
+                    for q in 0..8 {
+                        let o = IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1);
+                        if (o * (IVec3::ONE - odd)) != IVec3::ZERO {
+                            continue;
+                        }
+                        let g = lo + o;
+                        let a = coarse[(g.x + C * (g.y + C * g.z)) as usize].as_ref().unwrap();
+                        s += a.s;
+                        n += a.n;
+                        k += a.k;
+                        wsum += 1.0;
+                    }
+                    mixed = Some(Along { s: s / wsum, n: n.normalize_or_zero(), k: k / wsum, tall: true, pure: false });
+                }
+                let got = match mixed {
+                    Some(a) => Some(a),
+                    None => field.at_among(cell_of(c), p),
+                };
+                match got {
                     Some(a) if a.tall && !a.pure => {
                         let f = full_at(a.to_full(p), a.s, a.n);
                         // Held at the band stays there; nearer, distances along the normal scale by the weight.
@@ -1328,34 +1419,41 @@ impl SculptLayers {
         }
         // Per block: what the changes held give, and what shows (built from heights where it was).
         let mut out: HashMap<(usize, IVec3), (Box<[f32; N]>, Option<Box<[f32; N]>>)> = moved.into_iter().map(|(l, bc, v)| ((l, bc), (v, None))).collect();
-        for (l, bc, v, set) in tall {
-            let e = out.entry((l, bc)).or_insert_with(|| {
-                let held = match lin.get(l).and_then(|m| m.get(&bc)).filter(|x| !x[0].is_nan()) {
-                    Some(x) => Box::new(**x),
-                    None => read.block_values(l, bc, false),
+        let impure = any_impure.get();
+        let merged: Vec<((usize, IVec3), Box<[f32; N]>, Option<Box<[f32; N]>>)> = tall
+            .into_par_iter()
+            .map(|(l, bc, v, set)| {
+                let held = match out.get(&(l, bc)) {
+                    Some(e) => e.0.clone(),
+                    None => match lin.get(l).and_then(|m| m.get(&bc)).filter(|x| !x[0].is_nan()) {
+                        Some(x) => Box::new(**x),
+                        None => read.block_values(l, bc, false),
+                    },
                 };
-                (held, None)
-            });
-            // Where no column reaches but the layer holds a tall change, the layer cannot be built from heights
-            // (it overhangs its base): what shows there is the volume without it.
-            let held_d = layer.d[l].get(&bc);
-            let wd = held_d.map(|_| layer.weight(&frame, l, bc));
-            let band = read.band(l);
-            let drop = |i: usize| set[i] == 2 && any_impure.get() && held_d.is_some_and(|d| d[i].abs() >= TALL * band);
-            if !(0..N).any(|i| set[i] == 1 || drop(i)) {
-                // Reached, but shown as the changes give it: what was built there goes.
-                continue;
-            }
-            let mut shown = e.0.clone();
-            for i in 0..N {
-                if set[i] == 1 {
-                    shown[i] = v[i];
-                } else if drop(i) {
-                    let (d, w) = (held_d.unwrap(), wd.as_ref().unwrap());
-                    shown[i] = e.0[i] - w[i] * layer.blend.shape(d[i]);
+                // Where no column reaches but the layer holds a tall change, the layer cannot be built from heights
+                // (it overhangs its base): what shows there is the volume without it.
+                let held_d = layer.d[l].get(&bc);
+                let band = read.band(l);
+                let drop = |i: usize| set[i] == 2 && impure && held_d.is_some_and(|d| d[i].abs() >= TALL * band);
+                if !(0..N).any(|i| set[i] == 1 || drop(i)) {
+                    // Reached, but shown as the changes give it: what was built there goes.
+                    return ((l, bc), held, None);
                 }
-            }
-            e.1 = Some(shown);
+                let wd = held_d.map(|_| layer.weight(&frame, l, bc));
+                let mut shown = held.clone();
+                for i in 0..N {
+                    if set[i] == 1 {
+                        shown[i] = v[i];
+                    } else if drop(i) {
+                        let (d, w) = (held_d.unwrap(), wd.as_ref().unwrap());
+                        shown[i] = held[i] - w[i] * layer.blend.shape(d[i]);
+                    }
+                }
+                ((l, bc), held, Some(shown))
+            })
+            .collect();
+        for (key, held, shown) in merged {
+            out.insert(key, (held, shown));
         }
         // A change of the whole layer gives back what the changes give wherever it built before and does not now.
         // What was built and is not now (anywhere for a change of the whole layer) shows as the changes give it.
