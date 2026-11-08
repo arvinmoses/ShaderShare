@@ -130,6 +130,8 @@ pub fn level_for(vol: &LevelVolume, radius: f32, px: f32) -> usize {
 /// Layers holding more blocks than this move when a slider is let go, not every frame (some 80 ms and a big upload
 /// per move at 100k blocks).
 const LIVE_BLOCKS: usize = 20_000;
+/// The same for a layer taller than the band somewhere.
+const LIVE_TALL_BLOCKS: usize = 600;
 
 /// A change put off till the pointer lets go.
 enum Later {
@@ -1276,7 +1278,10 @@ impl VolumeMode {
 
     /// Whether sculpt layer `k` is small enough for a slider to move it every frame (else it moves when let go).
     pub fn live_edits(&self, k: usize) -> bool {
-        self.sculpt.as_ref().and_then(|s| s.layers().get(k).map(|x| x.blocks)).is_none_or(|n| n <= LIVE_BLOCKS)
+        let Some(s) = self.sculpt.as_ref() else { return true };
+        let n = s.layers().get(k).map_or(0, |x| x.blocks);
+        // A tall layer is built at part weights and turned over: about 80 ms per thousand blocks.
+        n <= if s.tall(k, &self.vol) { LIVE_TALL_BLOCKS } else { LIVE_BLOCKS }
     }
 
     /// Pick sculpt layer `k`, and its mask `mi` or (`None`) the layer itself, as what strokes work on: a painted mask

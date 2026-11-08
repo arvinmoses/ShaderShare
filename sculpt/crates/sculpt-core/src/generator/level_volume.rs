@@ -1706,6 +1706,21 @@ impl LevelVolume {
         self.dirty.insert((l as u8, bc));
     }
 
+    /// During a stroke, remove block `bc` of level `l` (kept for undo), so it reads the coarser levels again; not if
+    /// a finer block lies in it.
+    pub(crate) fn remove_block(&mut self, l: usize, bc: IVec3) {
+        if l == 0 || !self.blocks[l].contains_key(&bc) {
+            return;
+        }
+        if l + 1 < self.levels() && (0..8).any(|q| self.blocks[l + 1].contains_key(&(bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)))) {
+            return;
+        }
+        let k = (l as u8, bc);
+        self.keep(k);
+        self.blocks[l].remove(&bc);
+        self.dirty.insert(k);
+    }
+
     /// Make block `bc` of level `l` (from the coarser level) and its parents, if they do not exist.
     pub(crate) fn ensure(&mut self, l: usize, bc: IVec3) {
         if self.blocks[l].contains_key(&bc) {
