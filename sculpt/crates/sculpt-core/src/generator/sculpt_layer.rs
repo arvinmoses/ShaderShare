@@ -382,6 +382,8 @@ struct Moving {
     /// Where along it the layer's surface can lie, before and now (and a margin past).
     lo: f32,
     hi: f32,
+    /// How far along it the layer's surface lay before or lies now (for what was built before and goes).
+    reach: f32,
     tall: bool,
     /// Whether the layer shows it now at full weight as sculpted, or only its raises or carves, or not at all: what the
     /// changes held give exactly.
@@ -930,7 +932,7 @@ impl SculptLayer {
                     let k = if self.blend == LayerBlend::Subtract { -w } else { w };
                     let h = -w * self.blend.shape(c.h);
                     let (lo, hi) = span_of(-c.h, &[k], band);
-                    mv.push(Moving { s: c.foot(frame, l, *bc), n: c.n, h0: h, h1: h, k, lo, hi, tall: true, pure });
+                    mv.push(Moving { s: c.foot(frame, l, *bc), n: c.n, h0: h, h1: h, k, lo, hi, reach: lo.abs().max(hi.abs()), tall: true, pure });
                 }
             }
             if !mv.iter().any(|m| !m.pure) {
@@ -1356,24 +1358,28 @@ impl SculptLayers {
                     let tall = true;
                     let k = if layer.blend == LayerBlend::Subtract { -b } else { b };
                     let k0 = if was == LayerBlend::Subtract { -a } else { a };
-                    let (lo, hi) = span_of(-c.h, &[k0, k], band);
-                    (tall || h0 != h1).then(|| Moving { s: c.foot(&frame, l, bc), n: c.n, h0, h1, k, lo, hi, tall, pure: b == 0.0 || (b == 1.0 && layer.blend != LayerBlend::Subtract) })
+                    // Where it shows now only (what is built must not hang on what showed before), and as far as it
+                    // showed before too, for what goes.
+                    let (lo, hi) = span_of(-c.h, &[k], band);
+                    let (wlo, whi) = span_of(-c.h, &[k0, k], band);
+                    (tall || h0 != h1).then(|| Moving { s: c.foot(&frame, l, bc), n: c.n, h0, h1, k, lo, hi, reach: wlo.abs().max(whi.abs()), tall, pure: b == 0.0 || (b == 1.0 && layer.blend != LayerBlend::Subtract) })
                 })
                 .collect();
+            // What was built about the columns goes back to what the changes give, unless built again.
+            if !all && !mv.is_empty() {
+                let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for m in &mv {
+                    lo = lo.min(m.s - Vec3::splat(m.reach + band));
+                    hi = hi.max(m.s + Vec3::splat(m.reach + band));
+                }
+                let bsz = read.voxel(l) * B as f32;
+                restore.extend(layer.built[l].keys().filter(|bc| {
+                    let c = frame.pos(l, **bc * B);
+                    c.cmpge(lo - Vec3::splat(bsz)).all() && c.cmple(hi).all()
+                }).map(|bc| (l, *bc)));
+            }
             // Shown everywhere as the changes held give exactly: nothing to build, only what was built goes.
             if mv.iter().all(|m| m.pure) {
-                if !all && !mv.is_empty() {
-                    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-                    for m in &mv {
-                        lo = lo.min(m.s + Vec3::splat(m.lo - band));
-                        hi = hi.max(m.s + Vec3::splat(m.hi + band));
-                    }
-                    let bsz = read.voxel(l) * B as f32;
-                    restore.extend(layer.built[l].keys().filter(|bc| {
-                        let c = frame.pos(l, **bc * B);
-                        c.cmpge(lo - Vec3::splat(bsz)).all() && c.cmple(hi).all()
-                    }).map(|bc| (l, *bc)));
-                }
                 continue;
             }
             if mv.iter().any(|m| m.tall && m.h0 != m.h1) {
@@ -1382,8 +1388,8 @@ impl SculptLayers {
                 let at_full = if layer.blend == LayerBlend::Subtract { LayerBlend::Add } else { layer.blend };
                 let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
                 for m in &mv {
-                    lo = lo.min(m.s - Vec3::splat(m.lo.abs().max(m.hi.abs()) + band));
-                    hi = hi.max(m.s + Vec3::splat(m.lo.abs().max(m.hi.abs()) + band));
+                    lo = lo.min(m.s - Vec3::splat(m.reach + band));
+                    hi = hi.max(m.s + Vec3::splat(m.reach + band));
                 }
                 let bsz = read.voxel(l) * B as f32;
                 let index: HashMap<IVec3, usize> = keys.iter().enumerate().filter(|(_, k)| k.0 as usize == l).map(|(j, k)| (k.1, j)).collect();
@@ -1399,6 +1405,11 @@ impl SculptLayers {
                     .par_iter()
                     .filter_map(|&bc| {
                         let d = layer.d[l].get(&bc)?;
+                        // A block the volume does not hold of itself (none, or made for a surface built) shows none
+                        // of the layer: the layer at full is read about it as where it holds none.
+                        if (l > 0 && !read.exists(l, bc)) || lin.get(l).and_then(|m| m.get(&bc)).is_some_and(|x| x[0].is_nan()) {
+                            return None;
+                        }
                         // Its weight before the change (where the change did not reach, as it is).
                         let a = match index.get(&bc) {
                             Some(&j) => w0[j].clone(),
@@ -1440,7 +1451,10 @@ impl SculptLayers {
                     return ((l, bc), held, None);
                 }
                 let wd = held_d.map(|_| layer.weight(&frame, l, bc));
-                let mut shown = held.clone();
+                // A block made for a surface built takes the rest from the coarser levels as they are once built
+                // (marked here, filled when written).
+                let made = (l > 0 && !read.exists(l, bc)) || lin.get(l).and_then(|m| m.get(&bc)).is_some_and(|x| x[0].is_nan());
+                let mut shown = if made { Box::new([f32::NAN; N]) } else { held.clone() };
                 for i in 0..N {
                     if set[i] == 1 {
                         shown[i] = v[i];
@@ -1477,6 +1491,7 @@ impl SculptLayers {
         }
         // Coarsest first, so a block made here (or made back) reads the coarser levels as they are now.
         let mut unmake = Vec::new();
+        let mut fill: Vec<(usize, IVec3, Box<[f32; N]>)> = Vec::new();
         let built = &mut self.stack[k].built;
         for ((l, bc), (held, shown)) in out {
             if shown.is_some() {
@@ -1503,6 +1518,13 @@ impl SculptLayers {
                         }
                         vol.ensure(l, bc);
                     }
+                    let mut v = v;
+                    if v.iter().any(|x| x.is_nan()) {
+                        // (Filled at the end.)
+                        fill.push((l, bc, v.clone()));
+                        let band = vol.band(l);
+                        v.iter_mut().filter(|x| x.is_nan()).for_each(|x| *x = band);
+                    }
                     self.lin[l].insert(bc, Stored::from(held));
                     vol.set_block(l, bc, v);
                 }
@@ -1524,6 +1546,30 @@ impl SculptLayers {
             vol.remove_block(l, bc);
             if vol.exists(l, bc) {
                 let v = from_coarser(vol, &frame, l, bc);
+                vol.set_block(l, bc, v);
+            }
+        }
+        // Made blocks take what was not built from the coarser levels once those are all as they now show (a level at a
+        // time, coarsest first).
+        let mut fill = fill;
+        while !fill.is_empty() {
+            let l = fill.iter().map(|f| f.0).min().unwrap();
+            let (now, rest): (Vec<_>, Vec<_>) = fill.into_iter().partition(|f| f.0 == l);
+            fill = rest;
+            let read = &*vol;
+            let done: Vec<(IVec3, Box<[f32; N]>)> = now
+                .into_par_iter()
+                .map(|(_, bc, mut v)| {
+                    let c = from_coarser(read, &frame, l, bc);
+                    for i in 0..N {
+                        if v[i].is_nan() {
+                            v[i] = c[i];
+                        }
+                    }
+                    (bc, v)
+                })
+                .collect();
+            for (bc, v) in done {
                 vol.set_block(l, bc, v);
             }
         }
@@ -2161,6 +2207,12 @@ mod tests {
     /// Whether two fields show one surface: no sample on the other side of it, and samples near it (within half the
     /// band, where values are not clipped) within `tol` of a step.
     fn same(a: &LevelVolume, b: &LevelVolume, tol: f32) {
+        let (flips, worst) = off(a, b);
+        assert!(flips == 0 && worst <= tol, "{flips} samples change side, near the surface off by {worst} steps");
+    }
+
+    /// Samples on the other side of the surface, and the most samples near it are off by, in steps.
+    fn off(a: &LevelVolume, b: &LevelVolume) -> (usize, f32) {
         let (mut worst, mut flips) = (0.0f32, 0);
         for l in 0..a.levels() {
             let mut keys = a.level_keys(l);
@@ -2178,7 +2230,7 @@ mod tests {
                 }
             }
         }
-        assert!(flips == 0 && worst <= tol, "{flips} samples change side, near the surface off by {worst} steps");
+        (flips, worst)
     }
 
     fn differs(a: &LevelVolume, b: &LevelVolume) -> bool {
@@ -2527,6 +2579,141 @@ mod tests {
         step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Add));
         step(&mut vol, |v| layers.set_opacity(v, k, 0.5));
         save(&vol, &layers, "h_front_50");
+    }
+
+    /// Lines along z over the front crossing the surface more than once, between `x0` and `x1`.
+    fn strays_in(vol: &LevelVolume, x0: f32, x1: f32) -> usize {
+        let mut lines = 0;
+        let st = 0.5 * vol.voxel(3);
+        for yi in -12..=12 {
+            let mut x = x0;
+            while x <= x1 {
+                let y = 0.0125 * yi as f32;
+                let mut z = 1.3f32;
+                let mut prev = vol.value_upto(Vec3::new(x, y, z), 3, false);
+                let mut n = 0;
+                while z > 0.2 {
+                    z -= st;
+                    let v = vol.value_upto(Vec3::new(x, y, z), 3, false);
+                    if (v < 0.0) != (prev < 0.0) {
+                        n += 1;
+                    }
+                    prev = v;
+                }
+                lines += (n > 1) as usize;
+                x += 0.0125;
+            }
+        }
+        lines
+    }
+
+    /// A tall raise and a deep carve on one layer, in every blend: each shows as it should at full and half, and comes
+    /// back exactly at full however its weight went there (heights and lines crossing the surface more than once are
+    /// printed with `--nocapture`; `SCULPT_SHOTS` saves volumes and cross sections for screenshots).
+    #[test]
+    fn tall_blends() {
+        let dir = std::env::var("SCULPT_SHOTS").ok();
+        let start = ball();
+        let make = || {
+        let mut vol = ball();
+        let mut layers = SculptLayers::default();
+        let k = layers.add("Layer 1", vol.levels());
+        for _ in 0..10 {
+            stroke(&mut vol, 3, Vec3::new(-0.25, 0.0, 0.433));
+            layers.take_stroke(&vol, Some(k));
+        }
+        for _ in 0..8 {
+            vol.begin_stroke();
+            for i in 0..6 {
+                let x = 0.17 + 0.02 * i as f32;
+                let p = Vec3::new(x, 0.0, (0.25 - x * x).sqrt());
+                vol.plane_dab(3, p, p.normalize(), 0.1, 0.03, 0.5, 1.0, true);
+            }
+            vol.end_stroke();
+            layers.take_stroke(&vol, Some(k));
+        }
+        (vol, layers, k)
+        };
+        let (mut vol, mut layers, k) = make();
+        let sculpted = vol.snapshot();
+        // Heights along the ball's normal through the middle of each, in finest steps.
+        let along = |vol: &LevelVolume, x: f32| {
+            let d = Vec3::new(x, 0.0, (0.25 - x * x).sqrt()).normalize();
+            let hit = vol.raycast(d * 2.0, -d, 3, false).map_or(f32::NAN, |h| h.0.length());
+            (hit - 0.5) / vol.voxel(3)
+        };
+        let (rx, cx) = (-0.2, 0.22);
+        let at = |vol: &LevelVolume| format!("raise {:6.1} carve {:6.1} strays {:3}", along(vol, rx), along(vol, cx), strays_in(vol, -0.45, 0.35));
+        println!("BLEND sculpted        {}", at(&vol));
+        // Cross sections through y = 0 and y = 0.05 (P5 images, inside dark), written beside the shots.
+        let slice = |vol: &LevelVolume, name: &str| {
+            let Some(dir) = &dir else { return };
+            for (yn, y) in [("0", 0.0f32), ("05", 0.05)] {
+                let (w, h) = (360usize, 300usize);
+                let mut img = Vec::with_capacity(w * h);
+                for j in 0..h {
+                    for i in 0..w {
+                        let p = Vec3::new(-0.45 + 0.9 * i as f32 / w as f32, y, 0.95 - 0.75 * j as f32 / h as f32);
+                        let v = vol.value_upto(p, 3, false) / vol.voxel(3);
+                        img.push(if v < 0.0 { (60.0 + 20.0 * v.max(-2.5)) as u8 } else { (200.0 + 20.0 * v.min(2.5)) as u8 });
+                    }
+                }
+                let mut bytes = format!("P5 {w} {h} 255
+").into_bytes();
+                bytes.extend(img);
+                std::fs::write(format!("{dir}/slice_{name}_{yn}.pgm"), bytes).unwrap();
+            }
+        };
+        slice(&vol, "add");
+
+        let save = |vol: &LevelVolume, layers: &SculptLayers, name: &str| {
+            let Some(dir) = &dir else { return };
+            let mut bytes = Vec::new();
+            vol.write_to(&mut bytes).unwrap();
+            let mut l = Vec::new();
+            layers.write_to(&mut l).unwrap();
+            bytes.extend_from_slice(b"SCLY");
+            bytes.extend_from_slice(&(l.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&l);
+            std::fs::write(format!("{dir}/{name}.svol"), bytes).unwrap();
+        };
+        save(&vol, &layers, "a_add");
+        for (name, blend) in [("subtract", LayerBlend::Subtract), ("max", LayerBlend::Raise), ("min", LayerBlend::Carve)] {
+            (vol, layers, _) = make();
+            step(&mut vol, |v| layers.set_blend(v, k, blend));
+            println!("BLEND {name:8} 100%    {}", at(&vol));
+            let (r, c) = (along(&vol, rx), along(&vol, cx));
+            let (r0, c0) = (along(&sculpted, rx), along(&sculpted, cx));
+            let (er, ec) = match blend {
+                LayerBlend::Subtract => (-r0, -c0),
+                LayerBlend::Raise => (r0, 0.0),
+                _ => (0.0, c0),
+            };
+            assert!((r - er).abs() < 0.1 * r0.abs() + 1.0 && (c - ec).abs() < 0.1 * c0.abs() + 1.0, "{name}: raise {r} carve {c}, wanted {er} {ec}");
+            slice(&vol, name);
+            let before = vol.snapshot();
+            save(&vol, &layers, &format!("{name}_100"));
+            step(&mut vol, |v| layers.set_opacity(v, k, 0.5));
+            println!("BLEND {name:8} 50%     {}", at(&vol));
+            let (r2, c2) = (along(&vol, rx), along(&vol, cx));
+            assert!((r2 - 0.5 * er).abs() < 0.1 * r0.abs() + 1.0 && (c2 - 0.5 * ec).abs() < 0.1 * c0.abs() + 1.0, "{name} at half: raise {r2} carve {c2}, wanted {} {}", 0.5 * er, 0.5 * ec);
+            slice(&vol, &format!("{name}50"));
+            save(&vol, &layers, &format!("{name}_50"));
+            step(&mut vol, |v| layers.set_opacity(v, k, 1.0));
+            same(&vol, &before, 0.01);
+            step(&mut vol, |v| layers.set_opacity(v, k, 0.999));
+            step(&mut vol, |v| layers.set_opacity(v, k, 1.0));
+            same(&vol, &before, 0.01);
+            let over = 2.0;
+            step(&mut vol, |v| layers.set_opacity(v, k, over));
+            println!("BLEND {name:8} {over}x    {}", at(&vol));
+            step(&mut vol, |v| layers.set_opacity(v, k, 1.0));
+            same(&vol, &before, 0.01);
+            step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Add));
+            same(&vol, &sculpted, 0.01);
+        }
+        step(&mut vol, |v| layers.set_visible(v, k, false));
+        same(&vol, &start, 0.01);
     }
 
     /// How long a bigger layer takes at stroke ends and when its weight or blend changes (printed).
