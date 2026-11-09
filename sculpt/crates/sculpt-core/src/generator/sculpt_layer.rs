@@ -3,13 +3,13 @@
 //!
 //! * **What is shown is the truth.** Strokes on a layer sculpt the volume itself, at full speed and at whatever level
 //!   the brush picks. When one ends, the layer takes the stroke's change (the field after it less the field before,
-//!   block by block, at every level it reached) into its own: `shown = base + Σ w Δ`, `w` the layer's weight (0 to 1):
+//!   block by block, at every level it reached) into its own: `shown = base + Î£ w Î”`, `w` the layer's weight (0 to 1):
 //!   its opacity (up to 2, exaggerated) times its masks, 0 where it is hidden.
 //! * **A layer's blend** shapes what shows of its change: as sculpted, turned over, only its raises, or only its
 //!   carves. Strokes on it move what shows by what they did, as far as the blend shows it; the rest is the base's.
 //! * **Masks** stack as in a paint program: each is painted (starting from a fill) or noise, blended onto what is
 //!   under it (multiply, add, subtract, ...) at its own opacity, starting from white. Any change to a layer's weight
-//!   moves the volume by the change times `Δ`, only where the layer holds any.
+//!   moves the volume by the change times `Î”`, only where the layer holds any.
 //! * **Sculpting where a layer shows partly** keeps the layer's look: the stroke's change goes in divided by the
 //!   weight, so what shows is what was sculpted. Where the weight is under a quarter, a growing part of it goes to the
 //!   base instead (so nothing grows without bound where the layer barely shows).
@@ -403,9 +403,9 @@ fn span_of(h: f32, ks: &[f32], band: f32) -> (f32, f32) {
 }
 
 /// How far to the side of a column a sample `t` along it takes its value from it (columns spread apart over a
-/// rounded base).
+/// rounded base, and those by a steep wall stand short of it, so the deep ones must reach past it).
 fn side_reach(vx: f32, t: f32) -> f32 {
-    1.5 * vx + 0.08 * t.abs()
+    1.5 * vx + 0.2 * t.abs()
 }
 
 /// The layer's columns about a level's points: those whose stretch reaches each, blended smoothly by how far to the
@@ -536,6 +536,27 @@ impl<'a> ColField<'a> {
     }
 }
 
+/// A field's value and gradient (per step) at `f` in a cell, from its corners' values (x fastest).
+fn trilinear(cv: &[f32; 8], f: Vec3) -> (f32, Vec3) {
+    let (mut v, mut g) = (0.0, Vec3::ZERO);
+    for (c, &x) in cv.iter().enumerate() {
+        let o = IVec3::new(c as i32 & 1, (c as i32 >> 1) & 1, (c as i32 >> 2) & 1);
+        v += corner_weight(o, f) * x;
+        let (wx, wy, wz) = (if o.x == 1 { f.x } else { 1.0 - f.x }, if o.y == 1 { f.y } else { 1.0 - f.y }, if o.z == 1 { f.z } else { 1.0 - f.z });
+        let (sx, sy, sz) = (if o.x == 1 { 1.0 } else { -1.0 }, if o.y == 1 { 1.0 } else { -1.0 }, if o.z == 1 { 1.0 } else { -1.0 });
+        g += x * Vec3::new(sx * wy * wz, wx * sy * wz, wx * wy * sz);
+    }
+    (v, g)
+}
+
+/// How a distance to a surface rising along `g` scales when space is pressed along `n` by `k`: by `|k|` where it
+/// faces along `n`, not at all where it faces across.
+fn squash(g: Vec3, n: Vec3, k: f32) -> f32 {
+    let Some(g) = g.try_normalize() else { return k.abs() };
+    let c2 = g.dot(n).powi(2).min(1.0);
+    1.0 / (1.0 - c2 + c2 / (k * k)).sqrt()
+}
+
 /// The surface at level `l` where columns `mv` move it, where the layer is tall: the layer at full (`full`: the volume
 /// with it shown as sculpted, per block it holds) drawn out or pressed down along its base's normal by its weight, or
 /// mirrored through its base where it is turned over, so walls and overhangs keep their shape. Per block reached: its
@@ -554,35 +575,23 @@ fn build_tall(read: &LevelVolume, frame: &Frame, l: usize, mv: &[Moving], full: 
         }
         (frame.pos(l, i) - s).dot(n).clamp(-band, band)
     };
-    let full_at = |q: Vec3, s: Vec3, n: Vec3| -> f32 {
+    // The layer at full at `q`, and which way it rises there.
+    let full_at = |q: Vec3, s: Vec3, n: Vec3| -> (f32, Vec3) {
         let g = (q - frame.origin) / vx;
         let i = g.floor().as_ivec3();
         let f = g - i.as_vec3();
         let bc = i.div_euclid(IVec3::splat(B));
         let li = i - bc * B;
-        if li.cmplt(IVec3::splat(B - 1)).all() {
-            let blk: Option<&[f32; N]> = full.get(&bc).map(|b| &**b).or_else(|| lin.and_then(|m| m.get(&bc)).filter(|x| !x[0].is_nan()).map(|b| &**b));
-            if let Some(b) = blk {
-                let mut v = 0.0;
-                for c in 0..8 {
-                    let o = IVec3::new(c & 1, (c >> 1) & 1, (c >> 2) & 1);
-                    let w = corner_weight(o, f);
-                    if w > 0.0 {
-                        v += w * b[local(i + o)];
-                    }
-                }
-                return v;
-            }
+        let mut cv = [0.0f32; 8];
+        let blk: Option<&[f32; N]> = if li.cmplt(IVec3::splat(B - 1)).all() { full.get(&bc).map(|b| &**b).or_else(|| lin.and_then(|m| m.get(&bc)).filter(|x| !x[0].is_nan()).map(|b| &**b)) } else { None };
+        for (c, x) in cv.iter_mut().enumerate() {
+            let o = IVec3::new(c as i32 & 1, (c as i32 >> 1) & 1, (c as i32 >> 2) & 1);
+            *x = match blk {
+                Some(b) => b[local(i + o)],
+                None => at(i + o, s, n),
+            };
         }
-        let mut v = 0.0;
-        for c in 0..8 {
-            let o = IVec3::new(c & 1, (c >> 1) & 1, (c >> 2) & 1);
-            let w = corner_weight(o, f);
-            if w > 0.0 {
-                v += w * at(i + o, s, n);
-            }
-        }
-        v
+        trilinear(&cv, f)
     };
     let field = ColField::new(frame, vx, band, mv);
     let blocks: Vec<IVec3> = field.blocks.iter().filter(|(_, ks)| ks.iter().any(|&k| mv[k].tall)).map(|(bc, _)| *bc).collect();
@@ -654,9 +663,10 @@ fn build_tall(read: &LevelVolume, frame: &Frame, l: usize, mv: &[Moving], full: 
                 };
                 match got {
                     Some(a) if a.tall && !a.pure => {
-                        let f = full_at(a.to_full(p), a.s, a.n);
-                        // Held at the band stays there; nearer, distances along the normal scale by the weight.
-                        let mag = if f.abs() >= 0.999 * band { f } else { a.k.abs() * f };
+                        let (f, g) = full_at(a.to_full(p), a.s, a.n);
+                        // Held at the band stays there; nearer, distances scale as the surface is pressed along the
+                        // normal: by the weight where it faces along it, not at all across a wall.
+                        let mag = if f.abs() >= 0.999 * band { f } else { f * squash(g, a.n, a.k) };
                         v[i] = (mag * a.k.signum()).clamp(-band, band);
                         set[i] = 1;
                     }
@@ -977,8 +987,16 @@ impl SculptLayer {
                     for i in 0..N {
                         let q = frame.pos(l, bc * B + cell(i));
                         let Some(a) = field.at(bc, q).filter(|a| a.tall && !a.pure) else { continue };
-                        let v = vol.value_upto(a.to_shown(q), l, false).clamp(-band, band);
-                        let full = if v.abs() >= 0.999 * band { v * a.k.signum() } else { v / a.k };
+                        let r = a.to_shown(q);
+                        let v = vol.value_upto(r, l, false).clamp(-band, band);
+                        let full = if v.abs() >= 0.999 * band {
+                            v * a.k.signum()
+                        } else {
+                            let h = 0.5 * vx;
+                            let d = |e: Vec3| vol.value_upto(r + e * h, l, false) - vol.value_upto(r - e * h, l, false);
+                            let g = Vec3::new(d(Vec3::X), d(Vec3::Y), d(Vec3::Z));
+                            v * a.k.signum() * squash(g, a.n, 1.0 / a.k)
+                        };
                         let base = held[i] - w[i] * self.blend.shape(od.map_or(0.0, |x| x[i]));
                         nd[i] = full.clamp(-band, band) - base;
                         lin_now[i] = base + w[i] * self.blend.shape(nd[i]);
@@ -2615,6 +2633,30 @@ mod tests {
         save(&vol, &layers, "h_front_50");
     }
 
+    /// Neighbouring samples of the finest level on either side of the surface but over two steps apart: creases where
+    /// a surface built meets one that was not (a distance field never has them).
+    fn creases(vol: &LevelVolume) -> usize {
+        let l = vol.levels() - 1;
+        let vx = vol.voxel(l);
+        vol.level_keys(l)
+            .into_iter()
+            .map(|bc| {
+                let mut n = 0;
+                for i in 0..N {
+                    let g = bc * B + cell(i);
+                    let a = vol.sample(l, g, false);
+                    for e in [IVec3::X, IVec3::Y, IVec3::Z] {
+                        let b = vol.sample(l, g + e, false);
+                        if (a < 0.0) != (b < 0.0) && (a - b).abs() > 2.0 * vx {
+                            n += 1;
+                        }
+                    }
+                }
+                n
+            })
+            .sum()
+    }
+
     /// Lines along z over the front crossing the surface more than once, between `x0` and `x1`.
     fn strays_in(vol: &LevelVolume, x0: f32, x1: f32) -> usize {
         let mut lines = 0;
@@ -2740,7 +2782,13 @@ mod tests {
         };
         let (rx, cx) = (-0.2, 0.22);
         let at = |vol: &LevelVolume| format!("raise {:6.1} carve {:6.1} strays {:3}", along(vol, rx), along(vol, cx), strays_in(vol, -0.45, 0.35));
-        println!("BLEND sculpted        {}", at(&vol));
+        let crease0 = creases(&vol);
+        println!("BLEND sculpted        {} creases {crease0}", at(&vol));
+        // Built surfaces meet the rest about as cleanly as strokes leave them.
+        let clean = |vol: &LevelVolume, what: &str| {
+            let n = creases(vol);
+            assert!(n <= 4 * crease0, "{what}: {n} creases, sculpted {crease0}");
+        };
         // Cross sections through y = 0 and y = 0.05 (P5 images, inside dark), written beside the shots.
         let slice = |vol: &LevelVolume, name: &str| {
             let Some(dir) = &dir else { return };
@@ -2777,7 +2825,8 @@ mod tests {
         for (name, blend) in [("subtract", LayerBlend::Subtract), ("max", LayerBlend::Raise), ("min", LayerBlend::Carve)] {
             (vol, layers, _) = make();
             step(&mut vol, |v| layers.set_blend(v, k, blend));
-            println!("BLEND {name:8} 100%    {}", at(&vol));
+            println!("BLEND {name:8} 100%    {} creases {}", at(&vol), creases(&vol));
+            clean(&vol, name);
             let (r, c) = (along(&vol, rx), along(&vol, cx));
             let (r0, c0) = (along(&sculpted, rx), along(&sculpted, cx));
             let (er, ec) = match blend {
@@ -2790,7 +2839,8 @@ mod tests {
             let before = vol.snapshot();
             save(&vol, &layers, &format!("{name}_100"));
             step(&mut vol, |v| layers.set_opacity(v, k, 0.5));
-            println!("BLEND {name:8} 50%     {}", at(&vol));
+            println!("BLEND {name:8} 50%     {} creases {}", at(&vol), creases(&vol));
+            clean(&vol, &format!("{name} at half"));
             let (r2, c2) = (along(&vol, rx), along(&vol, cx));
             assert!((r2 - 0.5 * er).abs() < 0.1 * r0.abs() + 1.0 && (c2 - 0.5 * ec).abs() < 0.1 * c0.abs() + 1.0, "{name} at half: raise {r2} carve {c2}, wanted {} {}", 0.5 * er, 0.5 * ec);
             slice(&vol, &format!("{name}50"));
