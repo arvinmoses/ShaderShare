@@ -1633,6 +1633,10 @@ impl SculptLayers {
             return;
         }
         let Some(before) = vol.before_last() else { return };
+        // A file can open with more levels than it was saved with.
+        if self.lin.len() < vol.levels() {
+            self.lin.resize(vol.levels(), Shared::default());
+        }
         let frame = Frame::of(vol);
         let keys = vol.last_stroke_keys();
         // Blocks it made, coarsest first: each layer's change shows through them as it did.
@@ -2509,6 +2513,34 @@ mod tests {
             }
             assert_eq!(layers.lin.get(l).map_or(0, |m| m.len()), back.lin.get(l).map_or(0, |m| m.len()));
         }
+    }
+
+    /// A file saved with fewer levels than it opens with: strokes on the finer levels (once a crash) work.
+    #[test]
+    fn opened_with_more_levels() {
+        let mut vol = ball();
+        let mut layers = SculptLayers::default();
+        let k = layers.add("Layer 1", vol.levels());
+        for _ in 0..12 {
+            stroke(&mut vol, 3, Vec3::new(-0.05, 0.0, 0.5));
+            layers.take_stroke(&vol, Some(k));
+        }
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Subtract));
+        step(&mut vol, |v| layers.set_opacity(v, k, 0.5));
+        let (mut vb, mut lb) = (Vec::new(), Vec::new());
+        vol.write_to(&mut vb).unwrap();
+        layers.write_to(&mut lb).unwrap();
+        let mut vol = LevelVolume::read_from(&mut &vb[..], 6).unwrap();
+        let mut layers = SculptLayers::read_from(&mut &lb[..]).unwrap();
+        assert_eq!(vol.levels(), 6);
+        for l in [5, 4, 3] {
+            for x in [-0.1, -0.05, 0.0] {
+                stroke(&mut vol, l, Vec3::new(x, 0.0, 0.5));
+                layers.take_stroke(&vol, Some(k));
+            }
+        }
+        step(&mut vol, |v| layers.set_opacity(v, k, 1.0));
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Add));
     }
 
     /// The finest-level height of the surface over the ball at `x` along +z, in finest steps.
