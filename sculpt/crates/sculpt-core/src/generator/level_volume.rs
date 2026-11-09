@@ -1506,6 +1506,23 @@ impl LevelVolume {
         self.history.last().map(|h| h.keys().copied().collect()).unwrap_or_default()
     }
 
+    /// Make the last `n` steps in the history one (a step done as several), and drop what there is to redo.
+    pub fn merge_last(&mut self, n: usize) {
+        self.redo.clear();
+        if n < 2 || self.history.len() < n {
+            return;
+        }
+        let rest: Vec<Shared<Key, Was>> = self.history.drain(self.history.len() + 1 - n..).collect();
+        let first = self.history.last_mut().unwrap();
+        for e in rest {
+            for (k, was) in e.iter() {
+                if !first.contains_key(k) {
+                    first.insert(*k, was.clone());
+                }
+            }
+        }
+    }
+
     /// Drop the last stroke from the history (something else undoes it).
     pub fn forget_last(&mut self) {
         self.history.pop();

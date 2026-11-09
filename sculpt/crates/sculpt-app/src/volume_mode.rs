@@ -16,7 +16,7 @@ use std::time::Instant;
 use crate::tools::Brush;
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
-use sculpt_core::generator::sculpt_layer::{LayerBlend, MaskInfo, MaskKind, SculptInfo, SculptLayers};
+use sculpt_core::generator::sculpt_layer::{LayerBlend, MaskInfo, MaskKind, ReplayDab, SculptInfo, SculptLayers};
 use sculpt_core::generator::layer::GeneratorSpec;
 use sculpt_core::surface_noise::SurfaceNoise;
 use sculpt_core::generator::{BoolOp, Primitive};
@@ -68,6 +68,7 @@ struct Ahead {
     sculpt: Option<SculptLayers>,
     sculpt_take: Option<Option<usize>>,
     sculpt_was: Option<SculptLayers>,
+    sculpt_dabs: Vec<ReplayDab>,
     /// Blocks either side changed since the copy was made: drawn again from the real state when it comes back.
     changed: std::collections::HashSet<Key>,
     /// The strokes as given, and how many of their events the real state has done.
@@ -89,6 +90,7 @@ impl Ahead {
         std::mem::swap(&mut self.sculpt, &mut m.sculpt);
         std::mem::swap(&mut self.sculpt_take, &mut m.sculpt_take);
         std::mem::swap(&mut self.sculpt_was, &mut m.sculpt_was);
+        std::mem::swap(&mut self.sculpt_dabs, &mut m.sculpt_dabs);
     }
 }
 
@@ -168,6 +170,9 @@ pub struct VolumeMode {
     sculpt_take: Option<Option<usize>>,
     /// The sculpt layers as a mask stroke under way began.
     sculpt_was: Option<SculptLayers>,
+    /// The dabs of the stroke under way, as given, where it is done again on its layer at full as it ends (see
+    /// `SculptLayers::replay_stroke`).
+    sculpt_dabs: Vec<ReplayDab>,
     /// The sculpt layers as each step of `vol`'s history (named by `LevelVolume::last_id`) began, and as each step to
     /// redo ended.
     sculpt_undo: Vec<(u64, SculptLayers)>,
@@ -284,6 +289,7 @@ impl VolumeMode {
             sculpt: None,
             sculpt_take: None,
             sculpt_was: None,
+            sculpt_dabs: Vec::new(),
             sculpt_undo: Vec::new(),
             sculpt_redo: Vec::new(),
             sculpt_open: None,
@@ -468,9 +474,20 @@ impl VolumeMode {
             return;
         }
         let s = strength.clamp(0.0, 1.0);
-        let height = radius * if carve { 0.015 + 0.06 * s } else { 0.015 + 0.08 * s };
+        let mut height = radius * if carve { 0.015 + 0.06 * s } else { 0.015 + 0.08 * s };
         // Smooth: each dab moves the surface from a tenth to seven tenths of the way to its smoothed self.
         let alpha = if brush == Brush::Smooth { 0.1 + 0.6 * s } else { 0.1 + 0.3 * s };
+        // On a sculpt layer turned over, at a part weight or built: the stroke shows as the layer will show it (a
+        // clay stroke on Subtract carves, at half it is half as high), and is done again on the layer at full as it
+        // ends.
+        let mut carve = carve;
+        if let (None, Some(Some(k)), Some(sl)) = (self.layer.as_ref(), self.sculpt_take, self.sculpt.as_ref())
+            && let Some(w) = sl.stroke_weight(k)
+        {
+            self.sculpt_dabs.push(ReplayDab { at, level: self.level, radius, height, hardness, alpha, carve, smooth: brush == Brush::Smooth });
+            height *= w.abs();
+            carve ^= w < 0.0;
+        }
         let dabbed = match (form, self.layer.as_mut()) {
             (true, Some(layer)) if brush == Brush::Smooth => layer.smooth_dab(&mut self.vol, self.level, at, along, radius, hardness, alpha),
             (_, _) if brush == Brush::Smooth => self.vol.smooth_dab(self.level, at, along, radius, hardness, alpha),
@@ -539,6 +556,7 @@ impl VolumeMode {
             sculpt: self.sculpt.clone(),
             sculpt_take: self.sculpt_take,
             sculpt_was: self.sculpt_was.clone(),
+            sculpt_dabs: self.sculpt_dabs.clone(),
             changed: Default::default(),
             events: Vec::new(),
             done: 0,
@@ -732,8 +750,18 @@ impl VolumeMode {
             && let Some(s) = self.sculpt.as_mut()
         {
             let was = s.clone();
-            s.take_stroke(&self.vol, on);
-            self.sculpt_kept(was);
+            let dabs = std::mem::take(&mut self.sculpt_dabs);
+            match on {
+                Some(k) if !dabs.is_empty() => {
+                    if s.replay_stroke(&mut self.vol, k, &dabs) {
+                        self.sculpt_kept(was);
+                    }
+                }
+                _ => {
+                    s.take_stroke(&self.vol, on);
+                    self.sculpt_kept(was);
+                }
+            }
         }
         if std::mem::take(&mut self.on_layer)
             && let Some(layer) = self.layer.as_mut()
@@ -870,6 +898,7 @@ impl VolumeMode {
         }
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
+        self.sculpt_dabs.clear();
     }
 
     /// The pen is up: the stroke ends off the frame, once the detail it queued is all carried, frames going on
@@ -1788,6 +1817,45 @@ mod tests {
         assert_eq!(back.sculpt_layers().map(|s| s.1[0].blocks), mode.sculpt_layers().map(|s| s.1[0].blocks));
         back.set_layer_visible(0, false);
         same_surface(&back.vol, &base_only.vol, 0.02).unwrap();
+    }
+
+    /// A clay stroke on a layer turned over carves (it shows as the layer shows), is one undo, and goes into the layer
+    /// at full: in Add it raises; hidden, the ball is as it was.
+    #[test]
+    fn strokes_on_a_turned_sculpt_layer() {
+        let stroke = |mode: &mut VolumeMode, x: f32| {
+            mode.begin_stroke();
+            for k in 0..12 {
+                let d = Vec3::new(x + 0.01 * k as f32, 0.05, 1.0).normalize();
+                let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
+                mode.brush_dab(hit, 0.08, 0.002, 0.8, 0.3, Brush::Clay);
+            }
+            mode.end_stroke();
+            mode.settle();
+        };
+        let at = |mode: &VolumeMode, x: f32| {
+            let d = Vec3::new(x + 0.055, 0.05, 1.0).normalize();
+            mode.raycast(d * 3.0, -d).unwrap().0.length()
+        };
+        let mut mode = VolumeMode::ball(2e5);
+        let plain = mode.vol.preview_copy();
+        let r0 = at(&mode, 0.0);
+        mode.new_sculpt_layer();
+        stroke(&mut mode, -0.3);
+        mode.set_layer_blend(0, LayerBlend::Subtract);
+        let turned = mode.vol.preview_copy();
+        stroke(&mut mode, 0.0);
+        let r1 = at(&mode, 0.0);
+        assert!(r1 < r0 - 0.002, "clay on a turned layer carves: {r0} to {r1}");
+        assert!(mode.undo());
+        same_field(&mode.vol, &turned, 0.0).unwrap();
+        assert!(mode.redo());
+        assert!((at(&mode, 0.0) - r1).abs() < 1e-5);
+        mode.set_layer_blend(0, LayerBlend::Add);
+        let r2 = at(&mode, 0.0);
+        assert!(r2 > r0 + 0.002, "in Add it raises: {r0} to {r2}");
+        mode.set_layer_visible(0, false);
+        same_surface(&mode.vol, &plain, 0.02).unwrap();
     }
 
     /// At the app's scale (a ball of 1M triangles), how long a new stroke waits for the last one's work: after a big
