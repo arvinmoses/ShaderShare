@@ -1840,6 +1840,16 @@ impl SculptLayers {
         (x.visible && (x.opacity != 1.0 || x.blend == LayerBlend::Subtract || built)).then(|| if x.blend == LayerBlend::Subtract { -x.opacity } else { x.opacity })
     }
 
+    /// The finest level a stroke on layer `k` done again on it at full goes to: where some of it is built, none finer
+    /// than it holds already (what it is built from at a level stands only where its strokes went there, so a finer
+    /// level begun so would show patches of the layer as sculpted among it built).
+    pub fn stroke_level(&self, k: usize) -> usize {
+        match self.stack.get(k) {
+            Some(x) if x.built.iter().any(|m| !m.is_empty()) => x.d.iter().rposition(|m| !m.is_empty()).unwrap_or(0),
+            _ => usize::MAX,
+        }
+    }
+
     /// A stroke on layer `k` just ended in `vol` (shown as made, not taken in): it goes, and is done again on the
     /// layer at full, dab for dab, each where its point lies on the layer at full; the layer then shows as it did. One
     /// step in `vol`'s history (none if nothing came of it). Returns whether there is one.
@@ -1848,6 +1858,9 @@ impl SculptLayers {
             return false;
         }
         let frame = Frame::of(vol);
+        let finest = self.stroke_level(k);
+        let dabs: Vec<ReplayDab> = dabs.iter().map(|d| ReplayDab { level: d.level.min(finest), ..*d }).collect();
+        let dabs = &dabs[..];
         let at: Vec<(Vec3, usize)> = dabs.iter().map(|d| (d.at, d.level)).collect();
         let at = self.stack[k].full_points(vol, &frame, &at);
         let (opacity, blend) = (self.stack[k].opacity, self.stack[k].blend);
@@ -2792,6 +2805,40 @@ mod tests {
         same(&vol, &clayed, 0.01);
     }
 
+    /// A finer stroke on a tall layer built at half, in a file opened with more levels than it was made at: it is done
+    /// no finer than the layer holds, so no level shows patches of the layer as sculpted among it built (once, every
+    /// stroke there left thousands of creases at the new level).
+    #[test]
+    fn finer_strokes_on_built_layer() {
+        let mut vol = ball();
+        let mut layers = SculptLayers::default();
+        let k = layers.add("Layer 1", vol.levels());
+        for _ in 0..10 {
+            stroke(&mut vol, 3, Vec3::new(-0.25, 0.0, 0.433));
+            layers.take_stroke(&vol, Some(k));
+        }
+        let crease0 = creases_at(&vol, 3);
+        step(&mut vol, |v| layers.set_blend(v, k, LayerBlend::Subtract));
+        step(&mut vol, |v| layers.set_opacity(v, k, 0.5));
+        let (mut vb, mut lb) = (Vec::new(), Vec::new());
+        vol.write_to(&mut vb).unwrap();
+        layers.write_to(&mut lb).unwrap();
+        let mut vol = LevelVolume::read_from(&mut &vb[..], 6).unwrap();
+        let mut layers = SculptLayers::read_from(&mut &lb[..]).unwrap();
+        assert_eq!(layers.stroke_level(k), 3);
+        for y in [-0.04f32, 0.0, 0.04] {
+            clay_on(&mut vol, &mut layers, k, 4, y);
+        }
+        for l in 4..6 {
+            assert_eq!(creases_at(&vol, l), 0, "level {l}");
+        }
+        let n = creases_at(&vol, 3);
+        assert!(n <= 4 * crease0.max(1), "level 3: {n} creases, sculpted {crease0}");
+        let mut hidden = vol.snapshot();
+        step(&mut hidden, |v| layers.set_visible(v, k, false));
+        assert_eq!(strays(&hidden), 0);
+    }
+
     /// The finest-level height of the surface over the ball at `x` along +z, in finest steps.
     fn top(vol: &LevelVolume, x: f32) -> f32 {
         let hit = vol.raycast(Vec3::new(x, 0.0, 2.0), -Vec3::Z, 3, false).map_or(f32::NAN, |h| h.0.z);
@@ -2917,7 +2964,11 @@ mod tests {
     /// Neighbouring samples of the finest level on either side of the surface but over two steps apart: creases where
     /// a surface built meets one that was not (a distance field never has them).
     fn creases(vol: &LevelVolume) -> usize {
-        let l = vol.levels() - 1;
+        creases_at(vol, vol.levels() - 1)
+    }
+
+    /// The same at level `l`.
+    fn creases_at(vol: &LevelVolume, l: usize) -> usize {
         let vx = vol.voxel(l);
         vol.level_keys(l)
             .into_iter()

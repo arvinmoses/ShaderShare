@@ -460,6 +460,12 @@ impl VolumeMode {
                 }
                 _ => {}
             }
+            // A stroke done again on a sculpt layer at full shows at the level it will be done at.
+            if let (None, Some(Some(k)), Some(sl)) = (self.layer.as_ref(), self.sculpt_take, self.sculpt.as_ref())
+                && sl.stroke_weight(k).is_some()
+            {
+                self.level = self.level.min(sl.stroke_level(k));
+            }
             self.chosen = true;
         }
         let form = target == Some(Target::Form);
