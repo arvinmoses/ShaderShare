@@ -1084,17 +1084,51 @@ impl SculptLayer {
                                 continue;
                             }
                             let p = frame.pos(l, bc * B + cell(i));
-                            let mut best: Option<(f32, Column)> = None;
-                            for &(f, n, h, vm) in &coarse {
-                                let o = p - f;
-                                let t = o.dot(n);
-                                let side = (o - n * t).length_squared();
-                                if t.abs() < 0.5 * vx && side < vm * vm && best.is_none_or(|b| side < b.0) {
-                                    best = Some((side, Column { i: i as u16, b: t, n, h }));
+                            // The base here from the coarser columns about it: their normals blended, and each one's
+                            // distance along its normal, bent by how the base curves between it and here (its plane
+                            // alone lies off a curved base by half its offset times how far the normal turns), so
+                            // finer levels do not inherit the coarser ones' flats.
+                            let mut best: Option<(f32, f32)> = None;
+                            let (mut nsum, mut wsum) = (Vec3::ZERO, 0.0f32);
+                            let near: Vec<(Vec3, Vec3, f32, f32, f32)> = coarse
+                                .iter()
+                                .filter_map(|&(f, n, h, vm)| {
+                                    let o = p - f;
+                                    let t = o.dot(n);
+                                    let side = (o - n * t).length_squared();
+                                    let r2 = 2.25 * vm * vm;
+                                    (t.abs() < vm + vx && side < r2).then(|| {
+                                        let q = 1.0 - side / r2;
+                                        (f, n, h, side, q * q)
+                                    })
+                                })
+                                .collect();
+                            for &(_, n, h, side, w) in &near {
+                                nsum += w * n;
+                                wsum += w;
+                                if best.is_none_or(|b| side < b.0) {
+                                    best = Some((side, h));
                                 }
                             }
-                            if let Some((_, c)) = best {
-                                cols.push(c);
+                            let Some((side, h)) = best else { continue };
+                            let vm = coarse[0].3;
+                            if side >= vm * vm {
+                                continue;
+                            }
+                            let n = nsum.normalize_or_zero();
+                            if n == Vec3::ZERO {
+                                continue;
+                            }
+                            let mut b = 0.0f32;
+                            for &(f, nj, _, _, w) in &near {
+                                let o = p - f;
+                                let t = o.dot(nj);
+                                let a = o - nj * t;
+                                b += w * (t + 0.5 * a.dot(n - nj));
+                            }
+                            let b = b / wsum;
+                            if b.abs() < 0.5 * vx {
+                                cols.push(Column { i: i as u16, b, n, h });
                                 have[i] = true;
                                 any = true;
                             }
@@ -2605,6 +2639,68 @@ mod tests {
             }
         }
         lines
+    }
+
+    /// The layer's columns stand on its base at every level (finer ones, which take theirs from the coarser, do not
+    /// keep the coarser ones' flats), and a tall layer at half shows no seam where its rebuilt surface meets the rest.
+    #[test]
+    fn feet_on_base() {
+        let make = || {
+            let mut vol = ball();
+            let mut layers = SculptLayers::default();
+            let k = layers.add("Layer 1", vol.levels());
+            for _ in 0..10 {
+                stroke(&mut vol, 3, Vec3::new(-0.25, 0.0, 0.433));
+                layers.take_stroke(&vol, Some(k));
+            }
+            for _ in 0..8 {
+                vol.begin_stroke();
+                for i in 0..6 {
+                    let x = 0.17 + 0.02 * i as f32;
+                    let p = Vec3::new(x, 0.0, (0.25 - x * x).sqrt());
+                    vol.plane_dab(3, p, p.normalize(), 0.1, 0.03, 0.5, 1.0, true);
+                }
+                vol.end_stroke();
+                layers.take_stroke(&vol, Some(k));
+            }
+            (vol, layers, k)
+        };
+        let (vol, layers, k) = make();
+        let fr = Frame::of(&vol);
+        for l in 0..vol.levels() {
+            let vx = vol.voxel(l);
+            let (mut worst, mut turn) = (0.0f32, 0.0f32);
+            for (bc, cols) in layers.stack[k].cols[l].iter() {
+                for c in cols.iter() {
+                    let f = c.foot(&fr, l, *bc);
+                    worst = worst.max((f.length() - 0.5).abs() / vx);
+                    turn = turn.max(c.n.angle_between(f.normalize()).to_degrees());
+                }
+            }
+            println!("FEET level {l}: off the base by at most {worst:.3} steps, normals by {turn:.1} degrees");
+            assert!(worst < 0.35 && turn < 7.0, "level {l}: feet off the base by {worst} steps, normals by {turn} degrees");
+        }
+        // Heights over the ball's front where the layer moves nothing, at half in Max (the carve hidden).
+        let height = |vol: &LevelVolume, x: f32, y: f32| {
+            let d = Vec3::new(x, y, (0.25 - x * x - y * y).sqrt()).normalize();
+            vol.raycast(d * 2.0, -d, 3, false).map_or(f32::NAN, |r| (r.0.length() - 0.5) / vol.voxel(3))
+        };
+        let (mut half, mut layers, k) = make();
+        step(&mut half, |v| layers.set_blend(v, k, LayerBlend::Raise));
+        step(&mut half, |v| layers.set_opacity(v, k, 0.5));
+        let plain = ball();
+        let mut worst = 0.0f32;
+        for j in 0..90 {
+            for i in 0..90 {
+                let (x, y) = (-0.4 + 0.8 * i as f32 / 90.0, -0.25 + 0.5 * j as f32 / 90.0);
+                let (a, b) = (height(&vol, x, y), height(&plain, x, y));
+                if (a - b).abs() < 0.05 {
+                    worst = worst.max((height(&half, x, y) - b).abs());
+                }
+            }
+        }
+        println!("FEET max at half: off the ball where the layer is flat by at most {worst:.2} steps");
+        assert!(worst < 0.5, "max at half: off the ball by {worst} steps where the layer moves nothing");
     }
 
     /// A tall raise and a deep carve on one layer, in every blend: each shows as it should at full and half, and comes
