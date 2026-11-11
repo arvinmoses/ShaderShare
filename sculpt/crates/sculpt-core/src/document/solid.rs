@@ -263,6 +263,12 @@ impl Document {
         let order = self.composite_order();
         let eps = (self.bvh.bounds().extent().length() * 1e-4).max(1e-9);
         let mut out = self.base.clone();
+        // Max and Min test against the base surface's normals (see `recomposite`).
+        let base_normals = order.iter().any(|&i| self.layers[i].blend.uses_normal()).then(|| match &self.gen_basis {
+            Some((t, e, b)) if (*t, *e) == (self.topology_id, self.base_epoch) => b.normals().to_vec(),
+            _ => crate::mesh::compute_normals(&self.base, &self.faces, &self.topo),
+        });
+        let normals: &[Vec3] = base_normals.as_deref().unwrap_or(&self.normals);
         for &i in &order {
             let layer = &self.layers[i];
             if layer.gen_cache.is_some() {
@@ -277,7 +283,7 @@ impl Document {
                         out[v] += chunk[k] * w;
                     } else {
                         let acc = out[v] - self.base[v];
-                        out[v] = self.base[v] + layer.blend.apply(acc, chunk[k], w, self.normals[v], eps);
+                        out[v] = self.base[v] + layer.blend.apply(acc, chunk[k], w, normals[v], eps);
                     }
                 }
             }

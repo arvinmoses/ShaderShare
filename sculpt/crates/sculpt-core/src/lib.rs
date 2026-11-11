@@ -15,6 +15,7 @@ pub mod layers;
 pub mod lod;
 pub mod mask;
 pub mod mesh;
+pub mod mesh_layers;
 pub mod noise;
 pub mod pose;
 pub mod preview;

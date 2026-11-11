@@ -950,7 +950,16 @@ impl Document {
         let ranges: Vec<Range<usize>> = leaves.iter().map(|&l| self.bvh.leaves[l as usize].owned_range()).collect();
         let order = self.composite_order();
         let eps = (self.bvh.bounds().extent().length() * 1e-4).max(1e-9);
+        // Max and Min keep the parts of a layer that raise or lower the base surface, so they test against the base's
+        // normals: the composite's turn with the layers themselves (up a tall raise's wall, sideways), which let a
+        // layer's own steep sides through or held its top back.
+        let gated = order.iter().any(|&i| self.layers[i].blend.uses_normal());
+        let basis = gated.then(|| self.generator_basis());
         let slices = split_ranges_mut(&mut self.positions, ranges.iter().cloned());
+        let gate_normals: &[Vec3] = match &basis {
+            Some(b) => b.normals(),
+            None => &self.normals,
+        };
         let (base, layers, normals, bvh) = (&self.base, &self.layers, &self.normals, &self.bvh);
         let changed: Vec<u32> = slices
             .into_par_iter()
@@ -975,7 +984,7 @@ impl Document {
                     for (k, p) in pos.iter_mut().enumerate() {
                         let v = r.start + k;
                         let acc = *p - base[v];
-                        *p = base[v] + layer.blend.apply(acc, chunk[k], layer.weight(v), normals[v], eps);
+                        *p = base[v] + layer.blend.apply(acc, chunk[k], layer.weight(v), gate_normals[v], eps);
                     }
                 }
             }

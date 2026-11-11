@@ -93,7 +93,12 @@ impl LayerBlend {
         matches!(self, LayerBlend::Add | LayerBlend::Subtract)
     }
 
-    /// New accumulated offset. `eps` is the length below which a stored offset counts as "no data".
+    /// True when [`Self::apply`] reads the normal (which should be the base surface's).
+    pub fn uses_normal(self) -> bool {
+        matches!(self, LayerBlend::Max | LayerBlend::Min)
+    }
+
+    /// New accumulated offset. `normal` is the base surface's normal. `eps` is the length below which a stored offset counts as "no data".
     #[inline]
     pub fn apply(self, acc: Vec3, layer: Vec3, s: f32, normal: Vec3, eps: f32) -> Vec3 {
         match self {
