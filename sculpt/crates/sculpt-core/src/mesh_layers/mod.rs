@@ -6,7 +6,10 @@
 //! (block, cell, piece): the surface piece of one lattice cell. Those names are stable: a volume edit only renames or
 //! moves the vertices of the cells it reached, so after an edit the layers are carried onto the re-extracted mesh by
 //! copying each vertex's data from the vertex of the same name wherever its base position did not change (bit for
-//! bit) and it lies outside the changed box, and by closest point on the old base surface only for the rest.
+//! bit), and from the old surface under it only for the rest.
+//!
+//! What a carry did not copy it hands back as a [`Patch`]: when the volume edit is undone and the surface is as it
+//! was, [`MeshLayers::restore`] puts that data back exactly.
 //!
 //! The mesh itself is never saved: [`MeshLayers::save`] writes the layers against the vertex names, and
 //! [`MeshLayers::load`] extracts the mesh again from the volume and puts the data back by name.
@@ -34,11 +37,10 @@ use glam::Vec3;
 pub struct MeshLayerSettings {
     /// The finest volume level the mesh shows (as `Show::upto`).
     pub cap: usize,
-    /// Vertices within this many lattice steps of the changed box are carried by closest point even when their name
-    /// and position survived.
+    /// Not used: a vertex whose name and position survived is always copied. (Kept for saved files.)
     pub margin_steps: f32,
-    /// The lattice step the carry's distances are measured in; `None` takes the finest shown level's voxel that holds
-    /// blocks.
+    /// What [`MeshLayers::step`] gives; `None` takes the finest shown level's voxel that holds blocks. The carry
+    /// measures each vertex's distances in its own level's step.
     pub step: Option<f32>,
 }
 
@@ -67,10 +69,37 @@ pub struct CarryStats {
     pub triangles: usize,
     /// Vertices whose data was copied by name.
     pub copied: usize,
-    /// Vertices carried by closest point.
+    /// Vertices carried from the old surface under them.
     pub projected: usize,
+    /// Of `projected`: vertices no old surface was found under (they start with no layer data).
+    pub unplaced: usize,
     /// Old faces the closest-point search ran over.
     pub search_faces: usize,
+}
+
+/// What one [`MeshLayers::refit`] carried without copying: the layer offsets, freeze and channels of every old vertex
+/// whose name or base position did not survive, by name. [`MeshLayers::restore`] puts them back.
+#[derive(Clone, Debug, Default)]
+pub struct Patch {
+    /// The vertex names, ascending.
+    names: Vec<u64>,
+    /// Each one's base position.
+    base: Vec<Vec3>,
+    /// Every layer there was, with its offsets at those vertices (`None`: all zero).
+    layers: Vec<(LayerId, Option<Vec<Vec3>>)>,
+    freeze: Option<Vec<f32>>,
+    channels: Vec<(String, Vec<f32>)>,
+}
+
+impl Patch {
+    /// How many vertices it holds.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 pub struct MeshLayers {
@@ -79,6 +108,8 @@ pub struct MeshLayers {
     keys: Vec<u64>,
     settings: MeshLayerSettings,
     step: f32,
+    /// The volume as the mesh was extracted from it: the next carry finds the old surface in it.
+    pre: LevelVolume,
 }
 
 impl MeshLayers {
@@ -86,7 +117,7 @@ impl MeshLayers {
     pub fn from_volume(vol: &LevelVolume, settings: MeshLayerSettings) -> Result<MeshLayers> {
         let (mesh, keys, _) = extract_named(vol, settings.cap)?;
         let doc = Document::from_mesh(mesh)?;
-        Ok(MeshLayers { doc, keys, settings, step: step_of(vol, &settings) })
+        Ok(MeshLayers { doc, keys, settings, step: step_of(vol, &settings), pre: vol.snapshot() })
     }
 
     pub fn settings(&self) -> &MeshLayerSettings {
@@ -131,9 +162,15 @@ impl MeshLayers {
         b
     }
 
-    /// Re-extract the surface after a volume edit confined to `changed` (world box) and carry the layers, channels and
-    /// freeze onto it.
+    /// Re-extract the surface after a volume edit and carry the layers, channels and freeze onto it. (`changed`, the
+    /// edit's world box, is not read: what changed is told from the vertex names and positions.)
     pub fn refit(&mut self, vol: &LevelVolume, changed: Aabb) -> Result<CarryStats> {
+        Ok(self.refit_patch(vol, changed)?.0)
+    }
+
+    /// [`Self::refit`], also giving what the carry did not copy: kept beside the volume's undo step, it lets
+    /// [`Self::restore`] put that data back once the edit is undone.
+    pub fn refit_patch(&mut self, vol: &LevelVolume, _changed: Aabb) -> Result<(CarryStats, Patch)> {
         let mut st = CarryStats::default();
         let t = Instant::now();
         let (mesh, keys, _) = extract_named(vol, self.settings.cap)?;
@@ -143,19 +180,28 @@ impl MeshLayers {
         st.build_ms = ms(t);
         self.step = step_of(vol, &self.settings);
         let t = Instant::now();
-        let (doc, s2) = carry::carry(&self.doc, &self.keys, new, &keys, changed, self.settings.margin_steps * self.step, self.step)?;
+        let plan = carry::plan(carry::Geo::of(&self.doc, &self.keys), carry::Geo::of(&new, &keys), &new.normals, &self.pre, vol, self.settings.cap);
+        let (doc, patch, recomposite_ms) = carry::apply(&self.doc, &self.keys, new, &plan)?;
         st.carry_ms = ms(t);
-        st.match_ms = s2.match_ms;
-        st.project_ms = s2.project_ms;
-        st.recomposite_ms = s2.recomposite_ms;
-        st.copied = s2.copied;
-        st.projected = s2.projected;
-        st.search_faces = s2.search_faces;
+        st.match_ms = plan.match_ms;
+        st.project_ms = plan.project_ms;
+        st.recomposite_ms = recomposite_ms;
+        st.copied = plan.copied;
+        st.projected = plan.projected;
+        st.unplaced = plan.unplaced;
+        st.search_faces = plan.search_faces;
         st.vertices = doc.vertex_count();
         st.triangles = doc.faces.iter().map(|f| face_len(f) - 2).sum();
         self.doc = doc;
         self.keys = keys;
-        Ok(st)
+        self.pre = vol.snapshot();
+        Ok((st, patch))
+    }
+
+    /// Put back what a carry did not copy, wherever a vertex of the same name sits at the same base position again
+    /// (after the volume edit was undone and the surface refitted). Returns how many vertices that was.
+    pub fn restore(&mut self, patch: &Patch) -> Result<usize> {
+        carry::restore(&mut self.doc, &self.keys, patch)
     }
 }
 
