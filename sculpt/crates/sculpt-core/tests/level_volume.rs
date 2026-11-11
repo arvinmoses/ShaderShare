@@ -2131,3 +2131,73 @@ fn heights_of_a_file() {
     std::fs::write(out, h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
     eprintln!("{m} x {m}");
 }
+
+/// Samples of air sealed inside the solid (no path through air to the edge of the box), on a grid of half finest
+/// steps over the top of a ball of radius 0.5, in the field up to level `up`.
+fn pockets(v: &LevelVolume, up: usize) -> usize {
+    let st = 0.5 * v.voxel(v.levels() - 1);
+    let (lo, hi) = (Vec3::new(-0.3, -0.3, 0.25), Vec3::new(0.3, 0.3, 1.1));
+    let n = ((hi - lo) / st).ceil().as_ivec3() + glam::IVec3::ONE;
+    let idx = |x: i32, y: i32, z: i32| ((z * n.y + y) * n.x + x) as usize;
+    let mut air = vec![false; (n.x * n.y * n.z) as usize];
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                air[idx(x, y, z)] = v.value_upto(lo + glam::IVec3::new(x, y, z).as_vec3() * st, up, false) >= 0.0;
+            }
+        }
+    }
+    let mut seen = vec![false; air.len()];
+    let mut stack = Vec::new();
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                let edge = x == 0 || y == 0 || z == 0 || x == n.x - 1 || y == n.y - 1 || z == n.z - 1;
+                if edge && air[idx(x, y, z)] {
+                    seen[idx(x, y, z)] = true;
+                    stack.push(glam::IVec3::new(x, y, z));
+                }
+            }
+        }
+    }
+    while let Some(c) = stack.pop() {
+        for e in [glam::IVec3::X, glam::IVec3::Y, glam::IVec3::Z, -glam::IVec3::X, -glam::IVec3::Y, -glam::IVec3::Z] {
+            let d = c + e;
+            if d.cmplt(glam::IVec3::ZERO).any() || d.cmpge(n).any() {
+                continue;
+            }
+            let i = idx(d.x, d.y, d.z);
+            if air[i] && !seen[i] {
+                seen[i] = true;
+                stack.push(d);
+            }
+        }
+    }
+    air.iter().zip(&seen).filter(|(a, s)| **a && !**s).count()
+}
+
+/// Clay piled far above the band at the finest level is held by every coarser level, and seals no air inside it at
+/// any level.
+#[test]
+fn tall_clay_has_no_pockets() {
+    let _g = ALONE.read();
+    let mut v = LevelVolume::from_field(&|p: Vec3| p.length() - 0.5, 1.0, 1.0 / 16.0, 4);
+    for _ in 0..12 {
+        v.begin_stroke();
+        for i in 0..6 {
+            let p = Vec3::new(-0.05 + 0.02 * i as f32, 0.0, 0.5);
+            v.plane_dab(3, p, p.normalize(), 0.12, 0.03, 0.5, 1.0, false);
+        }
+        v.end_stroke();
+    }
+    let top = v.raycast(Vec3::new(0.0, 0.0, 2.0), -Vec3::Z, 3, false).map_or(0.0, |h| h.0.z);
+    assert!(top - 0.5 > 50.0 * v.voxel(3), "lift {}", (top - 0.5) / v.voxel(3));
+    // Each coarser level holds the raise to within a few of its own steps (once level 0 stayed 52 finest steps,
+    // six of its own, below it).
+    for up in 0..3 {
+        let t = v.raycast(Vec3::new(0.0, 0.0, 2.0), -Vec3::Z, up, false).map_or(0.0, |h| h.0.z);
+        assert!(top - t < 3.0 * v.voxel(up), "level {up} {:.1} of its steps below the top", (top - t) / v.voxel(up));
+    }
+    let each: Vec<usize> = (0..4).map(|up| pockets(&v, up)).collect();
+    assert_eq!(each, vec![0; 4]);
+}

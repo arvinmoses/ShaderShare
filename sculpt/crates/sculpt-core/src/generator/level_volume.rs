@@ -3950,6 +3950,7 @@ impl LevelVolume {
                         *t = (0..17).map(|k| wts[k] * ay[((2 * z + k) * 8 + y) * 8 + x]).sum();
                     }
                     let mut s = me.block_values(m - 1, cb, false);
+                    let was = s.clone();
                     let mut any = false;
                     // A few passes: each moves the coarse field at most about a band toward the target, since it compares
                     // only within the finer band.
@@ -3969,6 +3970,22 @@ impl LevelVolume {
                         any |= moved;
                         if !moved {
                             break;
+                        }
+                    }
+                    // Form far taller than the smoothing is wide: the smoothing reaches past it, into what this level
+                    // shows where it holds no blocks (the coarser level, interpolated, still without it), so the target
+                    // stays near the surface and the coarser level never takes the form in; inside a tall raise the
+                    // coarser levels kept the old surface. Where this level is most of a band inside (or outside), its
+                    // surface is that far off, which no detail kept here is; where the coarser level was clearly on
+                    // the other side (not just at its own surface, beside a small bump), it takes this level's side.
+                    for (i, (v, w)) in s.iter_mut().zip(was.iter()).enumerate() {
+                        if target[i].is_nan() {
+                            continue;
+                        }
+                        let f = at(2 * cell_of(i).x as usize + R as usize, 2 * cell_of(i).y as usize + R as usize, 2 * cell_of(i).z as usize + R as usize);
+                        if f.abs() >= 0.8 * fband && w.abs() > 0.5 * keep && (f < 0.0) != (*w < 0.0) && (f < 0.0) != (*v < 0.0) {
+                            *v = f;
+                            any = true;
                         }
                     }
                     any.then_some((cb, s))
