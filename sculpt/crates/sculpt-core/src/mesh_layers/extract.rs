@@ -1,72 +1,115 @@
 //! The volume's display surface as one named mesh.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use glam::Vec3;
 use rayon::prelude::*;
 
-use crate::generator::level_volume::{ExtractStats, Key, LevelVolume, Show};
+use crate::generator::level_volume::{BlockSurface, ExtractStats, HashMap, Key, LevelVolume, Show};
 use crate::mesh::{Face, NO_VERT, PolyMesh, face_len, face_verts};
 use crate::{Error, Result};
 
+/// One extraction: the mesh, each vertex's name, and each vertex's normal (the field's gradient, normalized), all in
+/// the mesh's vertex order.
+pub struct Extracted {
+    pub mesh: PolyMesh,
+    pub keys: Vec<u64>,
+    pub normals: Vec<Vec3>,
+    pub stats: ExtractStats,
+}
+
 /// The volume's display surface as one mesh, with each vertex's name. Vertices no face uses are left out.
 pub fn extract_named(vol: &LevelVolume, cap: usize) -> Result<(PolyMesh, Vec<u64>, ExtractStats)> {
-    let v = Show::upto(cap);
+    let e = extract_all(vol, cap)?;
+    Ok((e.mesh, e.keys, e.stats))
+}
+
+/// [`extract_named`] with the vertex normals too.
+pub fn extract_all(vol: &LevelVolume, cap: usize) -> Result<Extracted> {
+    let (surf, stats) = extract_blocks(vol, cap);
+    assemble(&surf, stats)
+}
+
+/// Every shown block's surface, as [`LevelVolume::extract_in`] gives it.
+pub(super) fn extract_blocks(vol: &LevelVolume, cap: usize) -> (HashMap<Key, BlockSurface>, ExtractStats) {
     let work: Vec<Key> = vol.keys();
-    let (surf, stats) = vol.extract_in(&work, &v);
-    let mut blocks: Vec<&Key> = surf.keys().collect();
-    blocks.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
-    let mut first: std::collections::HashMap<Key, u32> = std::collections::HashMap::with_capacity(blocks.len());
-    let mut total = 0usize;
-    for k in &blocks {
-        first.insert(**k, total as u32);
-        total += surf[*k].verts.len();
-    }
-    // Positions and names, block by block, in parallel.
-    let per_block: Vec<(Vec<Vec3>, Vec<u64>)> = blocks
-        .par_iter()
-        .map(|k| {
-            let s = &surf[*k];
-            let mut names = vec![u64::MAX; s.verts.len()];
-            for (cell, &info) in s.cells.iter().enumerate() {
-                let count = ((info >> 10) & 7) as usize;
-                let start = (info & 1023) as usize;
-                for p in 0..count {
-                    if let Some(slot) = names.get_mut(start + p) {
-                        *slot = name(**k, cell, p);
-                    }
-                }
-            }
-            (s.verts.clone(), names)
-        })
-        .collect();
-    let mut positions = Vec::with_capacity(total);
-    let mut names = Vec::with_capacity(total);
-    for (p, n) in per_block {
-        positions.extend(p);
-        names.extend(n);
-    }
-    if names.iter().any(|&n| n == u64::MAX) {
-        return Err(Error::InvalidData("a surface vertex has no cell".into()));
-    }
-    for k in &blocks {
+    vol.extract_in(&work, &Show::upto(cap))
+}
+
+/// The mesh of the block surfaces `surf` (every block shown, as a full extraction gives them): blocks in order (level,
+/// z, y, x), each block's vertices in its own order; faces as `surface_in` builds them.
+pub fn assemble(surf: &HashMap<Key, BlockSurface>, stats: ExtractStats) -> Result<Extracted> {
+    let mut blocks: Vec<(Key, &BlockSurface)> = surf.iter().map(|(k, s)| (*k, s)).collect();
+    blocks.par_sort_unstable_by_key(|(k, _)| (k.0, k.1.z, k.1.y, k.1.x));
+    for (k, _) in &blocks {
         if k.1.abs().max_element() >= 1 << 15 {
             return Err(Error::InvalidData(format!("block {:?} is too far out to be named", k.1)));
         }
     }
-    // The faces, as `surface_in` builds them.
-    let face_lists: Vec<Vec<Face>> = blocks
-        .par_iter()
-        .map(|k| {
-            let mut faces = Vec::with_capacity(surf[*k].quads.len());
-            for q in &surf[*k].quads {
-                let Some(ids) = q.iter().map(|(b, c, p)| Some(first[b] + surf[b].vertex(*c, *p)? as u32)).collect::<Option<Vec<u32>>>() else { continue };
-                let mut uniq: Vec<u32> = Vec::with_capacity(4);
-                for v in ids {
-                    if uniq.last() != Some(&v) && uniq.first() != Some(&v) || uniq.is_empty() {
-                        uniq.push(v);
+    // Where each block's vertices start, and each block's place in the order (one lookup per quad corner).
+    let mut first = Vec::with_capacity(blocks.len() + 1);
+    let mut total = 0usize;
+    for (_, s) in &blocks {
+        first.push(total as u32);
+        total += s.verts.len();
+    }
+    first.push(total as u32);
+    let place: HashMap<Key, u32> = blocks.iter().enumerate().map(|(i, (k, _))| (*k, i as u32)).collect();
+    // Positions, names and normals, block by block, each written in place.
+    let mut positions = vec![Vec3::ZERO; total];
+    let mut names = vec![u64::MAX; total];
+    let mut normals = vec![Vec3::ZERO; total];
+    {
+        let mut parts = Vec::with_capacity(blocks.len());
+        let (mut p, mut n, mut m) = (&mut positions[..], &mut names[..], &mut normals[..]);
+        for (_, s) in &blocks {
+            let len = s.verts.len();
+            let (a, rest_p) = p.split_at_mut(len);
+            let (b, rest_n) = n.split_at_mut(len);
+            let (c, rest_m) = m.split_at_mut(len);
+            parts.push((a, b, c));
+            (p, n, m) = (rest_p, rest_n, rest_m);
+        }
+        parts.into_par_iter().zip(blocks.par_iter()).for_each(|((pos, nam, nor), (k, s))| {
+            pos.copy_from_slice(&s.verts);
+            for (o, g) in nor.iter_mut().zip(&s.normals) {
+                *o = g.normalize_or_zero();
+            }
+            for (cell, &info) in s.cells.iter().enumerate() {
+                let count = ((info >> 10) & 7) as usize;
+                let start = (info & 1023) as usize;
+                for p in 0..count {
+                    if let Some(slot) = nam.get_mut(start + p) {
+                        *slot = name(*k, cell, p);
                     }
                 }
-                match uniq.len() {
-                    4 => faces.push([uniq[0], uniq[1], uniq[2], uniq[3]]),
+            }
+        });
+    }
+    if names.par_iter().any(|&n| n == u64::MAX) {
+        return Err(Error::InvalidData("a surface vertex has no cell".into()));
+    }
+    // The faces, as `surface_in` builds them.
+    let corner = |(b, c, p): &(Key, u16, u8)| -> Option<u32> {
+        let i = *place.get(b)? as usize;
+        Some(first[i] + blocks[i].1.vertex(*c, *p)? as u32)
+    };
+    let face_lists: Vec<Vec<Face>> = blocks
+        .par_iter()
+        .map(|(_, s)| {
+            let mut faces = Vec::with_capacity(s.quads.len());
+            for q in &s.quads {
+                let (Some(a), Some(b), Some(c), Some(d)) = (corner(&q[0]), corner(&q[1]), corner(&q[2]), corner(&q[3])) else { continue };
+                let mut uniq = [0u32; 4];
+                let mut len = 0usize;
+                for v in [a, b, c, d] {
+                    if len == 0 || uniq[len - 1] != v && uniq[0] != v {
+                        uniq[len] = v;
+                        len += 1;
+                    }
+                }
+                match len {
+                    4 => faces.push(uniq),
                     3 => faces.push([uniq[0], uniq[1], uniq[2], NO_VERT]),
                     _ => {}
                 }
@@ -74,35 +117,40 @@ pub fn extract_named(vol: &LevelVolume, cap: usize) -> Result<(PolyMesh, Vec<u64
             faces
         })
         .collect();
-    let mut faces: Vec<Face> = face_lists.into_iter().flatten().collect();
-    // Drop vertices no face uses (they would be loose in the document).
-    let mut used = vec![false; positions.len()];
-    for f in &faces {
-        for &v in face_verts(f) {
-            used[v as usize] = true;
-        }
+    let mut faces: Vec<Face> = Vec::with_capacity(face_lists.iter().map(|f| f.len()).sum());
+    for f in face_lists {
+        faces.extend_from_slice(&f);
     }
-    if used.iter().any(|u| !u) {
-        let mut remap = vec![NO_VERT; positions.len()];
+    // Drop vertices no face uses (they would be loose in the document).
+    let used: Vec<AtomicBool> = (0..total).into_par_iter().map(|_| AtomicBool::new(false)).collect();
+    faces.par_iter().for_each(|f| {
+        for &v in face_verts(f) {
+            used[v as usize].store(true, Ordering::Relaxed);
+        }
+    });
+    if used.par_iter().any(|u| !u.load(Ordering::Relaxed)) {
+        let mut remap = vec![NO_VERT; total];
         let mut next = 0u32;
-        let (mut p2, mut n2) = (Vec::with_capacity(positions.len()), Vec::with_capacity(positions.len()));
-        for i in 0..positions.len() {
-            if used[i] {
+        let (mut p2, mut n2, mut m2) = (Vec::with_capacity(total), Vec::with_capacity(total), Vec::with_capacity(total));
+        for i in 0..total {
+            if used[i].load(Ordering::Relaxed) {
                 remap[i] = next;
                 next += 1;
                 p2.push(positions[i]);
                 n2.push(names[i]);
+                m2.push(normals[i]);
             }
         }
-        for f in &mut faces {
+        faces.par_iter_mut().for_each(|f| {
             for v in f.iter_mut().filter(|v| **v != NO_VERT) {
                 *v = remap[*v as usize];
             }
-        }
+        });
         positions = p2;
         names = n2;
+        normals = m2;
     }
-    Ok((PolyMesh { positions, faces }, names, stats))
+    Ok(Extracted { mesh: PolyMesh { positions, faces }, keys: names, normals, stats })
 }
 
 /// A vertex name: level (3 bits), block z, y, x (16 bits each, offset), cell (9 bits), piece (2 bits). Ascending in

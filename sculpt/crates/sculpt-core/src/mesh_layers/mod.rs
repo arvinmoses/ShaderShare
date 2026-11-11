@@ -11,11 +11,15 @@
 //! The mesh itself is never saved: [`MeshLayers::save`] writes the layers against the vertex names, and
 //! [`MeshLayers::load`] extracts the mesh again from the volume and puts the data back by name.
 
+mod cache;
 mod carry;
 mod extract;
 mod file;
+mod job;
 
-pub use extract::{edge_defects, extract_named};
+pub use cache::{BlockCache, CacheUpdate};
+pub use extract::{Extracted, assemble, edge_defects, extract_all, extract_named};
+pub use job::{JobStats, SwapStats};
 
 use std::time::Instant;
 
@@ -79,14 +83,18 @@ pub struct MeshLayers {
     keys: Vec<u64>,
     settings: MeshLayerSettings,
     step: f32,
+    /// Refitting off the main thread: the block cache, the old base geometry, the job under way.
+    live: job::Live,
 }
 
 impl MeshLayers {
     /// Extract the volume's surface and start with no layers.
     pub fn from_volume(vol: &LevelVolume, settings: MeshLayerSettings) -> Result<MeshLayers> {
-        let (mesh, keys, _) = extract_named(vol, settings.cap)?;
-        let doc = Document::from_mesh(mesh)?;
-        Ok(MeshLayers { doc, keys, settings, step: step_of(vol, &settings) })
+        let cache = BlockCache::build(vol, settings.cap);
+        let ex = cache.assemble()?;
+        let doc = Document::from_mesh(ex.mesh)?;
+        let live = job::Live::new(cache, job::Geom::of_fresh(&doc, &ex.keys));
+        Ok(MeshLayers { doc, keys: ex.keys, settings, step: step_of(vol, &settings), live })
     }
 
     pub fn settings(&self) -> &MeshLayerSettings {
@@ -156,6 +164,53 @@ impl MeshLayers {
         self.doc = doc;
         self.keys = keys;
         Ok(st)
+    }
+}
+
+/// Refitting off the main thread (see `job`).
+impl MeshLayers {
+    /// After a volume edit: count the blocks `dirty` (as [`LevelVolume::drain_dirty`] gives them) and the world box
+    /// `changed` as changed, and start a refit job on another thread if none runs (one that runs takes them when it
+    /// ends). Costs the main thread a snapshot of the volume. Returns the milliseconds spent here.
+    pub fn refit_async(&mut self, vol: &LevelVolume, dirty: &[Key], changed: Aabb) -> f64 {
+        let t = Instant::now();
+        self.live.note(dirty, changed);
+        self.live.start(vol, &self.doc, &self.keys, self.settings);
+        ms(t)
+    }
+
+    /// If the refit job finished: carry the layers as they are now onto its mesh and swap it in (then start the next
+    /// job, from `vol`, if more changes came meanwhile). `None` while it runs or when none does.
+    pub fn poll(&mut self, vol: &LevelVolume) -> Option<Result<SwapStats>> {
+        self.live.poll(false, vol, &mut self.doc, &mut self.keys, &mut self.step, self.settings)
+    }
+
+    /// [`Self::poll`], waiting for the job under way.
+    pub fn wait(&mut self, vol: &LevelVolume) -> Option<Result<SwapStats>> {
+        self.live.poll(true, vol, &mut self.doc, &mut self.keys, &mut self.step, self.settings)
+    }
+
+    /// Whether a refit job is under way.
+    pub fn busy(&self) -> bool {
+        self.live.busy()
+    }
+
+    /// [`Self::refit_async`] and wait for it (and for any job under way first): the block-cached refit, at once.
+    pub fn refit_cached(&mut self, vol: &LevelVolume, dirty: &[Key], changed: Aabb) -> Result<SwapStats> {
+        let mut last = None;
+        while self.busy() {
+            last = self.wait(vol);
+        }
+        self.refit_async(vol, dirty, changed);
+        while self.busy() {
+            last = self.wait(vol);
+        }
+        last.unwrap_or_else(|| Ok(SwapStats::default()))
+    }
+
+    /// The block cache, while no job holds it.
+    pub fn block_cache(&self) -> Option<&BlockCache> {
+        self.live.cache.as_ref()
     }
 }
 
