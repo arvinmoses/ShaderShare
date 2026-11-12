@@ -346,7 +346,7 @@ fn masks_opacity_undo_redo_and_save_open() {
     assert!(VolumeMode::read_from(&mut std::io::Cursor::new(&plain)).unwrap().mesh.is_none());
 }
 
-/// The rows told of every change: a dab's blocks, a swap's, a hidden layer's.
+/// The rows told of every change: a dab's leaves, a swap's blocks, a hidden layer's.
 #[test]
 fn rows_follow_dabs_swaps_and_hiding() {
     let _one = one_at_a_time();
@@ -361,7 +361,7 @@ fn rows_follow_dabs_swaps_and_hiding() {
     let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
     mode.queue_dab(hit, 0.05, 0.002, 0.8, 0.3, Brush::Clay);
     let r = frame(&mut mode);
-    assert!(!r.all && !r.blocks.is_empty(), "a dab: {r:?}");
+    assert!(!r.all && !r.leaves.is_empty(), "a dab lists its leaves: {r:?}");
     mode.end_stroke();
     mode.target = Target::Form;
     stroke(&mut mode, Target::Form, Vec3::new(-0.6, 0.3, 0.7), 0.1, Brush::Clay);
