@@ -27,11 +27,15 @@ pub struct RowsDirty {
     pub removed: Vec<Key>,
     /// No visible mesh layer remains: clear every row and turn `layers_shown` off.
     pub none: bool,
+    /// Layer dabs, mask and restore changes: the live document's BVH leaves whose vertices moved (much faster than
+    /// `blocks`). Only valid for the document as it is at the take; leaves pending when a swap lands are turned into
+    /// `blocks` first.
+    pub leaves: Vec<u32>,
 }
 
 impl RowsDirty {
     pub fn is_empty(&self) -> bool {
-        !self.all && !self.none && self.blocks.is_empty() && self.removed.is_empty()
+        !self.all && !self.none && self.blocks.is_empty() && self.removed.is_empty() && self.leaves.is_empty()
     }
 }
 
@@ -245,6 +249,12 @@ impl MeshStack {
         // What the layers changed since the rows were last told is told now: the swap's own list holds only what it
         // changes from here.
         self.collect_doc();
+        if !self.rows.leaves.is_empty() {
+            // Leaves name the document the swap replaces: as blocks they still mean something after it.
+            let ls = std::mem::take(&mut self.rows.leaves);
+            let blocks = self.leaf_blocks(&ls);
+            self.rows.blocks.extend(blocks);
+        }
         let r = if wait { self.layers.wait(vol) } else { self.layers.poll(vol) };
         let Some(r) = r else { return false };
         let swapped = match r {
@@ -445,10 +455,14 @@ impl MeshStack {
             out.all = false;
             out.blocks.clear();
             out.removed.clear();
+            out.leaves.clear();
         } else if out.all {
             out.blocks.clear();
             out.removed.clear();
+            out.leaves.clear();
         } else {
+            out.leaves.sort_unstable();
+            out.leaves.dedup();
             let order = |k: &Key| (k.0, k.1.z, k.1.y, k.1.x);
             out.blocks.sort_unstable_by_key(order);
             out.blocks.dedup();
@@ -478,8 +492,7 @@ impl MeshStack {
                 if self.rows.all {
                     return;
                 }
-                let blocks = self.leaf_blocks(&ls);
-                self.rows.blocks.extend(blocks);
+                self.rows.leaves.extend_from_slice(&ls);
             }
         }
     }

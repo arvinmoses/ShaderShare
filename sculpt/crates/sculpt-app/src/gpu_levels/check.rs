@@ -36,7 +36,7 @@ pub fn device() -> Res<(wgpu::Device, wgpu::Queue, String)> {
     Ok((device, queue, format!("{} ({:?})", info.name, info.backend)))
 }
 
-fn read(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer) -> Vec<u32> {
+pub(super) fn read(device: &wgpu::Device, queue: &wgpu::Queue, buf: &wgpu::Buffer) -> Vec<u32> {
     let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: buf.size(), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let mut enc = device.create_command_encoder(&Default::default());
     enc.copy_buffer_to_buffer(buf, 0, &staging, 0, buf.size());
@@ -772,7 +772,7 @@ pub fn run(args: &[String]) -> Res<()> {
     Ok(())
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
+pub(super) fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     v.get(v.len() / 2).copied().unwrap_or(0.0)
 }

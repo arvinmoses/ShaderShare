@@ -4,6 +4,7 @@
 //! sculpt-app [file.svol] [--triangles M] [--theme NAME] [--zoom F] [--size WxH] [--screenshot out.png] [--demo-volume DIR]
 //! sculpt-app --gpu-levels-check [...]                                    (the GPU surface against the CPU reference)
 //! sculpt-app --gpu-rows-check [--old-shader FILE] [--triangles M]         (mesh layer rows on the GPU surface)
+//! sculpt-app --gpu-layer-rows-check [--triangles M]                      (mesh layers fed to those rows)
 //! sculpt-app --gpu-bench [...] | --gpu-volume-bench [...] | --gpu-sdf-bench | --gpu-sdf-check | --gpu-sdf-png <dir>
 //!                                                                         (headless GPU spikes, no window)
 //! ```
@@ -17,6 +18,7 @@ mod gpu_sdf;
 mod gpu_volume;
 mod icons;
 mod keymap;
+mod layer_rows;
 mod mesh_edit;
 mod mesh_stack;
 mod panels;
@@ -55,7 +57,8 @@ const HELP: &str = "sculpt-app [file.svol] [--triangles M] [--theme NAME] [--zoo
   --screenshot P   save the window once the volume has settled, then close
   --demo-volume D  run the scripted session (SCULPT_DEMO_SCRIPT picks one), saving every frame into D
 sculpt-app --gpu-levels-check            the GPU surface against the CPU reference
-sculpt-app --gpu-rows-check              mesh layer rows drawn on the GPU surface (gates)";
+sculpt-app --gpu-rows-check              mesh layer rows drawn on the GPU surface (gates)
+sculpt-app --gpu-layer-rows-check        mesh layers fed to the GPU rows through volume strokes and layer dabs (gates)";
 
 fn main() -> eframe::Result {
     // Headless GPU checks and benchmarks: no window, their own wgpu device.
@@ -80,6 +83,14 @@ fn main() -> eframe::Result {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_levels::check::rows_run(&args) {
             eprintln!("gpu-rows-check: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if first.as_deref() == Some("--gpu-layer-rows-check") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = gpu_levels::layer_check::run(&args) {
+            eprintln!("gpu-layer-rows-check: {e}");
             std::process::exit(1);
         }
         return Ok(());

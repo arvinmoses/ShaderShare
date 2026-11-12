@@ -337,6 +337,7 @@ impl SculptApp {
             (Brush::Clay, p.strength, p.hardness)
         };
         self.stroke = Some(Stroke { brush, size_px: p.size_px, strength, hardness, last: None, carry: 0.0, last_px: None });
+        self.volume.invert = modifiers.command;
         self.volume.begin_stroke();
         self.pending.push_front(Sample { pos, pressure: self.pen.pressure });
     }
@@ -491,6 +492,8 @@ impl SculptApp {
             let demo = self.volume_demo.as_ref();
             let eye = demo.and_then(|d| d.level_eye).unwrap_or(self.camera.eye());
             self.settling = vp.sync_volume(rs, mode, eye, focal_px, demo.map(|d| d.clock()));
+            let rows = mode.take_rows_dirty();
+            vp.sync_layer_rows(rs, mode.mesh_layers(), rows);
             if self.settling {
                 ctx.request_repaint();
             }

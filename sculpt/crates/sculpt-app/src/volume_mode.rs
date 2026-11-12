@@ -1818,11 +1818,13 @@ impl VolumeMode {
             return;
         }
         let snap = self.vol.preview_copy();
+        // The mesh shows the levels the GPU draws, so its vertices are the drawn ones.
+        let settings = sculpt_core::mesh_layers::MeshLayerSettings { cap: self.cap, ..Default::default() };
         let (tx, rx) = channel();
         std::thread::Builder::new()
             .name("mesh-layers-first".into())
             .spawn(move || {
-                let r = sculpt_core::mesh_layers::MeshLayers::from_volume(&snap, Default::default()).map_err(|e| e.to_string());
+                let r = sculpt_core::mesh_layers::MeshLayers::from_volume(&snap, settings).map_err(|e| e.to_string());
                 let _ = tx.send(r);
             })
             .expect("spawn the mesh layer build");
