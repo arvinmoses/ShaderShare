@@ -47,6 +47,19 @@ pub(crate) enum Entry {
     Meta { id: LayerId, before: LayerMeta, after: LayerMeta },
 }
 
+/// A volume step undone or redone whose refit is under way: once it swaps in, what goes back (`back`, restored newest
+/// first) and the step's entry on the other side, with the refit's own patch.
+struct Landing {
+    serial: u64,
+    /// The step's name on the side it goes to (`redo_id` after an undo, `last_id` after a redo).
+    id: Option<u64>,
+    back: Vec<Patch>,
+    /// It goes on the redo side (an undo), else the history (a redo).
+    to_redo: bool,
+    /// The history as it was then: anything done meanwhile drops the entry (what there was to redo goes).
+    epoch: u64,
+}
+
 /// What the last swap, and the last refit's start, cost on the main thread.
 #[derive(Clone, Debug, Default)]
 pub struct MeshTimes {
@@ -82,6 +95,10 @@ pub struct MeshStack {
     pub(crate) fills: HashMap<String, f32>,
     /// A change going on over frames (a slider dragged): the layer as it began.
     pub(crate) open: Option<(LayerId, LayerMeta)>,
+    /// An undo or redo of a volume step whose refit is under way.
+    landing: Option<Landing>,
+    /// Bumped by every new step.
+    epoch: u64,
     pub times: MeshTimes,
 }
 
@@ -146,6 +163,8 @@ impl MeshStack {
             active_mask: HashMap::new(),
             fills: HashMap::new(),
             open: None,
+            landing: None,
+            epoch: 0,
             times: MeshTimes::default(),
         }
     }
@@ -172,6 +191,7 @@ impl MeshStack {
         self.history.push(Entry::Volume { serial, id, back: Vec::new() });
         self.uncovered.push(serial);
         self.redo.clear();
+        self.epoch += 1;
         if self.history.len() > 512 {
             self.history.remove(0);
         }
@@ -181,6 +201,7 @@ impl MeshStack {
     pub(crate) fn push(&mut self, e: Entry) {
         self.history.push(e);
         self.redo.clear();
+        self.epoch += 1;
         if self.history.len() > 512 {
             self.history.remove(0);
         }
@@ -192,19 +213,12 @@ impl MeshStack {
         self.redo.clear();
         self.uncovered.clear();
         self.cover.clear();
-    }
-
-    pub fn can_undo(&self) -> bool {
-        !self.history.is_empty()
-    }
-
-    pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        self.epoch += 1;
     }
 
     /// Whether a refit is under way or waiting (blocks changed since the last one began).
     pub fn pending(&self) -> bool {
-        self.layers.busy() || !self.dirty.is_empty()
+        self.layers.busy() || !self.dirty.is_empty() || self.landing.is_some()
     }
 
     /// Start refitting to `vol` (the real volume, at rest) if blocks changed and no refit runs. Returns whether one
@@ -249,6 +263,22 @@ impl MeshStack {
             }
         };
         let patches = self.layers.take_patches();
+        if swapped && let Some(l) = self.landing.take() {
+            // An undo or redo of a volume step: its refit is in. What it could not carry goes with the step to the
+            // other side; what the step kept goes back.
+            let fwd = patches.into_iter().next().unwrap_or_default();
+            for p in l.back.iter().rev() {
+                if let Err(e) = self.layers.restore(p) {
+                    eprintln!("mesh layers: restore failed: {e}");
+                }
+            }
+            if let (true, Some(id)) = (l.epoch == self.epoch, l.id) {
+                let e = Entry::Volume { serial: l.serial, id, back: vec![fwd] };
+                if l.to_redo { self.redo.push(e) } else { self.history.push(e) }
+            }
+            self.times.swap_frame_ms = t.elapsed().as_secs_f64() * 1e3;
+            return true;
+        }
         if swapped {
             let oldest = self.cover.first().copied();
             let entry = oldest.and_then(|s| self.history.iter_mut().find(|e| matches!(e, Entry::Volume { serial, .. } if *serial == s)));
@@ -283,42 +313,26 @@ impl MeshStack {
         }
     }
 
-    /// Refit to `vol` at once (after its undo or redo), with every block it has not sent yet: returns the refit's
-    /// patch (what it could not carry by name).
-    fn refit_now(&mut self, vol: &LevelVolume) -> Patch {
-        self.finish(vol);
+    /// After `vol`'s undo or redo of a step: start refitting to it, with every block it has not sent yet; `l` lands
+    /// when the swap comes in. (No refit runs: [`Self::finish`] came first.)
+    fn start_landing(&mut self, vol: &LevelVolume, l: Landing) {
+        let t = Instant::now();
         let waiting = vol.dirty_keys();
         let mut keys: Vec<Key> = waiting.iter().copied().chain(self.dirty.drain()).collect();
         keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
         keys.dedup();
-        self.collect_doc();
         let b = MeshLayers::changed_box(vol, &keys);
-        let out = match self.layers.refit_cached_patch(vol, &keys, b) {
-            Ok((st, patch)) => {
-                let _ = self.layers.doc.take_geometry_dirty();
-                if !st.discarded {
-                    self.rows.blocks.extend_from_slice(&st.blocks.changed);
-                    self.rows.removed.extend_from_slice(&st.blocks.removed);
-                    self.times.swaps += 1;
-                }
-                self.times.swap = Some(st);
-                patch
-            }
-            Err(e) => {
-                eprintln!("mesh layers: refit failed: {e}");
-                self.dirty.extend(keys);
-                Patch::default()
-            }
-        };
+        self.layers.refit_async(vol, &keys, b);
+        // (Steps since the last refit are in this one; it covers none for undo: its patch goes with `l`.)
+        self.uncovered.clear();
+        self.landing = Some(l);
         // Those blocks still wait for the GPU: the next look at the volume's changes leaves them out.
         self.skip = waiting.into_iter().collect();
-        // (Its patches are this one's, taken: none left over.)
-        let _ = self.layers.take_patches();
-        out
+        self.times.refit_start_ms = t.elapsed().as_secs_f64() * 1e3;
     }
 
-    /// Undo the newest step: a layer stroke or setting, or a volume step (`vol.undo`, a refit at once, its patches
-    /// back). With no entry left, the volume's own next step if it has one. Returns whether anything was undone.
+    /// Undo the newest step: a layer stroke or setting, or a volume step (`vol.undo`, a refit started, its patches
+    /// back once it swaps in: until then the volume shows undone and the layers as they were where it did not change). With no entry left, the volume's own next step if it has one. Returns whether anything was undone.
     pub fn undo(&mut self, vol: &mut LevelVolume) -> bool {
         self.close_open();
         self.finish(vol);
@@ -328,11 +342,9 @@ impl MeshStack {
                     if !vol.undo() {
                         return false;
                     }
-                    let fwd = self.refit_now(vol);
                     let serial = self.serial();
-                    if let Some(id) = vol.redo_id() {
-                        self.redo.push(Entry::Volume { serial, id, back: vec![fwd] });
-                    }
+                    let l = Landing { serial, id: vol.redo_id(), back: Vec::new(), to_redo: true, epoch: self.epoch };
+                    self.start_landing(vol, l);
                     return true;
                 }
                 Some(Entry::Layer(p)) => {
@@ -354,15 +366,8 @@ impl MeshStack {
                         continue;
                     }
                     vol.undo();
-                    let fwd = self.refit_now(vol);
-                    for p in back.iter().rev() {
-                        if let Err(e) = self.layers.restore(p) {
-                            eprintln!("mesh layers: restore failed: {e}");
-                        }
-                    }
-                    if let Some(id) = vol.redo_id() {
-                        self.redo.push(Entry::Volume { serial, id, back: vec![fwd] });
-                    }
+                    let l = Landing { serial, id: vol.redo_id(), back, to_redo: true, epoch: self.epoch };
+                    self.start_landing(vol, l);
                     return true;
                 }
             }
@@ -393,15 +398,8 @@ impl MeshStack {
                     return false;
                 }
                 vol.redo();
-                let fwd = self.refit_now(vol);
-                for p in back.iter().rev() {
-                    if let Err(e) = self.layers.restore(p) {
-                        eprintln!("mesh layers: restore failed: {e}");
-                    }
-                }
-                if let Some(id) = vol.last_id() {
-                    self.history.push(Entry::Volume { serial, id, back: vec![fwd] });
-                }
+                let l = Landing { serial, id: vol.last_id(), back, to_redo: false, epoch: self.epoch };
+                self.start_landing(vol, l);
                 true
             }
         }
