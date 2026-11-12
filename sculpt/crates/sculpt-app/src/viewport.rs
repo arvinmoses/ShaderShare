@@ -67,6 +67,10 @@ pub struct Viewport {
     /// Mesh layers are shown: every block at its finest level (no level by distance, no budget) and no cluster
     /// culling (the clusters' bounds and cones are of the surface without the layers).
     pub layers_shown: bool,
+    /// Mesh layer rows kept up to date (see [`Self::sync_layer_rows`]); its stats say what the last frame did.
+    pub layer_rows: crate::layer_rows::LayerRowsSync,
+    /// How many volume surfaces were made on the GPU (each new one holds no rows).
+    volumes_made: u64,
     /// The volume's vertices as drawn, for checks (made when first needed).
     capture: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     shader: wgpu::ShaderModule,
@@ -239,6 +243,8 @@ impl Viewport {
             cull: true,
             volume_draws: 0,
             layers_shown: false,
+            layer_rows: Default::default(),
+            volumes_made: 0,
             capture: None,
             shader,
             bgl,
@@ -311,6 +317,7 @@ impl Viewport {
             let (mask_hash, mask_samples) = (empty("noise mask hash"), empty("noise mask samples"));
             let group = Self::levels_group(&device, &self.levels_bgl, &uniforms, &gpu, &mask_hash, &mask_samples);
             self.volume = Some(VolumeGpu { buffers_made: gpu.buffers_made, gpu, uniforms, group, mask_hash, mask_samples, mask_of: None, mask_bits: 0, generation: mode.generation });
+            self.volumes_made += 1;
         }
         let v = self.volume.as_mut().unwrap();
         v.gpu.set_cap(mode.cap);
@@ -407,6 +414,31 @@ impl Viewport {
     /// Drop the GPU's copy of the volume: the next sync builds it afresh (a new or opened volume).
     pub fn clear_volume(&mut self) {
         self.volume = None;
+    }
+
+    /// Mesh layers on the volume's surface, once a frame right after [`Self::sync_volume`]: `ml` the live mesh layers
+    /// (never a run-ahead copy) and `dirty` what changed since the last call. Sets the rows of the blocks listed (every
+    /// block's with `dirty.all`, on the first call that shows layers, or on a new GPU surface), drops those of blocks
+    /// removed, and turns [`Self::layers_shown`] on with the first rows and off with `dirty.none` or no `ml`. A block
+    /// the GPU extracted again for a volume edit after `ml`'s mesh was taken shows the plain volume until a later
+    /// `dirty.blocks` lists it; one extracted for the view only shows its rows again by itself.
+    #[allow(dead_code)] // (called from app.rs once mesh layers are wired in)
+    pub fn sync_layer_rows(&mut self, _rs: &egui_wgpu::RenderState, ml: Option<&sculpt_core::mesh_layers::MeshLayers>, dirty: crate::layer_rows::RowsDirty) {
+        self.sync_layer_rows_on(ml, dirty);
+    }
+
+    /// [`Self::sync_layer_rows`] with no window (the rows go up with the next draw or capture).
+    pub fn sync_layer_rows_on(&mut self, ml: Option<&sculpt_core::mesh_layers::MeshLayers>, dirty: crate::layer_rows::RowsDirty) {
+        match self.volume.as_mut() {
+            Some(v) => self.layers_shown = self.layer_rows.sync(&mut v.gpu, self.volumes_made, ml, dirty, self.layers_shown),
+            None => {
+                if dirty.none || ml.is_none() {
+                    self.layers_shown = false;
+                } else {
+                    self.layer_rows.want_all(&dirty);
+                }
+            }
+        }
     }
 
     /// The volume's GPU surface (where mesh layer rows are set), once synced.

@@ -23,6 +23,7 @@ use sculpt_core::generator::level_view::LevelView;
 use sculpt_core::generator::level_volume::{HashMap as KeyMap, HashSet as KeySet, Key, LevelVolume, Show, piece_table, quantize};
 
 pub mod check;
+pub mod layer_check;
 mod join;
 pub mod rows;
 mod upload;
@@ -776,8 +777,10 @@ impl GpuLevels {
         if work.is_empty() {
             return;
         }
-        // Their vertices may be renumbered: no rows until they are set again.
-        self.rows.extracted(work.iter().copied());
+        // Their vertices may be renumbered: no rows until they are set again (or, if their rows still fit, until
+        // `repoint_rows`).
+        let key_of = &self.key_of;
+        self.rows.extracted(work.iter().map(|&s| (s, key_of.get(s as usize).copied().flatten())));
         if work.len() as u32 > self.buf.work_len {
             // The work list grows with the slots; a longer list than that is a full rebuild's.
             let len = (work.len() as u32).next_power_of_two();
@@ -954,14 +957,25 @@ impl GpuLevels {
 
     /// Bring the GPU's copy up to date with `vol`: upload what changed and re-extract around it.
     pub fn sync(&mut self, vol: &mut LevelVolume) -> SyncStats {
-        self.sync_in(vol, None)
+        let s = self.sync_in(vol, None);
+        self.rows_landing();
+        s
+    }
+
+    /// Blocks whose change is left for a later sync show the surface before it: rows fit them only once it lands.
+    fn rows_landing(&mut self) {
+        if self.rows.has_rows() || !self.pending_set.is_empty() {
+            self.rows.landing(self.pending_set.iter().copied());
+        }
     }
 
     /// [`Self::sync`] just before [`Self::join`] of `plan`: the plan's blocks are neither sent nor extracted here
     /// (the join writes their samples and extracts them), only given slots.
     pub fn sync_for_join(&mut self, vol: &mut LevelVolume, plan: &sculpt_core::generator::detail_layer::GpuPlan) -> SyncStats {
         let skip: KeySet<Key> = plan.blocks.iter().copied().collect();
-        self.sync_in(vol, Some(&skip))
+        let s = self.sync_in(vol, Some(&skip));
+        self.rows_landing();
+        s
     }
 
     fn sync_in(&mut self, vol: &mut LevelVolume, skip: Option<&KeySet<Key>>) -> SyncStats {
@@ -985,6 +999,18 @@ impl GpuLevels {
         // The blocks that changed: those left from earlier syncs first. A big change goes up region by region over
         // several syncs, the rest shown as it was meanwhile; a join (whose blocks the GPU writes) takes everything.
         let drained = vol.drain_dirty();
+        // With rows held: the blocks whose surface this change of the volume reaches are edited now (rows made from a
+        // mesh taken before do not fit them); a block extracted for the view only keeps its surface. A new cap or
+        // origin changes every surface.
+        if self.rows.has_rows() {
+            if self.cap_changed || (!first && vol.origin() != self.origin) {
+                self.rows.edited(vol.keys());
+            } else if !drained.is_empty() {
+                let mut e = vol.extract_set_in(&drained, &self.view.show(self.cap));
+                e.extend_from_slice(&drained);
+                self.rows.edited(e);
+            }
+        }
         let n_dirty = drained.len() + self.pending_set.len();
         let mut dirty = self.take_region(vol, drained, full || skip.is_some());
         let spread = !self.pending_set.is_empty();
@@ -1239,8 +1265,25 @@ impl GpuLevels {
     /// and `fill(i, rows)` writes them in place, on many threads. `mark` as for [`Self::set_block_rows_since`]
     /// (`u64::MAX`: none). Returns how many blocks show them.
     pub fn set_many_block_rows(&mut self, blocks: &[(Key, usize)], mark: u64, fill: impl Fn(usize, &mut [Row]) + Sync) -> usize {
-        let with_slots: Vec<(Key, Option<u32>, u32)> = blocks.iter().map(|(k, n)| (*k, self.slot_of.get(k).copied(), *n as u32)).collect();
+        self.set_many_block_rows_held(blocks, mark, true, fill)
+    }
+
+    /// [`Self::set_many_block_rows`]; with `show` false the rows are only kept, for [`Self::repoint_rows`] to show
+    /// (as when the view is about to change).
+    pub fn set_many_block_rows_held(&mut self, blocks: &[(Key, usize)], mark: u64, show: bool, fill: impl Fn(usize, &mut [Row]) + Sync) -> usize {
+        let with_slots: Vec<(Key, Option<u32>, u32)> = blocks.iter().map(|(k, n)| (*k, if show { self.slot_of.get(k).copied() } else { None }, *n as u32)).collect();
         self.rows.set_many(&with_slots, mark, &fill)
+    }
+
+    /// The rows held, read only (for many threads at once).
+    pub fn rows_read(&self) -> rows::RowsRead<'_> {
+        self.rows.read()
+    }
+
+    /// Single rows changed in place: (row index, row), all in the places of `blocks` (which go up whole). Returns how
+    /// many differed from what was there.
+    pub fn write_rows(&mut self, writes: &[(u32, Row)], blocks: &[Key]) -> usize {
+        self.rows.write(writes, blocks)
     }
 
     /// Now, for [`Self::set_block_rows_since`]: take it when the surface the rows are made from is the one the GPU
@@ -1258,9 +1301,38 @@ impl GpuLevels {
         self.rows.clear_all();
     }
 
+    /// Point the blocks whose rows are not shown at them where they now can be: blocks that came into view or were
+    /// extracted again for the view only (their surface is as it was), with rows that still fit. Once a frame, after
+    /// the sync. Returns how many were pointed.
+    pub fn repoint_rows(&mut self) -> usize {
+        let slot_of = &self.slot_of;
+        self.rows.repoint(|k| slot_of.get(&k).copied())
+    }
+
+    /// Rows not shown whose block a newer mesh (taken at `mark`) left as it was: they hold for it too, so they show
+    /// once they fit (at the next [`Self::repoint_rows`]). `keep(k)` false leaves block `k` as it is.
+    pub fn remark_rows(&mut self, mark: u64, keep: impl Fn(Key) -> bool) {
+        self.rows.remark(mark, keep);
+    }
+
+    /// Blocks holding rows that are not shown (no slot, or refused until set again).
+    pub fn rows_unshown(&self) -> usize {
+        self.rows.unpointed()
+    }
+
+    /// Whether block `k`'s rows are shown.
+    pub fn rows_shown(&self, k: Key) -> bool {
+        self.rows.shown(k)
+    }
+
     /// Blocks that had rows showing and lost them since the last call: extracted again or gone from the GPU.
     pub fn take_rows_dropped(&mut self) -> Vec<Key> {
         self.rows.take_dropped()
+    }
+
+    /// Every block holding rows (shown or not).
+    pub fn rows_keys(&self) -> Vec<Key> {
+        self.rows.keys()
     }
 
     pub fn has_rows(&self) -> bool {
