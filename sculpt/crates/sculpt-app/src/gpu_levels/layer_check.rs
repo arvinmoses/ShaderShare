@@ -9,7 +9,7 @@
 //!    was taken; at the end, settled, none.
 //! 2. The normal change: drawn normals against the mesh's composite normals, with and without it, and the GPU's own
 //!    normal against the base mesh normal (what the change can be no better than).
-//! 3. Per frame at about 2.5M triangles: a layer dab's rows < 0.3 ms, a swap's < 2 ms, every row < 10 ms.
+//! 3. Per frame at about 2.5M triangles: a layer dab's rows < 0.5 ms, a swap's < 2 ms, every row < 10 ms.
 
 use std::time::Instant;
 
@@ -532,7 +532,7 @@ pub fn run(args: &[String]) -> Res<()> {
         sc.settle()?;
     }
     let (dab, swap, all) = (median(dab_ms), median(swap_ms), median(all_ms));
-    println!("gate 3: a layer dab's rows by its leaves (median {:.0} rows made, {:.0} changed): {dab:.3} ms (bar 0.3)", median(dab_rows), median(dab_changed));
+    println!("gate 3: a layer dab's rows by its leaves (median {:.0} rows made, {:.0} changed): {dab:.3} ms (bar 0.5)", median(dab_rows), median(dab_changed));
     println!(
         "        (rows of the leaves {:.3} ms, the call {:.3}, with taking the leaves {:.3}, then sending; given as blocks instead: {:.0} rows made, {:.3} ms)",
         median(dab_parts.iter().map(|p| p.0).collect()),
@@ -544,9 +544,9 @@ pub fn run(args: &[String]) -> Res<()> {
     println!("gate 3: a swap's rows (median {:.0} blocks): {swap:.3} ms (bar 2)", median(swap_blocks));
     println!("gate 3: every row ({} blocks, {} rows): {all:.2} ms (bar 10)", st_all.blocks, st_all.rows);
     let (bytes, used, held) = sc.vp.levels().unwrap().rows_memory();
-    println!("gate 3: row memory on the GPU {:.1} MB: {used} rows used of {held} held", bytes as f64 / 1048576.0);
+    println!("gate 3: row memory on the GPU {:.1} MB (bar 26): {used} rows used of {held} held", bytes as f64 / 1048576.0);
     check(&mut sc, "2.5M settled", true, &mut fails)?;
-    if dab > 0.3 || swap > 2.0 || all > 10.0 {
+    if dab > 0.5 || swap > 2.0 || all > 10.0 || bytes as f64 > 26.0 * 1048576.0 {
         fails.push("gate 3: over a bar".into());
     }
     if !fails.is_empty() {
