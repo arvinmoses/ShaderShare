@@ -1106,3 +1106,311 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------- mesh layer rows
+
+/// A block's vertex count in its GPU vertex order, from its cells (a cell's word names its first vertex and its
+/// pieces); the same as `BlockSurface::verts`, whose order is the GPU's (cells are compared equal in [`compare`]).
+fn gpu_vertex_count(s: &BlockSurface) -> usize {
+    s.cells.iter().map(|&c| if (c >> 10) & 7 == 0 { 0 } else { (c & 1023) as usize + ((c >> 10) & 7) as usize }).max().unwrap_or(0)
+}
+
+type Surfaces = sculpt_core::generator::level_volume::HashMap<Key, BlockSurface>;
+
+/// The shown blocks with surface the GPU holds, each with its slot, and the CPU's surface of every shown block.
+fn rows_blocks(vp: &mut crate::viewport::Viewport, vol: &LevelVolume) -> Res<(Vec<(Key, u32)>, Surfaces)> {
+    let gpu = vp.levels().ok_or("no volume on the GPU")?;
+    let show = gpu.show();
+    let keys: Vec<Key> = vol.keys().into_iter().filter(|k| !show.hides(*k)).collect();
+    let (surf, _) = vol.extract_in(&keys, &show);
+    let mut out = Vec::new();
+    for k in keys {
+        let s = gpu.slot(k).ok_or_else(|| format!("block {k:?} has no slot"))?;
+        let w = &surf[&k];
+        if gpu_vertex_count(w) != w.verts.len() {
+            return Err(format!("block {k:?}: the cells name {} vertices, the surface has {}", gpu_vertex_count(w), w.verts.len()).into());
+        }
+        if !w.verts.is_empty() {
+            out.push((k, s));
+        }
+    }
+    Ok((out, surf))
+}
+
+/// Sync until nothing is left to land.
+fn rows_settle(device: &wgpu::Device, queue: &wgpu::Queue, vp: &mut crate::viewport::Viewport, mode: &mut crate::volume_mode::VolumeMode, eye: Vec3) {
+    for _ in 0..200 {
+        let more = vp.sync_volume_on(device, queue, mode, eye, 1000.0, Some(1000.0));
+        if !more && mode.vol.dirty_keys().is_empty() {
+            break;
+        }
+    }
+}
+
+fn rows_capture(device: &wgpu::Device, queue: &wgpu::Queue, vp: &mut crate::viewport::Viewport, blocks: &[(Key, u32)], surf: &Surfaces) -> Vec<(Vec3, Vec3)> {
+    let slots: Vec<u32> = blocks.iter().map(|b| b.1).collect();
+    let counts: Vec<u32> = blocks.iter().map(|b| surf[&b.0].verts.len() as u32).collect();
+    vp.capture(device, queue, &slots, &counts)
+}
+
+fn same_bits(a: Vec3, b: Vec3) -> bool {
+    a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits() && a.z.to_bits() == b.z.to_bits()
+}
+
+/// Pixels differing between two images, of those where `keep(x, y)`: (differing, kept).
+fn pixels_differ(a: &[u8], b: &[u8], w: u32, keep: impl Fn(u32, u32) -> bool) -> (usize, usize) {
+    let (mut n, mut of) = (0, 0);
+    for (i, (p, q)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+        let (x, y) = (i as u32 % w, i as u32 / w);
+        if keep(x, y) {
+            of += 1;
+            n += (p != q) as usize;
+        }
+    }
+    (n, of)
+}
+
+/// `sculpt-app --gpu-rows-check [--old-shader FILE] [--triangles M]`: mesh layer rows drawn on the GPU's surface.
+/// 1. No rows, and rows all zero: the image and every drawn vertex bit-equal to none (and the image to one drawn with
+///    the shader in FILE, the viewport's shader before rows, if given).
+/// 2. Rows of half a step along the normal, with a change of normal, on the blocks right of x = 0: every drawn vertex
+///    is where it was plus its row, exactly; none moves in the other half and no pixel there differs. After a stroke,
+///    blocks the GPU extracted again lose their rows and the rest keep them.
+/// 3. Timing at about 2.5M triangles (`--triangles`, millions shown): a dab's rows, a swap's, every row; memory.
+pub fn rows_run(args: &[String]) -> Res<()> {
+    let (device, queue, adapter) = device()?;
+    println!("adapter: {adapter}");
+    let theme = crate::theme::ThemeLibrary::load(std::path::Path::new("no themes here")).themes[0].clone();
+    let old = match args.iter().position(|a| a == "--old-shader").and_then(|i| args.get(i + 1)) {
+        Some(f) => Some(std::fs::read_to_string(f)?.trim_start_matches('\u{feff}').to_string()),
+        None => None,
+    };
+    let size = [640u32, 480];
+    let cam = crate::camera::Camera { distance: 3.4, yaw: 0.0, pitch: 0.0, ..Default::default() };
+    let eye = cam.eye();
+    // A ball with strokes at levels 1 and 2, so blocks of three levels are drawn.
+    let mut mode = crate::volume_mode::VolumeMode::ball(2e5);
+    stroke(&mut mode.vol, 1, Vec3::new(-0.4, 0.1, 1.0), Vec3::new(0.4, 0.15, 1.0), 0.08, false, |v| { v.carry_pending(None); }, |_| {});
+    stroke(&mut mode.vol, 2, Vec3::new(-0.2, -0.2, 1.0), Vec3::new(0.3, -0.15, 1.0), 0.03, false, |v| { v.carry_pending(None); }, |_| {});
+    let mut vp = crate::viewport::Viewport::with_device(&device, include_str!("../viewport.wgsl"));
+    vp.layers_shown = true;
+    rows_settle(&device, &queue, &mut vp, &mut mode, eye);
+    let (blocks, surf) = rows_blocks(&mut vp, &mode.vol)?;
+    let verts: usize = blocks.iter().map(|b| surf[&b.0].verts.len()).sum();
+    let levels: std::collections::BTreeSet<u8> = blocks.iter().map(|b| b.0.0).collect();
+    println!("{} blocks with surface at levels {levels:?}, {verts} vertices; each block's GPU vertex order from its cells", blocks.len());
+
+    // ---- 1. zero rows
+    let none = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+    if let Some(src) = &old {
+        let mut vp_old = crate::viewport::Viewport::with_device(&device, src);
+        vp_old.layers_shown = true;
+        rows_settle(&device, &queue, &mut vp_old, &mut mode, eye);
+        let img = vp_old.render_offscreen(&device, &queue, size, &cam, &theme);
+        let (d, of) = pixels_differ(&none, &img, size[0], |_, _| true);
+        println!("gate 1: no rows against the shader before rows: {d} of {of} pixels differ");
+        if d > 0 {
+            return Err("gate 1: the image without rows differs from the shader before rows".into());
+        }
+    }
+    let p0 = rows_capture(&device, &queue, &mut vp, &blocks, &surf);
+    {
+        let gpu = vp.levels().unwrap();
+        for (k, _) in &blocks {
+            gpu.set_block_rows(*k, &vec![super::Row::default(); surf[k].verts.len()]);
+        }
+    }
+    let zero = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+    let pz = rows_capture(&device, &queue, &mut vp, &blocks, &surf);
+    let (d, of) = pixels_differ(&none, &zero, size[0], |_, _| true);
+    let moved = p0.iter().zip(&pz).filter(|(a, b)| !same_bits(a.0, b.0) || !same_bits(a.1, b.1)).count();
+    println!("gate 1: zero rows: {d} of {of} pixels differ, {moved} of {} drawn vertices differ in any bit", p0.len());
+    if d > 0 || moved > 0 {
+        return Err("gate 1: zero rows change the image".into());
+    }
+    // The drawn vertices are the CPU's, in the same order.
+    let mut worst = 0.0f32;
+    let mut at = 0;
+    for (k, _) in &blocks {
+        let vx = mode.vol.voxel(k.0 as usize);
+        for p in &surf[k].verts {
+            worst = worst.max((p0[at].0 - *p).length() / vx);
+            at += 1;
+        }
+    }
+    println!("drawn vertices against the CPU's, in GPU vertex order: within {worst:.4} steps");
+    if worst > 0.05 {
+        return Err(format!("the drawn vertices are not the CPU's in order ({worst} steps off)").into());
+    }
+
+    // ---- 2. a known field on the blocks right of x = 0
+    let dn = Vec3::new(0.3, 0.25, -0.2);
+    let origin = mode.vol.origin();
+    let voxels: Vec<f32> = (0..mode.vol.levels()).map(|l| mode.vol.voxel(l)).collect();
+    let voxel = |l: u8| voxels[l as usize];
+    let left_x = |k: &Key| origin.x + (k.1.x * 8) as f32 * voxel(k.0);
+    let right = |k: &Key| left_x(k) >= 0.0;
+    let mut want: Vec<Option<Vec3>> = Vec::with_capacity(p0.len());
+    {
+        let gpu = vp.levels().unwrap();
+        gpu.clear_all_rows();
+        for (k, _) in &blocks {
+            let s = &surf[k];
+            if right(k) {
+                let rows: Vec<super::Row> = s.normals.iter().map(|n| super::Row::new(n.normalize_or_zero() * 0.5 * voxel(k.0), dn)).collect();
+                want.extend(rows.iter().map(|r| Some(Vec3::from_array(r.offset))));
+                gpu.set_block_rows(*k, &rows);
+            } else {
+                want.extend(std::iter::repeat_n(None, s.verts.len()));
+            }
+        }
+    }
+    let with = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+    let p1 = rows_capture(&device, &queue, &mut vp, &blocks, &surf);
+    let dn_back = super::rows::unpack_normal_change(super::rows::pack_normal_change(dn));
+    let (mut wrong, mut bent_wrong, mut moved_left, mut n_right) = (0, 0, 0, 0);
+    for i in 0..p0.len() {
+        match want[i] {
+            Some(off) => {
+                n_right += 1;
+                wrong += !same_bits(p1[i].0, p0[i].0 + off) as usize;
+                bent_wrong += ((p1[i].1 - (p0[i].1 + dn_back).normalize()).length() > 1e-5) as usize;
+            }
+            None => moved_left += (!same_bits(p1[i].0, p0[i].0) || !same_bits(p1[i].1, p0[i].1)) as usize,
+        }
+    }
+    // Pixels by where the ball (radius about 1) is hit: left of x = -0.05, or right of the rows' edge.
+    let edge = blocks.iter().filter(|b| right(&b.0)).map(|b| left_x(&b.0)).fold(f32::MAX, f32::min);
+    let hit_x = |x: u32, y: u32| -> Option<f32> {
+        let r = cam.ray(glam::Vec2::new(x as f32 + 0.5, y as f32 + 0.5), glam::Vec2::new(size[0] as f32, size[1] as f32));
+        let b = r.origin.dot(r.dir);
+        let c = r.origin.length_squared() - 1.0;
+        let h = b * b - c;
+        (h > 0.0).then(|| (r.origin + r.dir * (-b - h.sqrt())).x)
+    };
+    let (d_left, of_left) = pixels_differ(&none, &with, size[0], |x, y| hit_x(x, y).is_some_and(|hx| hx < -0.05));
+    let (d_right, of_right) = pixels_differ(&none, &with, size[0], |x, y| hit_x(x, y).is_some_and(|hx| hx > edge + 0.05));
+    println!("gate 2: {n_right} vertices with rows: {wrong} not at base + offset exactly, {bent_wrong} normals not bent as packed; {moved_left} of {} without rows moved", p0.len() - n_right);
+    println!("gate 2: pixels: {d_left} of {of_left} differ in the half without rows, {d_right} of {of_right} in the half with rows");
+    if wrong > 0 || bent_wrong > 0 || moved_left > 0 || d_left > 0 || d_right == 0 {
+        return Err("gate 2: the rows are not drawn where they should be".into());
+    }
+    // A stroke on the right: blocks extracted again lose their rows, the rest keep theirs in place.
+    vp.levels().unwrap().take_rows_dropped();
+    let mark = vp.levels().unwrap().rows_mark();
+    stroke(&mut mode.vol, 1, Vec3::new(0.3, 0.0, 1.0), Vec3::new(0.5, 0.05, 1.0), 0.08, false, |v| { v.carry_pending(None); }, |_| {});
+    rows_settle(&device, &queue, &mut vp, &mut mode, eye);
+    let dropped: std::collections::HashSet<Key> = vp.levels().unwrap().take_rows_dropped().into_iter().collect();
+    let kept_blocks: Vec<(usize, Key, u32)> = {
+        let gpu = vp.levels().unwrap();
+        let mut at = 0;
+        let mut out = Vec::new();
+        for (k, _) in &blocks {
+            if right(k) && !dropped.contains(k)
+                && let Some(s) = gpu.slot(*k)
+            {
+                out.push((at, *k, s));
+            }
+            at += surf[k].verts.len();
+        }
+        out
+    };
+    let slots: Vec<u32> = kept_blocks.iter().map(|b| b.2).collect();
+    let counts: Vec<u32> = kept_blocks.iter().map(|b| surf[&b.1].verts.len() as u32).collect();
+    let p2 = vp.capture(&device, &queue, &slots, &counts);
+    let (mut kept_wrong, mut j) = (0, 0);
+    for (at, k, _) in &kept_blocks {
+        for i in 0..surf[k].verts.len() {
+            kept_wrong += !same_bits(p2[j].0, p1[at + i].0) as usize;
+            j += 1;
+        }
+    }
+    println!("gate 2: after a stroke, {} blocks lost their rows (extracted again); {} kept them, {kept_wrong} of their vertices moved", dropped.len(), kept_blocks.len());
+    if dropped.is_empty() || kept_wrong > 0 {
+        return Err("gate 2: rows after a stroke are wrong".into());
+    }
+    // Rows made from the surface before the stroke are refused for a block extracted since; rows made after are taken.
+    {
+        let gpu = vp.levels().unwrap();
+        let k = *dropped.iter().next().unwrap();
+        let rows = vec![super::Row::default(); surf.get(&k).map_or(1, |s| s.verts.len())];
+        if gpu.set_block_rows_since(k, &rows, mark) || !gpu.set_block_rows_since(k, &rows, gpu.rows_mark()) || !gpu.has_rows() {
+            return Err("gate 2: rows for a block extracted since their mark were not refused".into());
+        }
+        gpu.clear_block_rows(k);
+    }
+
+    // ---- 3. timing and memory at about 2.5M triangles
+    let tri_m: f32 = args.iter().position(|a| a == "--triangles").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(2.5);
+    // A fresh ball shows about 1.5 times what `ball` names over 4 (measured below).
+    let mut mode = crate::volume_mode::VolumeMode::ball(tri_m * 4e6 / 1.5);
+    let mut vp = crate::viewport::Viewport::with_device(&device, include_str!("../viewport.wgsl"));
+    vp.layers_shown = true;
+    rows_settle(&device, &queue, &mut vp, &mut mode, eye);
+    let (blocks, surf) = rows_blocks(&mut vp, &mode.vol)?;
+    let tris: usize = blocks.iter().map(|b| surf[&b.0].quads.len() * 2).sum();
+    let verts: usize = blocks.iter().map(|b| surf[&b.0].verts.len()).sum();
+    println!("timing: {} blocks, {tris} triangles, {verts} vertices", blocks.len());
+    // The offsets and normal changes the rows carry, per block, as a layer would hold them.
+    let offsets: Vec<Vec<(Vec3, Vec3)>> = {
+        use rayon::prelude::*;
+        blocks.par_iter().map(|(k, _)| surf[k].normals.iter().map(|n| (n.normalize_or_zero() * 0.001, Vec3::new(0.01, 0.0, 0.0))).collect()).collect()
+    };
+    let near = |c: Vec3, want: usize| -> Vec<usize> {
+        let mut by: Vec<(f32, usize)> = blocks.iter().enumerate().map(|(i, (k, _))| ((surf[k].verts[0] - c).length(), i)).collect();
+        by.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut n = 0;
+        by.into_iter()
+            .take_while(|(_, i)| {
+                let go = n < want;
+                n += surf[&blocks[*i].0].verts.len();
+                go
+            })
+            .map(|(_, i)| i)
+            .collect()
+    };
+    let time = |which: &[usize], par: bool, gpu: &mut GpuLevels| -> f64 {
+        let t = Instant::now();
+        if par {
+            let list: Vec<(Key, usize)> = which.iter().map(|&i| (blocks[i].0, offsets[i].len())).collect();
+            gpu.set_many_block_rows(&list, u64::MAX, |j, rows| {
+                for (r, (o, n)) in rows.iter_mut().zip(&offsets[which[j]]) {
+                    *r = super::Row::new(*o, *n);
+                }
+            });
+        } else {
+            let mut rows: Vec<super::Row> = Vec::new();
+            for &i in which {
+                rows.clear();
+                rows.extend(offsets[i].iter().map(|(o, n)| super::Row::new(*o, *n)));
+                gpu.set_block_rows(blocks[i].0, &rows);
+            }
+        }
+        gpu.flush_rows();
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let all: Vec<usize> = (0..blocks.len()).collect();
+    let dab = near(Vec3::new(0.0, 0.0, 1.0), 3000);
+    let swap = near(Vec3::new(0.0, 0.0, 1.0), 60_000);
+    let gpu = vp.levels().unwrap();
+    // The first time every block is placed and the buffer made.
+    let first = time(&all, true, gpu);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let all_ms = median((0..7).map(|_| { let t = time(&all, true, gpu); let _ = device.poll(wgpu::PollType::wait_indefinitely()); t }).collect());
+    let dab_v: usize = dab.iter().map(|&i| surf[&blocks[i].0].verts.len()).sum();
+    let dab_ms = median((0..50).map(|j| { let t = time(&dab, false, gpu); if j % 10 == 9 { let _ = device.poll(wgpu::PollType::wait_indefinitely()); } t }).collect());
+    let swap_v: usize = swap.iter().map(|&i| surf[&blocks[i].0].verts.len()).sum();
+    let swap_ms = median((0..15).map(|_| { let t = time(&swap, false, gpu); let _ = device.poll(wgpu::PollType::wait_indefinitely()); t }).collect());
+    let (bytes, used, held) = gpu.rows_memory();
+    println!("gate 3: a dab's rows ({} blocks, {dab_v} vertices): {dab_ms:.3} ms (bar 0.3)", dab.len());
+    println!("gate 3: a swap's rows ({} blocks, {swap_v} vertices): {swap_ms:.3} ms (bar 2)", swap.len());
+    println!("gate 3: every row ({verts} vertices): {all_ms:.2} ms (bar 6); the first time, placing them: {first:.2} ms");
+    println!("gate 3: row memory on the GPU {:.1} MB (bar 24): {used} rows used of {held} held", bytes as f64 / 1048576.0);
+    // Drawn with every row set: no validation error.
+    let _ = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+    if dab_ms > 0.3 || swap_ms > 2.0 || all_ms > 6.0 || bytes as f64 > 24.0 * 1048576.0 {
+        return Err("gate 3: over a bar".into());
+    }
+    println!("mesh layer rows: every gate passes");
+    Ok(())
+}

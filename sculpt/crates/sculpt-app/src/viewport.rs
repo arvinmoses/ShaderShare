@@ -45,6 +45,7 @@ struct Targets {
     size: [u32; 2],
     msaa: wgpu::TextureView,
     resolve: wgpu::TextureView,
+    resolve_tex: wgpu::Texture,
     depth: wgpu::TextureView,
 }
 
@@ -63,6 +64,13 @@ pub struct Viewport {
     pub cull: bool,
     /// What the last frame drew of the volume: clusters' pages drawn, of those holding surface.
     pub volume_draws: u32,
+    /// Mesh layers are shown: every block at its finest level (no level by distance, no budget) and no cluster
+    /// culling (the clusters' bounds and cones are of the surface without the layers).
+    pub layers_shown: bool,
+    /// The volume's vertices as drawn, for checks (made when first needed).
+    capture: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    shader: wgpu::ShaderModule,
+    bgl: wgpu::BindGroupLayout,
 }
 
 /// The volume playground's surface on the GPU: built there by `gpu_levels`, and drawn from its buffers, a page of
@@ -127,10 +135,14 @@ fn linear(c: egui::Color32) -> [f32; 4] {
 
 impl Viewport {
     pub fn new(rs: &egui_wgpu::RenderState) -> Viewport {
-        let device = &rs.device;
+        Self::with_device(&rs.device, include_str!("viewport.wgsl"))
+    }
+
+    /// A viewport on `device` drawing with the shader `wgsl` (the surface noise's appended), with no window.
+    pub fn with_device(device: &wgpu::Device, wgsl: &str) -> Viewport {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("viewport"),
-            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("viewport.wgsl"), sculpt_core::surface_noise::WGSL).into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", wgsl, sculpt_core::surface_noise::WGSL).into()),
         });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("viewport uniforms"),
@@ -142,7 +154,7 @@ impl Viewport {
             label: Some("viewport"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             }],
@@ -160,21 +172,25 @@ impl Viewport {
         let target = [Some(wgpu::ColorTargetState { format: COLOR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })];
         let ms = wgpu::MultisampleState { count: MSAA, ..Default::default() };
         // The volume's surface: vertices pulled from the GPU extractor's buffers.
-        let ro = |binding: u32| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let vc = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE;
+        let vfc = wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE;
+        let ro = |binding: u32| wgpu::BindGroupLayoutEntry { binding, visibility: vc, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let levels_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("viewport levels"),
             entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: vfc, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 ro(1),
                 ro(2),
                 ro(3),
-                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: vfc, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: vfc, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 ro(6),
                 ro(7),
                 ro(8),
                 ro(9),
                 ro(10),
+                ro(11),
+                ro(12),
             ],
         });
         let levels_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("viewport levels"), bind_group_layouts: &[Some(&bgl), Some(&levels_bgl)], immediate_size: 0 });
@@ -222,6 +238,10 @@ impl Viewport {
             levels_bgl,
             cull: true,
             volume_draws: 0,
+            layers_shown: false,
+            capture: None,
+            shader,
+            bgl,
             texture_id: None,
             last_upload: UploadStats::default(),
         }
@@ -231,8 +251,18 @@ impl Viewport {
         if self.targets.as_ref().is_some_and(|t| t.size == size) {
             return;
         }
+        let targets = Self::make_targets(&rs.device, size);
+        let mut renderer = rs.renderer.write();
+        match self.texture_id {
+            Some(id) => renderer.update_egui_texture_from_wgpu_texture(&rs.device, &targets.resolve, wgpu::FilterMode::Linear, id),
+            None => self.texture_id = Some(renderer.register_native_texture(&rs.device, &targets.resolve, wgpu::FilterMode::Linear)),
+        }
+        self.targets = Some(targets);
+    }
+
+    fn make_targets(device: &wgpu::Device, size: [u32; 2]) -> Targets {
         let tex = |label, format, samples, usage| {
-            rs.device
+            device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
@@ -246,14 +276,19 @@ impl Viewport {
                 .create_view(&Default::default())
         };
         let msaa = tex("viewport msaa", COLOR_FORMAT, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let resolve = tex("viewport color", COLOR_FORMAT, 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING);
+        let resolve_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("viewport color"),
+            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let resolve = resolve_tex.create_view(&Default::default());
         let depth = tex("viewport depth", DEPTH_FORMAT, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let mut renderer = rs.renderer.write();
-        match self.texture_id {
-            Some(id) => renderer.update_egui_texture_from_wgpu_texture(&rs.device, &resolve, wgpu::FilterMode::Linear, id),
-            None => self.texture_id = Some(renderer.register_native_texture(&rs.device, &resolve, wgpu::FilterMode::Linear)),
-        }
-        self.targets = Some(Targets { size, msaa, resolve, depth });
+        Targets { size, msaa, resolve, resolve_tex, depth }
     }
 
     /// Bring the volume playground's surface up to date: send the blocks that changed and rebuild the surface around them
@@ -261,22 +296,28 @@ impl Viewport {
     /// none). True while levels are still fading as they hand over, or a big change is still landing region by region
     /// (more frames are wanted).
     pub fn sync_volume(&mut self, rs: &egui_wgpu::RenderState, mode: &mut crate::volume_mode::VolumeMode, eye: glam::Vec3, focal_px: f32, clock: Option<f64>) -> bool {
+        self.sync_volume_on(&rs.device, &rs.queue, mode, eye, focal_px, clock)
+    }
+
+    /// [`Self::sync_volume`] on a device and queue.
+    pub fn sync_volume_on(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mode: &mut crate::volume_mode::VolumeMode, eye: glam::Vec3, focal_px: f32, clock: Option<f64>) -> bool {
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let now = clock.unwrap_or_else(|| START.get_or_init(Instant::now).elapsed().as_secs_f64());
         let t = Instant::now();
         if self.volume.as_ref().is_none_or(|v| v.generation != mode.generation) {
-            let gpu = crate::gpu_levels::GpuLevels::new(&rs.device, &rs.queue, &mode.vol, mode.cap);
-            let uniforms = rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some("volume levels uniforms"), size: std::mem::size_of::<LevelsUniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            let empty = |label| rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 256, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let gpu = crate::gpu_levels::GpuLevels::new(&device, &queue, &mode.vol, mode.cap);
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("volume levels uniforms"), size: std::mem::size_of::<LevelsUniforms>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let empty = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 256, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             let (mask_hash, mask_samples) = (empty("noise mask hash"), empty("noise mask samples"));
-            let group = Self::levels_group(&rs.device, &self.levels_bgl, &uniforms, &gpu, &mask_hash, &mask_samples);
+            let group = Self::levels_group(&device, &self.levels_bgl, &uniforms, &gpu, &mask_hash, &mask_samples);
             self.volume = Some(VolumeGpu { buffers_made: gpu.buffers_made, gpu, uniforms, group, mask_hash, mask_samples, mask_of: None, mask_bits: 0, generation: mode.generation });
         }
         let v = self.volume.as_mut().unwrap();
         v.gpu.set_cap(mode.cap);
-        v.gpu.view.on = mode.by_distance;
+        // With mesh layers shown every block is at its finest level: layers are rows on those blocks' vertices.
+        v.gpu.view.on = mode.by_distance && !self.layers_shown;
         v.gpu.view.tau_px = mode.level_px;
-        v.gpu.view.budget = mode.budget_on.then(|| (mode.budget_m as f64 * 1e6) as u64);
+        v.gpu.view.budget = (mode.budget_on && !self.layers_shown).then(|| (mode.budget_m as f64 * 1e6) as u64);
         // Levels hand over by fading (seconds; `SCULPT_FADE=0` switches it to at once).
         static FADE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
         v.gpu.view.fade_s = *FADE.get_or_init(|| std::env::var("SCULPT_FADE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.25));
@@ -303,14 +344,14 @@ impl Viewport {
             let (hash, samples, bits) = noise_mask(m);
             use eframe::egui_wgpu::wgpu::util::DeviceExt;
             let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-            v.mask_hash = rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("noise mask hash"), contents: bytemuck::cast_slice(&hash), usage: st });
-            v.mask_samples = rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("noise mask samples"), contents: bytemuck::cast_slice(&samples), usage: st });
+            v.mask_hash = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("noise mask hash"), contents: bytemuck::cast_slice(&hash), usage: st });
+            v.mask_samples = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("noise mask samples"), contents: bytemuck::cast_slice(&samples), usage: st });
             v.mask_bits = if m.is_empty() { 0 } else { bits };
             v.mask_of = Some(*epoch);
             regroup = true;
         }
         if regroup {
-            v.group = Self::levels_group(&rs.device, &self.levels_bgl, &v.uniforms, &v.gpu, &v.mask_hash, &v.mask_samples);
+            v.group = Self::levels_group(&device, &self.levels_bgl, &v.uniforms, &v.gpu, &v.mask_hash, &v.mask_samples);
             v.buffers_made = v.gpu.buffers_made;
         }
         let (noise_f, noise_i) = noise.as_ref().map_or(sculpt_core::surface_noise::SurfaceNoise { on: false, ..Default::default() }, |n| n.0).uniform();
@@ -318,7 +359,7 @@ impl Viewport {
         let mask_i = [v.mask_bits, (v.mask_bits > 0 && noise.is_some()) as u32, v.gpu.fade_buffers().4, v.gpu.cap as u32];
         let misc = [v.gpu.voxel0(), if mode.tint { 1.0 } else { 0.0 }, if fading { 1.0 } else { 0.0 }, now as f32];
         let u = LevelsUniforms { origin: v.gpu.origin().extend(0.0).to_array(), misc, noise_f, noise_i, mask_i };
-        rs.queue.write_buffer(&v.uniforms, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(&v.uniforms, 0, bytemuck::bytes_of(&u));
         mode.blocks = v.gpu.slots();
         if s.uploaded > 0 || s.full {
             mode.sync = s;
@@ -326,6 +367,11 @@ impl Viewport {
             mode.sync.pending = s.pending;
         }
         let fading = fading || s.pending > 0;
+        v.gpu.flush_rows();
+        if v.gpu.buffers_made != v.buffers_made {
+            v.group = Self::levels_group(device, &self.levels_bgl, &v.uniforms, &v.gpu, &v.mask_hash, &v.mask_samples);
+            v.buffers_made = v.gpu.buffers_made;
+        }
         self.volume_draws = v.gpu.status[2].max(0) as u32;
         mode.pages_drawn = self.volume_draws;
         mode.gpu_ms = v.gpu.gpu_ms;
@@ -352,6 +398,8 @@ impl Viewport {
                 wgpu::BindGroupEntry { binding: 8, resource: hash.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: samples.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: table.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: gpu.row_buffers().0.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: gpu.row_buffers().1.as_entire_binding() },
             ],
         })
     }
@@ -361,10 +409,111 @@ impl Viewport {
         self.volume = None;
     }
 
+    /// The volume's GPU surface (where mesh layer rows are set), once synced.
+    pub fn levels(&mut self) -> Option<&mut crate::gpu_levels::GpuLevels> {
+        self.volume.as_mut().map(|v| &mut v.gpu)
+    }
+
+    /// Rows set since the last sync sent, and the volume's bind group made again if a buffer was made afresh.
+    fn flush_rows(&mut self, device: &wgpu::Device) {
+        if let Some(v) = self.volume.as_mut() {
+            v.gpu.flush_rows();
+            if v.gpu.buffers_made != v.buffers_made {
+                v.group = Self::levels_group(device, &self.levels_bgl, &v.uniforms, &v.gpu, &v.mask_hash, &v.mask_samples);
+                v.buffers_made = v.gpu.buffers_made;
+            }
+        }
+    }
+
+    /// Render offscreen (no window) and read the image back: `size` pixels, RGBA8, rows top to bottom.
+    pub fn render_offscreen(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: [u32; 2], cam: &Camera, theme: &Theme) -> Vec<u8> {
+        if self.targets.as_ref().is_none_or(|t| t.size != size) {
+            self.targets = Some(Self::make_targets(device, size));
+        }
+        self.draw(device, queue, cam, theme, None);
+        let t = self.targets.as_ref().unwrap();
+        let row = (size[0] * 4).div_ceil(256) * 256;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * size[1]) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &t.resolve_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &staging, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size[1]) } },
+            wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = staging.slice(..).get_mapped_range().expect("mapped");
+        let mut out = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+        for y in 0..size[1] as usize {
+            out.extend_from_slice(&data[y * row as usize..y * row as usize + size[0] as usize * 4]);
+        }
+        out
+    }
+
+    /// The vertices of `slots` as drawn (after rows and surface noise): per slot its vertices in its GPU vertex order,
+    /// `counts[i]` of them, as (position, normal).
+    pub fn capture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, slots: &[u32], counts: &[u32]) -> Vec<(Vec3, Vec3)> {
+        self.flush_rows(device);
+        let Some(v) = self.volume.as_ref() else { return Vec::new() };
+        let (pipe, layout) = self.capture.get_or_insert_with(|| {
+            let ro = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
+            let rw = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("capture"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: ro, count: None },
+                    wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: rw, count: None },
+                ],
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("capture"), bind_group_layouts: &[Some(&self.bgl), Some(&self.levels_bgl), Some(&layout)], immediate_size: 0 });
+            let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("capture"), layout: Some(&pl), module: &self.shader, entry_point: Some("cs_capture"), compilation_options: Default::default(), cache: None });
+            (pipe, layout)
+        });
+        let mut work: Vec<[u32; 2]> = Vec::with_capacity(slots.len());
+        let mut total = 0u32;
+        for (s, n) in slots.iter().zip(counts) {
+            work.push([*s, total]);
+            total += n;
+        }
+        use eframe::egui_wgpu::wgpu::util::DeviceExt;
+        let work_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("capture work"), contents: bytemuck::cast_slice(&work), usage: wgpu::BufferUsages::STORAGE });
+        let size = (total.max(1) as u64) * 32;
+        let out = device.create_buffer(&wgpu::BufferDescriptor { label: Some("capture out"), size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("capture"), layout, entries: &[wgpu::BindGroupEntry { binding: 0, resource: work_buf.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() }] });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(pipe);
+            cp.set_bind_group(0, &self.bind_group, &[]);
+            cp.set_bind_group(1, &v.group, &[]);
+            cp.set_bind_group(2, &group, &[]);
+            let n = (work.len() as u32 * 2048).div_ceil(64);
+            let x = n.clamp(1, 65535);
+            cp.dispatch_workgroups(x, n.div_ceil(x).max(1), 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = staging.slice(..).get_mapped_range().expect("mapped");
+        let f: &[[f32; 4]] = bytemuck::cast_slice(&data);
+        (0..total as usize).map(|i| (Vec3::from_slice(&f[2 * i][..3]), Vec3::from_slice(&f[2 * i + 1][..3]))).collect()
+    }
+
     /// Render into the offscreen texture. Returns the egui texture to display.
     pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, theme: &Theme, cursor: Option<(Vec3, f32, f32)>) -> Option<egui::TextureId> {
         let size = [size[0].max(1), size[1].max(1)];
         self.ensure_targets(rs, size);
+        self.draw(&rs.device, &rs.queue, cam, theme, cursor);
+        self.texture_id
+    }
+
+    /// Draw the scene into the targets.
+    fn draw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cam: &Camera, theme: &Theme, cursor: Option<(Vec3, f32, f32)>) {
+        self.flush_rows(device);
+        let size = self.targets.as_ref().unwrap().size;
         let vp = &theme.viewport;
         let clay = linear(vp.clay.0);
         let overlay = [0.0; 4];
@@ -384,12 +533,12 @@ impl Viewport {
             box_min: [0.0; 4],
             box_size: [1.0; 4],
         };
-        rs.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
         let targets = self.targets.as_ref().unwrap();
-        let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
         if let Some(v) = &self.volume {
-            v.gpu.cull(&mut enc, view_proj, cam.eye(), self.cull);
+            v.gpu.cull(&mut enc, view_proj, cam.eye(), self.cull && !self.layers_shown);
         }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -424,10 +573,9 @@ impl Viewport {
                 }
             }
         }
-        rs.queue.submit([enc.finish()]);
+        queue.submit([enc.finish()]);
         if let Some(v) = &self.volume {
             v.gpu.after_submit();
         }
-        self.texture_id
     }
 }

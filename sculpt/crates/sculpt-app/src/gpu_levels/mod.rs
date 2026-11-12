@@ -24,7 +24,10 @@ use sculpt_core::generator::level_volume::{HashMap as KeyMap, HashSet as KeySet,
 
 pub mod check;
 mod join;
+pub mod rows;
 mod upload;
+
+pub use rows::Row;
 
 const SHADER: &str = include_str!("levels.wgsl");
 const PAGE_INDICES: u64 = 384;
@@ -183,6 +186,8 @@ pub struct GpuLevels {
     pub buffers_made: u64,
     /// Samples sent in bulk (made when first needed).
     scatter: Option<upload::Scatter>,
+    /// Mesh layer rows, per block in its GPU vertex order.
+    rows: rows::Rows,
 }
 
 fn hash_of(c: IVec3, l: u32) -> u32 {
@@ -317,6 +322,7 @@ impl GpuLevels {
             join: None,
             deferred: None,
             scatter: None,
+            rows: rows::Rows::new(device, slots),
         };
         g.queue.write_buffer(&g.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         g
@@ -542,6 +548,8 @@ impl GpuLevels {
             self.buffers_made += 1;
             self.queue.write_buffer(&self.buf.table, 0, bytemuck::cast_slice(&piece_table()));
         }
+        self.rows.fit_slots(&self.device, slots);
+        self.rows.reset_slots();
         self.slot_of.clear();
         self.key_of.clear();
         self.free.clear();
@@ -595,6 +603,7 @@ impl GpuLevels {
         let t = Instant::now();
         let old = std::mem::replace(&mut self.buf, Self::buffers(&self.device, &self.layout, slots, pages, vpages, hash_len));
         self.buffers_made += 1;
+        self.rows.fit_slots(&self.device, slots);
         let new = &self.buf;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("levels grow") });
         for (a, b) in [(&old.samples, &new.samples), (&old.meta, &new.meta), (&old.verts, &new.verts), (&old.cells, &new.cells), (&old.pages_buf, &new.pages_buf), (&old.slot_pages, &new.slot_pages), (&old.status, &new.status), (&old.clusters, &new.clusters), (&old.table, &new.table), (&old.morph, &new.morph)] {
@@ -767,6 +776,8 @@ impl GpuLevels {
         if work.is_empty() {
             return;
         }
+        // Their vertices may be renumbered: no rows until they are set again.
+        self.rows.extracted(work.iter().copied());
         if work.len() as u32 > self.buf.work_len {
             // The work list grows with the slots; a longer list than that is a full rebuild's.
             let len = (work.len() as u32).next_power_of_two();
@@ -1039,6 +1050,9 @@ impl GpuLevels {
         }
         for k in &gone {
             self.hash_remove(*k);
+            if vol.block(*k).is_none() {
+                self.rows.clear(*k, None);
+            }
         }
         lap("gone");
         let mut uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
@@ -1204,6 +1218,79 @@ impl GpuLevels {
 
     pub fn voxel0(&self) -> f32 {
         self.voxel0
+    }
+
+    // ---------------------------------------------------------------- mesh layer rows
+
+    /// Set block `k`'s rows, one per vertex in its GPU vertex order (`BlockSurface::verts`). They show from the next
+    /// frame if the block is on the GPU. A block extracted again later loses them (see [`Self::take_rows_dropped`]).
+    pub fn set_block_rows(&mut self, k: Key, rows: &[Row]) -> bool {
+        self.set_block_rows_since(k, rows, u64::MAX)
+    }
+
+    /// [`Self::set_block_rows`] for rows made from the surface as it was at `mark` ([`Self::rows_mark`]): if the GPU
+    /// extracted the block after that, its vertices may differ, and they are kept but not shown. True if shown.
+    pub fn set_block_rows_since(&mut self, k: Key, rows: &[Row], mark: u64) -> bool {
+        let slot = self.slot_of.get(&k).copied();
+        self.rows.set(k, slot, rows, mark)
+    }
+
+    /// Many blocks' rows at once (every row, as when a layer's opacity changes): `blocks[i]` is a block and its rows,
+    /// and `fill(i, rows)` writes them in place, on many threads. `mark` as for [`Self::set_block_rows_since`]
+    /// (`u64::MAX`: none). Returns how many blocks show them.
+    pub fn set_many_block_rows(&mut self, blocks: &[(Key, usize)], mark: u64, fill: impl Fn(usize, &mut [Row]) + Sync) -> usize {
+        let with_slots: Vec<(Key, Option<u32>, u32)> = blocks.iter().map(|(k, n)| (*k, self.slot_of.get(k).copied(), *n as u32)).collect();
+        self.rows.set_many(&with_slots, mark, &fill)
+    }
+
+    /// Now, for [`Self::set_block_rows_since`]: take it when the surface the rows are made from is the one the GPU
+    /// holds (after a sync with nothing pending).
+    pub fn rows_mark(&self) -> u64 {
+        self.rows.clock
+    }
+
+    pub fn clear_block_rows(&mut self, k: Key) {
+        let slot = self.slot_of.get(&k).copied();
+        self.rows.clear(k, slot);
+    }
+
+    pub fn clear_all_rows(&mut self) {
+        self.rows.clear_all();
+    }
+
+    /// Blocks that had rows showing and lost them since the last call: extracted again or gone from the GPU.
+    pub fn take_rows_dropped(&mut self) -> Vec<Key> {
+        self.rows.take_dropped()
+    }
+
+    pub fn has_rows(&self) -> bool {
+        self.rows.has_rows()
+    }
+
+    /// GPU bytes the rows take, and rows (in use, held).
+    pub fn rows_memory(&self) -> (u64, u64, u64) {
+        let (used, held) = self.rows.counts();
+        (self.rows.gpu_bytes(), used, held)
+    }
+
+    /// Send the rows set since the last call (the viewport does it before drawing). Bumps `buffers_made` if a buffer
+    /// was made afresh.
+    pub fn flush_rows(&mut self) {
+        let was = self.rows.made;
+        self.rows.flush(&self.device, &self.queue);
+        if self.rows.made != was {
+            self.buffers_made += 1;
+        }
+    }
+
+    /// What drawing reads for the rows: per slot (first row, rows), and the rows.
+    pub fn row_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
+        (&self.rows.start_buf, &self.rows.rows_buf)
+    }
+
+    /// The slot of block `k`, if the GPU holds it.
+    pub fn slot(&self, k: Key) -> Option<u32> {
+        self.slot_of.get(&k).copied()
     }
 }
 

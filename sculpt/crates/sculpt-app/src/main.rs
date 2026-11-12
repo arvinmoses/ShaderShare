@@ -3,6 +3,7 @@
 //! ```text
 //! sculpt-app [file.svol] [--triangles M] [--theme NAME] [--zoom F] [--size WxH] [--screenshot out.png] [--demo-volume DIR]
 //! sculpt-app --gpu-levels-check [...]                                    (the GPU surface against the CPU reference)
+//! sculpt-app --gpu-rows-check [--old-shader FILE] [--triangles M]         (mesh layer rows on the GPU surface)
 //! sculpt-app --gpu-bench [...] | --gpu-volume-bench [...] | --gpu-sdf-bench | --gpu-sdf-check | --gpu-sdf-png <dir>
 //!                                                                         (headless GPU spikes, no window)
 //! ```
@@ -51,7 +52,8 @@ const HELP: &str = "sculpt-app [file.svol] [--triangles M] [--theme NAME] [--zoo
   --triangles M    the new ball's size, in millions of triangles at its level 1 (default 1; fresh, it shows a quarter as many)
   --screenshot P   save the window once the volume has settled, then close
   --demo-volume D  run the scripted session (SCULPT_DEMO_SCRIPT picks one), saving every frame into D
-sculpt-app --gpu-levels-check            the GPU surface against the CPU reference";
+sculpt-app --gpu-levels-check            the GPU surface against the CPU reference
+sculpt-app --gpu-rows-check              mesh layer rows drawn on the GPU surface (gates)";
 
 fn main() -> eframe::Result {
     // Headless GPU checks and benchmarks: no window, their own wgpu device.
@@ -68,6 +70,14 @@ fn main() -> eframe::Result {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_levels::check::run(&args) {
             eprintln!("gpu-levels-check: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if first.as_deref() == Some("--gpu-rows-check") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = gpu_levels::check::rows_run(&args) {
+            eprintln!("gpu-rows-check: {e}");
             std::process::exit(1);
         }
         return Ok(());

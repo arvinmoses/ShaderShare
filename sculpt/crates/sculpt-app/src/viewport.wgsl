@@ -189,6 +189,18 @@ fn sn_octaves_for(vx: f32) -> u32 {
 @group(1) @binding(9) var<storage, read> lv_samples: array<u32>;
 // Per pattern of inside corners: the pieces (top 8 bits) and each edge's piece (2 bits each).
 @group(1) @binding(10) var<storage, read> lv_table: array<u32>;
+// Mesh layer rows: per slot (first row, rows) or (NONE, 0); per row an offset (xyz, f32 bits) and a packed change of
+// normal (w).
+@group(1) @binding(11) var<storage, read> lv_row_start: array<vec2<u32>>;
+@group(1) @binding(12) var<storage, read> lv_rows: array<vec4<u32>>;
+
+// A packed change of normal: x and y in 11 bits, z in 10, signed (gpu_levels/rows.rs).
+fn lv_normal_change(w: u32) -> vec3<f32> {
+    let x = f32(bitcast<i32>(w << 21u) >> 21u) / 512.0;
+    let y = f32(bitcast<i32>(w << 10u) >> 21u) / 512.0;
+    let z = f32(bitcast<i32>(w) >> 22u) / 256.0;
+    return vec3<f32>(x, y, z);
+}
 
 // ------------------------------------------------------------------ hand-overs between levels
 //
@@ -664,9 +676,29 @@ fn lv_oct_decode(w: u32) -> vec3<f32> {
     return normalize(n);
 }
 
+struct LvOut {
+    clip: vec4<f32>,
+    world: vec3<f32>,
+    normal: vec3<f32>,
+    overlay: f32,
+    base: vec3<f32>,
+};
+
 @vertex
 fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
+    let v = lv_vertex(idx);
     var o: MeshOut;
+    o.clip = v.clip;
+    o.world = v.world;
+    o.normal = v.normal;
+    o.overlay = v.overlay;
+    o.base = v.base;
+    return o;
+}
+
+// The drawn vertex `idx` (slot << 11 | piece << 9 | cell).
+fn lv_vertex(idx: u32) -> LvOut {
+    var o: LvOut;
     let slot = idx >> 11u;
     let piece = (idx >> 9u) & 3u;
     let info = lv_cells[slot * 512u + (idx & 511u)];
@@ -754,7 +786,20 @@ fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
         base = q.pos;
         n = q.nrm;
     }
-    var pos = base;
+    // Mesh layers: the vertex's row moves it and bends its normal (not while its block fades). A zero row changes
+    // nothing.
+    var moved = base;
+    let rs = lv_row_start[slot];
+    if (rs.x != 0xffffffffu && vi < rs.y && (L.misc.z < 0.5 || lv_fade(slot) >= 1.0)) {
+        let r = lv_rows[rs.x + vi];
+        if (any(r.xyz != vec3<u32>(0u))) {
+            moved = base + bitcast<vec3<f32>>(r.xyz);
+        }
+        if (r.w != 0u) {
+            n = normalize(n + lv_normal_change(r.w));
+        }
+    }
+    var pos = moved;
     if (SN_I.w != 0u) {
         // Surface noise moves the vertex by the octaves this block's lattice holds; the rest only shade.
         let k0 = u32(floor(octaves));
@@ -767,7 +812,7 @@ fn vs_levels(@builtin(vertex_index) idx: u32) -> MeshOut {
             h = mix(h, sn_height(base, k0 + 1u), fk);
         }
         if (k0 > 0u || fk > 0.001) {
-            pos = base + n * h * noise_mask(base);
+            pos = moved + n * h * noise_mask(base);
         }
     }
     o.clip = u.view_proj * vec4<f32>(pos, 1.0);
@@ -810,4 +855,30 @@ fn fs_levels(i: MeshOut) -> @location(0) vec4<f32> {
         n = normalize(n - (g - n * dot(n, g)));
     }
     return lit(i, n, base);
+}
+
+// Each listed slot's vertices as drawn, for checks: thread (item, piece, cell) writes position and normal of the
+// vertex at the item's base + its number in the block.
+@group(2) @binding(0) var<storage, read> cap_work: array<vec2<u32>>;
+@group(2) @binding(1) var<storage, read_write> cap_out: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn cs_capture(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let t = gid.x + gid.y * nwg.x * 64u;
+    let w = t >> 11u;
+    if (w >= arrayLength(&cap_work)) {
+        return;
+    }
+    let item = cap_work[w];
+    let idx = (item.x << 11u) | (t & 2047u);
+    let piece = (idx >> 9u) & 3u;
+    let info = lv_cells[item.x * 512u + (idx & 511u)];
+    let count = (info >> 10u) & 7u;
+    if (piece >= count) {
+        return;
+    }
+    let vi = (info & 1023u) + piece;
+    let v = lv_vertex(idx);
+    cap_out[(item.y + vi) * 2u] = vec4<f32>(v.world, 1.0);
+    cap_out[(item.y + vi) * 2u + 1u] = vec4<f32>(v.normal, 0.0);
 }
