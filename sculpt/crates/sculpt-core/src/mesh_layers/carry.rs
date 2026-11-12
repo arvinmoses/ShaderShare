@@ -19,6 +19,7 @@ use crate::generator::level_volume::LevelVolume;
 use crate::generator::voxel::MeshSdf;
 use crate::geom::Aabb;
 use crate::layers::SculptLayer;
+use crate::mask::SourceValues;
 use crate::mesh::{Face, NO_VERT, Topology, face_verts};
 use crate::Result;
 
@@ -247,7 +248,8 @@ pub(super) fn plan(old: Geo, new: Geo, new_normals: &[Vec3], pre: &LevelVolume, 
 
 /// `new` (fresh from `Document::from_mesh`) with `old`'s layers, channels and freeze carried onto it as `plan` says,
 /// what the carry did not copy (to put back with [`super::MeshLayers::restore`]), and the time recompositing took.
-pub(super) fn apply(old: &Document, old_keys: &[u64], mut new: Document, plan: &Plan) -> Result<(Document, Patch, f64)> {
+/// Mask sources that read no channel are taken from `sources` where it holds them (worked out for `new` ahead).
+pub(super) fn apply(old: &Document, old_keys: &[u64], mut new: Document, plan: &Plan, sources: &SourceValues) -> Result<(Document, Patch, f64)> {
     let new_n = new.vertex_count();
     let old_leaf = &old.bvh.vert_leaf;
     let old_get = |layer: &SculptLayer, v: u32| -> Vec3 {
@@ -363,7 +365,7 @@ pub(super) fn apply(old: &Document, old_keys: &[u64], mut new: Document, plan: &
     new.level = old.level;
     for i in 0..new.layers.len() {
         if let Some(stack) = new.layers[i].mask.clone() {
-            new.layers[i].mask_values = new.mask_values_for(&stack)?;
+            new.layers[i].mask_values = new.mask_values_with(&stack, sources)?;
         }
     }
     new.refresh_scales();
@@ -379,8 +381,51 @@ pub(super) fn apply(old: &Document, old_keys: &[u64], mut new: Document, plan: &
 /// Put back what `patch` holds onto `doc` (names `keys` in canonical order), wherever a vertex of the same name sits
 /// at the same base position bit for bit. Returns how many vertices that was.
 pub(super) fn restore(doc: &mut Document, keys: &[u64], patch: &Patch) -> Result<usize> {
-    // Per patch entry: the vertex it goes back to.
-    let to: Vec<u32> = patch
+    let to = targets(doc, keys, patch);
+    restore_to(doc, patch, &to)
+}
+
+/// [`restore`], also giving what it overwrote at the vertices it went back to: restoring that undoes it.
+pub(super) fn restore_swap(doc: &mut Document, keys: &[u64], patch: &Patch) -> Result<Patch> {
+    let to = targets(doc, keys, patch);
+    let kept: Vec<(usize, u32)> = to.iter().enumerate().filter(|(_, v)| **v != NONE).map(|(i, v)| (i, *v)).collect();
+    let vec_at = |layer: &SculptLayer, v: u32| -> Vec3 {
+        let l = doc.bvh.vert_leaf[v as usize] as usize;
+        layer.chunks[l].as_ref().map_or(Vec3::ZERO, |c| c[v as usize - doc.bvh.leaves[l].owned.start as usize])
+    };
+    let n = doc.vertex_count();
+    let inverse = Patch {
+        names: kept.iter().map(|&(i, _)| patch.names[i]).collect(),
+        base: kept.iter().map(|&(i, _)| patch.base[i]).collect(),
+        layers: patch
+            .layers
+            .iter()
+            .filter_map(|(id, _)| {
+                let layer = doc.layers.iter().find(|l| l.id == *id)?;
+                let vals: Vec<Vec3> = kept.iter().map(|&(_, v)| vec_at(layer, v)).collect();
+                Some((*id, vals.iter().any(|d| *d != Vec3::ZERO).then_some(vals)))
+            })
+            .collect(),
+        freeze: patch.freeze.as_ref().map(|_| kept.iter().map(|&(_, v)| doc.freeze[v as usize]).collect()),
+        channels: patch
+            .channels
+            .iter()
+            .map(|(name, _)| {
+                let vals = match doc.channels.get(name).filter(|c| c.len() == n) {
+                    Some(c) => kept.iter().map(|&(_, v)| c[v as usize]).collect(),
+                    None => vec![0.0; kept.len()],
+                };
+                (name.clone(), vals)
+            })
+            .collect(),
+    };
+    restore_to(doc, patch, &to)?;
+    Ok(inverse)
+}
+
+/// Per patch entry: the vertex of `doc` it goes back to (same name, same base bit for bit), or `NONE`.
+fn targets(doc: &Document, keys: &[u64], patch: &Patch) -> Vec<u32> {
+    patch
         .names
         .par_iter()
         .zip(patch.base.par_iter())
@@ -392,7 +437,10 @@ pub(super) fn restore(doc: &mut Document, keys: &[u64], patch: &Patch) -> Result
             }
             Err(_) => NONE,
         })
-        .collect();
+        .collect()
+}
+
+fn restore_to(doc: &mut Document, patch: &Patch, to: &[u32]) -> Result<usize> {
     let back = to.iter().filter(|v| **v != NONE).count();
     if back == 0 {
         return Ok(0);

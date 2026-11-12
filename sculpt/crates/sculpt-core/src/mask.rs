@@ -265,15 +265,77 @@ pub struct MaskContext<'a> {
 }
 
 pub fn evaluate(stack: &MaskStack, ctx: &MaskContext) -> Result<Vec<f32>> {
+    evaluate_with(stack, ctx, &SourceValues::default())
+}
+
+/// The values of the sources that read no channel (noise, direction, gradient), worked out ahead for one mesh (off the
+/// main thread), so a stack evaluated later only reads channels and combines.
+#[derive(Clone, Default)]
+pub struct SourceValues(Vec<(MaskSource, std::sync::Arc<Vec<f32>>)>);
+
+impl SourceValues {
+    /// The values of every source of `stacks` that reads no channel. `ctx.normals` are needed only if a direction
+    /// source is among them; `ctx.channels` are not read.
+    pub fn build(stacks: &[MaskStack], ctx: &MaskContext) -> Result<SourceValues> {
+        let mut want: Vec<MaskSource> = Vec::new();
+        for s in stacks.iter().filter(|s| s.enabled) {
+            s.free_sources(&mut want);
+        }
+        let mut out = Vec::with_capacity(want.len());
+        for src in want {
+            if matches!(src, MaskSource::Direction { .. }) && ctx.normals.len() != ctx.positions.len() {
+                continue;
+            }
+            let v = evaluate_source(&src, ctx)?;
+            out.push((src, std::sync::Arc::new(v)));
+        }
+        Ok(SourceValues(out))
+    }
+
+    fn get(&self, src: &MaskSource) -> Option<&[f32]> {
+        self.0.iter().find(|(s, _)| s == src).map(|(_, v)| v.as_slice())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether evaluating `stack` with these needs the mesh's normals (a direction source not held).
+    pub fn needs_normals(&self, stack: &MaskStack) -> bool {
+        stack.layers.iter().filter(|l| l.enabled && l.opacity > 0.0).any(|l| {
+            (matches!(l.source, MaskSource::Direction { .. }) && self.get(&l.source).is_none()) || l.mask.as_ref().is_some_and(|m| self.needs_normals(m))
+        })
+    }
+}
+
+impl MaskStack {
+    /// The sources (nested ones too) that read no channel and cost more than a fill, each once.
+    fn free_sources(&self, out: &mut Vec<MaskSource>) {
+        for l in self.layers.iter().filter(|l| l.enabled && l.opacity > 0.0) {
+            if matches!(l.source, MaskSource::Noise(_) | MaskSource::Direction { .. } | MaskSource::Gradient { .. }) && !out.contains(&l.source) {
+                out.push(l.source.clone());
+            }
+            if let Some(m) = &l.mask {
+                m.free_sources(out);
+            }
+        }
+    }
+}
+
+/// [`evaluate`], taking the values of sources held in `pre` from there (bit for bit what evaluating them gives).
+pub fn evaluate_with(stack: &MaskStack, ctx: &MaskContext, pre: &SourceValues) -> Result<Vec<f32>> {
     let n = ctx.positions.len();
     let mut out = vec![stack.base.clamp(0.0, 1.0); n];
     for layer in stack.layers.iter().filter(|l| l.enabled && l.opacity > 0.0) {
-        let mut src = evaluate_source(&layer.source, ctx)?;
+        let mut src: std::borrow::Cow<[f32]> = match pre.get(&layer.source).filter(|v| v.len() == n) {
+            Some(v) => std::borrow::Cow::Borrowed(v),
+            None => std::borrow::Cow::Owned(evaluate_source(&layer.source, ctx)?),
+        };
         if layer.blur > 0 {
-            src = blur(&src, ctx.topology, layer.blur);
+            src = std::borrow::Cow::Owned(blur(&src, ctx.topology, layer.blur));
         }
         let opacity = match &layer.mask {
-            Some(m) => Some(evaluate(m, ctx)?),
+            Some(m) => Some(evaluate_with(m, ctx, pre)?),
             None => None,
         };
         out.par_iter_mut().enumerate().for_each(|(v, a)| {
