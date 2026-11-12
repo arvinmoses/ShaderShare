@@ -22,6 +22,8 @@ use sculpt_core::surface_noise::SurfaceNoise;
 use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::generator::level_volume::{CarryDone, EndDone, Key, LevelVolume};
 
+use crate::mesh_stack::{MeshStack, RowsDirty};
+
 /// Run the calling thread below normal priority (background work: it takes what the frame leaves).
 fn lower_priority() {
     #[cfg(windows)]
@@ -262,6 +264,40 @@ pub struct VolumeMode {
     pub catch_up_ms: f64,
     /// Form strokes that took a previewed generator at its own level rather than wait for its job.
     pub adopted: usize,
+    /// Mesh layers on the volume's surface (see `mesh_stack`): never part of the copy strokes run ahead on.
+    pub mesh: Option<MeshStack>,
+    /// The first mesh layer's mesh being taken from the volume on another thread.
+    mesh_build: Option<MeshBuild>,
+    /// A stroke on a mesh layer or its mask under way.
+    mesh_stroke: Option<MeshStroke>,
+    /// Mesh layers went away: the rows are told once.
+    rows_none: bool,
+    /// A note for the status line about the mesh layers (made, waited for, refused), until read.
+    pub mesh_note: Option<String>,
+    /// Strokes on a mesh layer dig instead of build (Ctrl, as the app sees it).
+    pub invert: bool,
+}
+
+/// The mesh of the first mesh layer, being taken from the volume off the frame.
+struct MeshBuild {
+    rx: Receiver<Result<sculpt_core::mesh_layers::MeshLayers, String>>,
+    /// Volume blocks changed since the snapshot it is taken from.
+    dirty: std::collections::HashSet<Key>,
+    started: Instant,
+}
+
+/// A stroke on a mesh layer (or its painted mask).
+struct MeshStroke {
+    /// The layer itself (`Detail`) or its mask (`Mask`).
+    target: Target,
+    /// The last dab's centre and its area's normal.
+    last: Option<Vec3>,
+    n: Vec3,
+    /// The channel a mask stroke paints.
+    channel: Option<String>,
+    /// A mask stroke shows as it goes while refreshing the masks stays under a frame.
+    live: bool,
+    painted: bool,
 }
 
 impl VolumeMode {
@@ -339,6 +375,12 @@ impl VolumeMode {
             lag_ms: 0.0,
             catch_up_ms: 0.0,
             adopted: 0,
+            mesh: None,
+            mesh_build: None,
+            mesh_stroke: None,
+            rows_none: false,
+            mesh_note: None,
+            invert: false,
         }
     }
 
@@ -367,6 +409,14 @@ impl VolumeMode {
         // For replaying a session's strokes (`SCULPT_DAB_LOG`): every dab, as given.
         if std::env::var_os("SCULPT_DAB_LOG").is_some() {
             eprintln!("DAB {} {} {} {radius} {px} {strength} {hardness} {}{}", at.x, at.y, at.z, brush == Brush::Trim, if brush == Brush::Smooth { " smooth" } else { "" });
+        }
+        // On a mesh layer or its mask: nothing of the volume's.
+        if self.mesh_stroke.is_some() {
+            self.mesh_dab(at, radius, strength, hardness, brush);
+            if let Some(t) = self.begun.take() {
+                self.first_dab_ms = t.elapsed().as_secs_f64() * 1e3;
+            }
+            return;
         }
         // Running ahead: kept for the real state, and drawn on the copy.
         if let Some(a) = self.ahead.as_mut() {
@@ -522,10 +572,11 @@ impl VolumeMode {
     pub fn tick(&mut self) {
         if self.ahead.is_none() {
             self.tick_now();
-            return;
+        } else {
+            self.with_real(|m| m.tick_now());
+            self.catch_up(Some(CATCH_UP_MS));
         }
-        self.with_real(|m| m.tick_now());
-        self.catch_up(Some(CATCH_UP_MS));
+        self.mesh_tick();
     }
 
     /// `f` on the real state (while running ahead, the copy's put aside meanwhile).
@@ -534,8 +585,9 @@ impl VolumeMode {
         a.swap(self);
         let out = f(self);
         a.swap(self);
-        // As the viewport would have taken them, a frame at a time.
+        // As the viewport would have taken them, a frame at a time (the mesh layers told first).
         let dirty = a.vol.drain_dirty();
+        self.tap_keys(&dirty);
         a.changed.extend(dirty);
         self.ahead = Some(a);
         out
@@ -751,7 +803,14 @@ impl VolumeMode {
     }
 
     fn take_end(&mut self, done: EndDone) {
+        let was = self.vol.last_id();
         let end = self.vol.end_stroke_apply(done);
+        // (Always on the real state: the copy run ahead on never ends a stroke.)
+        if let (Some(m), Some(id)) = (self.mesh.as_mut(), self.vol.last_id())
+            && Some(id) != was
+        {
+            m.note_step(id);
+        }
         if let Some(on) = self.sculpt_take.take()
             && let Some(s) = self.sculpt.as_mut()
         {
@@ -828,7 +887,12 @@ impl VolumeMode {
 
     /// Whether frames should keep coming to finish carrying or ending a stroke.
     pub fn busy(&self) -> bool {
-        self.ahead.is_some() || self.ending || self.carrying() || self.follow_job.is_some() || self.form_end.is_some() || self.gen_job.is_some() || self.layer.as_ref().is_some_and(|l| l.busy())
+        self.mesh.as_ref().is_some_and(|m| m.pending())
+            || self.mesh_build.is_some()
+            || self.ahead.is_some()
+            || self.ending
+            || self.carrying()
+            || self.follow_job.is_some() || self.form_end.is_some() || self.gen_job.is_some() || self.layer.as_ref().is_some_and(|l| l.busy())
     }
 
     /// The specks the last stroke to end left, removed, once.
@@ -860,6 +924,12 @@ impl VolumeMode {
         }
         let now = Instant::now();
         self.begun = Some(now);
+        if let Some(m) = self.mesh.as_mut() {
+            m.forget_skip();
+        }
+        if self.on_mesh() && self.mesh_begin() {
+            return;
+        }
         let target = self.routed();
         if self.ahead.is_none() && self.waiting_for(target) {
             self.run_ahead();
@@ -912,6 +982,10 @@ impl VolumeMode {
     pub fn end_stroke(&mut self) {
         // Every dab given is done first.
         while self.run_dabs(f64::INFINITY) > 0 {}
+        if self.mesh_stroke.is_some() {
+            self.mesh_end();
+            return;
+        }
         if let Some(a) = self.ahead.as_mut() {
             // Ended for real once its dabs are; the copy's stroke is simply left.
             a.events.push(Event::End);
@@ -972,6 +1046,9 @@ impl VolumeMode {
     /// A new generator layer on top (rocks scattered over the form, to start with), made active. With no layers yet,
     /// the stack is made first, the finest level's work becoming a detail layer.
     pub fn add_generator(&mut self) {
+        if self.refuse_with_mesh("generator") {
+            return;
+        }
         self.settle();
         let top = self.vol.levels() - 1;
         if self.layer.is_none() {
@@ -1015,6 +1092,9 @@ impl VolumeMode {
     }
 
     pub fn add_noise_with(&mut self, n: SurfaceNoise) {
+        if self.refuse_with_mesh("surface noise") {
+            return;
+        }
         self.settle();
         if self.layer.is_none() {
             self.make_layer(self.vol.levels() - 1);
@@ -1158,6 +1238,9 @@ impl VolumeMode {
 
     /// Move the work at levels `from` and finer into a detail layer over the rest (the form).
     pub fn make_layer(&mut self, from: usize) {
+        if self.refuse_with_mesh("detail") {
+            return;
+        }
         self.settle();
         // (Sculpt layers are kept apart from such a stack: they stay as they show, merged.)
         self.merge_sculpt_layers();
@@ -1169,6 +1252,8 @@ impl VolumeMode {
         self.target = Target::Detail;
     }
 
+    /// (The panel makes mesh layers now: this is for the tests and the gauntlet's scenes.)
+    #[cfg_attr(not(test), allow(dead_code))]
     /// A new empty sculpt layer on top, made what strokes work on: it keeps what strokes on it change, at whatever
     /// level they work, and fades by its mask. Over a detail layer stack (generators, surface noise), a detail layer.
     pub fn new_sculpt_layer(&mut self) {
@@ -1184,9 +1269,13 @@ impl VolumeMode {
         self.target = Target::Detail;
     }
 
-    /// The sculpt layers, if any: the active one, and each (with a change put off shown as done).
+    /// The sculpt layers, if any (the mesh layers when there are some): the active one, and each (with a change put
+    /// off shown as done).
     pub fn sculpt_layers(&self) -> Option<(usize, Vec<SculptInfo>)> {
-        let mut out = self.sculpt.as_ref().filter(|s| !s.is_empty()).map(|s| (s.active(), s.layers()))?;
+        let mut out = match self.mesh.as_ref() {
+            Some(m) => m.infos()?,
+            None => self.sculpt.as_ref().filter(|s| !s.is_empty()).map(|s| (s.active(), s.layers()))?,
+        };
         match &self.sculpt_later {
             Some(Later::Opacity(k, o)) => {
                 if let Some(x) = out.1.get_mut(*k) {
@@ -1213,7 +1302,9 @@ impl VolumeMode {
 
     pub fn rename_layer(&mut self, k: usize, name: &str) {
         self.settle();
-        if let Some(layer) = self.layer.as_mut() {
+        if let Some(m) = self.mesh.as_mut() {
+            m.rename(k, name);
+        } else if let Some(layer) = self.layer.as_mut() {
             layer.rename(k, name);
         } else if let Some(s) = self.sculpt.as_mut() {
             s.rename(k, name);
@@ -1255,6 +1346,15 @@ impl VolumeMode {
 
     /// Keep the change going on over frames, if any, as one undo (a change put off till now done first).
     pub fn close_sculpt_edit(&mut self) {
+        if let Some(m) = self.mesh.as_mut() {
+            match self.sculpt_later.take() {
+                Some(Later::Opacity(k, o)) => m.set_opacity(k, o),
+                Some(Later::Mask(k, mi, info)) => m.set_mask(k, mi, info),
+                None => {}
+            }
+            m.close_open();
+            return;
+        }
         match self.sculpt_later.take() {
             Some(Later::Opacity(k, o)) => self.sculpt_edit(|s, vol| s.set_opacity(vol, k, o)),
             Some(Later::Mask(k, mi, info)) => self.sculpt_edit(|s, vol| s.set_mask(vol, k, mi, info)),
@@ -1303,16 +1403,27 @@ impl VolumeMode {
             self.sculpt_later = Some(Later::Opacity(k, opacity));
             return;
         }
+        if let Some(m) = self.mesh.as_mut() {
+            m.set_opacity(k, opacity);
+            return;
+        }
         self.sculpt_edit(|s, vol| s.set_opacity(vol, k, opacity));
     }
 
     /// Set how sculpt layer `k`'s strokes show (one undo).
     pub fn set_layer_blend(&mut self, k: usize, blend: LayerBlend) {
+        if let Some(m) = self.mesh.as_mut() {
+            m.set_blend(k, blend);
+            return;
+        }
         self.sculpt_step(|s, vol| s.set_blend(vol, k, blend));
     }
 
     /// Whether sculpt layer `k` is small enough for a slider to move it every frame (else it moves when let go).
     pub fn live_edits(&self, k: usize) -> bool {
+        if let Some(m) = self.mesh.as_ref() {
+            return m.live_edits(k);
+        }
         let Some(s) = self.sculpt.as_ref() else { return true };
         let n = s.layers().get(k).map_or(0, |x| x.blocks);
         // A tall layer is built at part weights and turned over: about 50 ms per thousand blocks.
@@ -1323,6 +1434,16 @@ impl VolumeMode {
     /// picked makes strokes paint it (the colour it is not filled with first).
     pub fn select_mask(&mut self, k: usize, mi: Option<usize>) {
         self.settle();
+        if let Some(m) = self.mesh.as_mut() {
+            m.close_open();
+            let fill = m.select_mask(k, mi);
+            self.target = match (fill, self.target) {
+                (None, _) => Target::Detail,
+                (Some(_), Target::Mask { show }) => Target::Mask { show },
+                (Some(f), _) => Target::Mask { show: f < 0.5 },
+            };
+            return;
+        }
         let Some(s) = self.sculpt.as_mut() else { return };
         s.set_active(k);
         s.set_active_mask(k, mi);
@@ -1339,6 +1460,15 @@ impl VolumeMode {
 
     /// Add a mask on top of the active sculpt layer's, picked (strokes paint a painted one).
     pub fn add_mask(&mut self, kind: MaskKind) {
+        if let Some(m) = self.mesh.as_mut() {
+            self.sculpt_later = None;
+            let k = m.active();
+            let mi = m.add_mask(kind);
+            if let Some(k) = k {
+                self.select_mask(k, mi);
+            }
+            return;
+        }
         let Some(k) = self.sculpt.as_ref().filter(|s| !s.is_empty()).map(|s| s.active()) else { return };
         let mut mi = None;
         self.sculpt_step(|s, vol| mi = s.add_mask(vol, k, kind));
@@ -1346,6 +1476,13 @@ impl VolumeMode {
     }
 
     pub fn remove_mask(&mut self, k: usize, mi: usize) {
+        if let Some(m) = self.mesh.as_mut() {
+            m.remove_mask(k, mi);
+            if m.active() == Some(k) && m.active_mask(k).is_none() && matches!(self.target, Target::Mask { .. }) {
+                self.target = Target::Detail;
+            }
+            return;
+        }
         self.sculpt_step(|s, vol| s.remove_mask(vol, k, mi));
         if self.sculpt.as_ref().is_some_and(|s| s.active() == k && s.active_mask(k).is_none()) && matches!(self.target, Target::Mask { .. }) {
             self.target = Target::Detail;
@@ -1353,6 +1490,10 @@ impl VolumeMode {
     }
 
     pub fn move_mask(&mut self, k: usize, mi: usize, up: bool) {
+        if let Some(m) = self.mesh.as_mut() {
+            m.move_mask(k, mi, up);
+            return;
+        }
         self.sculpt_step(|s, vol| s.move_mask(vol, k, mi, up));
     }
 
@@ -1360,6 +1501,10 @@ impl VolumeMode {
     pub fn set_mask(&mut self, k: usize, mi: usize, info: MaskInfo) {
         if !self.live_edits(k) {
             self.sculpt_later = Some(Later::Mask(k, mi, info));
+            return;
+        }
+        if let Some(m) = self.mesh.as_mut() {
+            m.set_mask(k, mi, info);
             return;
         }
         self.sculpt_edit(|s, vol| s.set_mask(vol, k, mi, info));
@@ -1377,7 +1522,13 @@ impl VolumeMode {
 
     pub fn remove_layer(&mut self, k: usize) {
         self.settle();
-        if let Some(layer) = self.layer.as_mut() {
+        if let Some(m) = self.mesh.as_mut() {
+            m.finish(&self.vol);
+            m.remove_layer(k);
+            if matches!(self.target, Target::Mask { .. }) {
+                self.target = Target::Detail;
+            }
+        } else if let Some(layer) = self.layer.as_mut() {
             layer.remove_layer(&mut self.vol, k);
         } else {
             self.sculpt_step(|s, vol| s.remove(vol, k));
@@ -1386,7 +1537,9 @@ impl VolumeMode {
 
     pub fn set_layer_visible(&mut self, k: usize, on: bool) {
         self.settle();
-        if let Some(layer) = self.layer.as_mut() {
+        if let Some(m) = self.mesh.as_mut() {
+            m.set_visible(k, on);
+        } else if let Some(layer) = self.layer.as_mut() {
             layer.set_visible(&mut self.vol, k, on);
         } else {
             self.sculpt_step(|s, vol| s.set_visible(vol, k, on));
@@ -1396,7 +1549,11 @@ impl VolumeMode {
     /// Hide the active layer everywhere (`to` 0, then paint it in with Mask: show) or show it everywhere (`to` 1).
     pub fn fill_mask(&mut self, to: f32) {
         self.settle();
-        if let Some(layer) = self.layer.as_mut() {
+        if let Some(m) = self.mesh.as_mut() {
+            // (A stroke on the layers: the volume's changes are in first.)
+            m.finish(&self.vol);
+            m.fill_mask(to);
+        } else if let Some(layer) = self.layer.as_mut() {
             layer.fill_mask(&mut self.vol, to);
         } else if let Some(k) = self.sculpt.as_ref().map(|s| s.active()) {
             self.sculpt_step(|s, vol| s.fill_mask(vol, k, to));
@@ -1413,7 +1570,9 @@ impl VolumeMode {
 
     pub fn set_active_layer(&mut self, k: usize) {
         self.settle();
-        if let Some(layer) = self.layer.as_mut() {
+        if let Some(m) = self.mesh.as_mut() {
+            m.set_active(k);
+        } else if let Some(layer) = self.layer.as_mut() {
             layer.set_active(k);
         } else if let Some(s) = self.sculpt.as_mut() {
             s.set_active(k);
@@ -1435,6 +1594,23 @@ impl VolumeMode {
             w.write_all(&(bytes.len() as u64).to_le_bytes())?;
             w.write_all(&bytes)?;
         }
+        // Mesh layers last: "MLAY", the length of what follows, the layers' stream, the app's own notes; then the
+        // offset of "MLAY" from the end and "MLAY" again, so a reader finds it from the end and reads the rest as
+        // before.
+        if let Some(m) = self.mesh.as_mut() {
+            m.finish(&self.vol);
+            m.close_open();
+            let mut body = Vec::new();
+            m.layers.write_to(&mut body).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let notes = serde_json::to_vec(&serde_json::json!({ "fills": m.fills })).map_err(|e| std::io::Error::other(e.to_string()))?;
+            body.extend_from_slice(&(notes.len() as u64).to_le_bytes());
+            body.extend_from_slice(&notes);
+            w.write_all(b"MLAY")?;
+            w.write_all(&(body.len() as u64).to_le_bytes())?;
+            w.write_all(&body)?;
+            w.write_all(&(body.len() as u64 + 24).to_le_bytes())?;
+            w.write_all(b"MLAY")?;
+        }
         Ok(())
     }
 
@@ -1442,6 +1618,8 @@ impl VolumeMode {
     pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<VolumeMode> {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
+        // Mesh layers, if any, are the last chunk: taken off, the rest reads as before.
+        let mlay = crate::mesh_stack::split_mlay(&mut bytes)?;
         let mut cur = std::io::Cursor::new(&bytes[..]);
         let (vol, layer) = Layered::read_from(&mut cur, OPEN_LEVELS)?;
         let pos = cur.position() as usize;
@@ -1477,6 +1655,11 @@ impl VolumeMode {
                 }
             }
         }
+        if let Some(body) = mlay {
+            let stack = MeshStack::read_from(&body, &mode.vol)?;
+            mode.mesh = Some(stack);
+            mode.target = Target::Detail;
+        }
         Ok(mode)
     }
 
@@ -1491,6 +1674,11 @@ impl VolumeMode {
     pub fn undo(&mut self) -> bool {
         self.settle();
         self.stroke_n = Vec3::ZERO;
+        if let Some(m) = self.mesh.as_mut() {
+            self.sculpt_later = None;
+            m.tap(self.vol.dirty_keys());
+            return m.undo(&mut self.vol);
+        }
         match self.layer.as_mut() {
             Some(layer) => layer.undo(&mut self.vol),
             None => {
@@ -1512,6 +1700,11 @@ impl VolumeMode {
     pub fn redo(&mut self) -> bool {
         self.settle();
         self.stroke_n = Vec3::ZERO;
+        if let Some(m) = self.mesh.as_mut() {
+            self.sculpt_later = None;
+            m.tap(self.vol.dirty_keys());
+            return m.redo(&mut self.vol);
+        }
         match self.layer.as_mut() {
             Some(layer) => layer.redo(&mut self.vol),
             None => {
@@ -1533,6 +1726,13 @@ impl VolumeMode {
     /// The surface under a ray: during a stroke, the one it began on at its level (so dabs do not climb what the stroke
     /// builds); otherwise the surface shown.
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(Vec3, Vec3)> {
+        // On a mesh layer or its mask: its surface as shown.
+        if let Some(m) = self.mesh.as_ref()
+            && (self.mesh_stroke.is_some() || (self.on_mesh() && !self.vol.in_stroke()))
+        {
+            let hit = m.layers.doc.raycast(&sculpt_core::geom::Ray::new(origin, dir))?;
+            return Some((hit.point, hit.normal));
+        }
         if let Some(layer) = self.layer.as_ref().filter(|l| self.target == Target::Form && l.form().in_stroke() && self.chosen) {
             return layer.form().raycast(origin, dir, self.level, true);
         }
@@ -1545,9 +1745,265 @@ impl VolumeMode {
 
 }
 
+/// Mesh layers (see `mesh_stack`): strokes on them and their masks, driving their refits, the rows to redraw.
+impl VolumeMode {
+    /// Whether strokes go to the mesh layers: there are some (or the first is being made), and a layer or its mask is
+    /// what strokes work on.
+    fn on_mesh(&self) -> bool {
+        (self.mesh.is_some() || self.mesh_build.is_some()) && matches!(self.target, Target::Detail | Target::Mask { .. })
+    }
+
+    /// With mesh layers, a `what` layer is not made (a note says so).
+    fn refuse_with_mesh(&mut self, what: &str) -> bool {
+        if self.mesh.is_none() && self.mesh_build.is_none() {
+            return false;
+        }
+        self.mesh_note = Some(format!("A {what} layer cannot go with mesh layers yet"));
+        true
+    }
+
+    /// The mesh layers (the real ones, never a copy run ahead on).
+    pub fn mesh_layers(&self) -> Option<&sculpt_core::mesh_layers::MeshLayers> {
+        self.mesh.as_ref().map(|m| &m.layers)
+    }
+
+    /// Whether a visible mesh layer exists.
+    pub fn layers_shown(&self) -> bool {
+        self.mesh.as_ref().is_some_and(|m| m.layers_shown())
+    }
+
+    /// What the GPU rows need redrawn since the last call.
+    pub fn take_rows_dirty(&mut self) -> RowsDirty {
+        match self.mesh.as_mut() {
+            Some(m) => m.take_rows_dirty(),
+            None => RowsDirty { none: std::mem::take(&mut self.rows_none), ..Default::default() },
+        }
+    }
+
+    /// Whether the volume has sculpt layers of its own (from an older file): mesh layers go only without them.
+    pub fn has_volume_layers(&self) -> bool {
+        self.mesh.is_none() && self.sculpt.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// Whether the first mesh layer's mesh is still being made.
+    pub fn mesh_building(&self) -> bool {
+        self.mesh_build.is_some()
+    }
+
+    /// The mask strokes paint on layer `k`, if one is picked.
+    pub fn active_mask(&self, k: usize) -> Option<usize> {
+        match self.mesh.as_ref() {
+            Some(m) => m.active_mask(k),
+            None => self.sculpt.as_ref().and_then(|s| s.active_mask(k)),
+        }
+    }
+
+    /// A new empty mesh layer on top, made what strokes work on. The first takes the mesh from the volume on another
+    /// thread (a note says when it is in). The volume's own sculpt layers, if any, are merged into it first (the panel
+    /// asks).
+    pub fn add_mesh_layer(&mut self) {
+        if self.layer.is_some() {
+            self.mesh_note = Some("Mesh layers cannot go with detail, generator or surface noise layers yet".into());
+            return;
+        }
+        self.settle();
+        self.merge_sculpt_layers();
+        self.sculpt_later = None;
+        self.target = Target::Detail;
+        if let Some(m) = self.mesh.as_mut() {
+            m.add_layer();
+            return;
+        }
+        if self.mesh_build.is_some() {
+            return;
+        }
+        let snap = self.vol.preview_copy();
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("mesh-layers-first".into())
+            .spawn(move || {
+                let r = sculpt_core::mesh_layers::MeshLayers::from_volume(&snap, Default::default()).map_err(|e| e.to_string());
+                let _ = tx.send(r);
+            })
+            .expect("spawn the mesh layer build");
+        self.mesh_build = Some(MeshBuild { rx, dirty: Default::default(), started: Instant::now() });
+        self.mesh_note = Some("Making the mesh for layers...".into());
+    }
+
+    /// Take the first mesh layer's mesh in if it is made (with `wait`, waiting for it).
+    fn mesh_take_build(&mut self, wait: bool) {
+        let Some(b) = self.mesh_build.as_ref() else { return };
+        let r = if wait {
+            b.rx.recv().map_err(|_| "the mesh build stopped".to_string()).and_then(|r| r)
+        } else {
+            match b.rx.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => Err("the mesh build stopped".into()),
+            }
+        };
+        let b = self.mesh_build.take().unwrap();
+        match r {
+            Ok(ml) => {
+                let vertices = ml.doc.vertex_count();
+                let mut stack = MeshStack::new(ml, b.dirty);
+                stack.add_layer();
+                self.mesh = Some(stack);
+                self.mesh_note = Some(format!("Mesh layers ready: {} vertices, {:.1} s", vertices, b.started.elapsed().as_secs_f64()));
+            }
+            Err(e) => self.mesh_note = Some(format!("Could not make the mesh for layers: {e}")),
+        }
+    }
+
+    /// Volume blocks changed: the mesh layers (or the mesh being made for them) are told.
+    fn tap_keys(&mut self, keys: &[Key]) {
+        if let Some(m) = self.mesh.as_mut() {
+            m.tap(keys.iter().copied());
+        } else if let Some(b) = self.mesh_build.as_mut() {
+            b.dirty.extend(keys.iter().copied());
+        }
+    }
+
+    /// The real volume's changes not yet drained, told to the mesh layers (while running ahead, `with_real` does it).
+    fn tap(&mut self) {
+        if self.ahead.is_some() || (self.mesh.is_none() && self.mesh_build.is_none()) {
+            return;
+        }
+        let keys = self.vol.dirty_keys();
+        self.tap_keys(&keys);
+    }
+
+    /// Whether the real volume is at rest: no stroke under way, ending, carrying or run ahead.
+    fn at_rest(&self) -> bool {
+        self.ahead.is_none() && !self.ending && self.end_job.is_none() && !self.carrying() && !self.vol.in_stroke() && self.layer.is_none()
+    }
+
+    /// Once a frame, after the volume's own work: the mesh layers told what the volume changed, a finished refit
+    /// swapped in, a new one started once the volume is at rest; during a mask stroke, the masks shown as painted.
+    fn mesh_tick(&mut self) {
+        self.mesh_take_build(false);
+        self.tap();
+        let rest = self.at_rest();
+        let Some(m) = self.mesh.as_mut() else { return };
+        if let Some(st) = self.mesh_stroke.as_mut() {
+            if st.live && st.painted {
+                let t = Instant::now();
+                let _ = m.layers.doc.refresh_painted_masks();
+                // Over a frame: shown when the stroke ends instead.
+                if t.elapsed().as_secs_f64() * 1e3 > 12.0 {
+                    st.live = false;
+                }
+                st.painted = false;
+            }
+            return;
+        }
+        let real = self.ahead.as_ref().map_or(&self.vol, |a| &a.vol);
+        m.poll(real, false);
+        if rest {
+            m.start_refit(&self.vol);
+        }
+    }
+
+    /// Begin a stroke on the active mesh layer or its mask: once everything the volume did is in the layers (a wait
+    /// only within a moment of a volume stroke). Returns false if there are no mesh layers after all.
+    fn mesh_begin(&mut self) -> bool {
+        self.settle();
+        self.mesh_take_build(true);
+        self.tap();
+        let target = self.target;
+        let Some(m) = self.mesh.as_mut() else { return false };
+        m.close_open();
+        let t = Instant::now();
+        m.finish(&self.vol);
+        let waited = t.elapsed().as_secs_f64() * 1e3;
+        if waited > 50.0 {
+            self.mesh_note = Some(format!("Waited {waited:.0} ms for the layers to follow the volume"));
+        }
+        let mut channel = None;
+        match target {
+            Target::Mask { .. } => channel = m.paint_channel(),
+            _ => {
+                let k = match m.active() {
+                    Some(k) => k,
+                    None => {
+                        m.add_layer();
+                        m.active().unwrap_or(0)
+                    }
+                };
+                // A hidden layer sculpted on shows again first (a step of its own).
+                if m.layers.doc.layers().get(k).is_some_and(|l| !l.visible) {
+                    m.set_visible(k, true);
+                }
+            }
+        }
+        m.layers.doc.begin_stroke(if matches!(target, Target::Mask { .. }) { "Paint mask" } else { "Sculpt layer" });
+        self.mesh_stroke = Some(MeshStroke { target, last: None, n: Vec3::ZERO, channel, live: true, painted: false });
+        self.stroke_n = Vec3::ZERO;
+        self.chosen = false;
+        self.lag_ms = 0.0;
+        true
+    }
+
+    /// One dab of a stroke on a mesh layer (Clay Buildup, Trim Dynamic or Smooth; `invert` digs) or its mask.
+    fn mesh_dab(&mut self, at: Vec3, radius: f32, strength: f32, hardness: f32, brush: Brush) {
+        use sculpt_core::brush::{self as b, Brush as _};
+        let invert = self.invert;
+        let (Some(m), Some(st)) = (self.mesh.as_mut(), self.mesh_stroke.as_mut()) else { return };
+        let t = Instant::now();
+        let doc = &mut m.layers.doc;
+        let s = strength.clamp(0.0, 1.0);
+        let falloff = b::Falloff { hardness: hardness.clamp(0.0, 0.999) };
+        let Some((_, n)) = doc.sample_area(at, radius, (st.n != Vec3::ZERO).then_some(st.n)) else { return };
+        st.n = n;
+        match st.target {
+            Target::Mask { show } => {
+                // (Smoothing a mask is not a thing yet; a noise mask picked has nothing to paint.)
+                let Some(ch) = st.channel.clone().filter(|_| brush != Brush::Smooth) else { return };
+                doc.paint(&sculpt_core::PaintTarget::Channel(ch), at, radius, &falloff, 0.3 + 0.7 * s, if show { 1.0 } else { 0.0 }, Some(n));
+                st.painted = true;
+            }
+            _ => {
+                let dab = b::Dab { center: at, normal: n, direction: st.last.map_or(Vec3::ZERO, |p| at - p), pressure: 1.0 };
+                let settings = |strength: f32| b::BrushSettings { radius, strength, falloff, spacing: 0.12, front_faces_only: true, invert };
+                let r = match brush {
+                    Brush::Clay => b::ClayBuildup { height: 0.015 + 0.08 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
+                    Brush::Trim => b::TrimDynamic { depth: 0.015 + 0.06 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
+                    Brush::Smooth => b::Smooth::default().dab(doc, &dab, &settings(0.1 + 0.6 * s)),
+                };
+                if let Err(e) = r {
+                    eprintln!("mesh layer dab: {e}");
+                }
+                st.last = Some(at);
+            }
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        self.last_ms += ms;
+        self.last_dabs += 1;
+        self.dab_ms = if self.dab_ms == 0.0 { ms } else { self.dab_ms * 0.8 + ms * 0.2 };
+    }
+
+    /// The stroke on a mesh layer or its mask ends: one step of the history.
+    fn mesh_end(&mut self) {
+        let Some(_) = self.mesh_stroke.take() else { return };
+        self.stroke_n = Vec3::ZERO;
+        self.chosen = false;
+        let Some(m) = self.mesh.as_mut() else { return };
+        m.layers.doc.end_stroke();
+        match m.layers.stroke_patch() {
+            Ok(p) if !p.is_empty() => m.push(crate::mesh_stack::Entry::Layer(p)),
+            Ok(_) => {}
+            Err(e) => eprintln!("mesh layers: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "gauntlet.rs"]
 mod gauntlet;
+
+#[cfg(test)]
+#[path = "mesh_tests.rs"]
+mod mesh_tests;
 
 #[cfg(test)]
 mod tests {

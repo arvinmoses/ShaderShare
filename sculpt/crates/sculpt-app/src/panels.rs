@@ -185,7 +185,9 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
     });
 }
 
-const SCULPT_HOVER: &str = "An empty layer on top to sculpt on, at full brush speed and any detail: it keeps what its strokes change. Its opacity and masks (painted or noise, blended like a paint program's) fade it anywhere. Sculpting the base under it does not carry it along.";
+const SCULPT_HOVER: &str = "An empty layer on top to sculpt on, on a mesh taken from the volume's surface: it keeps what its strokes change. Its opacity (up to 200%), blend and masks (one painted, one noise) fade it anywhere. Sculpting the base under it carries it along.";
+/// Asks whether to merge the volume's own sculpt layers so mesh layers can be added.
+const MERGE_ASK: &str = "mesh_merge_ask";
 const NOISE_HOVER: &str = "A layer of noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Its mask fades it. Brushes work on the surface under it.";
 const GENERATOR_HOVER: &str = "A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with. Its settings are under Properties; sculpting the form carries it along.";
 
@@ -193,19 +195,26 @@ const GENERATOR_HOVER: &str = "A layer that scatters a primitive over the form a
 fn volume_menu(app: &mut SculptApp, ui: &mut Ui) {
     let m = &mut app.volume;
     let top = m.vol.levels() - 1;
-    if ui.button("New sculpt layer").on_hover_text(SCULPT_HOVER).clicked() {
-        m.new_sculpt_layer();
+    let mesh = m.mesh.is_some() || m.mesh_building();
+    if ui.add_enabled(m.layer.is_none(), egui::Button::new("New sculpt layer")).on_hover_text(SCULPT_HOVER).clicked() {
+        if m.has_volume_layers() {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(MERGE_ASK), true));
+        } else {
+            m.add_mesh_layer();
+        }
         ui.close();
     }
-    if ui.button("New generator layer").on_hover_text(GENERATOR_HOVER).clicked() {
+    if ui.add_enabled(!mesh, egui::Button::new("New generator layer")).on_hover_text(GENERATOR_HOVER).clicked() {
         m.add_generator();
         ui.close();
     }
-    if ui.button("New surface noise layer").on_hover_text(NOISE_HOVER).clicked() {
+    if ui.add_enabled(!mesh, egui::Button::new("New surface noise layer")).on_hover_text(NOISE_HOVER).clicked() {
         m.add_noise();
         ui.close();
     }
     match m.layer.as_ref().map(|l| l.from()) {
+        // (Mesh layers stay layers: nothing merges them into the volume yet.)
+        None if mesh => {}
         None if m.sculpt_layers().is_some() => {
             if ui.button("Merge the layers").on_hover_text("One volume again, as shown. Undo starts afresh.").clicked() {
                 m.merge_layer();
@@ -523,7 +532,8 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                     let name = RichText::new(&info.name);
                     row.label(if info.visible { name } else { name.color(weak) }).on_hover_text(format!("{} blocks", fmt_count(info.blocks)));
                     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, Icon::Trash, 20.0, false, "Remove this layer and what it shows (undo brings it back)").clicked() {
+                        let hover = if m.mesh.is_some() { "Remove this layer and what it shows (undo cannot bring it back: the history goes)" } else { "Remove this layer and what it shows (undo brings it back)" };
+                        if icon_button(ui, Icon::Trash, 20.0, false, hover).clicked() {
                             act.remove = Some(k);
                         }
                         if let Some(o) = row_opacity(ui, info.opacity, MAX_OPACITY, "The layer's opacity: drag, or click to type. Over 100% exaggerates it.") {
@@ -593,7 +603,11 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                     act.target = Some(Target::Form);
                 }
                 ui.add_space(8.0);
-                note(ui, "Each layer keeps what its strokes change, at any detail. Its opacity and masks fade it: masks stack bottom to top, each blended onto those under it. Pick a painted mask to paint it. The base is what no layer holds.", weak);
+                if m.mesh.is_some() {
+                    note(ui, "Each layer keeps what its strokes change on a mesh taken from the volume's surface, and rides along when the base is sculpted. Its opacity, blend and masks (one painted, one noise) fade it. Pick the painted mask to paint it.", weak);
+                } else {
+                    note(ui, "Each layer keeps what its strokes change, at any detail. Its opacity and masks fade it: masks stack bottom to top, each blended onto those under it. Pick a painted mask to paint it. The base is what no layer holds.", weak);
+                }
             }
             None => {
                 let (_, mut row) = row_frame(ui, app, 0.0, true, accent);
@@ -680,7 +694,13 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 0)).show(ui, |ui| {
             ui.menu_button(RichText::new("+ Layer"), |ui| volume_menu(app, ui));
         });
+        if app.volume.mesh_building() {
+            note(ui, "Making the mesh for layers from the volume...", weak);
+        } else if let Some(n) = app.volume.mesh_note.as_ref() {
+            note(ui, n, weak);
+        }
     });
+    mesh_merge_question(app, ui.ctx());
     let m = &mut app.volume;
     if let Some(k) = act.select {
         m.set_active_layer(k);
@@ -712,6 +732,29 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
     }
     if let Some(k) = act.remove {
         m.remove_layer(k);
+    }
+}
+
+/// The volume has sculpt layers of its own (an older file) and a mesh layer was asked for: merge them first?
+fn mesh_merge_question(app: &mut SculptApp, ctx: &egui::Context) {
+    let id = egui::Id::new(MERGE_ASK);
+    if !ctx.data(|d| d.get_temp::<bool>(id).unwrap_or(false)) {
+        return;
+    }
+    let (mut yes, mut no) = (false, false);
+    egui::Window::new("New sculpt layer").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        ui.label("This volume has sculpt layers of its own (from an older file). Sculpt layers now live on a mesh taken from the volume, and the two kinds do not go together.");
+        ui.label("Merge the volume's layers into it as shown (their history goes) and add the new layer?");
+        ui.horizontal(|ui| {
+            yes = ui.button("Merge and add").clicked();
+            no = ui.button("Cancel").clicked();
+        });
+    });
+    if yes || no {
+        ctx.data_mut(|d| d.remove_temp::<bool>(id));
+    }
+    if yes {
+        app.volume.add_mesh_layer();
     }
 }
 
@@ -922,7 +965,7 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
         if let Some(to) = fill {
             m.select_mask(k, None);
             m.fill_mask(to);
-            let mi = m.sculpt.as_ref().and_then(|s| s.active_mask(k));
+            let mi = m.active_mask(k);
             m.select_mask(k, mi);
             m.target = Target::Mask { show: to < 0.5 };
         }

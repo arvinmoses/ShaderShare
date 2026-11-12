@@ -17,6 +17,8 @@ mod gpu_sdf;
 mod gpu_volume;
 mod icons;
 mod keymap;
+mod mesh_edit;
+mod mesh_stack;
 mod panels;
 mod pen;
 mod theme;
