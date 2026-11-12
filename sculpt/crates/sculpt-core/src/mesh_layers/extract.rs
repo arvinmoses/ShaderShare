@@ -10,11 +10,15 @@ use crate::mesh::{Face, NO_VERT, PolyMesh, face_len, face_verts};
 use crate::{Error, Result};
 
 /// One extraction: the mesh, each vertex's name, and each vertex's normal (the field's gradient, normalized), all in
-/// the mesh's vertex order.
+/// the mesh's vertex order (the canonical order). Also where each vertex sits in its block: see [`super::MeshLayers::blocks`].
 pub struct Extracted {
     pub mesh: PolyMesh,
     pub keys: Vec<u64>,
     pub normals: Vec<Vec3>,
+    /// Every block, in the mesh's order, with its first vertex (its vertices run to the next block's first).
+    pub blocks: Vec<(Key, u32)>,
+    /// Per vertex: its index in its block's `BlockSurface::verts` (the GPU's vertex order).
+    pub vi: Vec<u16>,
     pub stats: ExtractStats,
 }
 
@@ -59,6 +63,17 @@ pub fn assemble(surf: &HashMap<Key, BlockSurface>, stats: ExtractStats) -> Resul
     let mut positions = vec![Vec3::ZERO; total];
     let mut names = vec![u64::MAX; total];
     let mut normals = vec![Vec3::ZERO; total];
+    let mut vi: Vec<u16> = vec![0; total];
+    vi.par_chunks_mut(4096).enumerate().for_each(|(c, out)| {
+        let at = c * 4096;
+        let mut b = first.partition_point(|&f| f as usize <= at) - 1;
+        for (k, o) in out.iter_mut().enumerate() {
+            while first[b + 1] as usize <= at + k {
+                b += 1;
+            }
+            *o = (at + k - first[b] as usize) as u16;
+        }
+    });
     {
         let mut parts = Vec::with_capacity(blocks.len());
         let (mut p, mut n, mut m) = (&mut positions[..], &mut names[..], &mut normals[..]);
@@ -131,15 +146,25 @@ pub fn assemble(surf: &HashMap<Key, BlockSurface>, stats: ExtractStats) -> Resul
     if used.par_iter().any(|u| !u.load(Ordering::Relaxed)) {
         let mut remap = vec![NO_VERT; total];
         let mut next = 0u32;
-        let (mut p2, mut n2, mut m2) = (Vec::with_capacity(total), Vec::with_capacity(total), Vec::with_capacity(total));
+        let (mut p2, mut n2, mut m2, mut v2) = (Vec::with_capacity(total), Vec::with_capacity(total), Vec::with_capacity(total), Vec::with_capacity(total));
+        let mut b = 0;
         for i in 0..total {
+            while b < blocks.len() && first[b] as usize <= i {
+                // Block `b` starts here: its first kept vertex is the next one kept.
+                first[b] = next;
+                b += 1;
+            }
             if used[i].load(Ordering::Relaxed) {
                 remap[i] = next;
                 next += 1;
                 p2.push(positions[i]);
                 n2.push(names[i]);
                 m2.push(normals[i]);
+                v2.push(vi[i]);
             }
+        }
+        for f in &mut first[b..] {
+            *f = next;
         }
         faces.par_iter_mut().for_each(|f| {
             for v in f.iter_mut().filter(|v| **v != NO_VERT) {
@@ -149,8 +174,16 @@ pub fn assemble(surf: &HashMap<Key, BlockSurface>, stats: ExtractStats) -> Resul
         positions = p2;
         names = n2;
         normals = m2;
+        vi = v2;
     }
-    Ok(Extracted { mesh: PolyMesh { positions, faces }, keys: names, normals, stats })
+    let blocks = blocks.iter().zip(&first).map(|((k, _), f)| (*k, *f)).collect();
+    Ok(Extracted { mesh: PolyMesh { positions, faces }, keys: names, normals, blocks, vi, stats })
+}
+
+/// The block of a vertex name.
+pub(super) fn key_of(name: u64) -> Key {
+    let c = |s: u32| ((name >> s) & 0xFFFF) as i32 - (1 << 15);
+    ((name >> 61) as u8, glam::IVec3::new(c(13), c(29), c(45)))
 }
 
 /// A vertex name: level (3 bits), block z, y, x (16 bits each, offset), cell (9 bits), piece (2 bits). Ascending in

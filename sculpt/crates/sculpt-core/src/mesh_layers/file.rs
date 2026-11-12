@@ -1,6 +1,7 @@
 //! Saving layers against vertex names, and reading them back onto a fresh extraction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use glam::Vec3;
@@ -17,7 +18,64 @@ use crate::{Error, Result};
 impl MeshLayers {
     /// Write the layers, channels and freeze, keyed by vertex name, to `dir` (a directory). The mesh is not written.
     pub fn save(&self, dir: &Path) -> Result<()> {
+        let (m, blobs) = self.to_parts()?;
         std::fs::create_dir_all(dir.join("blobs"))?;
+        for (path, bytes) in &blobs {
+            std::fs::write(dir.join(path), bytes)?;
+        }
+        std::fs::write(dir.join(MANIFEST), serde_json::to_string_pretty(&m)?)?;
+        Ok(())
+    }
+
+    /// [`Self::save`] as one stream: a header, the manifest and the blobs, each with its length, so
+    /// [`Self::read_from`] reads exactly what this wrote.
+    pub fn write_to(&self, w: &mut impl Write) -> Result<()> {
+        let (m, blobs) = self.to_parts()?;
+        let manifest = serde_json::to_vec(&m)?;
+        w.write_all(STREAM_MAGIC)?;
+        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&(manifest.len() as u64).to_le_bytes())?;
+        w.write_all(&manifest)?;
+        w.write_all(&(blobs.len() as u32).to_le_bytes())?;
+        for (path, bytes) in &blobs {
+            w.write_all(&(path.len() as u32).to_le_bytes())?;
+            w.write_all(path.as_bytes())?;
+            w.write_all(&(bytes.len() as u64).to_le_bytes())?;
+            w.write_all(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Read what [`Self::write_to`] wrote (and nothing past it), extracting the mesh again from `vol`, as
+    /// [`Self::load`].
+    pub fn read_from(r: &mut impl Read, vol: &LevelVolume) -> Result<(MeshLayers, usize)> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != STREAM_MAGIC {
+            return Err(Error::Format("not a mesh layers stream".into()));
+        }
+        let version = read_u32(r)?;
+        if version != 1 {
+            return Err(Error::Format(format!("mesh layers stream version {version} is not known")));
+        }
+        let len = read_u64(r)?;
+        let manifest = read_bytes(r, len)?;
+        let m: Manifest = serde_json::from_slice(&manifest)?;
+        let count = read_u32(r)?;
+        let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
+        for _ in 0..count {
+            let len = read_u32(r)? as u64;
+            let path = String::from_utf8(read_bytes(r, len)?).map_err(|_| Error::Format("a blob name is not text".into()))?;
+            let len = read_u64(r)?;
+            blobs.insert(path, read_bytes(r, len)?);
+        }
+        Self::from_parts(m, vol, |b| blobs.get(&b.path).cloned().ok_or_else(|| Error::Format(format!("{}: not in the stream", b.path))))
+    }
+
+    /// The manifest and the blobs (path, bytes).
+    fn to_parts(&self) -> Result<(Manifest, Vec<(String, Vec<u8>)>)> {
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        let dir = &mut blobs;
         let doc = &self.doc;
         let to_canon = self.internal_to_canonical();
         let keys_blob = write_blob(dir, "keys", "u64", &self.keys)?;
@@ -75,14 +133,24 @@ impl MeshLayers {
             next_layer_id: doc.next_layer_id,
             metadata: doc.metadata.clone(),
         };
-        std::fs::write(dir.join(MANIFEST), serde_json::to_string_pretty(&m)?)?;
-        Ok(())
+        Ok((m, blobs))
     }
 
     /// Read what [`Self::save`] wrote, extracting the mesh again from `vol`. Data whose vertex name the surface no
     /// longer has is dropped (the second value counts those vertices).
     pub fn load(dir: &Path, vol: &LevelVolume) -> Result<(MeshLayers, usize)> {
         let m: Manifest = serde_json::from_str(&std::fs::read_to_string(dir.join(MANIFEST))?)?;
+        Self::from_parts(m, vol, |b| {
+            if b.path.contains("..") || Path::new(&b.path).is_absolute() {
+                return Err(Error::Format(format!("blob path escapes the directory: {}", b.path)));
+            }
+            Ok(std::fs::read(dir.join(&b.path))?)
+        })
+    }
+
+    /// The layers of manifest `m` on `vol`'s surface, each blob's bytes from `bytes`.
+    fn from_parts(m: Manifest, vol: &LevelVolume, bytes: impl Fn(&Blob) -> Result<Vec<u8>>) -> Result<(MeshLayers, usize)> {
+        let dir = &bytes;
         if m.format != FORMAT {
             return Err(Error::Format(format!("not a {FORMAT} manifest")));
         }
@@ -167,6 +235,29 @@ impl MeshLayers {
 
 const FORMAT: &str = "sculpt-mesh-layers";
 const MANIFEST: &str = "mesh_layers.json";
+const STREAM_MAGIC: &[u8; 4] = b"SMLS";
+
+fn read_u32(r: &mut impl Read) -> Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_u64(r: &mut impl Read) -> Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// `len` bytes, read in pieces (a bad length fails at the end of the stream rather than allocating it all).
+fn read_bytes(r: &mut impl Read, len: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    r.take(len).read_to_end(&mut out)?;
+    if out.len() as u64 != len {
+        return Err(Error::Format("mesh layers stream ends early".into()));
+    }
+    Ok(out)
+}
 
 #[derive(Serialize, Deserialize)]
 struct Blob {
@@ -203,20 +294,17 @@ struct Manifest {
     metadata: BTreeMap<String, serde_json::Value>,
 }
 
-fn write_blob<T: bytemuck::Pod>(dir: &Path, name: &str, dtype: &str, data: &[T]) -> Result<Blob> {
+fn write_blob<T: bytemuck::Pod>(blobs: &mut Vec<(String, Vec<u8>)>, name: &str, dtype: &str, data: &[T]) -> Result<Blob> {
     let rel = format!("blobs/{name}.bin");
-    std::fs::write(dir.join(&rel), bytemuck::cast_slice(data))?;
+    blobs.push((rel.clone(), bytemuck::cast_slice(data).to_vec()));
     Ok(Blob { path: rel, dtype: dtype.into(), count: data.len() as u64 })
 }
 
-fn read_blob<T: bytemuck::Pod>(dir: &Path, b: &Blob, dtype: &str) -> Result<Vec<T>> {
+fn read_blob<T: bytemuck::Pod>(bytes: &impl Fn(&Blob) -> Result<Vec<u8>>, b: &Blob, dtype: &str) -> Result<Vec<T>> {
     if b.dtype != dtype {
         return Err(Error::Format(format!("{}: expected {dtype}, found {}", b.path, b.dtype)));
     }
-    if b.path.contains("..") || Path::new(&b.path).is_absolute() {
-        return Err(Error::Format(format!("blob path escapes the directory: {}", b.path)));
-    }
-    let bytes = std::fs::read(dir.join(&b.path))?;
+    let bytes = bytes(b)?;
     if bytes.len() != b.count as usize * std::mem::size_of::<T>() {
         return Err(Error::Format(format!("{}: expected {} values, found {} bytes", b.path, b.count, bytes.len())));
     }

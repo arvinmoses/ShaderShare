@@ -533,6 +533,12 @@ impl Document {
         Ok(())
     }
 
+    /// Weigh again the layer masks (and generator densities) that read a channel painted since the last refresh.
+    /// `end_stroke` does this; call it to see a mask stroke's effect while the stroke is still open.
+    pub fn refresh_painted_masks(&mut self) -> Result<()> {
+        self.refresh_dependent_masks()
+    }
+
     fn refresh_dependent_masks(&mut self) -> Result<()> {
         if self.dirty_channels.is_empty() {
             return Ok(());
@@ -620,6 +626,18 @@ impl Document {
     }
 
     pub fn evaluate_mask(&mut self, stack: &MaskStack) -> Result<Vec<f32>> {
+        self.evaluate_mask_with(stack, &mask::SourceValues::default())
+    }
+
+    /// [`Self::mask_values_for`], with the values of sources worked out ahead taken from `pre`.
+    pub(crate) fn mask_values_with(&mut self, stack: &MaskStack, pre: &mask::SourceValues) -> Result<Option<Vec<f32>>> {
+        if !stack.enabled {
+            return Ok(None);
+        }
+        self.evaluate_mask_with(stack, pre).map(Some)
+    }
+
+    fn evaluate_mask_with(&mut self, stack: &MaskStack, pre: &mask::SourceValues) -> Result<Vec<f32>> {
         let mut bakes = Vec::new();
         stack.required_bakes(&mut bakes);
         for b in bakes {
@@ -627,10 +645,11 @@ impl Document {
                 self.bake(b, &BakeSettings::default());
             }
         }
-        let rest_normals = if stack.uses_normals() { mesh::compute_normals(&self.rest, &self.faces, &self.topo) } else { Vec::new() };
-        mask::evaluate(
+        let rest_normals = if stack.uses_normals() && pre.needs_normals(stack) { mesh::compute_normals(&self.rest, &self.faces, &self.topo) } else { Vec::new() };
+        mask::evaluate_with(
             stack,
             &MaskContext { positions: &self.rest, normals: &rest_normals, topology: &self.topo, channels: &self.channels },
+            pre,
         )
     }
 

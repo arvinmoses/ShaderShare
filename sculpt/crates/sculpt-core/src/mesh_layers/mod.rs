@@ -19,11 +19,14 @@ mod carry;
 mod extract;
 mod file;
 mod job;
+mod patch;
 
 pub use cache::{BlockCache, CacheUpdate};
 pub use extract::{Extracted, assemble, edge_defects, extract_all, extract_named};
-pub use job::{JobStats, SwapStats};
+pub use job::{BlockChanges, JobStats, SwapStats};
 
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 use glam::IVec3;
@@ -106,10 +109,31 @@ impl Patch {
     }
 }
 
+/// Where each vertex sits among the volume's blocks, internal -> canonical, and the base mesh's normals: built with
+/// each new mesh (in the refit job), never changed after.
+#[derive(Default)]
+pub(super) struct Layout {
+    /// Every block, in canonical order, with its first canonical vertex.
+    pub(super) blocks: Vec<(Key, u32)>,
+    /// Per canonical vertex: its index in its block's GPU vertices.
+    pub(super) vi: Vec<u16>,
+    pub(super) i2c: Vec<u32>,
+    /// Per internal vertex: the base mesh's normal (as `Document::from_mesh` computed it, before any layer).
+    pub(super) base_normals: Vec<Vec3>,
+}
+
+impl Layout {
+    /// For `doc`, fresh from `Document::from_mesh` of the extraction that gave `blocks` and `vi`.
+    pub(super) fn new(blocks: Vec<(Key, u32)>, vi: Vec<u16>, doc: &Document) -> Layout {
+        Layout { blocks, vi, i2c: invert(&doc.canonical_to_internal), base_normals: doc.normals.clone() }
+    }
+}
+
 pub struct MeshLayers {
     pub doc: Document,
     /// The vertex names, in the document's canonical order (the extraction order, which is ascending).
     keys: Vec<u64>,
+    layout: Arc<Layout>,
     settings: MeshLayerSettings,
     step: f32,
     /// The volume as the mesh was extracted from it: the next carry finds the old surface in it.
@@ -125,8 +149,9 @@ impl MeshLayers {
         let cache = BlockCache::build(vol, settings.cap);
         let ex = cache.assemble()?;
         let doc = Document::from_mesh(ex.mesh)?;
-        let live = job::Live::new(cache, job::Geom::of(&doc, &ex.keys));
-        Ok(MeshLayers { doc, keys: ex.keys, settings, step: step_of(vol, &settings), pre: vol.snapshot(), live })
+        let layout = Arc::new(Layout::new(ex.blocks, ex.vi, &doc));
+        let live = job::Live::new(cache, job::Geom::of(&doc, &ex.keys, layout.clone()));
+        Ok(MeshLayers { doc, keys: ex.keys, layout, settings, step: step_of(vol, &settings), pre: vol.snapshot(), live })
     }
 
     pub fn settings(&self) -> &MeshLayerSettings {
@@ -138,9 +163,47 @@ impl MeshLayers {
         &self.keys
     }
 
-    /// Internal -> canonical index.
-    pub fn internal_to_canonical(&self) -> Vec<u32> {
-        invert(&self.doc.canonical_to_internal)
+    /// Internal -> canonical index (kept with the mesh).
+    pub fn internal_to_canonical(&self) -> &[u32] {
+        &self.layout.i2c
+    }
+
+    /// Every block of the volume the mesh was taken from (as the block cache holds them: every stored block shown up
+    /// to `cap`), in canonical order, each with its first canonical vertex. Block `i`'s vertices are the canonical
+    /// range [`Self::block_vertices`]`(i)`; a block whose vertices no face uses has an empty range.
+    ///
+    /// How a vertex maps onto the GPU's surface: canonical vertex `c` of block `key` is the vertex `vi = `
+    /// [`Self::vertex_vi`]`()[c]` of that block's `BlockSurface::verts`, the one `vs_levels` draws for a corner (cell,
+    /// piece) with `vi = (cells[cell] & 1023) + min(piece, count - 1)`. Its name ([`Self::keys`]) holds the block, the
+    /// cell (bits 4-12) and the piece (bits 0-3), and `vi = (cells[cell] & 1023) + piece`. So per-vertex data for the
+    /// GPU goes at `row_start[slot of key] + vi`, read from internal vertex `doc.canonical_index(c)`. Vertices of a block
+    /// that no face uses (dropped from the mesh) have no canonical vertex: their rows stay zero.
+    pub fn blocks(&self) -> &[(Key, u32)] {
+        &self.layout.blocks
+    }
+
+    /// The canonical vertices of block `i` of [`Self::blocks`].
+    pub fn block_vertices(&self, i: usize) -> Range<usize> {
+        let b = &self.layout.blocks;
+        let end = b.get(i + 1).map_or(self.keys.len(), |n| n.1 as usize);
+        b[i].1 as usize..end
+    }
+
+    /// The block (index into [`Self::blocks`]) holding canonical vertex `c`.
+    pub fn block_of(&self, c: usize) -> usize {
+        // The last block starting at or before `c` (empty blocks share a start with the next).
+        self.layout.blocks.partition_point(|b| b.1 as usize <= c) - 1
+    }
+
+    /// Per canonical vertex: its index in its block's GPU vertex order (see [`Self::blocks`]).
+    pub fn vertex_vi(&self) -> &[u16] {
+        &self.layout.vi
+    }
+
+    /// Per internal vertex: the base mesh's normal (area-weighted, as `Document::from_mesh` computes it before any
+    /// layer), the normal Max/Min layers gate on.
+    pub fn base_normals(&self) -> &[Vec3] {
+        &self.layout.base_normals
     }
 
     /// Layer `id`'s stored offsets, one per vertex in internal order.
@@ -182,15 +245,17 @@ impl MeshLayers {
     pub fn refit_patch(&mut self, vol: &LevelVolume, _changed: Aabb) -> Result<(CarryStats, Patch)> {
         let mut st = CarryStats::default();
         let t = Instant::now();
-        let (mesh, keys, _) = extract_named(vol, self.settings.cap)?;
+        let ex = extract_all(vol, self.settings.cap)?;
+        let (keys, blocks, vi) = (ex.keys, ex.blocks, ex.vi);
         st.extract_ms = ms(t);
         let t = Instant::now();
-        let new = Document::from_mesh(mesh)?;
+        let new = Document::from_mesh(ex.mesh)?;
+        let layout = Arc::new(Layout::new(blocks, vi, &new));
         st.build_ms = ms(t);
         self.step = step_of(vol, &self.settings);
         let t = Instant::now();
         let plan = carry::plan(carry::Geo::of(&self.doc, &self.keys), carry::Geo::of(&new, &keys), &new.normals, &self.pre, vol, self.settings.cap);
-        let (doc, patch, recomposite_ms) = carry::apply(&self.doc, &self.keys, new, &plan)?;
+        let (doc, patch, recomposite_ms) = carry::apply(&self.doc, &self.keys, new, &plan, &Default::default())?;
         st.carry_ms = ms(t);
         st.match_ms = plan.match_ms;
         st.project_ms = plan.project_ms;
@@ -203,6 +268,7 @@ impl MeshLayers {
         st.triangles = doc.faces.iter().map(|f| face_len(f) - 2).sum();
         self.doc = doc;
         self.keys = keys;
+        self.layout = layout;
         self.pre = vol.snapshot();
         Ok((st, patch))
     }
@@ -223,20 +289,21 @@ impl MeshLayers {
     pub fn refit_async(&mut self, vol: &LevelVolume, dirty: &[Key], _changed: Aabb) -> f64 {
         let t = Instant::now();
         self.live.note(dirty);
-        self.live.start(vol, &self.pre, &self.doc, &self.keys, self.settings);
+        self.live.start(vol, &self.pre, &self.doc, &self.keys, &self.layout, self.settings);
         ms(t)
     }
 
     /// If the refit job finished: carry the layers as they are now onto its mesh and swap it in (then start the next
     /// job, from `vol`, if more changes came meanwhile). `None` while it runs or when none does. What the carry did not
     /// copy is kept as a [`Patch`]: take it with [`Self::take_patches`].
+    /// Its [`SwapStats::blocks`] lists the blocks whose per-vertex data the swap changed.
     pub fn poll(&mut self, vol: &LevelVolume) -> Option<Result<SwapStats>> {
-        self.live.poll(false, vol, &mut self.pre, &mut self.doc, &mut self.keys, &mut self.step, self.settings)
+        self.live.poll(false, vol, &mut self.pre, &mut self.doc, &mut self.keys, &mut self.layout, &mut self.step, self.settings)
     }
 
     /// [`Self::poll`], waiting for the job under way.
     pub fn wait(&mut self, vol: &LevelVolume) -> Option<Result<SwapStats>> {
-        self.live.poll(true, vol, &mut self.pre, &mut self.doc, &mut self.keys, &mut self.step, self.settings)
+        self.live.poll(true, vol, &mut self.pre, &mut self.doc, &mut self.keys, &mut self.layout, &mut self.step, self.settings)
     }
 
     /// The patches of the swaps since the last call, oldest first: one per swap, which may cover several

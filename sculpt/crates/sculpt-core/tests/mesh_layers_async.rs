@@ -309,3 +309,75 @@ fn b2_at_2_5m(everywhere: bool) {
     assert!(worst_frame < 16.0, "swap frame {worst_frame:.1} ms");
     assert!(worst_latency < 400.0, "latency {worst_latency:.0} ms");
 }
+
+// ------------------------------------------------------------------------------------------------------------ C0d
+
+/// The swap frame at 2.47M triangles with a Max layer (its gate reads the base normals) or a noise-masked layer: the
+/// basis and the mask values come from the job, so the main thread stays under a frame.
+#[test]
+#[ignore]
+fn c0d_swap_with_a_max_layer_at_2_5m_triangles() {
+    c0d_at_2_5m(true);
+}
+
+#[test]
+#[ignore]
+fn c0d_swap_with_a_noise_mask_at_2_5m_triangles() {
+    c0d_at_2_5m(false);
+}
+
+fn c0d_at_2_5m(max: bool) {
+    use sculpt_core::LayerBlend;
+    use sculpt_core::mask::{MaskLayer, MaskSource, MaskStack};
+    use sculpt_core::noise::NoiseParams;
+    let what = if max { "Max" } else { "noise mask" };
+    let t = Instant::now();
+    let mut vol = ball(1.0 / 512.0, 1, 0.5);
+    let mut ml = MeshLayers::from_volume(&vol, MeshLayerSettings::default()).unwrap();
+    let tris: usize = ml.doc.faces().iter().map(|f| face_len(f) - 2).sum();
+    eprintln!("C0d: volume + mesh layers {:.0} ms, {} verts, {tris} tris", t.elapsed().as_secs_f64() * 1e3, ml.doc.vertex_count());
+    assert!(tris > 2_000_000);
+    // Two layers on top: Max and Min, or each with a paint and a noise mask (as the panel makes them).
+    for (n, at) in [-0.05f32, 0.1].into_iter().enumerate() {
+        let id = ml.doc.add_layer(&format!("clay {n}"));
+        for k in 0..4 {
+            layer_dab(&mut ml.doc, Vec3::new(at + 0.03 * k as f32, 0.0, 1.0), 0.12);
+        }
+        if max {
+            let mut m = ml.doc.layer(id).unwrap().meta();
+            m.blend = if n == 0 { LayerBlend::Max } else { LayerBlend::Min };
+            ml.doc.set_layer_meta(id, m, false).unwrap();
+        } else {
+            let paint = format!("paint.{n}");
+            let half: Vec<f32> = ml.doc.base_positions().iter().map(|p| if p.x < at { 0.0 } else { 1.0 }).collect();
+            ml.doc.set_channel(&paint, half).unwrap();
+            let noise = NoiseParams { seed: n as u32, ..Default::default() };
+            let stack = MaskStack::new(1.0)
+                .with(MaskLayer::new("paint", MaskSource::Channel { name: paint }).blend(sculpt_core::mask::BlendMode::Multiply))
+                .with(MaskLayer::new("noise", MaskSource::Noise(noise)).blend(sculpt_core::mask::BlendMode::Multiply));
+            ml.doc.set_layer_mask(id, Some(stack)).unwrap();
+        }
+    }
+    vol.drain_dirty();
+    let mut worst = 0.0f64;
+    for (i, c) in [Vec3::new(0.2, 0.1, -1.0), Vec3::new(-0.3, 0.8, -0.2), Vec3::new(1.0, -0.2, 0.1)].into_iter().enumerate() {
+        let stroke = vol_stroke(&mut vol, c, 0.1);
+        let dirty = vol.drain_dirty();
+        ml.refit_async(&vol, &dirty, stroke);
+        let (st, frame_ms) = loop {
+            let t = Instant::now();
+            if let Some(r) = ml.poll(&vol) {
+                break (r.unwrap(), t.elapsed().as_secs_f64() * 1e3);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        eprintln!(
+            "C0d {what} stroke {i}: swap frame {frame_ms:.1} ms (swap {:.1}, apply {:.1}, recomposite {:.1}); job {:.0} ms",
+            st.swap_ms, st.apply_ms, st.recomposite_ms, st.job.total_ms
+        );
+        assert!(!st.discarded);
+        worst = worst.max(frame_ms);
+    }
+    eprintln!("C0d {what}: worst swap frame {worst:.1} ms");
+    assert!(worst < 16.0, "swap frame {worst:.1} ms");
+}
