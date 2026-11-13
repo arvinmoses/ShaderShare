@@ -383,8 +383,10 @@ fn stroking_on_a_subtract_layer_shows_immediately_and_flatten_needs_add() {
     let l = d.insert_layer("Dig", Placement::Top).unwrap();
     set_blend(&mut d, l, Subtract);
     let flat = top_y(&d);
-    bump(&mut d); // positive delta, subtracted: a dent appears right away
-    assert!(top_y(&d) < flat - 0.01);
+    // A brush moves what is shown, whatever the blend: clay raises right away (stored negated, so the layer digs
+    // where it holds positive offsets).
+    bump(&mut d);
+    assert!(top_y(&d) > flat + 0.01);
     assert!(d.flatten_layer(l).is_err());
     let m = d.insert_layer("Other", Placement::Top).unwrap();
     assert!(d.merge_down(m).is_err(), "merge needs both layers in Add mode");

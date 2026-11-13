@@ -858,14 +858,29 @@ impl Document {
                         chunk_refs.push(c.as_mut().unwrap());
                     }
                 }
+                // A brush asks for `d` on the surface as shown. Add and Subtract store what shows as `d` through the layer's
+                // weight and sign; Max and Min store it through the weight and are recomposited. Where the weight is small
+                // (a mask's edge, a low strength) the gain is held at `MAX_GAIN`, so the surface moves less than asked
+                // rather than storing offsets far larger than what shows; under `MIN_WEIGHT` nothing is stored.
+                const MAX_GAIN: f32 = 4.0;
+                const MIN_WEIGHT: f32 = 0.02;
+                let through_weight = blend.is_linear() || blend.uses_normal();
                 disp.leaves.par_iter().zip(chunk_refs).zip(pos_slices).zip(ranges.par_iter()).for_each(
                     |((((_, list), chunk), pos), r)| {
                         for &(k, d) in list {
                             let v = r.start + k as usize;
+                            if !through_weight {
+                                chunk[k as usize] += d;
+                                continue;
+                            }
                             let w = scale * mask_values.map_or(1.0, |m| m[v]);
-                            chunk[k as usize] += d;
+                            if w.abs() < MIN_WEIGHT {
+                                continue;
+                            }
+                            let stored = d * ((1.0 / w).clamp(-MAX_GAIN, MAX_GAIN) * sign);
+                            chunk[k as usize] += stored;
                             if blend.is_linear() {
-                                pos[k as usize] += d * (w * sign);
+                                pos[k as usize] += stored * (w * sign);
                             }
                         }
                     },
