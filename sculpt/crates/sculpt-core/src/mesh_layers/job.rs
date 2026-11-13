@@ -224,6 +224,31 @@ impl Job {
     }
 }
 
+/// Refit jobs (and their parallel parts) run here, on as many threads as cores below normal priority: they take what
+/// the frame leaves, and a dab's own parallel work never queues behind theirs in the global pool.
+fn refit_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        rayon::ThreadPoolBuilder::new().num_threads(cores).thread_name(|i| format!("refit {i}")).start_handler(|_| lower_priority()).build().expect("a thread pool")
+    })
+}
+
+/// Run the calling thread below normal priority.
+fn lower_priority() {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        // THREAD_PRIORITY_BELOW_NORMAL
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), -1);
+        }
+    }
+}
+
 /// The refit state kept beside the document: the block cache and the old geometry while idle, the job while one
 /// runs, the changes since it started, and the patches of the swaps not yet taken.
 pub(super) struct Live {
@@ -233,6 +258,10 @@ pub(super) struct Live {
     pending: Vec<Key>,
     has_pending: bool,
     pub(super) patches: Vec<Patch>,
+    /// Hold what a swap replaced until [`Self::free_old`] or the next job's start (see `MeshLayers::set_hold_old`),
+    /// else free it at once.
+    pub(super) hold_old: bool,
+    old: Option<(Box<dyn Send + Sync>, Instant)>,
 }
 
 struct Running {
@@ -243,11 +272,24 @@ struct Running {
 
 impl Live {
     pub(super) fn new(cache: BlockCache, geom: Geom) -> Live {
-        Live { cache: Some(cache), geom: Some(Arc::new(geom)), running: None, pending: Vec::new(), has_pending: false, patches: Vec::new() }
+        Live { cache: Some(cache), geom: Some(Arc::new(geom)), running: None, pending: Vec::new(), has_pending: false, patches: Vec::new(), hold_old: false, old: None }
     }
 
     pub(super) fn busy(&self) -> bool {
         self.running.is_some()
+    }
+
+    /// Free what the last swap replaced, if it is still held: off this thread, below the frame's priority. (Even so
+    /// it slows a stroke's dabs on every core while it runs, up to 20 ms a frame at 5M: hence holding it.)
+    pub(super) fn free_old(&mut self) {
+        if let Some((old, _)) = self.old.take() {
+            refit_pool().spawn(move || drop(old));
+        }
+    }
+
+    /// How long ago the swap whose replaced mesh is held came in, if one is held.
+    pub(super) fn old_held_ms(&self) -> Option<f64> {
+        self.old.as_ref().map(|(_, at)| ms(*at))
     }
 
     /// Count `dirty` as waiting for the next job.
@@ -273,8 +315,16 @@ impl Live {
         self.has_pending = false;
         let stacks = doc.layers.iter().filter_map(|l| l.mask.clone()).filter(|s| s.enabled).collect();
         let basis = doc.layers.iter().any(|l| l.blend.uses_normal());
+        // What the last swap replaced, if still held: freed now, beside the job, where it only slows the job.
+        self.free_old();
         let job = Job { vol: vol.snapshot(), pre: pre.snapshot(), dirty: dirty.clone(), cache: self.cache.take(), old: self.geom.clone().unwrap(), settings, stacks, basis };
-        let handle = std::thread::Builder::new().name("mesh-layers-refit".into()).spawn(move || job.run()).expect("spawn the refit job");
+        let handle = std::thread::Builder::new()
+            .name("mesh-layers-refit".into())
+            .spawn(move || {
+                lower_priority();
+                refit_pool().install(move || job.run())
+            })
+            .expect("spawn the refit job");
         self.running = Some(Running { handle, dirty, started: Instant::now() });
     }
 
@@ -332,8 +382,12 @@ impl Live {
                         let old_geom = self.geom.replace(geom);
                         let patch_len = patch.len();
                         self.patches.push(patch);
-                        // Freeing the old mesh takes a while: not on this thread.
-                        std::thread::spawn(move || drop((old, old_keys, old_layout, old_geom, old_pre, plan, sources)));
+                        // Freeing the old mesh takes a while (70 to 80 ms at 5M): not on this thread.
+                        self.free_old();
+                        self.old = Some((Box::new((old, old_keys, old_layout, old_geom, old_pre, plan, sources)), Instant::now()));
+                        if !self.hold_old {
+                            self.free_old();
+                        }
                         let swap_ms = ms(t);
                         Ok(SwapStats { job: stats, swap_ms, apply_ms, recomposite_ms, latency_ms: r.started.elapsed().as_secs_f64() * 1e3, discarded: false, patch_len, blocks: changes })
                     }

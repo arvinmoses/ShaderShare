@@ -39,8 +39,18 @@ fn lower_priority() {
     }
 }
 
-/// While strokes run ahead of the work still landing: the most a frame spends doing them for real.
-const CATCH_UP_MS: f64 = 24.0;
+/// While strokes run ahead of the work still landing: what a frame spends doing them for real is this less what the
+/// frame's own dabs took, at least [`CATCH_UP_MIN_MS`]. The copy is what is drawn, so the pen does not notice; the
+/// real state only catches up later.
+const CATCH_UP_MS: f64 = 14.0;
+const CATCH_UP_MIN_MS: f64 = 2.0;
+/// The mesh layers' refit after volume strokes starts once the pen has been up this long (while the form is what strokes
+/// work on): back-to-back strokes share one, and none runs under the next stroke's dabs. Whatever needs the layers
+/// current (a layer stroke, undo, redo, save) refits at once instead.
+const REFIT_AFTER_MS: f64 = 250.0;
+/// What a refit's swap replaced is freed (if the next refit has not freed it already) once the pen and the swap have
+/// both been still this long: freeing it slows a stroke's dabs for a moment.
+const FREE_OLD_AFTER_MS: f64 = 1000.0;
 /// The least time a frame spends on queued dabs (see [`VolumeMode::run_frame_dabs`]).
 const DAB_FRAME_MS: f64 = 9.0;
 
@@ -226,6 +236,11 @@ pub struct VolumeMode {
     /// The last stroke's level and time per dab, for the readout.
     pub stroke_level: usize,
     pub dab_ms: f64,
+    /// What this frame's dabs took so far (see [`VolumeMode::tick`]).
+    frame_dab_ms: f64,
+    /// When the pen last went up, and whether it is down.
+    pen_up: Instant,
+    pen_down: bool,
     /// Dabs given but not done yet: (at, radius, px, strength, hardness, brush).
     queued: std::collections::VecDeque<(Vec3, f32, f32, f32, f32, Brush)>,
     /// GPU time of the last surface rebuild.
@@ -355,6 +370,9 @@ impl VolumeMode {
             pages_used: 0,
             stroke_level: 0,
             dab_ms: 0.0,
+            frame_dab_ms: 0.0,
+            pen_up: Instant::now(),
+            pen_down: false,
             queued: Default::default(),
             gpu_ms: 0.0,
             stroke_n: Vec3::ZERO,
@@ -460,8 +478,11 @@ impl VolumeMode {
     /// One frame's share of queued dabs: `DAB_FRAME_MS` of them, or half the time all would take if that is more,
     /// so a burst spreads over a few frames and the stroke never trails the pen by much more than two frames' work.
     pub fn run_frame_dabs(&mut self) -> usize {
+        let t = Instant::now();
         let all = self.queued.len() as f64 * self.dab_ms.max(0.05);
-        self.run_dabs(DAB_FRAME_MS.max(0.5 * all))
+        let n = self.run_dabs(DAB_FRAME_MS.max(0.5 * all));
+        self.frame_dab_ms += t.elapsed().as_secs_f64() * 1e3;
+        n
     }
 
     /// Blocks the copy changed, while running ahead (see [`Ahead`]).
@@ -574,8 +595,12 @@ impl VolumeMode {
             self.tick_now();
         } else {
             self.with_real(|m| m.tick_now());
-            self.catch_up(Some(CATCH_UP_MS));
+            // A frame that ran dabs of its own does no catch-up dab it has no room for (a wide brush's dab is most
+            // of a frame); the frames without (the pen resting, between dabs, up) do at least one.
+            let budget = (CATCH_UP_MS - self.frame_dab_ms).max(CATCH_UP_MIN_MS);
+            self.catch_up_with(Some(budget), false, self.frame_dab_ms > 0.0);
         }
+        self.frame_dab_ms = 0.0;
         self.mesh_tick();
     }
 
@@ -625,22 +650,28 @@ impl VolumeMode {
     /// Do the strokes run ahead for real, as far as the work they must come after allows, for at most `budget_ms`
     /// (at least one event); once all are done, draw the real state again.
     fn catch_up(&mut self, budget_ms: Option<f64>) -> bool {
-        self.catch_up_with(budget_ms, false)
+        self.catch_up_with(budget_ms, false, false)
     }
 
     /// [`Self::catch_up`], the next begin going ahead whatever is still landing.
     fn catch_up_forced(&mut self) -> bool {
         debug_assert!(false, "a stroke run ahead still waits once everything has landed");
-        self.catch_up_with(None, true)
+        self.catch_up_with(None, true, false)
     }
 
-    /// Returns whether any event was done.
-    fn catch_up_with(&mut self, budget_ms: Option<f64>, force: bool) -> bool {
+    /// Returns whether any event was done. `fit`: not even a first dab unless about one dab's time is left of the
+    /// budget.
+    fn catch_up_with(&mut self, budget_ms: Option<f64>, force: bool, fit: bool) -> bool {
         let t = Instant::now();
         let mut any = false;
         loop {
             let Some(event) = self.ahead.as_ref().and_then(|a| a.events.get(a.done).copied()) else { break };
             let first = !any;
+            if let (true, Some(b), Event::Dab { .. }) = (fit, budget_ms, event)
+                && t.elapsed().as_secs_f64() * 1e3 + self.dab_ms > b
+            {
+                break;
+            }
             let done = self.with_real(|m| match event {
                 Event::Begin(target, at) => {
                     if m.waiting_for(target) && !(force && first) {
@@ -924,6 +955,7 @@ impl VolumeMode {
         }
         let now = Instant::now();
         self.begun = Some(now);
+        self.pen_down = true;
         if let Some(m) = self.mesh.as_mut() {
             m.forget_skip();
         }
@@ -982,6 +1014,8 @@ impl VolumeMode {
     pub fn end_stroke(&mut self) {
         // Every dab given is done first.
         while self.run_dabs(f64::INFINITY) > 0 {}
+        self.pen_up = Instant::now();
+        self.pen_down = false;
         if self.mesh_stroke.is_some() {
             self.mesh_end();
             return;
@@ -1881,12 +1915,19 @@ impl VolumeMode {
     }
 
     /// Once a frame, after the volume's own work: the mesh layers told what the volume changed, a finished refit
-    /// swapped in, a new one started once the volume is at rest; during a mask stroke, the masks shown as painted.
+    /// swapped in, a new one started once the volume is at rest and the pen has been up `REFIT_AFTER_MS`; during a
+    /// mask stroke, the masks shown as painted.
     fn mesh_tick(&mut self) {
         self.mesh_take_build(false);
         self.tap();
-        let rest = self.at_rest();
+        // (With a layer or its mask picked the next stroke is on the layers: it would only wait for the refit.)
+        let waited = self.target != Target::Form || self.pen_up.elapsed().as_secs_f64() * 1e3 >= REFIT_AFTER_MS;
+        let rest = self.at_rest() && waited;
+        let idle = !self.pen_down && self.pen_up.elapsed().as_secs_f64() * 1e3 >= FREE_OLD_AFTER_MS;
         let Some(m) = self.mesh.as_mut() else { return };
+        if idle && m.layers.old_held_ms().is_some_and(|t| t >= FREE_OLD_AFTER_MS) {
+            m.layers.free_old();
+        }
         if let Some(st) = self.mesh_stroke.as_mut() {
             if st.live && st.painted {
                 let t = Instant::now();
@@ -2011,6 +2052,10 @@ mod gauntlet;
 #[cfg(test)]
 #[path = "mesh_tests.rs"]
 mod mesh_tests;
+
+#[cfg(test)]
+#[path = "form_speed_tests.rs"]
+mod form_speed_tests;
 
 #[cfg(test)]
 mod tests {

@@ -317,6 +317,27 @@ impl MeshLayers {
         self.live.busy()
     }
 
+    /// With `hold`, what a swap replaces (the old mesh, its document and volume) is kept until [`Self::free_old`] or
+    /// the next refit job's start (which frees it beside the job) rather than freed at once off the thread: freeing
+    /// it slows work on every core for a moment (70 to 80 ms at 5M), so a caller can choose when. At most one swap's
+    /// worth is held: the next swap frees the last.
+    pub fn set_hold_old(&mut self, hold: bool) {
+        self.live.hold_old = hold;
+        if !hold {
+            self.live.free_old();
+        }
+    }
+
+    /// Free what the last swap replaced, if held (off the thread, below normal priority).
+    pub fn free_old(&mut self) {
+        self.live.free_old();
+    }
+
+    /// How long ago the swap whose replaced mesh is held came in (ms), if one is held.
+    pub fn old_held_ms(&self) -> Option<f64> {
+        self.live.old_held_ms()
+    }
+
     /// [`Self::refit_async`] and wait for it (and for any job under way first): the block-cached refit, at once.
     pub fn refit_cached(&mut self, vol: &LevelVolume, dirty: &[Key], changed: Aabb) -> Result<SwapStats> {
         let mut last = None;

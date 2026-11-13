@@ -151,7 +151,10 @@ impl MeshStack {
         Ok(stack)
     }
 
-    pub fn new(layers: MeshLayers, dirty: HashSet<Key>) -> MeshStack {
+    pub fn new(mut layers: MeshLayers, dirty: HashSet<Key>) -> MeshStack {
+        // What a swap replaces is freed when the volume mode says (between strokes): freed at once it slowed the dabs
+        // of a stroke under way.
+        layers.set_hold_old(true);
         MeshStack {
             layers,
             dirty,
