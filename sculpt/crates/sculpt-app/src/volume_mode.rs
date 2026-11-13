@@ -1971,7 +1971,8 @@ impl VolumeMode {
                 let r = match brush {
                     Brush::Clay => b::ClayBuildup { height: 0.015 + 0.08 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
                     Brush::Trim => b::TrimDynamic { depth: 0.015 + 0.06 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
-                    Brush::Smooth => b::Smooth::default().dab(doc, &dab, &settings(0.1 + 0.6 * s)),
+                    // Each dab moves the surface from a tenth to seven tenths of the way to its smoothed self, as on the volume.
+                    Brush::Smooth => b::FormSmooth.dab(doc, &dab, &settings(0.1 + 0.6 * s)),
                 };
                 if let Err(e) = r {
                     eprintln!("mesh layer dab: {e}");

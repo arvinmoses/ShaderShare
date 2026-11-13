@@ -29,6 +29,7 @@ use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 
 use super::remesh::{EDGES, EDGE_OF, FACES, corner, find, union};
+use crate::height_grid::{blur, quartic_terms, solve};
 use crate::mesh::{NO_VERT, PolyMesh};
 
 /// Hash maps keyed by block coordinates, looked up in every inner loop here: hashed the fast way (as rustc's own maps
@@ -367,30 +368,7 @@ impl Ground {
     /// neighbours' mean, when any has one.
     fn smooth(&mut self, radius: i32) {
         let size = self.size();
-        for _ in 0..3 {
-            for axis in 0..2 {
-                let prev = self.h.clone();
-                // A row at a time over the threads: a wide brush's are a few hundred columns each way.
-                self.h.par_chunks_mut(size as usize).enumerate().for_each(|(b, row)| {
-                    let b = b as i32;
-                    for a in 0..size {
-                        let (mut sum, mut count) = (0.0f32, 0usize);
-                        for d in -radius..=radius {
-                            let (x, y) = if axis == 0 { (a + d, b) } else { (a, b + d) };
-                            if x < 0 || y < 0 || x >= size || y >= size {
-                                continue;
-                            }
-                            let v = prev[(y * size + x) as usize];
-                            if v.is_finite() {
-                                sum += v;
-                                count += 1;
-                            }
-                        }
-                        row[a as usize] = if count > 0 { sum / count as f32 } else { f32::NAN };
-                    }
-                });
-            }
-        }
+        blur(&mut self.h, size, radius);
     }
 
     /// The signed distance from `p` to the surface's tangent plane under it, when its column and the three around it
@@ -424,38 +402,6 @@ enum Was {
     /// A level 0 block wholly inside the solid.
     Inside,
     Stored(Stored),
-}
-
-/// The terms of a polynomial in `a`, `b` up to the fourth degree.
-fn quartic_terms(a: f64, b: f64) -> [f64; 15] {
-    let (a2, b2) = (a * a, b * b);
-    [1.0, a, b, a2, a * b, b2, a2 * a, a2 * b, a * b2, b2 * b, a2 * a2, a2 * a * b, a2 * b2, a * b2 * b, b2 * b2]
-}
-
-/// `m x = v` by elimination with partial pivoting; `None` when `m` is (near) singular.
-fn solve<const K: usize>(mut m: [[f64; K]; K], mut v: [f64; K]) -> Option<[f64; K]> {
-    let scale = (0..K).map(|i| m[i][i].abs()).fold(0.0, f64::max).max(1e-300);
-    for c in 0..K {
-        let p = (c..K).max_by(|&a, &b| m[a][c].abs().total_cmp(&m[b][c].abs()))?;
-        if m[p][c].abs() < 1e-12 * scale {
-            return None;
-        }
-        m.swap(c, p);
-        v.swap(c, p);
-        for r in c + 1..K {
-            let f = m[r][c] / m[c][c];
-            for k in c..K {
-                m[r][k] -= f * m[c][k];
-            }
-            v[r] -= f * v[c];
-        }
-    }
-    let mut x = [0.0f64; K];
-    for c in (0..K).rev() {
-        let s: f64 = (c + 1..K).map(|k| m[c][k] * x[k]).sum();
-        x[c] = (v[c] - s) / m[c][c];
-    }
-    Some(x)
 }
 
 fn local(i: IVec3) -> usize {

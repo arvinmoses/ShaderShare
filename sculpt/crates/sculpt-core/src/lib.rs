@@ -9,6 +9,7 @@ pub mod bvh;
 pub mod document;
 pub mod generator;
 pub mod geom;
+mod height_grid;
 pub mod io;
 pub mod layer_ops;
 pub mod layers;

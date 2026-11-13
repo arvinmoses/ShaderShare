@@ -260,6 +260,221 @@ impl Brush for Smooth {
     }
 }
 
+// ---------------------------------------------------------------- Form smooth
+
+/// Smoothing at the brush's scale, as the volume's smooth does it (`LevelVolume::smooth_dab`): the surface under the
+/// brush as heights along the brush normal on a grid out to 1.75 r, a quartic fitted to them that keeps the form, what
+/// departs from it blurred at about a quarter of the radius, and each vertex moved along the brush normal only, its
+/// share and falloff of the way to that. Nothing slides sideways, a ball stays a ball, and the strength is the same at
+/// any density. Vertices facing away from the brush normal are left out.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FormSmooth;
+
+impl Brush for FormSmooth {
+    fn name(&self) -> &'static str {
+        "Smooth"
+    }
+
+    fn dab(&mut self, doc: &mut Document, dab: &Dab, s: &BrushSettings) -> Result<()> {
+        let n = dab.normal.normalize_or_zero();
+        if n == Vec3::ZERO {
+            return Ok(());
+        }
+        let r = s.radius;
+        let Some(target) = SmoothTarget::new(doc, dab.center, n, r) else { return Ok(()) };
+        let (fade, falloff) = ((s.strength * dab.pressure).clamp(0.0, 1.0), s.falloff);
+        let disp = doc.compute_displacements(dab.center, r, |doc, v, _| {
+            if doc.normals[v].dot(n) <= 0.0 {
+                return None;
+            }
+            let q = doc.positions[v] - dab.center;
+            let t = (q - n * q.dot(n)).length() / r;
+            let f = falloff.eval(t) * fade;
+            if f <= 0.0 {
+                return None;
+            }
+            target.toward(q).map(|d| n * (d * f))
+        });
+        doc.apply_displacements(&disp)
+    }
+}
+
+/// The smoothed surface under a dab (see [`FormSmooth`]), as how far each point under it is from its smoothed self
+/// along the brush normal.
+pub struct SmoothTarget {
+    n: Vec3,
+    t1: Vec3,
+    t2: Vec3,
+    step: f32,
+    half: i32,
+    /// `1 / (1.5 r)`: the fit's coordinates.
+    inv_fit: f32,
+    fit: [f64; 15],
+    /// What departs from the fit, smoothed: `1 - (1 - blur)^3` of it, which keeps any polynomial up to the fifth degree.
+    smoothed: Vec<f32>,
+}
+
+impl SmoothTarget {
+    /// About this many columns either way out to 1.75 r, fewer where the mesh is coarser than that.
+    const HALF: f32 = 20.0;
+
+    pub fn new(doc: &Document, center: Vec3, n: Vec3, r: f32) -> Option<SmoothTarget> {
+        use crate::height_grid::{blur, quartic_terms, solve};
+        use rayon::prelude::*;
+        let (t1, t2) = n.any_orthonormal_pair();
+        let (out, depth) = (1.75 * r, 0.35 * r);
+        // The surface facing along `n` over the disc out to 1.75 r, from `depth` above the centre to twice that below (as the volume's
+        // columns reach): (across, across, height) from the centre.
+        let mut leaves = Vec::new();
+        doc.bvh.query_sphere(center, (out * out + 4.0 * depth * depth).sqrt(), &mut leaves);
+        let samples: Vec<Vec<[f32; 3]>> = leaves
+            .par_iter()
+            .map(|&l| {
+                let mut list = Vec::new();
+                for v in doc.bvh.leaves[l as usize].owned_range() {
+                    if doc.normals[v].dot(n) <= 0.0 {
+                        continue;
+                    }
+                    let q = doc.positions[v] - center;
+                    let (a, b, h) = (q.dot(t1), q.dot(t2), q.dot(n));
+                    if a * a + b * b <= out * out && h <= depth && h >= -2.0 * depth {
+                        list.push([a, b, h]);
+                    }
+                }
+                list
+            })
+            .collect();
+        // The columns are no closer than the mesh's edges, so each holds a vertex or two: the vertices under the radius
+        // tell the spacing (an even triangle mesh has 2 / (sqrt 3 e^2) of them per unit of area).
+        let inside = samples.iter().flatten().filter(|p| p[0] * p[0] + p[1] * p[1] < r * r).count();
+        if inside == 0 {
+            return None;
+        }
+        let edge = (2.0 * std::f32::consts::PI * r * r / (3f32.sqrt() * inside as f32)).sqrt();
+        let step = (out / Self::HALF).max(edge);
+        let half = (out / step).ceil() as i32 + 1;
+        let size = 2 * half + 1;
+        let cells = (size * size) as usize;
+        // Each vertex's height spread over the four columns around it.
+        let heights = Self::splat(samples.iter().flatten().map(|&[a, b, h]| (a, b, h)), step, half);
+        // The form at the brush's scale: a quartic fitted to the heights out to 1.5 r (weighted down toward there).
+        let scale = 1.5 * r / step;
+        let at = |c: usize| (((c as i32 % size) - half) as f32 / scale, ((c as i32 / size) - half) as f32 / scale);
+        let fit_to = |grid: &[f32]| {
+            let (mut m, mut v) = ([[0.0f64; 15]; 15], [0.0f64; 15]);
+            for (c, &h) in grid.iter().enumerate() {
+                let (a, b) = at(c);
+                let d2 = (a * a + b * b) as f64;
+                if !h.is_finite() || d2 >= 1.0 {
+                    continue;
+                }
+                let wt = (1.0 - d2) * (1.0 - d2);
+                let f = quartic_terms(a as f64, b as f64);
+                for j in 0..15 {
+                    let wf = wt * f[j];
+                    v[j] += wf * h as f64;
+                    for k in j..15 {
+                        m[j][k] += wf * f[k];
+                    }
+                }
+            }
+            for j in 0..15 {
+                for k in 0..j {
+                    m[j][k] = m[k][j];
+                }
+            }
+            solve(m, v)
+        };
+        let eval = |fit: &[f64; 15], a: f32, b: f32| quartic_terms(a as f64, b as f64).iter().zip(fit.iter()).map(|(t, c)| t * c).sum::<f64>() as f32;
+        let mut fit = fit_to(&heights)?;
+        // What departs from the fit, each vertex's own. A column's mean height on a curved surface is not the height at
+        // its middle, so the fit to the columns sits off the vertices by that (a little under a convex form): the
+        // vertices' departures are fitted again and that taken into the fit. (Left in, it was taken away at the rim
+        // below, where the departures fade, and each dab sank the surface there a little.)
+        let inv_fit = 1.0 / (1.5 * r);
+        let mut off = Self::splat(samples.iter().flatten().map(|&[a, b, h]| (a, b, h - eval(&fit, a * inv_fit, b * inv_fit))), step, half);
+        let more = fit_to(&off)?;
+        for (f, m) in fit.iter_mut().zip(more) {
+            *f += m;
+        }
+        // Fading to nothing over the last sixth of where it was fitted, and nothing past it or where no surface was met
+        // (the blur there reads the fitted form going on).
+        for (c, h) in off.iter_mut().enumerate() {
+            let (a, b) = at(c);
+            let x = ((1.0 - (a * a + b * b).sqrt()) * 6.0).clamp(0.0, 1.0);
+            *h = if h.is_finite() { (*h - eval(&more, a, b)) * x * x * (3.0 - 2.0 * x) } else { 0.0 };
+        }
+        let rho = ((r / step / 4.0).round() as i32).max(1);
+        blur(&mut off, size, rho);
+        let once = off.clone();
+        blur(&mut off, size, rho);
+        let twice = off.clone();
+        blur(&mut off, size, rho);
+        let smoothed = (0..cells).map(|c| 3.0 * (once[c] - twice[c]) + off[c]).collect();
+        Some(SmoothTarget { n, t1, t2, step, half, inv_fit, fit, smoothed })
+    }
+
+    /// `values` at (across, across) spread over the four columns around each (`step` apart, `-half..=half` each way):
+    /// each column their weighted mean, NaN where none reached it, unless three of the eight around it have one: then
+    /// their mean (a column between vertices that missed it).
+    fn splat(values: impl Iterator<Item = (f32, f32, f32)>, step: f32, half: i32) -> Vec<f32> {
+        let size = 2 * half + 1;
+        let cells = (size * size) as usize;
+        let (mut wv, mut w) = (vec![0.0f32; cells], vec![0.0f32; cells]);
+        for (a, b, value) in values {
+            let (x, y) = (a / step + half as f32, b / step + half as f32);
+            let (i, j) = (x.floor() as i32, y.floor() as i32);
+            let (fx, fy) = (x - i as f32, y - j as f32);
+            for (di, dj, k) in [(0, 0, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)] {
+                let (ci, cj) = (i + di, j + dj);
+                if ci >= 0 && cj >= 0 && ci < size && cj < size {
+                    let c = (cj * size + ci) as usize;
+                    wv[c] += k * value;
+                    w[c] += k;
+                }
+            }
+        }
+        let mut out: Vec<f32> = wv.iter().zip(&w).map(|(&s, &w)| if w > 1e-3 { s / w } else { f32::NAN }).collect();
+        let holes: Vec<(usize, f32)> = (0..cells)
+            .filter(|&c| out[c].is_nan())
+            .filter_map(|c| {
+                let (i, j) = ((c as i32) % size, (c as i32) / size);
+                let (mut sum, mut k) = (0.0f32, 0);
+                for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+                    let (x, y) = (i + di, j + dj);
+                    if x >= 0 && y >= 0 && x < size && y < size && out[(y * size + x) as usize].is_finite() {
+                        sum += out[(y * size + x) as usize];
+                        k += 1;
+                    }
+                }
+                (k >= 3).then(|| (c, sum / k as f32))
+            })
+            .collect();
+        for (c, v) in holes {
+            out[c] = v;
+        }
+        out
+    }
+
+    /// How far the point `q` (from the dab's centre) is from its smoothed self along the brush normal (positive: it
+    /// should rise); `None` past the grid.
+    pub fn toward(&self, q: Vec3) -> Option<f32> {
+        let (a, b, h) = (q.dot(self.t1), q.dot(self.t2), q.dot(self.n));
+        let size = 2 * self.half + 1;
+        let (x, y) = (a / self.step + self.half as f32, b / self.step + self.half as f32);
+        let (i, j) = (x.floor() as i32, y.floor() as i32);
+        if i < 0 || j < 0 || i + 1 >= size || j + 1 >= size {
+            return None;
+        }
+        let (fx, fy) = (x - i as f32, y - j as f32);
+        let g = |di: i32, dj: i32| self.smoothed[((j + dj) * size + i + di) as usize];
+        let s = (g(0, 0) * (1.0 - fx) + g(1, 0) * fx) * (1.0 - fy) + (g(0, 1) * (1.0 - fx) + g(1, 1) * fx) * fy;
+        let (fa, fb) = ((a * self.inv_fit) as f64, (b * self.inv_fit) as f64);
+        let form = crate::height_grid::quartic_terms(fa, fb).iter().zip(self.fit.iter()).map(|(t, c)| t * c).sum::<f64>() as f32;
+        Some(s - (h - form))
+    }
+}
+
 // ----------------------------------------------------------------------- Move
 
 /// ZBrush *Move*: grabs the vertices under the cursor once at stroke start,
