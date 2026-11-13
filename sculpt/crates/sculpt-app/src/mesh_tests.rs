@@ -417,6 +417,322 @@ fn rows_follow_dabs_swaps_and_hiding() {
     assert!(frame(&mut mode).all);
 }
 
+// --------------------------------------------------------------------------------------- brushes on a layer
+
+/// A stroke as the app gives it: dabs every 0.15 r along the arc from `from` to `to`, `passes` times back and forth in
+/// one stroke, each dab where the pen's ray meets what `raycast` gives.
+#[allow(clippy::too_many_arguments)]
+fn app_stroke(mode: &mut VolumeMode, target: Target, from: Vec3, to: Vec3, r: f32, strength: f32, brush: Brush, passes: usize) {
+    mode.target = target;
+    mode.begin_stroke();
+    let (a, b) = (from.normalize(), to.normalize());
+    let n = (a.angle_between(b) / (0.15 * r)).ceil().max(1.0) as usize;
+    for p in 0..passes {
+        for k in 0..=n {
+            let t = k as f32 / n as f32;
+            let t = if p % 2 == 0 { t } else { 1.0 - t };
+            let d = a.lerp(b, t).normalize();
+            if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
+                mode.queue_dab(hit, r, 0.004, strength, 0.3, brush);
+            }
+            if k % 3 == 2 {
+                frame(mode);
+            }
+        }
+    }
+    mode.end_stroke();
+    settle_frames(mode);
+}
+
+/// Radial height of what is shown (the layers' composite with `layer`, else the volume) along `d`.
+fn height(mode: &mut VolumeMode, layer: bool, d: Vec3) -> f32 {
+    mode.target = if layer { Target::Detail } else { Target::Form };
+    mode.raycast(d * 3.0, -d).map_or(f32::NAN, |(p, _)| p.length())
+}
+
+/// Heights across the middle of the stroke from `from` to `to`, 65 samples over +-1.6 r.
+fn across(mode: &mut VolumeMode, layer: bool, from: Vec3, to: Vec3, r: f32) -> Vec<f32> {
+    let (a, b) = (from.normalize(), to.normalize());
+    let mid = a.lerp(b, 0.5).normalize();
+    let side = (b - a).cross(mid).normalize();
+    (0..65).map(|i| height(mode, layer, (mid + side * (1.6 * r * (i as f32 / 32.0 - 1.0))).normalize())).collect()
+}
+
+/// The change from `before` to `after` furthest from zero.
+fn extreme(before: &[f32], after: &[f32]) -> f32 {
+    after.iter().zip(before).map(|(a, b)| a - b).fold(0.0f32, |m, x| if x.abs() > m.abs() { x } else { m })
+}
+
+/// Faces within `r` of `c` turned more than 90 degrees from the base's, of how many.
+fn turned_over(ml: &MeshLayers, c: Vec3, r: f32) -> (usize, usize) {
+    let doc = &ml.doc;
+    let (base, p) = (doc.base_positions(), doc.positions());
+    let (mut over, mut n) = (0, 0);
+    for f in doc.faces() {
+        let (a, b, d) = (f[0] as usize, f[1] as usize, f[2] as usize);
+        if base[a].distance(c) > r {
+            continue;
+        }
+        let nb = (base[b] - base[a]).cross(base[d] - base[a]).normalize_or_zero();
+        let nc = (p[b] - p[a]).cross(p[d] - p[a]).normalize_or_zero();
+        n += 1;
+        if nb.dot(nc) < 0.0 {
+            over += 1;
+        }
+    }
+    (over, n)
+}
+
+/// Bumpiness of what is shown within `r` of `c`: the mean size of (ring average - position) along the base normal.
+fn bumpiness(ml: &MeshLayers, c: Vec3, r: f32) -> f64 {
+    let doc = &ml.doc;
+    let (p, n, topo) = (doc.positions(), ml.base_normals(), doc.topology());
+    let (mut s, mut k) = (0.0f64, 0usize);
+    for v in 0..p.len() {
+        if doc.base_positions()[v].distance(c) > r {
+            continue;
+        }
+        let ring = topo.vert_verts.row(v);
+        if ring.is_empty() {
+            continue;
+        }
+        let avg = ring.iter().map(|&u| p[u as usize]).sum::<Vec3>() / ring.len() as f32;
+        s += (avg - p[v]).dot(n[v]).abs() as f64;
+        k += 1;
+    }
+    s / k.max(1) as f64
+}
+
+/// Smoothing smooths whatever the layer's blend and strength: a clay stroke on a layer, the layer set to Add or
+/// Subtract at 50, 100 or 200%, then three smooth strokes: the bumpiness falls with each, no face turns over.
+#[test]
+fn smoothing_smooths_under_every_blend() {
+    let _one = one_at_a_time();
+    let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
+    let c = Vec3::new(0.0, 0.1, 1.0).normalize();
+    let mut fails = Vec::new();
+    for blend in [RowBlend::Add, RowBlend::Subtract] {
+        for opacity in [0.5f32, 1.0, 2.0] {
+            let mut mode = ball_with_layer(2.64e6);
+            app_stroke(&mut mode, Target::Detail, from, to, 0.08, 0.8, Brush::Clay, 1);
+            mode.set_layer_blend(0, blend);
+            mode.set_layer_opacity(0, opacity);
+            mode.close_sculpt_edit();
+            settle_frames(&mut mode);
+            let mut last = bumpiness(ml(&mut mode), c, 0.2);
+            let mut line = format!("{} {:.0}%: bumpiness {last:.3e}", blend.label(), opacity * 100.0);
+            for pass in 0..3 {
+                app_stroke(&mut mode, Target::Detail, from, to, 0.1, 0.5, Brush::Smooth, 2);
+                let b = bumpiness(ml(&mut mode), c, 0.2);
+                let (over, nf) = turned_over(ml(&mut mode), c, 0.2);
+                line += &format!(" -> {b:.3e} ({over} of {nf} faces turned over)");
+                if b >= last || over > 0 {
+                    fails.push(format!("{} {:.0}% smooth stroke {}: {last:.3e} -> {b:.3e}, {over} turned over", blend.label(), opacity * 100.0, pass + 1));
+                }
+                last = b;
+            }
+            eprintln!("{line}");
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// Clay and trim on a Subtract layer, three passes in one stroke, do what they do on an Add layer (they ran away: clay
+/// 0.68 r deep, trim 1.9 r high). Clay stays within 1.3 clay steps of where it began. Trim on any layer still runs on
+/// (its plane follows the cut down each dab, about 4.9 clay steps here): that is the trim's own matter, so on Subtract
+/// it is held to what it does on Add.
+#[test]
+fn strokes_on_subtract_stay_bounded() {
+    let _one = one_at_a_time();
+    let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
+    let (r, strength) = (0.08f32, 0.8f32);
+    let h = r * (0.015 + 0.08 * strength);
+    let mut fails = Vec::new();
+    for brush in [Brush::Clay, Brush::Trim] {
+        let mut on = [0.0f32; 2];
+        for (i, blend) in [RowBlend::Add, RowBlend::Subtract].into_iter().enumerate() {
+            let mut mode = ball_with_layer(2.64e6);
+            mode.set_layer_blend(0, blend);
+            mode.close_sculpt_edit();
+            let before = across(&mut mode, true, from, to, r);
+            app_stroke(&mut mode, Target::Detail, from, to, r, strength, brush, 3);
+            on[i] = extreme(&before, &across(&mut mode, true, from, to, r));
+            eprintln!("{brush:?} on a {} layer, three passes: {:.3} r ({:.2} h)", blend.label(), on[i] / r, on[i] / h);
+        }
+        let [add, sub] = on;
+        if !((sub - add).abs() <= 0.02 * add.abs()) {
+            fails.push(format!("{brush:?}: {:.3} r on Subtract against {:.3} r on Add", sub / r, add / r));
+        }
+        if brush == Brush::Clay && !(sub.abs() <= 1.3 * h) {
+            fails.push(format!("{brush:?}: {:.3} r, {:.2} h", sub / r, sub / h));
+        }
+    }
+    assert!(fails.is_empty(), "{fails:?}");
+}
+
+/// Ctrl on a layer does what it does on the base: the app swaps the brush (Clay + Ctrl sends Trim) and sets `invert`;
+/// Clay + Ctrl lowers and Trim + Ctrl raises.
+#[test]
+fn ctrl_on_a_layer_does_what_it_does_on_the_base() {
+    let _one = one_at_a_time();
+    let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
+    let r = 0.08;
+    let mut fails = Vec::new();
+    // (tool, the brush the app sends with Ctrl, whether it should raise)
+    for (tool, sent, raises) in [("Clay", Brush::Trim, false), ("Trim", Brush::Clay, true)] {
+        let mut mode = ball_with_layer(2.64e6);
+        let before = across(&mut mode, true, from, to, r);
+        mode.invert = true;
+        app_stroke(&mut mode, Target::Detail, from, to, r, 0.8, sent, 1);
+        mode.invert = false;
+        let e = extreme(&before, &across(&mut mode, true, from, to, r));
+        eprintln!("{tool} + Ctrl on a layer: {:.4} r", e / r);
+        if (e > 0.0) != raises || e.abs() < 0.02 * r {
+            fails.push(format!("{tool} + Ctrl: {:.4} r", e / r));
+        }
+    }
+    assert!(fails.is_empty(), "{fails:?}");
+}
+
+/// Within `r` of `c` on a ball about the origin: the 99th percentile of the angle (degrees) between the vertex normals
+/// of `p` (area weighted over `faces`) and the ball's own, and the spread (sd) of the radius.
+fn off_ball(p: &[Vec3], base: &[Vec3], faces: &[sculpt_core::mesh::Face], c: Vec3, r: f32) -> (f64, f64) {
+    let mut n = vec![Vec3::ZERO; p.len()];
+    for f in faces {
+        let vs = sculpt_core::mesh::face_verts(f);
+        let fnrm = if vs.len() == 4 {
+            (p[vs[2] as usize] - p[vs[0] as usize]).cross(p[vs[3] as usize] - p[vs[1] as usize])
+        } else {
+            (p[vs[1] as usize] - p[vs[0] as usize]).cross(p[vs[2] as usize] - p[vs[0] as usize])
+        };
+        for &v in vs {
+            n[v as usize] += fnrm;
+        }
+    }
+    let idx: Vec<usize> = (0..p.len()).filter(|&v| base[v].distance(c) < r).collect();
+    let mut a: Vec<f64> = idx.iter().map(|&v| (n[v].normalize_or_zero().dot(p[v].normalize()).clamp(-1.0, 1.0) as f64).acos().to_degrees()).collect();
+    let rm = idx.iter().map(|&v| p[v].length() as f64).sum::<f64>() / idx.len().max(1) as f64;
+    let sd = (idx.iter().map(|&v| (p[v].length() as f64 - rm).powi(2)).sum::<f64>() / idx.len().max(1) as f64).sqrt();
+    (pct(&mut a, 0.99), sd)
+}
+
+/// Layer 0's stored offsets within `r` of `c`: the mean of their part across the base normal, over the mean edge there.
+fn sideways_in_edges(ml: &MeshLayers, c: Vec3, r: f32) -> f64 {
+    let doc = &ml.doc;
+    let d = ml.layer_deltas(doc.layers()[0].id).unwrap();
+    let n = ml.base_normals();
+    let (mut side, mut k, mut e, mut ke) = (0.0f64, 0usize, 0.0f64, 0usize);
+    for v in 0..d.len() {
+        if doc.base_positions()[v].distance(c) > r {
+            continue;
+        }
+        side += (d[v] - n[v] * d[v].dot(n[v])).length() as f64;
+        k += 1;
+        for &u in doc.topology().vert_verts.row(v) {
+            e += doc.base_positions()[v].distance(doc.base_positions()[u as usize]) as f64;
+            ke += 1;
+        }
+    }
+    (side / k.max(1) as f64) / (e / ke.max(1) as f64)
+}
+
+/// Eight smooth strokes on a plain ball on an Add layer leave it a ball: the stored offsets' sideways part under 1% of
+/// an edge, the radius's spread under twice the base's, and with the layer switched to Subtract the normals' 99th
+/// percentile off a ball's under twice the base's. (The ring average slid vertices 8 to 13% of an edge, spread the
+/// radius 280 times and turned the normals 23 times as far.)
+#[test]
+fn smooth_on_a_plain_ball_stores_next_to_nothing() {
+    let _one = one_at_a_time();
+    let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
+    let c = Vec3::new(0.0, 0.1, 1.0).normalize();
+    let mut mode = ball_with_layer(2.64e6);
+    for _ in 0..8 {
+        app_stroke(&mut mode, Target::Detail, from, to, 0.1, 1.0, Brush::Smooth, 2);
+    }
+    let r = 0.12;
+    let side = sideways_in_edges(ml(&mut mode), c, r);
+    let (base_p99, base_sd, add_p99, add_sd) = {
+        let doc = &ml(&mut mode).doc;
+        let (b, a) = (off_ball(doc.base_positions(), doc.base_positions(), doc.faces(), c, r), off_ball(doc.positions(), doc.base_positions(), doc.faces(), c, r));
+        (b.0, b.1, a.0, a.1)
+    };
+    mode.set_layer_blend(0, RowBlend::Subtract);
+    mode.close_sculpt_edit();
+    settle_frames(&mut mode);
+    let sub_p99 = {
+        let doc = &ml(&mut mode).doc;
+        off_ball(doc.positions(), doc.base_positions(), doc.faces(), c, r).0
+    };
+    eprintln!(
+        "sideways {:.2}% of an edge; radius sd {:.3e} (base {base_sd:.3e}, {:.2} times); normals p99 off a ball's: base {base_p99:.3} deg, Add {add_p99:.3}, Subtract {sub_p99:.3} ({:.2} times)",
+        side * 100.0,
+        add_sd,
+        add_sd / base_sd,
+        sub_p99 / base_p99
+    );
+    assert!(side < 0.01, "sideways {:.2}% of an edge", side * 100.0);
+    assert!(add_sd < 2.0 * base_sd, "radius sd {add_sd:.3e} against the base's {base_sd:.3e}");
+    assert!(sub_p99 < 2.0 * base_p99, "normals p99 {sub_p99:.3} deg on Subtract against the base's {base_p99:.3}");
+}
+
+/// Heights of what is shown (`layer`: the layers' composite, else the volume) over a patch of directions about the
+/// stroke in [`layer_smooth_matches_base_smooth`].
+fn patch(mode: &mut VolumeMode, layer: bool) -> Vec<f32> {
+    let mut out = Vec::new();
+    for j in 0..9 {
+        for i in 0..25 {
+            let d = Vec3::new(-0.15 + 0.3 * i as f32 / 24.0, 0.05 + 0.1 * j as f32 / 8.0, 1.0).normalize();
+            out.push(height(mode, layer, d));
+        }
+    }
+    out
+}
+
+fn rms_between(a: &[f32], b: &[f32]) -> f64 {
+    (a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum::<f64>() / a.len() as f64).sqrt()
+}
+
+/// A field of small bumps on the volume, then the same smooth stroke on the volume and on a mesh layer over it: what is
+/// left of the bumps is within 15% of each other, at 250k and at 2.5M triangles.
+#[test]
+fn layer_smooth_matches_base_smooth() {
+    let _one = one_at_a_time();
+    let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
+    let mut fails = Vec::new();
+    for tris in [6.6e5f32, 6.6e6] {
+        let mut left = [0.0f64; 2];
+        for (k, layer) in [false, true].into_iter().enumerate() {
+            let mut mode = VolumeMode::ball(tris);
+            let plain = patch(&mut mode, false);
+            for j in 0..3 {
+                for i in 0..5 {
+                    let d = Vec3::new(-0.2 + 0.1 * i as f32 + 0.03 * j as f32, 0.05 + 0.05 * j as f32, 1.0);
+                    app_stroke(&mut mode, Target::Form, d, d, 0.03, 1.0, Brush::Clay, 1);
+                }
+            }
+            if layer {
+                mode.add_mesh_layer();
+                settle_frames(&mut mode);
+            }
+            let bumps = patch(&mut mode, layer);
+            app_stroke(&mut mode, if layer { Target::Detail } else { Target::Form }, from, to, 0.1, 0.5, Brush::Smooth, 2);
+            let after = patch(&mut mode, layer);
+            left[k] = rms_between(&after, &plain) / rms_between(&bumps, &plain);
+            eprintln!(
+                "{tris:.0} on the {}: bumps {:.3e} rms, after smoothing {:.3e} ({:.1}% left)",
+                if layer { "layer" } else { "volume" },
+                rms_between(&bumps, &plain),
+                rms_between(&after, &plain),
+                left[k] * 100.0
+            );
+        }
+        if !((left[1] - left[0]).abs() <= 0.15 * left[0]) {
+            fails.push(format!("{tris:.0}: {:.1}% left on the layer against {:.1}% on the volume", left[1] * 100.0, left[0] * 100.0));
+        }
+    }
+    assert!(fails.is_empty(), "{fails:?}");
+}
+
 // ------------------------------------------------------------------------------------------- timing (ignored)
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
@@ -434,8 +750,8 @@ fn big() -> VolumeMode {
     mode
 }
 
-/// Layer dabs at 2.5M triangles, brush over about 3k vertices: median < 1 ms, p95 < 2 ms, on an Add and on a Max
-/// layer; a 50k-vertex brush reported.
+/// Layer dabs at 2.5M triangles, brush over about 3k vertices: median < 1 ms, p95 < 2 ms for each of Clay, Trim and
+/// Smooth, on an Add and on a Max layer; a 50k-vertex brush reported.
 #[test]
 #[ignore]
 fn layer_dab_times_at_2_5m() {
@@ -449,26 +765,33 @@ fn layer_dab_times_at_2_5m() {
         let d0 = Vec3::new(0.0, 0.0, 1.0);
         let (c, _) = mode.raycast(d0 * 3.0, -d0).unwrap();
         let n = verts_in(&mode, c, r);
-        let mut times = Vec::new();
-        for s in 0..4 {
+        let brushes = [Brush::Clay, Brush::Trim, Brush::Smooth];
+        let mut times: [Vec<f64>; 3] = Default::default();
+        for s in 0..6 {
+            let k = s % 3;
             mode.begin_stroke();
-            for k in 0..60 {
-                let d = Vec3::new(-0.4 + 0.8 * k as f32 / 59.0, 0.15 * s as f32 - 0.2, 1.0).normalize();
+            for i in 0..60 {
+                let d = Vec3::new(-0.4 + 0.8 * i as f32 / 59.0, 0.1 * (s / 3) as f32 - 0.05, 1.0).normalize();
                 let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
                 let t = Instant::now();
-                mode.brush_dab(hit, r, 0.002, 0.7, 0.3, if s % 2 == 0 { Brush::Clay } else { Brush::Trim });
-                times.push(t.elapsed().as_secs_f64() * 1e3);
+                mode.brush_dab(hit, r, 0.002, 0.7, 0.3, brushes[k]);
+                times[k].push(t.elapsed().as_secs_f64() * 1e3);
             }
             mode.end_stroke();
             frame(&mut mode);
         }
         let t = Instant::now();
         let rows = frame(&mut mode);
-        let (med, p95) = (pct(&mut times, 0.5), pct(&mut times, 0.95));
-        eprintln!("{} brush r {r} (~{n} vertices): dab median {med:.2} ms, p95 {p95:.2} ms, max {:.2}; frame after {:.1} ms ({} blocks)", blend.label(), times.last().unwrap(), t.elapsed().as_secs_f64() * 1e3, rows.blocks.len());
-        if r < 0.1 && (med >= 1.0 || p95 >= 2.0) {
-            fails.push(format!("{}: median {med:.2} p95 {p95:.2}", blend.label()));
+        let frame_ms = t.elapsed().as_secs_f64() * 1e3;
+        for (k, times) in times.iter_mut().enumerate() {
+            let max = times.iter().cloned().fold(0.0, f64::max);
+            let (med, p95) = (pct(times, 0.5), pct(times, 0.95));
+            eprintln!("{} {:?} brush r {r} (~{n} vertices): dab median {med:.2} ms, p95 {p95:.2} ms, max {max:.2}", blend.label(), brushes[k]);
+            if r < 0.1 && (med >= 1.0 || p95 >= 2.0) {
+                fails.push(format!("{} {:?}: median {med:.2} p95 {p95:.2}", blend.label(), brushes[k]));
+            }
         }
+        eprintln!("{} r {r}: frame after {frame_ms:.1} ms ({} blocks)", blend.label(), rows.blocks.len());
     }
     assert!(fails.is_empty(), "{fails:?}");
 }

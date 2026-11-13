@@ -289,7 +289,8 @@ pub struct VolumeMode {
     rows_none: bool,
     /// A note for the status line about the mesh layers (made, waited for, refused), until read.
     pub mesh_note: Option<String>,
-    /// Strokes on a mesh layer dig instead of build (Ctrl, as the app sees it).
+    /// Ctrl held for this stroke, as the app sees it. The app already swaps the brush for Ctrl (Clay for Trim and
+    /// back), so no brush inverts on top of that.
     pub invert: bool,
 }
 
@@ -1987,10 +1988,10 @@ impl VolumeMode {
         true
     }
 
-    /// One dab of a stroke on a mesh layer (Clay Buildup, Trim Dynamic or Smooth; `invert` digs) or its mask.
+    /// One dab of a stroke on a mesh layer (Clay Buildup, Trim Dynamic or Smooth) or its mask. Ctrl already swapped the
+    /// brush (Clay for Trim and back), as on the volume, so the layer brushes are never inverted on top of that.
     fn mesh_dab(&mut self, at: Vec3, radius: f32, strength: f32, hardness: f32, brush: Brush) {
         use sculpt_core::brush::{self as b, Brush as _};
-        let invert = self.invert;
         let (Some(m), Some(st)) = (self.mesh.as_mut(), self.mesh_stroke.as_mut()) else { return };
         let t = Instant::now();
         let doc = &mut m.layers.doc;
@@ -2007,11 +2008,12 @@ impl VolumeMode {
             }
             _ => {
                 let dab = b::Dab { center: at, normal: n, direction: st.last.map_or(Vec3::ZERO, |p| at - p), pressure: 1.0 };
-                let settings = |strength: f32| b::BrushSettings { radius, strength, falloff, spacing: 0.12, front_faces_only: true, invert };
+                let settings = |strength: f32| b::BrushSettings { radius, strength, falloff, spacing: 0.12, front_faces_only: true, invert: false };
                 let r = match brush {
                     Brush::Clay => b::ClayBuildup { height: 0.015 + 0.08 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
                     Brush::Trim => b::TrimDynamic { depth: 0.015 + 0.06 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
-                    Brush::Smooth => b::Smooth::default().dab(doc, &dab, &settings(0.1 + 0.6 * s)),
+                    // Each dab moves the surface from a tenth to seven tenths of the way to its smoothed self, as on the volume.
+                    Brush::Smooth => b::FormSmooth.dab(doc, &dab, &settings(0.1 + 0.6 * s)),
                 };
                 if let Err(e) = r {
                     eprintln!("mesh layer dab: {e}");
