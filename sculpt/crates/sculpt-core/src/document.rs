@@ -1333,6 +1333,11 @@ impl Document {
         self.undo.open = Some(Group::new(label));
     }
 
+    /// Whether the open stroke has changed anything yet (a stroke that changed nothing adds no undo step).
+    pub fn stroke_changed(&self) -> bool {
+        self.undo.open.as_ref().is_some_and(|g| !g.records.is_empty())
+    }
+
     /// Finish the open operation and refresh masks fed by painted channels.
     pub fn end_stroke(&mut self) {
         self.stroke_origin.iter_mut().for_each(|c| *c = None);

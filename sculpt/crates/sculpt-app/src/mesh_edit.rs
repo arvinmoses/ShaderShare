@@ -328,8 +328,9 @@ impl MeshStack {
         for _ in 0..2 {
             doc.paint(&PaintTarget::Channel(name.clone()), c, r, &flat, 1.0, to, None);
         }
+        let changed = doc.stroke_changed();
         doc.end_stroke();
-        match self.layers.stroke_patch() {
+        match if changed { self.layers.stroke_patch() } else { Ok(Default::default()) } {
             Ok(p) if !p.is_empty() => self.push(Entry::Layer(p)),
             Ok(_) => {}
             Err(e) => eprintln!("mesh layers: {e}"),

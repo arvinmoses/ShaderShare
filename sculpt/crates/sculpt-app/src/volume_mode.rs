@@ -1990,7 +1990,12 @@ impl VolumeMode {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
         let Some(m) = self.mesh.as_mut() else { return };
+        // A stroke that changed nothing (the pen off the model) is no step; the last step is an older one.
+        let changed = m.layers.doc.stroke_changed();
         m.layers.doc.end_stroke();
+        if !changed {
+            return;
+        }
         match m.layers.stroke_patch() {
             Ok(p) if !p.is_empty() => m.push(crate::mesh_stack::Entry::Layer(p)),
             Ok(_) => {}

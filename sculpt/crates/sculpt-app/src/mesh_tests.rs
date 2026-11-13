@@ -209,6 +209,40 @@ fn layer_stroke_then_volume_stroke_under_it_undo_redo() {
     base_is_fresh(&mut mode, "at the end");
 }
 
+/// A layer stroke that changes nothing (every dab off the model) adds no step: not again the stroke before it, nor
+/// an error after an opacity edit.
+#[test]
+fn a_stroke_that_misses_adds_no_step() {
+    let _one = one_at_a_time();
+    let mut mode = ball_with_layer(2e5);
+    let s0 = state(ml(&mut mode));
+    stroke(&mut mode, Target::Detail, Vec3::new(0.2, 0.1, 1.0), 0.08, Brush::Clay);
+    settle_frames(&mut mode);
+    let s1 = state(ml(&mut mode));
+    assert!(differ(&s0, &s1).1 > 100, "the layer stroke changed little");
+    let steps = mode.mesh.as_ref().unwrap().history.len();
+    let miss = |mode: &mut VolumeMode| {
+        mode.target = Target::Detail;
+        mode.begin_stroke();
+        mode.queue_dab(Vec3::new(50.0, 50.0, 50.0), 0.08, 0.002, 0.8, 0.3, Brush::Clay);
+        frame(mode);
+        mode.end_stroke();
+        settle_frames(mode);
+    };
+    miss(&mut mode);
+    assert_eq!(mode.mesh.as_ref().unwrap().history.len(), steps, "a stroke off the model made a step");
+    mode.set_layer_opacity(0, 0.7);
+    mode.close_sculpt_edit();
+    let steps = mode.mesh.as_ref().unwrap().history.len();
+    miss(&mut mode);
+    assert_eq!(mode.mesh.as_ref().unwrap().history.len(), steps, "a stroke off the model after an edit made a step");
+    assert!(mode.undo());
+    settle_frames(&mut mode);
+    assert!(mode.undo());
+    settle_frames(&mut mode);
+    assert_eq!(differ(&state(ml(&mut mode)), &s0), (0, 0), "two undos: the opacity, then the stroke");
+}
+
 /// Three volume strokes ending within one refit (one swap covering all three), over a layer: undo three times gives
 /// the start back bit for bit, redo three times the end.
 #[test]
