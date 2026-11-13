@@ -570,6 +570,30 @@ fn strokes_on_subtract_stay_bounded() {
     assert!(fails.is_empty(), "{fails:?}");
 }
 
+/// Ctrl on a layer does what it does on the base: the app swaps the brush (Clay + Ctrl sends Trim) and sets `invert`;
+/// Clay + Ctrl lowers and Trim + Ctrl raises.
+#[test]
+fn ctrl_on_a_layer_does_what_it_does_on_the_base() {
+    let _one = one_at_a_time();
+    let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
+    let r = 0.08;
+    let mut fails = Vec::new();
+    // (tool, the brush the app sends with Ctrl, whether it should raise)
+    for (tool, sent, raises) in [("Clay", Brush::Trim, false), ("Trim", Brush::Clay, true)] {
+        let mut mode = ball_with_layer(2.64e6);
+        let before = across(&mut mode, true, from, to, r);
+        mode.invert = true;
+        app_stroke(&mut mode, Target::Detail, from, to, r, 0.8, sent, 1);
+        mode.invert = false;
+        let e = extreme(&before, &across(&mut mode, true, from, to, r));
+        eprintln!("{tool} + Ctrl on a layer: {:.4} r", e / r);
+        if (e > 0.0) != raises || e.abs() < 0.02 * r {
+            fails.push(format!("{tool} + Ctrl: {:.4} r", e / r));
+        }
+    }
+    assert!(fails.is_empty(), "{fails:?}");
+}
+
 // ------------------------------------------------------------------------------------------- timing (ignored)
 
 fn pct(v: &mut [f64], p: f64) -> f64 {
