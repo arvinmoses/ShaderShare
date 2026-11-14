@@ -160,7 +160,6 @@ pub fn level_for(vol: &LevelVolume, radius: f32, px: f32) -> usize {
 
 /// A slider's change put off till the pointer lets go (a layer too big to move every frame).
 enum PendingSlider {
-    Opacity(usize, f32),
     Mask(usize, usize, MaskInfo),
 }
 
@@ -1233,11 +1232,6 @@ impl VolumeMode {
     pub fn layer_rows(&self) -> Option<(usize, Vec<LayerInfo>)> {
         let mut out = self.mesh.as_ref()?.infos()?;
         match &self.pending_slider {
-            Some(PendingSlider::Opacity(k, o)) => {
-                if let Some(x) = out.1.get_mut(*k) {
-                    x.opacity = *o;
-                }
-            }
             Some(PendingSlider::Mask(k, mi, info)) => {
                 if let Some(m) = out.1.get_mut(*k).and_then(|x| x.masks.get_mut(*mi)) {
                     *m = info.clone();
@@ -1261,7 +1255,6 @@ impl VolumeMode {
     pub fn close_slider_edit(&mut self) {
         if let Some(m) = self.mesh.as_mut() {
             match self.pending_slider.take() {
-                Some(PendingSlider::Opacity(k, o)) => m.set_opacity(k, o),
                 Some(PendingSlider::Mask(k, mi, info)) => m.set_mask(k, mi, info),
                 None => {}
             }
@@ -1269,12 +1262,9 @@ impl VolumeMode {
         }
     }
 
-    /// Set mesh layer `k`'s opacity (a drag is one undo).
+    /// Set mesh layer `k`'s opacity (a drag is one undo). Always live: a whole layer over 2.3M vertices takes about
+    /// 10 ms here, plus its rows.
     pub fn set_layer_opacity(&mut self, k: usize, opacity: f32) {
-        if !self.live_edits(k) {
-            self.pending_slider = Some(PendingSlider::Opacity(k, opacity));
-            return;
-        }
         if let Some(m) = self.mesh.as_mut() {
             m.set_opacity(k, opacity);
         }
