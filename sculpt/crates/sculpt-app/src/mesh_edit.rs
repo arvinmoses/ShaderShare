@@ -1,31 +1,11 @@
-//! The layer panel's rows driving the mesh layers: the same `SculptInfo` / `MaskInfo` the volume's own sculpt layers
-//! give, and the same edits (opacity 0-200%, blend, visibility, name, a paint mask and a noise mask per layer), each
-//! a step of the one history.
+//! The layer panel's rows driving the mesh layers (`layer_ui`'s `LayerInfo` / `MaskInfo`), and their edits (opacity
+//! 0-200%, blend, visibility, name, a paint mask and a noise mask per layer), each a step of the one history.
 
-use sculpt_core::generator::sculpt_layer::{LayerBlend as RowBlend, MaskInfo, MaskKind, NoiseMask, SculptInfo};
 use sculpt_core::mask::{BlendMode, Levels, MaskLayer, MaskSource, MaskStack};
 use sculpt_core::{LayerBlend, LayerId, LayerMeta, PaintTarget};
 
+use crate::layer_ui::{LayerInfo, MAX_OPACITY, MaskInfo, MaskKind, NoiseMask};
 use crate::mesh_stack::{Entry, MeshStack};
-
-/// How a row's blend shows on a mesh layer.
-pub fn to_core(b: RowBlend) -> LayerBlend {
-    match b {
-        RowBlend::Add => LayerBlend::Add,
-        RowBlend::Subtract => LayerBlend::Subtract,
-        RowBlend::Raise => LayerBlend::Max,
-        RowBlend::Carve => LayerBlend::Min,
-    }
-}
-
-pub fn from_core(b: LayerBlend) -> RowBlend {
-    match b {
-        LayerBlend::Subtract => RowBlend::Subtract,
-        LayerBlend::Max => RowBlend::Raise,
-        LayerBlend::Min => RowBlend::Carve,
-        LayerBlend::Add | LayerBlend::Normal => RowBlend::Add,
-    }
-}
 
 /// A noise mask's look as levels on the raw noise: `balance` the middle, `contrast` how short the ramp.
 fn noise_levels(n: &NoiseMask) -> Levels {
@@ -51,7 +31,7 @@ impl MeshStack {
     }
 
     /// The layers bottom first, as the rows show them, and the active one.
-    pub fn infos(&self) -> Option<(usize, Vec<SculptInfo>)> {
+    pub fn infos(&self) -> Option<(usize, Vec<LayerInfo>)> {
         let doc = &self.layers.doc;
         if doc.layers().is_empty() {
             return None;
@@ -60,11 +40,12 @@ impl MeshStack {
         let out = doc
             .layers()
             .iter()
-            .map(|l| SculptInfo {
+            .map(|l| LayerInfo {
                 name: l.name.clone(),
                 visible: l.visible,
                 opacity: l.opacity,
-                blend: from_core(l.blend),
+                // (The rows offer no Normal: such a layer shows as Add.)
+                blend: if l.blend == LayerBlend::Normal { LayerBlend::Add } else { l.blend },
                 // (Vertices, roughly: the leaves its strokes reached.)
                 blocks: l.allocated_leaves().len() * leaf_len,
                 masks: l.mask.as_ref().map(|s| s.layers.iter().map(|m| self.mask_info(m)).collect()).unwrap_or_default(),
@@ -152,12 +133,12 @@ impl MeshStack {
         self.meta_step(k, |m| m.visible = on);
     }
 
-    pub fn set_blend(&mut self, k: usize, b: RowBlend) {
-        self.meta_step(k, |m| m.blend = to_core(b));
+    pub fn set_blend(&mut self, k: usize, b: LayerBlend) {
+        self.meta_step(k, |m| m.blend = b);
     }
 
     pub fn set_opacity(&mut self, k: usize, opacity: f32) {
-        let o = opacity.clamp(0.0, sculpt_core::generator::sculpt_layer::MAX_OPACITY);
+        let o = opacity.clamp(0.0, MAX_OPACITY);
         self.meta_drag(k, |doc, id| doc.set_layer_opacity(id, o));
     }
 

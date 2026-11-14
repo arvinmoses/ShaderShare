@@ -1452,23 +1452,6 @@ impl LevelVolume {
         self.history.last().map(|h| h.keys().copied().collect()).unwrap_or_default()
     }
 
-    /// Make the last `n` steps in the history one (a step done as several), and drop what there is to redo.
-    pub fn merge_last(&mut self, n: usize) {
-        self.redo.clear();
-        if n < 2 || self.history.len() < n {
-            return;
-        }
-        let rest: Vec<Shared<Key, Was>> = self.history.drain(self.history.len() + 1 - n..).collect();
-        let first = self.history.last_mut().unwrap();
-        for e in rest {
-            for (k, was) in e.iter() {
-                if !first.contains_key(k) {
-                    first.insert(*k, was.clone());
-                }
-            }
-        }
-    }
-
     /// Drop the last stroke from the history (something else undoes it).
     pub fn forget_last(&mut self) {
         self.history.pop();
@@ -1489,48 +1472,6 @@ impl LevelVolume {
     pub fn redo_id(&self) -> Option<u64> {
         self.redo.last().map(|h| h.stamp())
     }
-
-    /// The field as it was before the last step in the history.
-    pub(crate) fn before_last(&self) -> Option<LevelVolume> {
-        let entry = self.history.last()?.clone();
-        let mut out = self.snapshot();
-        out.stroke = None;
-        out.swap_in(entry);
-        Some(out)
-    }
-
-    /// During a stroke, set block `bc` of level `l`'s samples outright (kept for undo as any change is).
-    pub fn set_block(&mut self, l: usize, bc: IVec3, s: Block) {
-        let k = (l as u8, bc);
-        self.keep(k);
-        if l == 0 {
-            self.inside0.remove(&bc);
-        }
-        self.blocks[l].insert(bc, Stored::from(s));
-        self.dirty.insert(k);
-    }
-
-    /// [`Self::end_stroke_plain`], kept as a step even when it changed nothing (`keep`): something kept beside the
-    /// volume changed.
-    pub fn end_stroke_marked(&mut self, keep: bool) -> bool {
-        if keep && self.stroke.is_some() {
-            self.keep_stroke();
-            return true;
-        }
-        self.end_stroke_plain()
-    }
-
-    /// End a stroke as it is (none of [`Self::end_stroke`]'s work on the field): kept for undo, if it changed
-    /// anything. Returns whether it did.
-    pub fn end_stroke_plain(&mut self) -> bool {
-        if self.stroke.as_ref().is_none_or(|s| s.is_empty()) {
-            self.stroke = None;
-            return false;
-        }
-        self.keep_stroke();
-        true
-    }
-
 
     /// Block `bc` of level `l`'s 512 samples, stored or interpolated from coarser levels.
     pub(crate) fn block_values(&self, l: usize, bc: IVec3, base: bool) -> Block {
@@ -1667,21 +1608,6 @@ impl LevelVolume {
         }
         self.blocks[l].insert(bc, s);
         self.dirty.insert((l as u8, bc));
-    }
-
-    /// During a stroke, remove block `bc` of level `l` (kept for undo), so it reads the coarser levels again; not if
-    /// a finer block lies in it.
-    pub(crate) fn remove_block(&mut self, l: usize, bc: IVec3) {
-        if l == 0 || !self.blocks[l].contains_key(&bc) {
-            return;
-        }
-        if l + 1 < self.levels() && (0..8).any(|q| self.blocks[l + 1].contains_key(&(bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)))) {
-            return;
-        }
-        let k = (l as u8, bc);
-        self.keep(k);
-        self.blocks[l].remove(&bc);
-        self.dirty.insert(k);
     }
 
     /// Make block `bc` of level `l` (from the coarser level) and its parents, if they do not exist.

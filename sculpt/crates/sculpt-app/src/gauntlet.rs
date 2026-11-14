@@ -18,7 +18,7 @@ struct Line {
     to: (f32, f32),
     passes: usize,
     per_frame: usize,
-    /// On a scene with a sculpt layer: whether the stroke works on the form under it rather than the layer.
+    /// On a scene with a mesh layer: whether the stroke works on the form under it rather than the layer.
     form: bool,
 }
 
@@ -41,7 +41,8 @@ struct Scene {
     /// What is scored: a square of this half-width on the patch.
     half: f32,
     lines: Vec<Line>,
-    /// Strokes on a new sculpt layer (see `VolumeMode::new_sculpt_layer`) rather than on the volume.
+    /// Strokes on a new mesh layer (see `VolumeMode::add_mesh_layer`) rather than on the volume: scored on the layers'
+    /// surface.
     layer: bool,
 }
 
@@ -85,7 +86,7 @@ fn scenes() -> Vec<Scene> {
     }
     l.push(Line { per_frame: 8, ..line(Brush::Trim, 0.038, 0.000476, (-0.07, 0.0), (0.07, 0.01)) });
     out.push(Scene { layer: false, name: "fast_drags", half: 0.08, lines: l });
-    // On a sculpt layer: close rows, big strokes, and the form moved under the rows by a big stroke.
+    // On a mesh layer: close rows, big strokes, and the form moved under the rows by a big stroke.
     let mut l = Vec::new();
     rows(&mut l, 0.016, 0.0004);
     out.push(Scene { layer: true, name: "layer_clay_close_rows", half: 0.08, lines: l });
@@ -150,10 +151,27 @@ fn phantoms(v: &LevelVolume, l: usize) -> usize {
         .sum()
 }
 
+/// A frame's tick. With mesh layers, as the app's frame: the GPU takes the volume's changes (else the layers wait for
+/// them to be drained, never at rest) and the rows.
+fn tick(mode: &mut VolumeMode, layer: bool) {
+    mode.tick();
+    if layer {
+        mode.vol.drain_dirty();
+        mode.take_rows_dirty();
+    }
+}
+
 fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
     let mut mode = VolumeMode::ball(1e6);
     if scene.layer {
-        mode.new_sculpt_layer();
+        // The first mesh layer's mesh is made off the frame: frames until it is in.
+        mode.add_mesh_layer();
+        let start = Instant::now();
+        while (mode.mesh_building() || mode.busy()) && start.elapsed().as_secs_f64() < 60.0 {
+            tick(&mut mode, scene.layer);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        assert!(mode.mesh.is_some(), "{}: no mesh layer: {:?}", scene.name, mode.mesh_note);
     }
     let centre = Vec3::new(0.3, -0.05, 0.95).normalize();
     let (t1, t2) = (Vec3::Y.cross(centre).normalize(), centre.cross(Vec3::Y.cross(centre).normalize()));
@@ -182,19 +200,20 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
                     s.dab_mean += ms;
                     s.dab_worst = s.dab_worst.max(ms / k.max(1) as f64);
                     dabs += k;
-                    mode.tick();
+                    tick(&mut mode, scene.layer);
                     s.frame_worst = s.frame_worst.max(t0.elapsed().as_secs_f64() * 1e3);
                 }
             }
         }
-        finest = finest.max(mode.level);
+        // (A stroke on a mesh layer picks no level of the volume: the level it would work at.)
+        finest = finest.max(if scene.layer && !ln.form { mode.level_for(ln.r, ln.px) } else { mode.level });
         // The pen up: the frames that do what is queued, then those until the stroke's end is all in.
         while mode.dabs_queued() {
             let t0 = Instant::now();
             let k = mode.run_frame_dabs();
             s.dab_mean += t0.elapsed().as_secs_f64() * 1e3;
             dabs += k;
-            mode.tick();
+            tick(&mut mode, scene.layer);
             s.frame_worst = s.frame_worst.max(t0.elapsed().as_secs_f64() * 1e3);
         }
         let t0 = Instant::now();
@@ -203,12 +222,16 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
         let start = Instant::now();
         while mode.busy() && start.elapsed().as_secs_f64() < 20.0 {
             let t0 = Instant::now();
-            mode.tick();
+            tick(&mut mode, scene.layer);
             worst = worst.max(t0.elapsed().as_secs_f64() * 1e3);
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
         mode.settle();
         s.end_worst = s.end_worst.max(worst);
+    }
+    if scene.layer && scene.lines.iter().any(|l| !l.form) {
+        let held = mode.mesh_layers().map_or(0, |m| m.doc.layers()[0].allocated_leaves().len());
+        assert!(held > 0, "{}: the layer took none of its strokes", scene.name);
     }
     s.dab_mean /= dabs.max(1) as f64;
     // Heights over the patch along its normal, and what stands off its neighbourhood.
@@ -217,11 +240,17 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
     let m = (2.0 * scene.half / g) as usize;
     let top = mode.vol.levels() - 1;
     let vol = &mode.vol;
+    // With mesh layers, the surface shown is theirs.
+    let doc = mode.mesh_layers().map(|m| &m.doc);
     let h: Vec<f32> = (0..m * m)
         .into_par_iter()
         .map(|q| {
             let p = centre + t1 * (-scene.half + g * (q % m) as f32) + t2 * (-scene.half + g * (q / m) as f32);
-            vol.raycast(p + centre * 0.1, -centre, top, false).map_or(f32::NAN, |(q, _)| (q - centre).dot(centre))
+            let hit = match doc {
+                Some(doc) => doc.raycast(&sculpt_core::geom::Ray::new(p + centre * 0.1, -centre)).map(|h| h.point),
+                None => vol.raycast(p + centre * 0.1, -centre, top, false).map(|(q, _)| q),
+            };
+            hit.map_or(f32::NAN, |q| (q - centre).dot(centre))
         })
         .collect();
     let k = ((1.5 * vx / g).ceil() as usize).max(1);

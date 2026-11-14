@@ -11,10 +11,11 @@ use sculpt_core::brush::Falloff;
 use crate::app::{Dialog, SculptApp, fmt_count};
 use crate::icons::{Icon, icon_button};
 use crate::keymap::Command;
+use crate::layer_ui::{MAX_OPACITY, MaskInfo, MaskKind, NoiseMask, ROW_BLENDS};
 use crate::theme::{Hex, bold};
 use crate::tools::Tool;
 use crate::volume_mode::{Target, VolumeMode};
-use sculpt_core::generator::sculpt_layer::{LayerBlend, MAX_OPACITY, MaskInfo, MaskKind, NoiseMask};
+use sculpt_core::LayerBlend;
 use sculpt_core::mask::BlendMode;
 use sculpt_core::noise::NoiseKind;
 
@@ -72,7 +73,7 @@ fn target_text(app: &SculptApp) -> (String, Color32) {
     let m = &app.volume;
     let ui = &app.theme.ui;
     let Some(layer) = m.layer.as_ref() else {
-        let Some((active, layers)) = m.sculpt_layers() else { return ("Strokes edit the volume".into(), ui.accent.0) };
+        let Some((active, layers)) = m.layer_rows() else { return ("Strokes edit the volume".into(), ui.accent.0) };
         let Some(info) = layers.get(active) else { return ("Strokes edit the volume".into(), ui.accent.0) };
         let name = &info.name;
         let mask = info.active_mask.and_then(|i| info.masks.get(i));
@@ -186,8 +187,6 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
 }
 
 const SCULPT_HOVER: &str = "An empty layer on top to sculpt on, on a mesh taken from the volume's surface: it keeps what its strokes change. Its opacity (up to 200%), blend and masks (one painted, one noise) fade it anywhere. Sculpting the base under it carries it along.";
-/// Asks whether to merge the volume's own sculpt layers so mesh layers can be added.
-const MERGE_ASK: &str = "mesh_merge_ask";
 const NOISE_HOVER: &str = "A layer of noise over the whole surface, drawn by the GPU as it is shown: its coarse octaves move the surface, every octave shades it, finer than any level. Its mask fades it. Brushes work on the surface under it.";
 const GENERATOR_HOVER: &str = "A layer that scatters a primitive over the form and joins it softly (or cuts it): rocks to start with. Its settings are under Properties; sculpting the form carries it along.";
 
@@ -197,11 +196,7 @@ fn volume_menu(app: &mut SculptApp, ui: &mut Ui) {
     let top = m.vol.levels() - 1;
     let mesh = m.mesh.is_some() || m.mesh_building();
     if ui.add_enabled(m.layer.is_none(), egui::Button::new("New sculpt layer")).on_hover_text(SCULPT_HOVER).clicked() {
-        if m.has_volume_layers() {
-            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(MERGE_ASK), true));
-        } else {
-            m.add_mesh_layer();
-        }
+        m.add_mesh_layer();
         ui.close();
     }
     if ui.add_enabled(!mesh, egui::Button::new("New generator layer")).on_hover_text(GENERATOR_HOVER).clicked() {
@@ -215,12 +210,6 @@ fn volume_menu(app: &mut SculptApp, ui: &mut Ui) {
     match m.layer.as_ref().map(|l| l.from()) {
         // (Mesh layers stay layers: nothing merges them into the volume yet.)
         None if mesh => {}
-        None if m.sculpt_layers().is_some() => {
-            if ui.button("Merge the layers").on_hover_text("One volume again, as shown. Undo starts afresh.").clicked() {
-                m.merge_layer();
-                ui.close();
-            }
-        }
         None => {
             ui.menu_button("Move detail to a layer", |ui| {
                 ui.label(RichText::new("The work at this level and finer goes into a detail layer over the form.").small());
@@ -489,10 +478,11 @@ fn row_blend<T: Copy + PartialEq>(ui: &mut Ui, fs: f32, id: impl std::hash::Hash
 
 fn layer_blend_hover(b: LayerBlend) -> &'static str {
     match b {
-        LayerBlend::Add => "The layer's strokes as sculpted.",
+        // (Normal is not offered: a layer set to it shows as Add.)
+        LayerBlend::Add | LayerBlend::Normal => "The layer's strokes as sculpted.",
         LayerBlend::Subtract => "Turned over: what the layer raised is carved, and what it carved is raised.",
-        LayerBlend::Raise => "The higher surface of the base with the layer and without it: only what the layer raises shows.",
-        LayerBlend::Carve => "The lower surface of the base with the layer and without it: only what the layer carves shows.",
+        LayerBlend::Max => "The higher surface of the base with the layer and without it: only what the layer raises shows.",
+        LayerBlend::Min => "The lower surface of the base with the layer and without it: only what the layer carves shows.",
     }
 }
 
@@ -517,8 +507,8 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.y = 0.0;
         let m = &app.volume;
         match m.layer.as_ref() {
-            None if m.sculpt_layers().is_some() => {
-                let (active, layers) = m.sculpt_layers().unwrap();
+            None if m.layer_rows().is_some() => {
+                let (active, layers) = m.layer_rows().unwrap();
                 let on_mask = matches!(m.target, Target::Mask { .. });
                 for k in (0..layers.len()).rev() {
                     let info = &layers[k];
@@ -532,14 +522,14 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
                     let name = RichText::new(&info.name);
                     row.label(if info.visible { name } else { name.color(weak) }).on_hover_text(format!("{} blocks", fmt_count(info.blocks)));
                     row.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let hover = if m.mesh.is_some() { "Remove this layer and what it shows (undo cannot bring it back: the history goes)" } else { "Remove this layer and what it shows (undo brings it back)" };
+                        let hover = "Remove this layer and what it shows (undo cannot bring it back: the history goes)";
                         if icon_button(ui, Icon::Trash, 20.0, false, hover).clicked() {
                             act.remove = Some(k);
                         }
                         if let Some(o) = row_opacity(ui, info.opacity, MAX_OPACITY, "The layer's opacity: drag, or click to type. Over 100% exaggerates it.") {
                             act.opacity = Some((k, o));
                         }
-                        if let Some(b) = row_blend(ui, fs, ("row_layer_blend", k), info.blend, &LayerBlend::ALL, LayerBlend::label, layer_blend_hover) {
+                        if let Some(b) = row_blend(ui, fs, ("row_layer_blend", k), info.blend, &ROW_BLENDS, LayerBlend::label, layer_blend_hover) {
                             act.blend = Some((k, b));
                         }
                     });
@@ -706,7 +696,6 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
             }
         }
     });
-    mesh_merge_question(app, ui.ctx());
     let m = &mut app.volume;
     if let Some(k) = act.select {
         m.set_active_layer(k);
@@ -738,29 +727,6 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
     }
     if let Some(k) = act.remove {
         m.remove_layer(k);
-    }
-}
-
-/// The volume has sculpt layers of its own (an older file) and a mesh layer was asked for: merge them first?
-fn mesh_merge_question(app: &mut SculptApp, ctx: &egui::Context) {
-    let id = egui::Id::new(MERGE_ASK);
-    if !ctx.data(|d| d.get_temp::<bool>(id).unwrap_or(false)) {
-        return;
-    }
-    let (mut yes, mut no) = (false, false);
-    egui::Window::new("New sculpt layer").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-        ui.label("This volume has sculpt layers of its own (from an older file). Sculpt layers now live on a mesh taken from the volume, and the two kinds do not go together.");
-        ui.label("Merge the volume's layers into it as shown (their history goes) and add the new layer?");
-        ui.horizontal(|ui| {
-            yes = ui.button("Merge and add").clicked();
-            no = ui.button("Cancel").clicked();
-        });
-    });
-    if yes || no {
-        ctx.data_mut(|d| d.remove_temp::<bool>(id));
-    }
-    if yes {
-        app.volume.add_mesh_layer();
     }
 }
 
@@ -897,7 +863,7 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
     let level_text = |m: &VolumeMode, l: usize| format!("level {l}  (step {:.5})", m.vol.voxel(l));
     if m.layer.is_none()
         && m.target != Target::Form
-        && let Some((k, layers)) = m.sculpt_layers()
+        && let Some((k, layers)) = m.layer_rows()
     {
         let Some(info) = layers.get(k).cloned() else { return };
         if matches!(m.target, Target::Mask { .. })
@@ -924,7 +890,7 @@ fn layer_props(app: &mut SculptApp, ui: &mut Ui) {
             }
             prop(ui, "Blend", |ui| {
                 egui::ComboBox::from_id_salt(("layer_blend", k)).selected_text(info.blend.label()).show_ui(ui, |ui| {
-                    for b in LayerBlend::ALL {
+                    for b in ROW_BLENDS {
                         let hover = layer_blend_hover(b);
                         if ui.selectable_label(info.blend == b, b.label()).on_hover_text(hover).clicked() && info.blend != b {
                             blend = Some(b);

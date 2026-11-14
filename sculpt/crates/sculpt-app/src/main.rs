@@ -14,6 +14,7 @@ mod gpu_levels;
 mod icons;
 mod keymap;
 mod layer_rows;
+mod layer_ui;
 mod mesh_edit;
 mod mesh_stack;
 mod panels;
