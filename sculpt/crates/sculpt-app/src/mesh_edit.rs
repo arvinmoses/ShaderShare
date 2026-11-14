@@ -328,14 +328,13 @@ impl MeshStack {
         for _ in 0..2 {
             doc.paint(&PaintTarget::Channel(name.clone()), c, r, &flat, 1.0, to, None);
         }
-        let changed = doc.stroke_changed();
-        doc.end_stroke();
-        match if changed { self.layers.stroke_patch() } else { Ok(Default::default()) } {
-            Ok(p) if !p.is_empty() => self.push(Entry::Layer(p)),
-            Ok(_) => {}
+        let was = self.fills.insert(name.clone(), to);
+        match self.layers.take_stroke_patch() {
+            // (The step holds the fill it replaced, for the panel after an undo.)
+            Ok(Some(patch)) => self.push(Entry::Layer { patch, fill: Some((name, was)) }),
+            Ok(None) => {}
             Err(e) => eprintln!("mesh layers: {e}"),
         }
-        self.fills.insert(name, to);
         self.active_mask.insert(id, Some(mi));
         Some(mi)
     }

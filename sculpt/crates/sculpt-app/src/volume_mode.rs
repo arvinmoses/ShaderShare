@@ -603,6 +603,25 @@ impl VolumeMode {
         }
         self.frame_dab_ms = 0.0;
         self.mesh_tick();
+        self.mesh_failure_note();
+    }
+
+    /// While the layers' last refit failed, the note says so (and goes once one succeeds).
+    fn mesh_failure_note(&mut self) {
+        const LEAD: &str = "Layers could not follow the volume";
+        match self.mesh.as_ref().and_then(|m| m.failure.as_ref()) {
+            Some(e) => {
+                let n = format!("{LEAD}: {e}");
+                if self.mesh_note.as_ref() != Some(&n) {
+                    self.mesh_note = Some(n);
+                }
+            }
+            None => {
+                if self.mesh_note.as_ref().is_some_and(|n| n.starts_with(LEAD)) {
+                    self.mesh_note = None;
+                }
+            }
+        }
     }
 
     /// `f` on the real state (while running ahead, the copy's put aside meanwhile).
@@ -1728,7 +1747,11 @@ impl VolumeMode {
         if let Some(m) = self.mesh.as_mut() {
             self.sculpt_later = None;
             m.tap(self.vol.dirty_keys());
-            return m.undo(&mut self.vol);
+            let done = m.undo(&mut self.vol);
+            if let Some(n) = m.note.take() {
+                self.mesh_note = Some(n);
+            }
+            return done;
         }
         match self.layer.as_mut() {
             Some(layer) => layer.undo(&mut self.vol),
@@ -1754,7 +1777,11 @@ impl VolumeMode {
         if let Some(m) = self.mesh.as_mut() {
             self.sculpt_later = None;
             m.tap(self.vol.dirty_keys());
-            return m.redo(&mut self.vol);
+            let done = m.redo(&mut self.vol);
+            if let Some(n) = m.note.take() {
+                self.mesh_note = Some(n);
+            }
+            return done;
         }
         match self.layer.as_mut() {
             Some(layer) => layer.redo(&mut self.vol),
@@ -2001,6 +2028,7 @@ impl VolumeMode {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
         self.lag_ms = 0.0;
+        self.mesh_failure_note();
         true
     }
 
@@ -2049,15 +2077,10 @@ impl VolumeMode {
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
         let Some(m) = self.mesh.as_mut() else { return };
-        // A stroke that changed nothing (the pen off the model) is no step; the last step is an older one.
-        let changed = m.layers.doc.stroke_changed();
-        m.layers.doc.end_stroke();
-        if !changed {
-            return;
-        }
-        match m.layers.stroke_patch() {
-            Ok(p) if !p.is_empty() => m.push(crate::mesh_stack::Entry::Layer(p)),
-            Ok(_) => {}
+        // (A stroke that changed nothing, the pen off the model, is no step.)
+        match m.layers.take_stroke_patch() {
+            Ok(Some(patch)) => m.push(crate::mesh_stack::Entry::Layer { patch, fill: None }),
+            Ok(None) => {}
             Err(e) => eprintln!("mesh layers: {e}"),
         }
     }

@@ -380,6 +380,119 @@ fn masks_opacity_undo_redo_and_save_open() {
     assert!(VolumeMode::read_from(&mut std::io::Cursor::new(&plain)).unwrap().mesh.is_none());
 }
 
+/// Carve the whole volume away as one step (the mesh it leaves has no faces), kept in the layers' history as a
+/// stroke's end keeps it.
+fn carve_all(mode: &mut VolumeMode) {
+    mode.settle();
+    let v = &mut mode.vol;
+    assert_eq!(v.levels(), 1, "a carve over every block of a fine level takes for ever");
+    v.begin_stroke();
+    v.ball_dab(0, Vec3::ZERO, 2.0, 0.05, true);
+    v.end_stroke();
+    let id = v.last_id().unwrap();
+    mode.mesh.as_mut().unwrap().note_step(id);
+}
+
+fn failed(mode: &VolumeMode) -> bool {
+    let m = mode.mesh.as_ref().unwrap();
+    let noted = mode.mesh_note.as_ref().is_some_and(|n| n.starts_with("Layers could not follow the volume"));
+    assert_eq!(m.failure.is_some(), noted, "the note and the failure disagree: {:?}", mode.mesh_note);
+    m.failure.is_some()
+}
+
+fn sides(mode: &VolumeMode) -> (usize, usize) {
+    let m = mode.mesh.as_ref().unwrap();
+    (m.history.len(), m.redo.len())
+}
+
+/// Everything carved away: the layers cannot follow (no faces). Frames settle and no refit runs again, waiting for
+/// the layers (finishing, saving) returns, the note says why; undo brings the layers back bit for bit, redo carves
+/// again (its refit failing as it lands: the step is not lost), and undo after it brings them back again; the layer
+/// stroke under it still undoes and redoes.
+#[test]
+fn layers_survive_the_volume_carved_away() {
+    let _one = one_at_a_time();
+    // One level, so the carve over the whole ball is quick.
+    let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 1.0 / 48.0, 1));
+    mode.add_mesh_layer();
+    settle_frames(&mut mode);
+    assert!(mode.mesh.is_some(), "{:?}", mode.mesh_note);
+    let s0 = state(ml(&mut mode));
+    stroke(&mut mode, Target::Detail, Vec3::new(0.2, 0.1, 1.0), 0.08, Brush::Clay);
+    settle_frames(&mut mode);
+    let s1 = state(ml(&mut mode));
+    assert!(differ(&s0, &s1).1 > 100, "the layer stroke changed little");
+    carve_all(&mut mode);
+    settle_frames(&mut mode);
+    assert!(failed(&mode), "the refit of nothing did not fail");
+    let swaps = mode.mesh.as_ref().unwrap().times.swaps;
+    for _ in 0..5 {
+        frame(&mut mode);
+        assert!(!ml(&mut mode).busy() && !mode.busy(), "a failed refit ran again");
+    }
+    mode.mesh.as_mut().unwrap().finish(&mode.vol);
+    let mut bytes = Vec::new();
+    mode.write_to(&mut bytes).unwrap();
+    assert_eq!(mode.mesh.as_ref().unwrap().times.swaps, swaps);
+    assert_eq!(differ(&state(ml(&mut mode)), &s1), (0, 0), "the layers changed while they could not follow");
+    let check = |mode: &mut VolumeMode, want: &HashMap<u64, Vec<u32>>, what: &str| {
+        settle_frames(mode);
+        let d = differ(&state(ml(mode)), want);
+        eprintln!("{what}: {d:?}");
+        assert_eq!(d, (0, 0), "{what}");
+    };
+    assert!(mode.undo());
+    check(&mut mode, &s1, "undo the carve");
+    assert!(!failed(&mode));
+    base_is_fresh(&mut mode, "after undoing the carve");
+    // The redo's own refit fails: the step goes back on the history all the same.
+    let (h, r) = sides(&mode);
+    assert!(mode.redo());
+    settle_frames(&mut mode);
+    assert!(failed(&mode));
+    assert_eq!(sides(&mode), (h + 1, r - 1), "the carve's step was lost");
+    assert!(mode.undo());
+    check(&mut mode, &s1, "undo the carve again");
+    assert!(!failed(&mode));
+    assert!(mode.undo());
+    check(&mut mode, &s0, "undo the layer stroke");
+    assert!(mode.redo());
+    check(&mut mode, &s1, "redo the layer stroke");
+    assert!(mode.redo());
+    settle_frames(&mut mode);
+    assert!(failed(&mode));
+    assert!(mode.undo());
+    check(&mut mode, &s1, "undo the carve a third time");
+    base_is_fresh(&mut mode, "at the end");
+}
+
+/// A mask fill's undo puts back the fill the panel shows (and the mask's values), its redo the new one.
+#[test]
+fn undoing_a_fill_shows_the_fill_before() {
+    let _one = one_at_a_time();
+    let mut mode = ball_with_layer(2e5);
+    stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.1, 1.0), 0.15, Brush::Clay);
+    mode.set_active_layer(0);
+    mode.add_mask(MaskKind::Paint { fill: 1.0 });
+    settle_frames(&mut mode);
+    let fill = |mode: &VolumeMode| match mode.sculpt_layers().unwrap().1[0].masks[0].kind {
+        MaskKind::Paint { fill } => fill,
+        _ => panic!("not a painted mask"),
+    };
+    assert_eq!(fill(&mode), 1.0);
+    let s0 = state(ml(&mut mode));
+    mode.fill_mask(0.0);
+    let s1 = state(ml(&mut mode));
+    assert!(differ(&s0, &s1).1 > 100, "the fill changed little");
+    assert_eq!(fill(&mode), 0.0);
+    assert!(mode.undo());
+    assert_eq!(fill(&mode), 1.0, "the panel's fill after undo");
+    assert_eq!(differ(&state(ml(&mut mode)), &s0), (0, 0), "undo the fill");
+    assert!(mode.redo());
+    assert_eq!(fill(&mode), 0.0, "the panel's fill after redo");
+    assert_eq!(differ(&state(ml(&mut mode)), &s1), (0, 0), "redo the fill");
+}
+
 /// The rows told of every change: a dab's leaves, a swap's blocks, a hidden layer's.
 #[test]
 fn rows_follow_dabs_swaps_and_hiding() {

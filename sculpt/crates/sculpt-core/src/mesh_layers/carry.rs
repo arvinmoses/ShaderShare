@@ -381,12 +381,15 @@ pub(super) fn apply(old: &Document, old_keys: &[u64], mut new: Document, plan: &
 /// Put back what `patch` holds onto `doc` (names `keys` in canonical order), wherever a vertex of the same name sits
 /// at the same base position bit for bit. Returns how many vertices that was.
 pub(super) fn restore(doc: &mut Document, keys: &[u64], patch: &Patch) -> Result<usize> {
+    check(doc, patch)?;
     let to = targets(doc, keys, patch);
     restore_to(doc, patch, &to)
 }
 
-/// [`restore`], also giving what it overwrote at the vertices it went back to: restoring that undoes it.
+/// [`restore`], also giving what it overwrote at the vertices it went back to: restoring that undoes it. A patch that
+/// does not fit the document is refused before anything changes.
 pub(super) fn restore_swap(doc: &mut Document, keys: &[u64], patch: &Patch) -> Result<Patch> {
+    check(doc, patch)?;
     let to = targets(doc, keys, patch);
     let kept: Vec<(usize, u32)> = to.iter().enumerate().filter(|(_, v)| **v != NONE).map(|(i, v)| (i, *v)).collect();
     let vec_at = |layer: &SculptLayer, v: u32| -> Vec3 {
@@ -421,6 +424,30 @@ pub(super) fn restore_swap(doc: &mut Document, keys: &[u64], patch: &Patch) -> R
     };
     restore_to(doc, patch, &to)?;
     Ok(inverse)
+}
+
+/// Whether `patch` can go onto `doc` whole: every list one per name, and every channel it writes that `doc` has one
+/// per vertex. Checked before anything changes, so a restore that fails leaves the document as it was. (What restoring
+/// can still fail on after that is a mask that cannot be weighed, which a restore cannot cause: the masks and the
+/// channels they read are the document's own.)
+fn check(doc: &Document, patch: &Patch) -> Result<()> {
+    let n = patch.names.len();
+    let bad = |what: &str| Err(crate::Error::InvalidData(format!("a damaged patch: {what}")));
+    if patch.base.len() != n {
+        return bad("base positions");
+    }
+    if patch.layers.iter().any(|(_, v)| v.as_ref().is_some_and(|v| v.len() != n)) {
+        return bad("layer offsets");
+    }
+    if patch.freeze.as_ref().is_some_and(|f| f.len() != n) || doc.freeze.len() != doc.vertex_count() {
+        return bad("freeze");
+    }
+    for (name, vals) in &patch.channels {
+        if vals.len() != n || doc.channels.get(name).is_some_and(|c| c.len() != doc.vertex_count()) {
+            return bad(&format!("channel '{name}'"));
+        }
+    }
+    Ok(())
 }
 
 /// Per patch entry: the vertex of `doc` it goes back to (same name, same base bit for bit), or `NONE`.

@@ -11,13 +11,29 @@ use crate::undo::{Data, Target};
 use crate::{Error, Result};
 
 impl MeshLayers {
-    /// The last finished stroke of the document (its newest undo group, as `Document::end_stroke` left it) as a
+    /// End the document's open stroke (a layer or mask stroke, begun with `Document::begin_stroke`) and take it as a
     /// [`Patch`] holding what the stroke overwrote: every vertex of the leaves it touched, by name, with the values
     /// before the stroke of each layer, channel and the freeze it changed. [`Self::restore_swap`] of it undoes the
-    /// stroke and gives the patch that redoes it. Call it right after `end_stroke`, before anything else changes the
-    /// document. A channel the stroke created comes back as zeros (it is not removed). Errors when the group changed
-    /// the base or the layer list (not a layer or mask stroke), or a stroke is still open.
-    pub fn stroke_patch(&self) -> Result<Patch> {
+    /// stroke and gives the patch that redoes it. `None` when the stroke changed nothing (or none was open). A channel
+    /// the stroke created comes back as zeros (it is not removed). The stroke's group leaves the document's own undo:
+    /// the patch undoes it, and kept there it doubled what every stroke holds. Errors when the stroke changed the base
+    /// or the layer list (not a layer or mask stroke); its group is left in the document's undo then.
+    pub fn take_stroke_patch(&mut self) -> Result<Option<Patch>> {
+        let changed = self.doc.stroke_changed();
+        self.doc.end_stroke();
+        // (A stroke that changed something always leaves its group on top: commit pushes every group with records.)
+        if !changed {
+            return Ok(None);
+        }
+        let patch = self.stroke_patch()?;
+        self.doc.undo.undo.pop();
+        Ok((!patch.is_empty()).then_some(patch))
+    }
+
+    /// The document's newest undo group (a stroke just ended) as a [`Patch`]: see [`Self::take_stroke_patch`], the
+    /// only caller (which knows that group is the stroke's). Errors when the group is not a layer or mask stroke, or a
+    /// stroke is still open.
+    fn stroke_patch(&self) -> Result<Patch> {
         let doc = &self.doc;
         if doc.undo.open.as_ref().is_some_and(|g| !g.records.is_empty()) {
             return Err(Error::InvalidData("a stroke is still open".into()));
@@ -101,5 +117,30 @@ impl MeshLayers {
     /// to, which restored in turn undoes it. Entries with no vertex of the same name and base are left out of both.
     pub fn restore_swap(&mut self, patch: &Patch) -> Result<Patch> {
         carry::restore_swap(&mut self.doc, &self.keys, patch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generator::level_volume::LevelVolume;
+
+    /// A patch whose lists do not match its names is refused before it writes anything (it panicked halfway).
+    #[test]
+    fn a_damaged_patch_is_refused_before_anything_changes() {
+        let vol = LevelVolume::from_field(&|p: Vec3| p.length() - 0.5, 0.8, 1.0 / 32.0, 1);
+        let mut ml = MeshLayers::from_volume(&vol, Default::default()).unwrap();
+        let id = ml.doc.add_layer("a");
+        let n = 4;
+        let names = ml.keys()[..n].to_vec();
+        let base = (0..n).map(|c| ml.doc.base[ml.doc.canonical_to_internal[c] as usize]).collect();
+        let bad = Patch { names, base, layers: vec![(id, Some(vec![Vec3::ONE; n - 1]))], freeze: None, channels: Vec::new() };
+        let before = ml.layer_deltas(id).unwrap();
+        assert!(ml.restore_swap(&bad).is_err());
+        assert!(ml.restore(&bad).is_err());
+        assert!(ml.layer_deltas(id).unwrap() == before, "a refused patch wrote something");
+        let good = Patch { layers: vec![(id, Some(vec![Vec3::ONE; n]))], ..bad };
+        assert_eq!(ml.restore_swap(&good).unwrap().len(), n);
+        assert!(ml.layer_deltas(id).unwrap() != before);
     }
 }

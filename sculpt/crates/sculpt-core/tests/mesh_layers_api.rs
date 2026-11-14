@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use glam::Vec3;
-use sculpt_core::brush::{self, BrushSettings, ClayBuildup, Falloff};
+use sculpt_core::brush::{BrushSettings, ClayBuildup, Falloff};
 use sculpt_core::generator::level_volume::{Key, LevelVolume};
 use sculpt_core::geom::Ray;
 use sculpt_core::mask::{BlendMode, MaskLayer, MaskSource, MaskStack};
@@ -17,21 +17,27 @@ use sculpt_core::{Document, LayerBlend, LayerId, PaintTarget};
 mod common;
 use common::*;
 
-/// A clay stroke on the active layer around direction `dir`.
+/// A clay stroke on the active layer around direction `dir`, left open as the app leaves a stroke for
+/// `take_stroke_patch` (`brush::stroke` but for its end).
 fn layer_dab(doc: &mut Document, dir: Vec3, radius: f32) {
+    use sculpt_core::brush::{Brush, Dab, StrokeSampler};
     let s = BrushSettings { radius, strength: 0.5, ..Default::default() };
     let mut clay = ClayBuildup { height: 0.1, ..Default::default() };
     let side = dir.any_orthonormal_vector();
-    let path: Vec<(Vec3, f32)> = (0..=6)
-        .filter_map(|k| {
-            let d = (dir + side * (0.1 * (k as f32 / 6.0 - 0.5))).normalize();
-            doc.raycast(&Ray::new(d * 3.0, -d)).map(|h| (h.point, 1.0))
-        })
-        .collect();
-    brush::stroke(doc, &mut clay, &s, &path).unwrap();
+    doc.begin_stroke(clay.name());
+    let mut sampler = StrokeSampler::new(s.radius * s.spacing);
+    for k in 0..=6 {
+        let d = (dir + side * (0.1 * (k as f32 / 6.0 - 0.5))).normalize();
+        let Some(h) = doc.raycast(&Ray::new(d * 3.0, -d)) else { continue };
+        for (point, dir, pr) in sampler.push(h.point, 1.0) {
+            let guess = doc.sample_area(point, s.radius, None).map_or(Vec3::Z, |(_, n)| n);
+            let Some(hit) = doc.project_to_surface(point, guess, s.radius) else { continue };
+            clay.dab(doc, &Dab { center: hit.point, normal: hit.normal, direction: dir, pressure: pr }, &s).unwrap();
+        }
+    }
 }
 
-/// A paint stroke on channel `name` around direction `dir`.
+/// A paint stroke on channel `name` around direction `dir`, left open.
 fn paint_dab(doc: &mut Document, name: &str, dir: Vec3, radius: f32, value: f32) {
     doc.begin_stroke("Paint");
     let side = dir.any_orthonormal_vector();
@@ -41,7 +47,6 @@ fn paint_dab(doc: &mut Document, name: &str, dir: Vec3, radius: f32, value: f32)
             doc.paint(&PaintTarget::Channel(name.into()), h.point, radius, &Falloff::default(), 0.8, value, None);
         }
     }
-    doc.end_stroke();
 }
 
 /// Every layer composited afresh (strokes add up dab by dab, to rounding).
@@ -273,15 +278,17 @@ fn c0c_scene() -> (LevelVolume, MeshLayers, LayerId) {
 fn c0c_strokes(ml: &mut MeshLayers, id: LayerId) -> ([HashMap<u64, Vec<u32>>; 3], [sculpt_core::mesh_layers::Patch; 2]) {
     let s0 = state(ml);
     ml.doc.set_active_layer(Some(id)).unwrap();
+    let groups = ml.doc.undo_labels().len();
     layer_dab(&mut ml.doc, Vec3::new(0.15, 0.05, 1.0), 0.1);
-    let p1 = ml.stroke_patch().unwrap();
+    let p1 = ml.take_stroke_patch().unwrap().expect("the layer stroke changed nothing");
     fresh(&mut ml.doc);
     let s1 = state(ml);
     paint_dab(&mut ml.doc, "paint.half", Vec3::new(0.05, 0.0, 1.0), 0.1, 0.0);
-    let p2 = ml.stroke_patch().unwrap();
+    let p2 = ml.take_stroke_patch().unwrap().expect("the mask stroke changed nothing");
     fresh(&mut ml.doc);
     let s2 = state(ml);
     assert!(!p1.is_empty() && !p2.is_empty());
+    assert_eq!(ml.doc.undo_labels().len(), groups, "a taken stroke stayed in the document's undo");
     let all = |_: u64| true;
     assert!(differ(&s0, &s1, &all).1 > 0 && differ(&s1, &s2, &all).1 > 0, "a stroke changed nothing");
     ([s0, s1, s2], [p1, p2])
@@ -309,6 +316,37 @@ fn c0c_round_trip(ml: &mut MeshLayers, s: &[HashMap<u64, Vec<u32>>; 3], p: &[scu
     for (x, at) in [(a, "undo mask"), (b, "undo layer"), (c, "redo layer"), (d, "redo mask")] {
         assert_eq!(x, (0, 0), "{what}: {at}");
     }
+}
+
+/// Taking a stroke's patch takes only that stroke's own group off the document's undo: a stroke that changed
+/// nothing takes none (the layer edit before it stays on top), and a slider drag (edits of one layer coalesced)
+/// stays one step across it.
+#[test]
+fn c0c_taking_a_stroke_leaves_other_undo_groups_alone() {
+    let (_vol, mut ml, id) = c0c_scene();
+    ml.doc.set_active_layer(Some(id)).unwrap();
+    let opacity = |ml: &MeshLayers| ml.doc.layer(id).unwrap().opacity;
+    let drag = |ml: &mut MeshLayers, o: f32| {
+        let mut m = ml.doc.layer(id).unwrap().meta();
+        m.opacity = o;
+        ml.doc.set_layer_meta(id, m, true).unwrap();
+    };
+    let start = opacity(&ml);
+    drag(&mut ml, 0.8);
+    let n = ml.doc.undo_labels().len();
+    assert_eq!(ml.doc.undo_labels().last(), Some(&"Edit layer"));
+    ml.doc.begin_stroke("Sculpt layer");
+    assert!(ml.take_stroke_patch().unwrap().is_none(), "a stroke that changed nothing gave a patch");
+    assert_eq!(ml.doc.undo_labels().len(), n, "a stroke that changed nothing took a group");
+    drag(&mut ml, 0.6);
+    assert_eq!(ml.doc.undo_labels().len(), n, "the drag is no longer one step");
+    layer_dab(&mut ml.doc, Vec3::new(0.15, 0.05, 1.0), 0.1);
+    assert!(ml.take_stroke_patch().unwrap().is_some());
+    assert_eq!(ml.doc.undo_labels().len(), n, "the stroke's group stayed");
+    // (No stroke open: nothing to take.)
+    assert!(ml.take_stroke_patch().unwrap().is_none());
+    assert!(ml.doc.undo());
+    assert_eq!(opacity(&ml), start, "one undo of the drag");
 }
 
 #[test]
