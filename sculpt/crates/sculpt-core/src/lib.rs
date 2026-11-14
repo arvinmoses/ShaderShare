@@ -6,6 +6,7 @@
 pub mod bake;
 pub mod brush;
 pub mod bvh;
+pub mod decimate;
 pub mod document;
 pub mod generator;
 pub mod geom;
