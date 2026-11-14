@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use sculpt_core::generator::sculpt_layer::{LayerBlend as RowBlend, MaskKind, NoiseMask};
+use sculpt_core::LayerBlend;
 use sculpt_core::mesh_layers::{MeshLayerSettings, MeshLayers};
 
 use super::*;
+use crate::layer_ui::{MaskKind, NoiseMask};
 
 /// One frame as the app runs it: a frame's share of the dabs, the tick, the GPU taking the volume's changes, the rows.
 fn frame(mode: &mut VolumeMode) -> RowsDirty {
@@ -232,7 +233,7 @@ fn a_stroke_that_misses_adds_no_step() {
     miss(&mut mode);
     assert_eq!(mode.mesh.as_ref().unwrap().history.len(), steps, "a stroke off the model made a step");
     mode.set_layer_opacity(0, 0.7);
-    mode.close_sculpt_edit();
+    mode.close_slider_edit();
     let steps = mode.mesh.as_ref().unwrap().history.len();
     miss(&mut mode);
     assert_eq!(mode.mesh.as_ref().unwrap().history.len(), steps, "a stroke off the model after an edit made a step");
@@ -298,7 +299,7 @@ fn masks_opacity_undo_redo_and_save_open() {
     let mut mode = ball_with_layer(2e5);
     stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.1, 1.0), 0.15, Brush::Clay);
     mode.add_mesh_layer();
-    assert_eq!(mode.sculpt_layers().unwrap().1.len(), 2);
+    assert_eq!(mode.layer_rows().unwrap().1.len(), 2);
     stroke(&mut mode, Target::Detail, Vec3::new(0.1, 0.0, 1.0), 0.12, Brush::Trim);
     // Layer 0: a painted mask, painted black along a stroke; a noise mask on layer 1.
     mode.set_active_layer(0);
@@ -319,7 +320,7 @@ fn masks_opacity_undo_redo_and_save_open() {
         mode.set_layer_opacity(1, o);
         frame(&mut mode);
     }
-    mode.close_sculpt_edit();
+    mode.close_slider_edit();
     let s2 = state(ml(&mut mode));
     assert!(differ(&s1, &s2).1 > 50);
     assert!(mode.undo());
@@ -328,8 +329,8 @@ fn masks_opacity_undo_redo_and_save_open() {
     assert_eq!(differ(&state(ml(&mut mode)), &s2), (0, 0), "redo the opacity drag");
     mode.set_active_layer(1);
     mode.add_mask(MaskKind::Noise(NoiseMask::default()));
-    mode.set_layer_blend(1, RowBlend::Raise);
-    let info = mode.sculpt_layers().unwrap().1;
+    mode.set_layer_blend(1, LayerBlend::Max);
+    let info = mode.layer_rows().unwrap().1;
     assert_eq!(info[0].masks.len(), 1);
     assert_eq!(info[1].masks.len(), 1);
     assert!(matches!(info[1].masks[0].kind, MaskKind::Noise(_)));
@@ -369,7 +370,7 @@ fn masks_opacity_undo_redo_and_save_open() {
     eprintln!("second save and open: {d2:?}");
     assert_eq!(d2, (0, 0), "second save and open");
     // (Which mask is picked is not saved.)
-    let rows = |m: &VolumeMode| m.sculpt_layers().unwrap().1.into_iter().map(|mut x| {
+    let rows = |m: &VolumeMode| m.layer_rows().unwrap().1.into_iter().map(|mut x| {
         x.active_mask = None;
         x
     }).collect::<Vec<_>>();
@@ -640,7 +641,7 @@ fn undoing_a_fill_shows_the_fill_before() {
     mode.set_active_layer(0);
     mode.add_mask(MaskKind::Paint { fill: 1.0 });
     settle_frames(&mut mode);
-    let fill = |mode: &VolumeMode| match mode.sculpt_layers().unwrap().1[0].masks[0].kind {
+    let fill = |mode: &VolumeMode| match mode.layer_rows().unwrap().1[0].masks[0].kind {
         MaskKind::Paint { fill } => fill,
         _ => panic!("not a painted mask"),
     };
@@ -789,13 +790,13 @@ fn smoothing_smooths_under_every_blend() {
     let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
     let c = Vec3::new(0.0, 0.1, 1.0).normalize();
     let mut fails = Vec::new();
-    for blend in [RowBlend::Add, RowBlend::Subtract] {
+    for blend in [LayerBlend::Add, LayerBlend::Subtract] {
         for opacity in [0.5f32, 1.0, 2.0] {
             let mut mode = ball_with_layer(2.64e6);
             app_stroke(&mut mode, Target::Detail, from, to, 0.08, 0.8, Brush::Clay, 1);
             mode.set_layer_blend(0, blend);
             mode.set_layer_opacity(0, opacity);
-            mode.close_sculpt_edit();
+            mode.close_slider_edit();
             settle_frames(&mut mode);
             let mut last = bumpiness(ml(&mut mode), c, 0.2);
             let mut line = format!("{} {:.0}%: bumpiness {last:.3e}", blend.label(), opacity * 100.0);
@@ -828,10 +829,10 @@ fn strokes_on_subtract_stay_bounded() {
     let mut fails = Vec::new();
     for brush in [Brush::Clay, Brush::Trim] {
         let mut on = [0.0f32; 2];
-        for (i, blend) in [RowBlend::Add, RowBlend::Subtract].into_iter().enumerate() {
+        for (i, blend) in [LayerBlend::Add, LayerBlend::Subtract].into_iter().enumerate() {
             let mut mode = ball_with_layer(2.64e6);
             mode.set_layer_blend(0, blend);
-            mode.close_sculpt_edit();
+            mode.close_slider_edit();
             let before = across(&mut mode, true, from, to, r);
             app_stroke(&mut mode, Target::Detail, from, to, r, strength, brush, 3);
             on[i] = extreme(&before, &across(&mut mode, true, from, to, r));
@@ -934,8 +935,8 @@ fn smooth_on_a_plain_ball_stores_next_to_nothing() {
         let (b, a) = (off_ball(doc.base_positions(), doc.base_positions(), doc.faces(), c, r), off_ball(doc.positions(), doc.base_positions(), doc.faces(), c, r));
         (b.0, b.1, a.0, a.1)
     };
-    mode.set_layer_blend(0, RowBlend::Subtract);
-    mode.close_sculpt_edit();
+    mode.set_layer_blend(0, LayerBlend::Subtract);
+    mode.close_slider_edit();
     settle_frames(&mut mode);
     let sub_p99 = {
         let doc = &ml(&mut mode).doc;
@@ -1037,7 +1038,7 @@ fn layer_dab_times_at_2_5m() {
     let mut mode = big();
     let verts_in = |mode: &VolumeMode, c: Vec3, r: f32| mode.mesh.as_ref().unwrap().layers.doc.positions().iter().filter(|p| p.distance(c) < r).count();
     let mut fails = Vec::new();
-    for (blend, r) in [(RowBlend::Add, 0.098), (RowBlend::Raise, 0.098), (RowBlend::Add, 0.4), (RowBlend::Raise, 0.4)] {
+    for (blend, r) in [(LayerBlend::Add, 0.098), (LayerBlend::Max, 0.098), (LayerBlend::Add, 0.4), (LayerBlend::Max, 0.4)] {
         mode.set_layer_blend(0, blend);
         mode.target = Target::Detail;
         let d0 = Vec3::new(0.0, 0.0, 1.0);

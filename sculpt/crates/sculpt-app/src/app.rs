@@ -907,7 +907,7 @@ impl eframe::App for SculptApp {
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport_ui(ui, frame));
         // A slider let go: what it changed is one undo.
         if !ctx.input(|i| i.pointer.any_down()) {
-            self.volume.close_sculpt_edit();
+            self.volume.close_slider_edit();
         }
 
         self.stats.frame_ms = t0.elapsed().as_secs_f32() * 1e3;
