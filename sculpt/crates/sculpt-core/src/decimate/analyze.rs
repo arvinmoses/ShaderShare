@@ -31,6 +31,9 @@ pub struct AnalyzeOptions {
     pub max_valence: usize,
     /// Largest turn of a face normal a collapse may cause, in degrees.
     pub max_normal_turn_deg: f32,
+    /// Keep every border vertex where it is (otherwise borders are decimated too, sliding only along themselves), so
+    /// pieces that meet at their borders still weld after decimation.
+    pub freeze_borders: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -44,6 +47,7 @@ impl Default for AnalyzeOptions {
             round_quantile: 0.5,
             max_valence: 24,
             max_normal_turn_deg: 75.0,
+            freeze_borders: false,
         }
     }
 }
@@ -173,6 +177,11 @@ impl Analysis {
             }
         }
         drop(edges);
+        if opts.freeze_borders {
+            for (l, b) in locked.iter_mut().zip(&border) {
+                *l |= *b;
+            }
+        }
         stats.locked_vertices = locked.iter().filter(|l| **l).count();
 
         // Face planes, area weighted.

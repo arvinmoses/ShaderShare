@@ -94,6 +94,20 @@ fn borders_stay_put() {
 }
 
 #[test]
+fn frozen_borders_keep_every_border_vertex() {
+    let mut m = TriMesh::from_poly(&grid(60, 2.0));
+    for p in &mut m.positions {
+        p.y = 0.1 * (3.0 * p.x).sin() * (4.0 * p.z).cos();
+    }
+    let input = check_manifold(m.positions.len(), &m.triangles);
+    let a = Analysis::build(&m, &AnalyzeOptions { freeze_borders: true, ..Default::default() }, None).unwrap();
+    let d = a.extract(Target::KeepPercent(5.0));
+    let r = check_manifold(d.mesh.positions.len(), &d.mesh.triangles);
+    assert!(r.manifold(), "{r:?}");
+    assert_eq!(r.border_edges, input.border_edges);
+}
+
+#[test]
 fn evenness_trades_silhouette_for_even_triangles() {
     let m = lumpy(120);
     let target = Target::Triangles(6000);
