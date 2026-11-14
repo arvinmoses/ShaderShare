@@ -4,7 +4,7 @@
 
 use glam::Vec3;
 use sculpt_core::generator::level_view::LevelView;
-use sculpt_core::generator::level_volume::{BlockSurface, HashMap, Key, LevelVolume};
+use sculpt_core::generator::level_volume::{BlockSurface, HashMap, Key, LevelVolume, key_order};
 use sculpt_core::mesh::edge_counts;
 
 fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool) {
@@ -354,10 +354,10 @@ fn big_patch_view_costs() {
         for n in [6000usize, 24000] {
             let mut region: Vec<Key> = keys[keys.len() / 3..keys.len() / 3 + n].to_vec();
             let mut up: Vec<Key> = region.iter().flat_map(|k| (0..k.0).map(move |l| (l, k.1.div_euclid(glam::IVec3::splat(1 << (k.0 - l)))))).collect();
-            up.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+            up.sort_unstable_by_key(key_order);
             up.dedup();
             region.extend(up);
-            region.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+            region.sort_unstable_by_key(key_order);
             let show = sculpt_core::generator::level_volume::Show::upto(5);
             for _ in 0..2 {
                 let t = Instant::now();

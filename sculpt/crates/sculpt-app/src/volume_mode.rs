@@ -26,21 +26,6 @@ use sculpt_core::generator::level_volume::{CarryDone, EndDone, Key, LevelVolume}
 use crate::layer_ui::{LayerInfo, MaskInfo, MaskKind};
 use crate::mesh_stack::{MeshStack, RowsDirty};
 
-/// Run the calling thread below normal priority (background work: it takes what the frame leaves).
-fn lower_priority() {
-    #[cfg(windows)]
-    {
-        unsafe extern "system" {
-            fn GetCurrentThread() -> isize;
-            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
-        }
-        // THREAD_PRIORITY_BELOW_NORMAL
-        unsafe {
-            SetThreadPriority(GetCurrentThread(), -1);
-        }
-    }
-}
-
 /// While strokes run ahead of the work still landing: what a frame spends doing them for real is this less what the
 /// frame's own dabs took, at least [`CATCH_UP_MIN_MS`]. The copy is what is drawn, so the pen does not notice; the
 /// real state only catches up later.
@@ -323,7 +308,7 @@ impl VolumeMode {
         let threads = (cores / 4).max(2);
         let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("carry {i}")).build().expect("a thread pool"));
         // Below the frame's threads, so a dab never waits for its share of the cores behind them.
-        let work = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(cores).thread_name(|i| format!("work {i}")).start_handler(|_| lower_priority()).build().expect("a thread pool"));
+        let work = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(cores).thread_name(|i| format!("work {i}")).start_handler(|_| sculpt_core::lower_priority()).build().expect("a thread pool"));
         VolumeMode {
             vol,
             layer: None,

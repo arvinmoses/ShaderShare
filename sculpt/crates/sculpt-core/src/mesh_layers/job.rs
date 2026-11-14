@@ -17,7 +17,7 @@ use super::carry::{self, Geo};
 use super::extract::key_of;
 use super::{Layout, MeshLayerSettings, Patch, ms, step_of};
 use crate::document::Document;
-use crate::generator::level_volume::{Key, LevelVolume};
+use crate::generator::level_volume::{Key, LevelVolume, key_order};
 use crate::mask::{MaskContext, MaskStack, SourceValues};
 use crate::mesh::{Face, face_len, face_verts};
 use crate::{Error, Result};
@@ -230,23 +230,8 @@ fn refit_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        rayon::ThreadPoolBuilder::new().num_threads(cores).thread_name(|i| format!("refit {i}")).start_handler(|_| lower_priority()).build().expect("a thread pool")
+        rayon::ThreadPoolBuilder::new().num_threads(cores).thread_name(|i| format!("refit {i}")).start_handler(|_| crate::lower_priority()).build().expect("a thread pool")
     })
-}
-
-/// Run the calling thread below normal priority.
-fn lower_priority() {
-    #[cfg(windows)]
-    {
-        unsafe extern "system" {
-            fn GetCurrentThread() -> isize;
-            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
-        }
-        // THREAD_PRIORITY_BELOW_NORMAL
-        unsafe {
-            SetThreadPriority(GetCurrentThread(), -1);
-        }
-    }
 }
 
 /// The refit state kept beside the document: the block cache and the old geometry while idle, the job while one
@@ -322,7 +307,7 @@ impl Live {
             self.cache = None;
         }
         let mut dirty = std::mem::take(&mut self.pending);
-        dirty.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        dirty.sort_unstable_by_key(key_order);
         dirty.dedup();
         self.has_pending = false;
         let stacks = doc.layers.iter().filter_map(|l| l.mask.clone()).filter(|s| s.enabled).collect();
@@ -333,7 +318,7 @@ impl Live {
         let handle = std::thread::Builder::new()
             .name("mesh-layers-refit".into())
             .spawn(move || {
-                lower_priority();
+                crate::lower_priority();
                 refit_pool().install(move || job.run())
             })
             .expect("spawn the refit job");
@@ -470,10 +455,9 @@ fn block_changes(old: &Geom, new: Geo, layout: &Layout, rebuilt: bool, dirty: &[
     }
     set.extend(dirty.iter().copied());
     set.extend(new_blocks.iter().filter(|k| !old_blocks.contains(k)).copied());
-    let order = |k: &Key| (k.0, k.1.z, k.1.y, k.1.x);
     let mut changed: Vec<Key> = set.into_iter().filter(|k| new_blocks.contains(k)).collect();
-    changed.sort_unstable_by_key(order);
+    changed.sort_unstable_by_key(key_order);
     let mut removed: Vec<Key> = old_blocks.iter().filter(|k| !new_blocks.contains(k)).copied().collect();
-    removed.sort_unstable_by_key(order);
+    removed.sort_unstable_by_key(key_order);
     BlockChanges { changed, removed }
 }

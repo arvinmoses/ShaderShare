@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use glam::Vec3;
 use rayon::prelude::*;
 
-use crate::generator::level_volume::{BlockSurface, ExtractStats, HashMap, Key, LevelVolume, Show};
+use crate::generator::level_volume::{BlockSurface, ExtractStats, HashMap, Key, LevelVolume, Show, key_order};
 use crate::mesh::{Face, NO_VERT, PolyMesh, face_len, face_verts};
 use crate::{Error, Result};
 
@@ -44,7 +44,7 @@ pub(super) fn extract_blocks(vol: &LevelVolume, cap: usize) -> (HashMap<Key, Blo
 /// z, y, x), each block's vertices in its own order; faces as `surface_in` builds them.
 pub fn assemble(surf: &HashMap<Key, BlockSurface>, stats: ExtractStats) -> Result<Extracted> {
     let mut blocks: Vec<(Key, &BlockSurface)> = surf.iter().map(|(k, s)| (*k, s)).collect();
-    blocks.par_sort_unstable_by_key(|(k, _)| (k.0, k.1.z, k.1.y, k.1.x));
+    blocks.par_sort_unstable_by_key(|(k, _)| key_order(k));
     for (k, _) in &blocks {
         if k.1.abs().max_element() >= 1 << 15 {
             return Err(Error::InvalidData(format!("block {:?} is too far out to be named", k.1)));

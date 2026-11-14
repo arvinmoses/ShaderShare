@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use sculpt_core::DirtySet;
-use sculpt_core::generator::level_volume::Key;
+use sculpt_core::generator::level_volume::{Key, key_order};
 use sculpt_core::mesh_layers::MeshLayers;
 
 use crate::gpu_levels::{GpuLevels, Row};
@@ -182,7 +182,7 @@ impl LeafIndex {
             all.changed.append(&mut p.changed);
             all.made += p.made;
         }
-        all.whole.sort_unstable_by_key(|k| key_order(*k));
+        all.whole.sort_unstable_by_key(key_order);
         all.whole.dedup();
         all
     }
@@ -248,14 +248,9 @@ pub fn dab_blocks(ml: &MeshLayers, dirty: &DirtySet) -> Vec<Key> {
     }
 }
 
-/// A block key in the order [`MeshLayers::blocks`] are in: (level, z, y, x).
-fn key_order(k: Key) -> (u8, i32, i32, i32) {
-    (k.0, k.1.z, k.1.y, k.1.x)
-}
-
 /// Block `k`'s index in [`MeshLayers::blocks`].
 pub fn block_index(ml: &MeshLayers, k: Key) -> Option<usize> {
-    ml.blocks().binary_search_by(|b| key_order(b.0).cmp(&key_order(k))).ok()
+    ml.blocks().binary_search_by(|b| key_order(&b.0).cmp(&key_order(&k))).ok()
 }
 
 /// What one [`LayerRowsSync::sync`] did.
@@ -415,11 +410,11 @@ impl LayerRowsSync {
         }
         if swapped && !all {
             // Blocks waiting for a newer mesh that this swap did not change: the rows they hold are the new mesh's too.
-            let listed = |k: Key| list.binary_search_by(|&i| key_order(ml.blocks()[i].0).cmp(&key_order(k))).is_ok();
+            let listed = |k: Key| list.binary_search_by(|&i| key_order(&ml.blocks()[i].0).cmp(&key_order(&k))).is_ok();
             gpu.remark_rows(self.mark, |k| !listed(k));
         }
         if self.dabbed.len() > self.dabbed_room {
-            self.dabbed.sort_unstable_by_key(|k| key_order(*k));
+            self.dabbed.sort_unstable_by_key(key_order);
             self.dabbed.dedup();
             self.dabbed_room = (self.dabbed.len() * 2).max(4096);
         }

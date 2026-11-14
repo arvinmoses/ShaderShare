@@ -4,7 +4,7 @@
 use sculpt_core::generator::level_volume::HashMap;
 
 use glam::Vec3;
-use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
+use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume, key_order};
 use sculpt_core::mesh::edge_counts;
 
 /// Held alone by the test that times dabs (they are measured against each other, and the tests alongside, many of
@@ -1984,8 +1984,8 @@ fn app_ball() -> LevelVolume {
 /// Every block of `a` and `b`, bit for bit.
 fn same_blocks(a: &LevelVolume, b: &LevelVolume) -> bool {
     let (mut ka, mut kb) = (a.keys(), b.keys());
-    ka.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
-    kb.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+    ka.sort_unstable_by_key(key_order);
+    kb.sort_unstable_by_key(key_order);
     ka == kb && ka.iter().all(|&k| a.block(k).unwrap().iter().zip(b.block(k).unwrap().iter()).all(|(x, y)| x.to_bits() == y.to_bits()))
 }
 

@@ -20,7 +20,7 @@ use eframe::egui_wgpu::wgpu;
 use glam::{IVec3, Mat4, Vec3};
 use rayon::prelude::*;
 use sculpt_core::generator::level_view::LevelView;
-use sculpt_core::generator::level_volume::{HashMap as KeyMap, HashSet as KeySet, Key, LevelVolume, Show, piece_table, quantize};
+use sculpt_core::generator::level_volume::{HashMap as KeyMap, HashSet as KeySet, Key, LevelVolume, Show, key_order, piece_table, quantize};
 
 pub mod check;
 pub mod layer_check;
@@ -1037,7 +1037,7 @@ impl GpuLevels {
                 }
             }
             dirty.extend(flips);
-            dirty.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+            dirty.sort_unstable_by_key(key_order);
             dirty.dedup();
         }
         lap("choose");

@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use sculpt_core::generator::level_volume::{Key, LevelVolume};
+use sculpt_core::generator::level_volume::{Key, LevelVolume, key_order};
 use sculpt_core::mesh_layers::{MeshLayers, Patch, SwapStats};
 use sculpt_core::{DirtySet, LayerId, LayerMeta};
 
@@ -320,7 +320,7 @@ impl MeshStack {
             return false;
         }
         let mut keys: Vec<Key> = self.dirty.drain().collect();
-        keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        keys.sort_unstable_by_key(key_order);
         self.times.refit_start_ms = self.layers.refit_async(vol, &keys);
         self.started(keys);
         true
@@ -430,7 +430,7 @@ impl MeshStack {
         let t = Instant::now();
         let waiting = vol.dirty_keys();
         let mut keys: Vec<Key> = waiting.iter().copied().chain(self.dirty.drain()).collect();
-        keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        keys.sort_unstable_by_key(key_order);
         keys.dedup();
         self.layers.refit_async(vol, &keys);
         // (Not started when the last refit failed and the step changed no block: the layers stay where they are.)
@@ -621,7 +621,7 @@ impl MeshStack {
         } else {
             out.leaves.sort_unstable();
             out.leaves.dedup();
-            let order = |k: &Key| (k.0, k.1.z, k.1.y, k.1.x);
+            let order = key_order;
             out.blocks.sort_unstable_by_key(order);
             out.blocks.dedup();
             out.removed.sort_unstable_by_key(order);
@@ -678,7 +678,7 @@ impl MeshStack {
                         last = b;
                     }
                 }
-                ks.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+                ks.sort_unstable_by_key(key_order);
                 ks.dedup();
                 *slot = Some(ks.into_boxed_slice());
             }

@@ -295,6 +295,14 @@ pub type Block = Box<[f32; N]>;
 pub type Stored = Arc<[f32; N]>;
 /// A block's level and coordinates (in blocks of that level).
 pub type Key = (u8, IVec3);
+
+/// A key's place in the order blocks are kept in (level, then z, y, x), as one number: quicker to compare than the
+/// tuple, and the same order.
+#[inline]
+pub fn key_order(k: &Key) -> u128 {
+    let c = |v: i32| (v as u32 as u128) ^ (1 << 31);
+    ((k.0 as u128) << 96) | (c(k.1.z) << 64) | (c(k.1.y) << 32) | c(k.1.x)
+}
 /// One bit per sample.
 type SignMask = [u64; 8];
 
@@ -1136,7 +1144,7 @@ impl LevelVolume {
     /// Every stored block.
     pub fn keys(&self) -> Vec<Key> {
         let mut out: Vec<Key> = self.blocks.iter().enumerate().flat_map(|(l, m)| m.keys().map(move |bc| (l as u8, *bc))).collect();
-        out.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        out.sort_unstable_by_key(key_order);
         out
     }
 
@@ -1184,7 +1192,7 @@ impl LevelVolume {
 
     pub fn drain_dirty(&mut self) -> Vec<Key> {
         let mut out: Vec<Key> = self.dirty.drain().collect();
-        out.par_sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        out.par_sort_unstable_by_key(key_order);
         out
     }
 
@@ -3197,7 +3205,7 @@ impl LevelVolume {
             .flat_map(|&(l, bc)| (0..27).map(move |k| (l, bc + IVec3::new(k % 3 - 1, (k / 3) % 3 - 1, k / 9 - 1))))
             .filter(|k| !rebased_set.contains(k) && self.blocks[k.0 as usize].contains_key(&k.1))
             .collect();
-        beside.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        beside.sort_unstable_by_key(key_order);
         beside.dedup();
         self.redistance(&beside, false);
         let touched: Vec<Key> = self.stroke.as_ref().unwrap().keys().copied().collect();
@@ -4161,16 +4169,9 @@ impl LevelVolume {
         Self::unique(out)
     }
 
-    /// A key's place in the order (level, then z, y, x), as one number: quicker to compare than the tuple.
-    #[inline]
-    fn order(k: &Key) -> u128 {
-        let c = |v: i32| (v as u32 as u128) ^ (1 << 31);
-        ((k.0 as u128) << 96) | (c(k.1.z) << 64) | (c(k.1.y) << 32) | c(k.1.x)
-    }
-
     /// `keys` in order, each once (sorted over the threads).
     fn unique(mut keys: Vec<Key>) -> Vec<Key> {
-        keys.par_sort_unstable_by_key(Self::order);
+        keys.par_sort_unstable_by_key(key_order);
         keys.dedup();
         keys
     }
@@ -4459,7 +4460,7 @@ impl LevelVolume {
                 frontier = next;
             }
         }
-        out.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        out.sort_unstable_by_key(key_order);
         out.dedup();
         out
     }
@@ -4528,7 +4529,7 @@ impl LevelVolume {
             }
             out
         }).collect();
-        v.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        v.sort_unstable_by_key(key_order);
         v.dedup();
         v
     }
@@ -4843,7 +4844,7 @@ impl LevelVolume {
         let mut first: HashMap<Key, u32> = HashMap::default();
         let mut positions = Vec::new();
         let mut keys: Vec<&Key> = surf.keys().collect();
-        keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        keys.sort_unstable_by_key(|k| key_order(k));
         for k in &keys {
             first.insert(**k, positions.len() as u32);
             positions.extend_from_slice(&surf[*k].verts);

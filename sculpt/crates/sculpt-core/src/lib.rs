@@ -32,6 +32,21 @@ pub use layer_ops::{Placement, TreeRow};
 pub use preview::Preview;
 pub use layers::{LayerBlend, LayerId, LayerKind, LayerMeta, SculptLayer};
 
+/// Run the calling thread below normal priority (background work: it takes what the frame leaves).
+pub fn lower_priority() {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        // THREAD_PRIORITY_BELOW_NORMAL
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), -1);
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid mesh: {0}")]

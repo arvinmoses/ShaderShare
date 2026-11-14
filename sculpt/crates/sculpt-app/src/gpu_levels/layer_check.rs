@@ -16,7 +16,7 @@ use std::time::Instant;
 use eframe::egui_wgpu::wgpu;
 use glam::Vec3;
 use sculpt_core::brush::{self, BrushSettings, ClayBuildup};
-use sculpt_core::generator::level_volume::Key;
+use sculpt_core::generator::level_volume::{Key, key_order};
 use sculpt_core::geom::Ray;
 use sculpt_core::mesh_layers::{MeshLayerSettings, MeshLayers, SwapStats};
 use sculpt_core::{LayerBlend, LayerId};
@@ -85,7 +85,7 @@ impl Scene<'_> {
     fn refit(&mut self) {
         self.gather();
         let mut keys = std::mem::take(&mut self.changed);
-        keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        keys.sort_unstable_by_key(key_order);
         keys.dedup();
         if !keys.is_empty() {
             self.ml.refit_async(&self.mode.vol, &keys);

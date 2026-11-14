@@ -25,7 +25,7 @@ use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 
 use super::layer::GeneratorSpec;
-use super::level_volume::{EndDone, EndJob, HashMap, HashSet, Key, LevelDab, LevelVolume, Shared, Stored, StrokeEnd};
+use super::level_volume::{EndDone, EndJob, HashMap, HashSet, Key, LevelDab, key_order, LevelVolume, Shared, Stored, StrokeEnd};
 use super::volume_gen::{Anchor, GpuGen, GpuInstance, VolumeGen};
 
 const B: i32 = 8;
@@ -1300,7 +1300,7 @@ impl FollowJob {
                 let (form, stack, region, blocks) = (&self.form, &self.stack, &self.region, shown.clone());
                 Some(land.work(&force, |vol| {
                     let mut sorted = region.clone();
-                    sorted.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+                    sorted.sort_unstable_by_key(key_order);
                     for &key in &sorted {
                         if !composed(&mid, key.0 as usize, key.1) {
                             vol.mirror(form, key);
@@ -1899,7 +1899,7 @@ impl Layered {
         }
         // The form's blocks again, coarsest first, where `shown` held work that the layers have (and is not theirs).
         let mut back: Vec<Key> = detail.keys().into_iter().chain(shown.keys()).filter(|k| (k.0 as usize) >= self.from && !composed(&self.stack, k.0 as usize, k.1)).collect();
-        back.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        back.sort_unstable_by_key(key_order);
         back.dedup();
         for key in back {
             shown.mirror(&self.form, key);
@@ -2597,7 +2597,7 @@ impl Layered {
             }
         }
         let mut sorted = region.clone();
-        sorted.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
+        sorted.sort_unstable_by_key(key_order);
         // (The layers' levels only where no layer is composed: their blocks there are composed below, or stay.)
         if after.is_none() {
             for &key in &sorted {
