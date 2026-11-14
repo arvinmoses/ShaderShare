@@ -1,5 +1,7 @@
 # Spike 1: GPU compute displacement boolean
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Question: can the displacement boolean (spike A in `spike_results.md`) run as a wgpu compute shader so a
 slider drag with up to 100k instances on a ~6M face mesh is interactive?
 

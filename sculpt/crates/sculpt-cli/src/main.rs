@@ -5,29 +5,18 @@
 //! sculpt-cli bench [level]             brush latency on a dense sphere
 //! sculpt-cli generator-bench [levels] [counts] [--no-voxel] [--mixed]   Generator Boolean spike timings
 //! sculpt-cli generator-edit-bench [levels] [count]   Time of each kind of generator layer edit
-//! sculpt-cli refine-bench <quality|time|cracks|dump> ...   Generator boundary refinement (spike 3)
-//! sculpt-cli adf-bench perf|quality [...]   Spike 6: adaptively sampled distance field boolean
-//! sculpt-cli generator-drag-sim [levels] [counts] [--view ..]           Generator slider-drag scheduler simulation
 //! sculpt-cli info  <project_dir>       summarize a project
 //! sculpt-cli import-channel <project_dir> <name> <file>
 //! sculpt-cli render <project_dir> <out.png>
 //! ```
 
-mod adf_bench;
 mod generator_bench;
 mod generator_edit_bench;
-mod refine_bench;
-mod generator_drag_sim;
 mod render;
-mod render_mesh;
 mod rock;
-mod rock_field;
 mod rock_layers;
-mod rock_tiers;
 mod solid_bench;
 mod levels_carry;
-mod multilevel_spike;
-mod volume_spike;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -53,26 +42,16 @@ fn main() {
         Some("bench") => bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9)),
         Some("generator-bench") => generator_bench::run(&args[1..]),
         Some("generator-edit-bench") => generator_edit_bench::run(&args[1..]),
-        Some("refine-bench") => refine_bench::run(&args[1..]),
         Some("rock") => rock::run(&args[1..]),
-        Some("rock-field") => rock_field::run(&args[1..]),
         Some("rock-layers") => rock_layers::run(&args[1..]),
-        Some("rock-tiers") => rock_tiers::run(&args[1..]),
         Some("solid-bench") => solid_bench::run(&args[1..]),
-        Some("volume-spike") if args.get(1).is_some_and(|a| a == "levels") => volume_spike::levels(&args[2..]),
-        Some("volume-spike") if args.get(1).is_some_and(|a| a == "video") => volume_spike::video(&args[2..]),
-        Some("volume-spike") if args.get(1).is_some_and(|a| a == "brushes") => volume_spike::brushes(&args[2..]),
-        Some("volume-spike") if args.get(1).is_some_and(|a| a == "multilevel") => multilevel_spike::run(&args[2..]),
         Some("volume-spike") if args.get(1).is_some_and(|a| a == "levels-carry") => levels_carry::run(&args[2..]),
-        Some("volume-spike") => volume_spike::run(&args[1..]),
-        Some("adf-bench") => adf_bench::run(&args[1..]),
-        Some("generator-drag-sim") => generator_drag_sim::run(&args[1..]),
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
         Some("import-channel") if args.len() == 4 => import_channel(Path::new(&args[1]), &args[2], Path::new(&args[3])),
         Some("render") if args.len() == 3 => render_project(Path::new(&args[1]), Path::new(&args[2])),
         _ => {
             eprintln!(
-                "usage: sculpt-cli demo [out] | bench [level] | generator-bench [levels] [counts] | refine-bench <quality|time|cracks|dump> | adf-bench perf|quality | generator-drag-sim [levels] [counts] | info <project> | import-channel <project> <name> <file> | render <project> <png>"
+                "usage: sculpt-cli demo [out] | bench [level] | generator-bench [levels] [counts] | info <project> | import-channel <project> <name> <file> | render <project> <png>"
             );
             std::process::exit(2);
         }

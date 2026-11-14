@@ -1,5 +1,7 @@
 # Hand-off prompt: build the Generator Boolean layer (local session)
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Paste everything below the line into a new Claude Code session running **on the user's own machine**,
 in a clone of `arvinmoses/ShaderShare`, on branch `ccr-32ffc09b-o5mvh1` (all work is on it and pushed).
 The app lives in `sculpt/` (Cargo workspace: `sculpt-core`, `sculpt-cli`, `sculpt-app`).

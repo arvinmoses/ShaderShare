@@ -8,7 +8,7 @@ use sculpt_core::generator::density::Density;
 use sculpt_core::generator::layer::{EdgeSide, GeneratorSpec, PlaceOn};
 use sculpt_core::generator::volume_gen::VolumeGen;
 use sculpt_core::generator::level_volume::LevelVolume;
-use sculpt_core::generator::levels::edge_counts;
+use sculpt_core::mesh::edge_counts;
 use sculpt_core::generator::{BoolOp, Instance, Primitive};
 
 struct Lv {

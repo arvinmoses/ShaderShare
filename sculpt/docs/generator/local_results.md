@@ -1,5 +1,7 @@
 # Local benchmark results (real GPU)
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Machine: Windows 11 Home (build 26200), 24 CPU threads, rustc 1.97.0.
 GPU: AMD Radeon AI PRO R9700 (discrete, Vulkan, AMD proprietary driver 25.20.42.14 / LLPC; a second R9700 and an
 integrated Radeon are present, wgpu picked the first discrete one). Timestamp queries available.

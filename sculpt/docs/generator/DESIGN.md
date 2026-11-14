@@ -1,5 +1,7 @@
 # Generator Boolean layer: design
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Status: proposal. The boolean strategy (displacement, voxel, or hybrid) is decided
 by the measurements in `spike_results.md`. Everything else here is independent of it.
 

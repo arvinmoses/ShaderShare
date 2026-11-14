@@ -2,9 +2,7 @@
 //!
 //! * [`sdf`]: analytic primitive signed distance fields.
 //! * [`instances`]: instance transforms and the spatial hash over their AABBs.
-//! * [`schedule`]: LOD-aware, time-budgeted progressive evaluation (interactive drag scheduler).
 //! * [`place`]: mask-weighted surface sampling and sharp-edge sampling.
-//! * [`refine`]: SPIKE 3, adaptive boundary refinement (temporary crisp patches).
 //! * [`voxel`]: SPIKE B timing code (sparse brick SDF + surface nets). Measurement
 //!   only, not a feature implementation.
 //!
@@ -31,20 +29,16 @@
 //!   therefore never make an overhang or undercut; the result is single-valued
 //!   along each vertex normal.
 
-pub mod adf;
 pub mod density;
 pub mod instances;
 pub mod layer;
 pub mod detail_layer;
 pub mod level_view;
 pub mod level_volume;
-pub mod levels;
 pub mod mapping;
 pub mod place;
-pub mod refine;
 pub mod sculpt_layer;
 pub mod remesh;
-pub mod schedule;
 pub mod sdf;
 pub mod volume;
 pub mod voxel;

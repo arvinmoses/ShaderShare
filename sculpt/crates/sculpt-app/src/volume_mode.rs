@@ -2638,7 +2638,7 @@ mod tests {
         }
         same(&end, &print(&ahead)).unwrap_or_else(|e| panic!("{name}: redoing everything did not bring back the end: {e}"));
         let (mesh, _) = ahead.vol.surface(ahead.vol.levels() - 1);
-        assert_eq!(sculpt_core::generator::levels::edge_counts(&mesh.faces).0, 0, "{name}: the surface has open edges");
+        assert_eq!(sculpt_core::mesh::edge_counts(&mesh.faces).0, 0, "{name}: the surface has open edges");
         eprintln!("{name}: the same after every one of {undone} undos and redos");
         (ran, ahead.adopted)
     }
@@ -3211,7 +3211,7 @@ mod tests {
                 mode.tick();
                 if watch {
                     let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
-                    let (open, nm) = sculpt_core::generator::levels::edge_counts(&mesh.faces);
+                    let (open, nm) = sculpt_core::mesh::edge_counts(&mesh.faces);
                     let mut sizes = pieces(&mesh);
                     sizes.sort_unstable();
                     let small = sizes.iter().filter(|&&s| s < sculpt_core::generator::level_volume::SPECK_VERTS).count();
@@ -3609,7 +3609,7 @@ mod tests {
         let history = |m: &VolumeMode| m.layer.as_ref().map_or(0, |l| l.history_len());
         let before = history(&mode);
         let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
-        let open0 = sculpt_core::generator::levels::edge_counts(&mesh.faces);
+        let open0 = sculpt_core::mesh::edge_counts(&mesh.faces);
 
         // The stroke, seen from far (eye about 3 from the surface, focal 1100 px), a frame after each dab.
         mode.target = Target::Form;
@@ -3645,7 +3645,7 @@ mod tests {
         assert!(bumps0 > 0.0008, "the layer does not hold the bumps");
         assert!(bumps1 > 0.9 * bumps0 && bumps1 < 1.1 * bumps0, "the bumps did not ride the form whole");
         let (mesh, _) = mode.vol.surface(mode.vol.levels() - 1);
-        let open1 = sculpt_core::generator::levels::edge_counts(&mesh.faces);
+        let open1 = sculpt_core::mesh::edge_counts(&mesh.faces);
         eprintln!("open and tangled edges {open0:?} -> {open1:?}; {} pieces", pieces(&mesh).len());
         assert_eq!(open1.0, 0, "the surface has open edges");
 

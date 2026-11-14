@@ -6,7 +6,7 @@ use std::time::Instant;
 use glam::Vec3;
 use sculpt_core::generator::detail_layer::Layered;
 use sculpt_core::generator::level_volume::LevelVolume;
-use sculpt_core::generator::levels::edge_counts;
+use sculpt_core::mesh::edge_counts;
 
 fn check(v: &LevelVolume, cap: usize) -> (usize, usize, usize) {
     let (mesh, stats) = v.surface(cap);

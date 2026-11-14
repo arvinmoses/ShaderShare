@@ -1,5 +1,7 @@
 # Generator Boolean spike 4: LOD-aware evaluation and progressive refinement
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Follows `spike_results.md` (spike 3) and `DESIGN.md`. Question: can the CPU displacement boolean (spike A) stay inside an interactive frame (16 ms) while a slider is dragged, even at 100k instances on a 6.3M-face mesh, where spike 3 measured 278 ms?
 
 ## TL;DR

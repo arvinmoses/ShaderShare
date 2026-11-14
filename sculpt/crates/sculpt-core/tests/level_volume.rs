@@ -5,7 +5,7 @@ use sculpt_core::generator::level_volume::HashMap;
 
 use glam::Vec3;
 use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
-use sculpt_core::generator::levels::edge_counts;
+use sculpt_core::mesh::edge_counts;
 
 /// Held alone by the test that times dabs (they are measured against each other, and the tests alongside, many of
 /// them on every core, slowed its quickest dab several times over); shared by every other.

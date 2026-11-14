@@ -5,7 +5,7 @@
 use glam::Vec3;
 use sculpt_core::generator::level_view::LevelView;
 use sculpt_core::generator::level_volume::{BlockSurface, HashMap, Key, LevelVolume};
-use sculpt_core::generator::levels::edge_counts;
+use sculpt_core::mesh::edge_counts;
 
 fn stroke(v: &mut LevelVolume, l: usize, a: Vec3, b: Vec3, r: f32, trim: bool) {
     v.begin_stroke();

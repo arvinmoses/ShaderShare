@@ -1,5 +1,7 @@
 # Spike 6: Adaptively Sampled Distance Field (ADF) boolean
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Code: `crates/sculpt-core/src/generator/adf.rs` (spike, not wired into `Document`), tests in
 `crates/sculpt-core/tests/adf.rs`, benchmark `sculpt-cli adf-bench`. Context: `DESIGN.md`,
 `spike_results.md` (A = displacement boolean, B = uniform sparse bricks + surface nets).

@@ -1,5 +1,7 @@
 # Spike 5: GPU sparse-SDF boolean for the Generator Boolean layer
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Question: does moving the true voxel/SDF boolean ("B" in `spike_results.md`) to the GPU make it interactive?
 Code: `crates/sculpt-app/src/gpu_sdf/` (`mod.rs`, `sdf.wgsl`, `bench.rs`, `check.rs`, `render.rs`, `render.wgsl`), plus
 `MeshSdf::flatten` / `pseudo_normals` in `sculpt-core` (`generator/voxel.rs`) so the GPU can use the same closest-point structure as the CPU code.

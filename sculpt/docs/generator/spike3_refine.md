@@ -1,5 +1,7 @@
 # Spike 3: adaptive boundary refinement for the displacement boolean
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Code: `crates/sculpt-core/src/generator/refine.rs` (new), CLI: `sculpt-cli refine-bench`
 (`crates/sculpt-cli/src/refine_bench.rs`, `render_mesh.rs`), tests: `crates/sculpt-core/tests/refine.rs`.
 Context: `DESIGN.md`, `spike_results.md` (spike A = per-vertex displacement boolean).

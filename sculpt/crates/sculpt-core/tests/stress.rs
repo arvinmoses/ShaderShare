@@ -14,7 +14,7 @@ use sculpt_core::generator::density::Density;
 use sculpt_core::generator::detail_layer::Layered;
 use sculpt_core::generator::layer::{EdgeSide, GeneratorSpec, PlaceOn};
 use sculpt_core::generator::level_volume::{Key, LevelVolume};
-use sculpt_core::generator::levels::edge_counts;
+use sculpt_core::mesh::edge_counts;
 use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::noise::NoiseKind;
 use sculpt_core::surface_noise::SurfaceNoise;

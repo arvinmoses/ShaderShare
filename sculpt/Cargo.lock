@@ -2150,7 +2150,6 @@ dependencies = [
  "png",
  "rayon",
  "sculpt-core",
- "serde_json",
 ]
 
 [[package]]

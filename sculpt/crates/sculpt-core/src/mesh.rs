@@ -215,3 +215,16 @@ pub fn permute<T: Copy + Default + Send + Sync>(old_to_new: &[u32], data: &[T]) 
 pub fn unpermute<T: Copy + Default + Send + Sync>(old_to_new: &[u32], data: &[T]) -> Vec<T> {
     old_to_new.par_iter().map(|&new| data[new as usize]).collect()
 }
+
+/// Edges with one face, and edges with more than two, over quads and triangles.
+pub fn edge_counts(faces: &[[u32; 4]]) -> (usize, usize) {
+    let mut count: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for f in faces {
+        let n = if f[3] == NO_VERT { 3 } else { 4 };
+        for k in 0..n {
+            let (a, b) = (f[k], f[(k + 1) % n]);
+            *count.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    (count.values().filter(|&&c| c == 1).count(), count.values().filter(|&&c| c > 2).count())
+}

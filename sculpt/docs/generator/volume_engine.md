@@ -1,5 +1,7 @@
 # The volume engine: several resolutions, surface on the GPU
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Code: `sculpt-core/src/generator/level_volume.rs` (the field, brushes, history, files, the reference extractor),
 `sculpt-app/src/gpu_levels/` (the GPU copy, extraction, culling), `sculpt-app/src/volume_mode.rs` (the playground),
 `sculpt-app/src/volume_demo.rs` (the scripted review session). Tests: `sculpt-core/tests/level_volume.rs`,

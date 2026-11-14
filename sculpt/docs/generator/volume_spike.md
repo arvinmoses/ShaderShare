@@ -1,5 +1,7 @@
 # Spike: volume sculpting (can a volume brush keep up?)
 
+> The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
+
 Code: `crates/sculpt-core/src/generator/volume.rs` (spike, not wired into the app or the document), benchmark
 `sculpt-cli volume-spike [millions] [--images DIR]`. Measured on this machine (24 threads, 64 GB), CPU only.
 
