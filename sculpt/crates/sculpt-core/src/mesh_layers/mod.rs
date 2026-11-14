@@ -351,6 +351,10 @@ impl MeshLayers {
             last = self.wait(vol);
         }
         self.refit_async(vol, dirty, changed);
+        if !self.busy() && self.refit_failed() {
+            // No new blocks after a failed refit: none ran, and the layers are not at `vol`.
+            return Err(crate::Error::InvalidData("the last refit failed and no new blocks came".into()));
+        }
         while self.busy() {
             last = self.wait(vol);
         }
