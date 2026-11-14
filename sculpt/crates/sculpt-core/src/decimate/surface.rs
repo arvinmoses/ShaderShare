@@ -141,7 +141,7 @@ impl Surface {
     /// The first point of the surface on the segment `o + t d`, `t` in `0..=max_t` (`d` of unit length), walking the
     /// grid cell by cell along it.
     pub fn ray(&self, o: Vec3, d: Vec3, max_t: f32) -> Option<Hit> {
-        if d.length_squared() == 0.0 {
+        if d.length_squared() == 0.0 || !o.is_finite() || !d.is_finite() || !max_t.is_finite() {
             return None;
         }
         let rel = (o - self.min) / self.h;
@@ -162,7 +162,9 @@ impl Surface {
             }
         }
         let mut best: Option<Hit> = None;
-        loop {
+        // Cells the segment can cross, as a guard.
+        let cells = 3 * (max_t / self.h).ceil().min(1e6) as usize + 6;
+        for _ in 0..cells {
             if let Some(&(s, e)) = self.cells.get(&key(c)) {
                 for &f in &self.ids[s as usize..e as usize] {
                     let t = self.mesh.triangles[f as usize];
@@ -184,6 +186,7 @@ impl Surface {
             c[k] += step[k];
             next[k] += delta[k];
         }
+        best
     }
 }
 

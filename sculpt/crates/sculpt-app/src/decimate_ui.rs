@@ -20,7 +20,7 @@
 //! * Closing the window drops the preview (and the analyses) and shows the volume again.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
@@ -43,6 +43,8 @@ const MAP_SIZES: [usize; 5] = [256, 512, 1024, 2048, 4096];
 const LIVE_MAP: usize = 256;
 /// The tessellated preview is held to about this many triangles (the level drops on big outputs).
 const TESS_BUDGET: usize = 3_000_000;
+/// Outputs bigger than this are not previewed (UVs and tessellation run on the frame).
+const PREVIEW_MAX: usize = 1_000_000;
 
 /// Points sampled on each mesh for the surface error.
 const ERROR_SAMPLES: usize = 100_000;
@@ -74,6 +76,14 @@ struct Job {
     key: i32,
     progress: Arc<Progress>,
     rx: Receiver<Option<Analysis>>,
+}
+
+/// Maps for output `generation` at `res`, baked off the frame (with their bake time).
+struct BakeJob {
+    generation: u64,
+    res: usize,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Option<(Maps, f32)>>,
 }
 
 /// Closed/manifold and the surface error of output `generation`, measured off the frame.
@@ -132,7 +142,10 @@ pub struct Decimate {
     strength: f32,
     baker: Option<Arc<Baker>>,
     /// UVs and maps of output `generation` (maps at the size given), the tessellated mesh shown, and its timings.
-    uv: Option<(u64, UvMesh)>,
+    uv: Option<(u64, Arc<UvMesh>)>,
+    bake_job: Option<BakeJob>,
+    uv_ms: f32,
+    bake_ms: f32,
     maps: Option<(u64, Maps)>,
     tess: Option<(Arc<TriMesh>, Arc<Vec<[Vec2; 3]>>)>,
     tess_note: String,
@@ -208,6 +221,9 @@ impl Decimate {
             strength: 1.0,
             baker: None,
             uv: None,
+            bake_job: None,
+            uv_ms: 0.0,
+            bake_ms: 0.0,
             maps: None,
             tess: None,
             tess_note: String::new(),
@@ -221,7 +237,7 @@ impl Decimate {
 
     /// Work still under way that a screenshot should wait for.
     pub fn busy(&self) -> bool {
-        self.job.is_some() || self.surface_rx.is_some() || self.check.is_some() || self.gpu_dirty || (self.script.is_some() && !self.script_started)
+        self.job.is_some() || self.bake_job.is_some() || self.surface_rx.is_some() || self.check.is_some() || self.gpu_dirty || (self.script.is_some() && !self.script_started)
     }
 
     fn target(&self) -> Target {
@@ -239,6 +255,7 @@ impl Decimate {
                 self.surface = None;
                 self.baker = None;
                 self.uv = None;
+                self.cancel_bake();
                 self.maps = None;
                 self.tess = None;
                 let (tx, rx) = channel();
@@ -346,60 +363,96 @@ impl Decimate {
         }
     }
 
-    /// The tessellate + displace preview of the output: UVs and maps made again only when the output (or the map
-    /// size) changed. `live`: a small map, for scrubbing.
+    /// The tessellate + displace / normal map preview of the output. UVs are made again only when the output changed;
+    /// a small map is baked at once when there is none for this output, and the size set is baked off the frame
+    /// (`live`: not, while a slider drags) and swapped in when ready.
     fn preview(&mut self, live: bool) {
         self.tess = None;
         self.gpu_dirty = true;
         if !self.displace && !self.nmap {
+            self.cancel_bake();
             return;
         }
         let (Some(out), Some(baker)) = (self.result.clone(), self.baker.clone()) else {
             self.tess_note = "Waiting for the input surface…".into();
             return;
         };
-        let g = self.generation;
-        let t = Instant::now();
-        if self.uv.as_ref().is_none_or(|u| u.0 != g) {
-            self.uv = Some((g, quick_uv(&out, 4.0 / 1024.0)));
-            self.maps = None;
+        if out.triangles.len() > PREVIEW_MAX {
+            self.cancel_bake();
+            self.tess_note = format!("The preview is for outputs up to {} triangles", fmt_count(PREVIEW_MAX));
+            return;
         }
-        let uv_ms = t.elapsed().as_secs_f32() * 1e3;
-        let res = if live { LIVE_MAP.min(self.map_res) } else { self.map_res };
-        let uv = &self.uv.as_ref().unwrap().1;
-        let t = Instant::now();
-        if self.maps.as_ref().is_none_or(|m| m.0 != g || (!live && m.1.res != res)) {
-            let edge = mean_edge(&out);
-            match baker.bake(uv, res, 1.5 * edge, None) {
-                Some(m) => {
-                    self.maps = Some((g, m));
-                    self.map_dirty = true;
-                }
-                None => return,
+        let g = self.generation;
+        if self.uv.as_ref().is_none_or(|u| u.0 != g) {
+            let t = Instant::now();
+            self.uv = Some((g, Arc::new(quick_uv(&out, 4.0 / 1024.0))));
+            self.uv_ms = t.elapsed().as_secs_f32() * 1e3;
+            self.maps = None;
+            self.cancel_bake();
+        }
+        let uv = self.uv.as_ref().unwrap().1.clone();
+        let max_dist = 1.5 * mean_edge(&out);
+        if self.maps.as_ref().is_none_or(|m| m.0 != g) {
+            let t = Instant::now();
+            let Some(m) = baker.bake(&uv, LIVE_MAP.min(self.map_res), max_dist, None) else { return };
+            self.bake_ms = t.elapsed().as_secs_f32() * 1e3;
+            self.maps = Some((g, m));
+            self.map_dirty = true;
+        }
+        let res = self.map_res;
+        if live {
+            self.cancel_bake();
+        } else if self.maps.as_ref().is_some_and(|m| m.1.res != res) && self.bake_job.as_ref().is_none_or(|j| j.generation != g || j.res != res) {
+            self.cancel_bake();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = channel();
+            let c = cancel.clone();
+            let spawned = std::thread::Builder::new().name("decimate bake".into()).spawn(move || {
+                let t = Instant::now();
+                let m = baker.bake(&uv, res, max_dist, Some(&c));
+                let _ = tx.send(m.map(|m| (m, t.elapsed().as_secs_f32() * 1e3)));
+            });
+            if spawned.is_ok() {
+                self.bake_job = Some(BakeJob { generation: g, res, cancel, rx });
             }
         }
-        let bake_ms = t.elapsed().as_secs_f32() * 1e3;
-        let maps = &self.maps.as_ref().unwrap().1;
+        self.build_view();
+    }
+
+    /// The mesh shown for the preview from the UVs and maps there are: tessellated and displaced, or the output split
+    /// along its UV seams (for the normal map alone).
+    fn build_view(&mut self) {
+        let (Some((_, uv)), Some((_, maps)), Some(out)) = (self.uv.as_ref(), self.maps.as_ref(), self.result.as_ref()) else { return };
+        let baking = match self.bake_job.as_ref() {
+            Some(j) => format!(" ({}² baking…)", j.res),
+            None => String::new(),
+        };
+        let maps_note = format!("{} charts, map {}²{baking}  ·  UV {:.1} ms, bake {:.0} ms", uv.charts, maps.res, self.uv_ms, self.bake_ms);
         if !self.displace {
             let low = TriMesh { positions: uv.positions.clone(), triangles: uv.triangles.clone() };
             let corners: Vec<[Vec2; 3]> = uv.triangles.iter().map(|t| t.map(|v| uv.uvs[v as usize])).collect();
-            self.tess_note = format!("{} charts, map {}²  ·  UV {uv_ms:.1} ms, bake {bake_ms:.0} ms", uv.charts, maps.res);
+            self.tess_note = maps_note;
             self.tess = Some((Arc::new(low), Arc::new(corners)));
-            return;
+        } else {
+            let fit = ((TESS_BUDGET as f32 / out.triangles.len().max(1) as f32).sqrt() as usize).max(1);
+            let level = self.level.min(fit);
+            let t = Instant::now();
+            let tess = tessellate(uv, maps, level, self.strength);
+            self.tess_note = format!(
+                "{} triangles (level {level}{})  ·  {maps_note}, tessellate {:.0} ms",
+                fmt_count(tess.mesh.triangles.len()),
+                if level < self.level { ", held down for size" } else { "" },
+                t.elapsed().as_secs_f32() * 1e3,
+            );
+            self.tess = Some((Arc::new(tess.mesh), Arc::new(tess.corner_uvs)));
         }
-        let fit = ((TESS_BUDGET as f32 / out.triangles.len().max(1) as f32).sqrt() as usize).max(1);
-        let level = self.level.min(fit);
-        let t = Instant::now();
-        let tess = tessellate(uv, maps, level, self.strength);
-        let tess_ms = t.elapsed().as_secs_f32() * 1e3;
-        self.tess_note = format!(
-            "{} triangles (level {level}{}), {} charts, map {}²  ·  UV {uv_ms:.1} ms, bake {bake_ms:.0} ms, tessellate {tess_ms:.0} ms",
-            fmt_count(tess.mesh.triangles.len()),
-            if level < self.level { ", held down for size" } else { "" },
-            uv.charts,
-            maps.res,
-        );
-        self.tess = Some((Arc::new(tess.mesh), Arc::new(tess.corner_uvs)));
+        self.gpu_dirty = true;
+    }
+
+    fn cancel_bake(&mut self) {
+        if let Some(j) = self.bake_job.take() {
+            j.cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The mesh to show and its corner UVs: the preview when one is on (the tessellated mesh, or the output split
@@ -465,6 +518,22 @@ impl Decimate {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        if let Some(j) = self.bake_job.as_ref() {
+            match j.rx.try_recv() {
+                Ok(Some((m, ms))) => {
+                    let g = j.generation;
+                    self.bake_job = None;
+                    if self.uv.as_ref().is_some_and(|u| u.0 == g) {
+                        self.maps = Some((g, m));
+                        self.bake_ms = ms;
+                        self.map_dirty = true;
+                        self.build_view();
+                    }
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => self.bake_job = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         if let Some(c) = self.check.as_ref() {
             match c.rx.try_recv() {
                 Ok((report, err, ms)) => {
@@ -505,6 +574,7 @@ impl Decimate {
         self.surface_rx = None;
         self.baker = None;
         self.uv = None;
+        self.cancel_bake();
         self.maps = None;
         self.tess = None;
         self.cache.clear();
@@ -756,7 +826,7 @@ pub fn window(app: &mut SculptApp, ctx: &egui::Context) {
     if !d.open && (d.input.is_some() || d.job.is_some()) {
         d.close();
     }
-    if d.job.is_some() || d.check.is_some() {
+    if d.job.is_some() || d.check.is_some() || d.bake_job.is_some() {
         ctx.request_repaint();
     }
 
