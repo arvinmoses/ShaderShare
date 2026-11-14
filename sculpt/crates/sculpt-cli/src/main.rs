@@ -8,8 +8,10 @@
 //! sculpt-cli info  <project_dir>       summarize a project
 //! sculpt-cli import-channel <project_dir> <name> <file>
 //! sculpt-cli render <project_dir> <out.png>
+//! sculpt-cli decimate-compare [out_dir] [seed] [voxel]   noisy rock decimated, wireframe grids
 //! ```
 
+mod decimate_compare;
 mod generator_bench;
 mod generator_edit_bench;
 mod render;
@@ -44,6 +46,7 @@ fn main() {
         Some("generator-edit-bench") => generator_edit_bench::run(&args[1..]),
         Some("rock") => rock::run(&args[1..]),
         Some("rock-layers") => rock_layers::run(&args[1..]),
+        Some("decimate-compare") => decimate_compare::run(&args[1..]),
         Some("solid-bench") => solid_bench::run(&args[1..]),
         Some("volume-spike") if args.get(1).is_some_and(|a| a == "levels-carry") => levels_carry::run(&args[2..]),
         Some("info") if args.len() == 2 => info(Path::new(&args[1])),
