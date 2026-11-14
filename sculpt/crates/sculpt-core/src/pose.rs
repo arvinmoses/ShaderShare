@@ -8,6 +8,8 @@
 //! Poses transform the base mesh *and rotate every layer's deltas* by the
 //! same per-vertex rotation, so sculpted detail on layers follows the limb
 //! instead of shearing off.
+//!
+//! Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

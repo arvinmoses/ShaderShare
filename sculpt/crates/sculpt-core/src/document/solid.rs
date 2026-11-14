@@ -7,6 +7,8 @@
 //!
 //! A generator layer scatters on the surface *below* it, so each layer after the first gets a coarse extraction of the
 //! field so far to scatter on. That is what lets small chips land on the faces a big cut made.
+//!
+//! Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;

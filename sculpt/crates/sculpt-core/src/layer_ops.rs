@@ -9,6 +9,11 @@
 //!
 //! Every structural edit is a list of reversible [`StructOp`]s recorded in the
 //! normal undo stack, so undo and redo treat strokes and structure alike.
+//!
+//! Old mesh-mode code, mostly: the tree operations (folders, ordering, grouping, duplicate, merge down, solo, pasting
+//! masks, inserting generators) are reached only from sculpt-cli and the tests, not the app. The app reaches the
+//! scale and composite bookkeeping, [`Document::delete_layer`] (through `remove_layer`),
+//! [`Document::set_layer_meta`] and [`paint_channel`].
 
 use std::collections::{BTreeSet, HashMap};
 

@@ -3,6 +3,8 @@
 //! A preview is a `res x res` grid seen from the front (looking down -Z at the rest pose). It is built
 //! from a bounded number of vertices per spatial leaf, so cost scales with the leaf count, not the face
 //! count, and it never touches the sculpt path.
+//!
+//! Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.
 
 use glam::Vec3;
 

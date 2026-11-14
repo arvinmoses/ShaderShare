@@ -14,6 +14,8 @@
 //! distance to the sculpted surface and the old stack's field, and that difference is added to the new stack's field
 //! before one extraction. The result can never fold or tear, wherever the stack moved; the sculpt is baked into the new
 //! base, and the layers start empty again.
+//!
+//! Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.
 
 use std::collections::BTreeMap;
 

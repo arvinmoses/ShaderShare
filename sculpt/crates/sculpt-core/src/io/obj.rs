@@ -1,5 +1,7 @@
 //! Wavefront OBJ (positions + polygons). Vertex order is preserved exactly,
 //! which is what makes per-vertex data from other programs line up.
+//!
+//! Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.
 
 use std::fmt::Write as _;
 use std::path::Path;

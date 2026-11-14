@@ -225,6 +225,8 @@ pub enum SmoothMode {
     Surface,
 }
 
+/// Smooth on a mesh document, by [`SmoothMode`].
+/// (Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.)
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Smooth {
     pub mode: SmoothMode,
@@ -484,6 +486,8 @@ impl SmoothTarget {
 /// Per leaf: `(local vertex, weight, position at grab time)`.
 type Grab = Vec<(u32, Vec<(u32, f32, Vec3)>)>;
 
+/// The Move brush: grabs the vertices under the cursor as a stroke starts and drags them with it (see above).
+/// (Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.)
 #[derive(Debug, Default)]
 pub struct MoveBrush {
     pub topological: bool,
@@ -561,6 +565,7 @@ impl MoveBrush {
 // ---------------------------------------------------------------------- Paint
 
 /// Paints freeze or a mask channel (towards `value`).
+/// (Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.)
 #[derive(Clone, Debug)]
 pub struct PaintBrush {
     pub target: PaintTarget,
@@ -583,6 +588,7 @@ impl Brush for PaintBrush {
 // --------------------------------------------------------------------- Stroke
 
 /// Turns a stream of surface samples into evenly spaced dabs.
+/// (Old mesh-mode code: reached only from sculpt-cli and the tests, not the app.)
 #[derive(Debug)]
 pub struct StrokeSampler {
     pub spacing: f32,
