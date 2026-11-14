@@ -113,14 +113,18 @@ pub fn split_mlay(bytes: &mut Vec<u8>) -> std::io::Result<Option<Vec<u8>>> {
     if n < 24 || &bytes[n - 4..] != b"MLAY" {
         return Ok(None);
     }
-    let back = u64::from_le_bytes(bytes[n - 12..n - 4].try_into().unwrap()) as usize;
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "a damaged mesh layers chunk");
+    let back = usize::try_from(u64::from_le_bytes(bytes[n - 12..n - 4].try_into().unwrap())).map_err(|_| bad())?;
+    // (A chunk is at least its two marks and two lengths.)
+    if back < 24 {
+        return Err(bad());
+    }
     let start = n.checked_sub(back).ok_or_else(bad)?;
     if &bytes[start..start + 4] != b"MLAY" {
         return Err(bad());
     }
-    let len = u64::from_le_bytes(bytes[start + 4..start + 12].try_into().unwrap()) as usize;
-    if start + 12 + len + 12 != n {
+    let len = usize::try_from(u64::from_le_bytes(bytes[start + 4..start + 12].try_into().unwrap())).map_err(|_| bad())?;
+    if len.checked_add(24) != Some(back) {
         return Err(bad());
     }
     let body = bytes[start + 12..start + 12 + len].to_vec();
@@ -139,9 +143,11 @@ impl MeshStack {
         }
         let at = cur.position() as usize;
         let mut stack = MeshStack::new(layers, HashSet::new());
+        // (The notes are optional: damaged, they are left out.)
         if body.len() >= at + 8 {
-            let len = u64::from_le_bytes(body[at..at + 8].try_into().unwrap()) as usize;
-            if let Some(json) = body.get(at + 8..at + 8 + len)
+            let len = u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+            let end = usize::try_from(len).ok().and_then(|len| (at + 8).checked_add(len));
+            if let Some(json) = end.and_then(|end| body.get(at + 8..end))
                 && let Ok(v) = serde_json::from_slice::<serde_json::Value>(json)
                 && let Some(f) = v.get("fills").and_then(|f| serde_json::from_value::<HashMap<String, f32>>(f.clone()).ok())
             {
@@ -530,5 +536,45 @@ impl MeshStack {
             out.extend_from_slice(slot.as_ref().unwrap());
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::split_mlay;
+
+    /// `before`, then a mesh layers chunk holding `body` with the given offset back and length (as written: the
+    /// body's length plus 24, and its length).
+    fn file(before: &[u8], body: &[u8], back: u64, len: u64) -> Vec<u8> {
+        let mut out = before.to_vec();
+        out.extend_from_slice(b"MLAY");
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(&back.to_le_bytes());
+        out.extend_from_slice(b"MLAY");
+        out
+    }
+
+    #[test]
+    fn a_whole_chunk_comes_off() {
+        let body = b"layers and notes";
+        let mut bytes = file(b"the volume", body, body.len() as u64 + 24, body.len() as u64);
+        assert_eq!(split_mlay(&mut bytes).unwrap().as_deref(), Some(&body[..]));
+        assert_eq!(bytes, b"the volume");
+        let mut plain = b"a volume with no chunk at all, long enough".to_vec();
+        assert!(split_mlay(&mut plain).unwrap().is_none());
+    }
+
+    /// A damaged offset or length is an error, never a panic or an overflow.
+    #[test]
+    fn a_damaged_chunk_is_an_error() {
+        let body = b"layers and notes";
+        let n = body.len() as u64;
+        let total = file(b"the volume", body, n + 24, n).len() as u64;
+        for (back, len) in [(0, n), (5, n), (12, n), (23, n), (total + 1, n), (u64::MAX, n), (n + 24, u64::MAX), (n + 24, u64::MAX - 11), (n + 24, n + 1), (n + 24, 0)] {
+            let mut bytes = file(b"the volume", body, back, len);
+            let r = split_mlay(&mut bytes);
+            assert!(r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidData), "back {back}, len {len}: {r:?}");
+        }
     }
 }

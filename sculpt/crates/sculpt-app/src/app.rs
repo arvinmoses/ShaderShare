@@ -293,18 +293,17 @@ impl SculptApp {
         let t = Instant::now();
         self.end_stroke();
         let mode = &mut self.volume;
-        mode.settle();
-        let r = std::fs::File::create(&p).and_then(|f| {
-            let mut w = std::io::BufWriter::new(f);
-            mode.write_to(&mut w)?;
-            std::io::Write::flush(&mut w)
-        });
-        match r {
+        // Every wait before any file is touched.
+        mode.prepare_save();
+        match save_atomically(std::path::Path::new(&p), |w| mode.write_to(w)) {
             Ok(()) => {
                 self.status = format!("Saved {} ({:.2}s)", file_name(&p), t.elapsed().as_secs_f32());
                 self.volume_path = Some(p);
             }
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Err(SaveError::Write(e)) => self.status = format!("Save failed: {e}"),
+            Err(SaveError::Replace(e, tmp)) => {
+                self.status = format!("Save could not replace {} ({e}): the new file is kept as {}", file_name(&p), tmp.display());
+            }
         }
     }
 
@@ -808,6 +807,35 @@ impl SculptApp {
 }
 
 /// The last part of a path, for messages and the title.
+/// Why [`save_atomically`] failed.
+#[derive(Debug)]
+pub enum SaveError {
+    /// Writing the new file failed: the target is as it was, and nothing new is left behind.
+    Write(std::io::Error),
+    /// The new file is written in full but could not take the target's place (a sync client holding it, say): it is
+    /// kept at the path given, the target as it was.
+    Replace(std::io::Error, PathBuf),
+}
+
+/// Write a file through `write` without ever leaving `path` half written: into a new file beside it, flushed to the
+/// disk, then renamed over it.
+pub fn save_atomically(path: &std::path::Path, write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>) -> Result<(), SaveError> {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".saving");
+    let tmp = path.with_file_name(name);
+    let written = (|| {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        write(&mut w)?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SaveError::Write(e));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| SaveError::Replace(e, tmp))
+}
+
 pub fn file_name(p: &str) -> String {
     std::path::Path::new(p).file_name().map_or(p.to_string(), |n| n.to_string_lossy().into_owned())
 }
@@ -865,5 +893,44 @@ impl eframe::App for SculptApp {
 
     fn on_exit(&mut self) {
         self.save_settings();
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    fn dir(what: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sculpt-save-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A save replaces the file whole; one whose writing fails leaves the old file as it was and nothing beside it; one
+    /// that cannot replace the file keeps the new one and says where.
+    #[test]
+    fn a_save_replaces_the_file_whole_or_not_at_all() {
+        let d = dir("whole");
+        let p = d.join("a.svol");
+        std::fs::write(&p, b"old contents").unwrap();
+        save_atomically(&p, |w| std::io::Write::write_all(w, b"new")).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        let r = save_atomically(&p, |w| {
+            std::io::Write::write_all(w, b"half")?;
+            Err(std::io::Error::other("the writer failed"))
+        });
+        assert!(matches!(r, Err(SaveError::Write(_))), "{r:?}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"new", "a failed save touched the file");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "a failed save left a file behind");
+        // A target that cannot be replaced (here a directory with a file in it).
+        let blocked = d.join("blocked.svol");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("x"), b"x").unwrap();
+        match save_atomically(&blocked, |w| std::io::Write::write_all(w, b"kept")) {
+            Err(SaveError::Replace(_, tmp)) => assert_eq!(std::fs::read(&tmp).unwrap(), b"kept"),
+            r => panic!("{r:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

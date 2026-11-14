@@ -1614,6 +1614,16 @@ impl VolumeMode {
         }
     }
 
+    /// Before a save opens any file: everything settled and the layers caught up, so the waits come before a file is
+    /// touched ([`Self::write_to`] then finds nothing left to wait for).
+    pub fn prepare_save(&mut self) {
+        self.settle();
+        if let Some(m) = self.mesh.as_mut() {
+            m.finish(&self.vol);
+            m.close_open();
+        }
+    }
+
     /// Write the volume (with its layers, if any) as a `.svol` file.
     pub fn write_to(&mut self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         self.settle();
@@ -1663,12 +1673,19 @@ impl VolumeMode {
             layer.deferred = true;
             mode.layer = Some(layer);
         }
+        // A chunk's length as the file gives it, checked against the file: a damaged one is an error, not a panic.
+        let chunk = |at: usize, len: u64| -> std::io::Result<&[u8]> {
+            usize::try_from(len)
+                .ok()
+                .and_then(|len| at.checked_add(len))
+                .and_then(|end| bytes.get(at..end))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "a chunk runs past the end of the file"))
+        };
         // (The layers' reader took the mark already.)
         if mode.layer.is_none() && pos >= 4 && &bytes[pos - 4..pos] == b"SCLY" && bytes.len() >= pos + 8 {
-            let len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
-            if let Some(mut data) = bytes.get(pos + 8..pos + 8 + len) {
-                mode.sculpt = Some(SculptLayers::read_from(&mut data)?);
-            }
+            let len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            let mut data = chunk(pos + 8, len)?;
+            mode.sculpt = Some(SculptLayers::read_from(&mut data)?);
         }
         // Surface noise as files before it was a layer kept it: after the layers, or in their place (its mark read
         // already, then). It becomes a layer.
@@ -1682,12 +1699,11 @@ impl VolumeMode {
         if let Some(at) = at
             && bytes.len() >= at + 4
         {
-            let len = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
-            if let Some(json) = bytes.get(at + 4..at + 4 + len) {
-                let n: SurfaceNoise = serde_json::from_slice(json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-                if n.on {
-                    mode.add_noise_with(n);
-                }
+            let len = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+            let json = chunk(at + 4, len as u64)?;
+            let n: SurfaceNoise = serde_json::from_slice(json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            if n.on {
+                mode.add_noise_with(n);
             }
         }
         if let Some(body) = mlay {
