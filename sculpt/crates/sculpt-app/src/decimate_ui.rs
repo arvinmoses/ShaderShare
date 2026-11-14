@@ -13,6 +13,9 @@
 //!   ready. Relaxing on top stays, at strength `e`, so the drag and the exact result look alike and `e` evens vertex
 //!   spacing as well as choosing which edges go.
 //! * Closed/manifold and the surface error are measured off the frame when a slider is let go.
+//! * **Tessellate + displace** previews the final asset: quick UVs on the output, a height map baked from the input
+//!   (low resolution while a slider drags, the size set when let go), and the output split `level`² per triangle and
+//!   displaced by it. Shown in place of the output; geometry only for now (no normal map in the viewport).
 //! * Closing the window drops the preview (and the analyses) and shows the volume again.
 
 use std::sync::Arc;
@@ -22,7 +25,10 @@ use std::time::Instant;
 
 use eframe::egui_wgpu;
 use egui::{RichText, Ui};
-use sculpt_core::decimate::{Analysis, AnalyzeOptions, ManifoldReport, Progress, Surface, SurfaceError, Target, TriMesh, check_manifold, even_out, surface_error};
+use sculpt_core::decimate::{
+    Analysis, AnalyzeOptions, Baker, ManifoldReport, Maps, Progress, Surface, SurfaceError, Target, TriMesh, UvMesh, check_manifold, even_out, quick_uv,
+    surface_error, tessellate,
+};
 
 use crate::app::{SculptApp, fmt_count};
 use crate::panels::prop;
@@ -30,6 +36,12 @@ use crate::volume_mode::VolumeMode;
 
 /// Analyses kept for evenness values let go before (each is several times the input's size).
 const CACHE: usize = 3;
+/// Map sizes offered, and the size baked while a slider drags.
+const MAP_SIZES: [usize; 5] = [256, 512, 1024, 2048, 4096];
+const LIVE_MAP: usize = 256;
+/// The tessellated preview is held to about this many triangles (the level drops on big outputs).
+const TESS_BUDGET: usize = 3_000_000;
+
 /// Points sampled on each mesh for the surface error.
 const ERROR_SAMPLES: usize = 100_000;
 
@@ -108,6 +120,17 @@ pub struct Decimate {
     /// The export dialog's path while it is open.
     export: Option<String>,
     note: String,
+    /// Tessellate + displace preview: on, level, map size, strength.
+    displace: bool,
+    level: usize,
+    map_res: usize,
+    strength: f32,
+    baker: Option<Arc<Baker>>,
+    /// UVs and maps of output `generation` (maps at the size given), the tessellated mesh shown, and its timings.
+    uv: Option<(u64, UvMesh)>,
+    maps: Option<(u64, Maps)>,
+    tess: Option<Arc<TriMesh>>,
+    tess_note: String,
 }
 
 fn key_of(e: f32) -> i32 {
@@ -172,6 +195,15 @@ impl Decimate {
             gpu_dirty: false,
             export: None,
             note: String::new(),
+            displace: false,
+            level: 8,
+            map_res: 1024,
+            strength: 1.0,
+            baker: None,
+            uv: None,
+            maps: None,
+            tess: None,
+            tess_note: String::new(),
         }
     }
 
@@ -198,6 +230,10 @@ impl Decimate {
                 let mesh = Arc::new(mesh);
                 self.input = Some(mesh.clone());
                 self.surface = None;
+                self.baker = None;
+                self.uv = None;
+                self.maps = None;
+                self.tess = None;
                 let (tx, rx) = channel();
                 let spawned = std::thread::Builder::new().name("decimate surface".into()).spawn(move || {
                     let _ = tx.send(Surface::new(mesh));
@@ -297,9 +333,61 @@ impl Decimate {
         self.result = Some(Arc::new(out));
         self.generation += 1;
         self.gpu_dirty = true;
+        self.preview(live);
         if !live {
             self.start_check();
         }
+    }
+
+    /// The tessellate + displace preview of the output: UVs and maps made again only when the output (or the map
+    /// size) changed. `live`: a small map, for scrubbing.
+    fn preview(&mut self, live: bool) {
+        self.tess = None;
+        self.gpu_dirty = true;
+        if !self.displace {
+            return;
+        }
+        let (Some(out), Some(baker)) = (self.result.clone(), self.baker.clone()) else {
+            self.tess_note = "Waiting for the input surface…".into();
+            return;
+        };
+        let g = self.generation;
+        let t = Instant::now();
+        if self.uv.as_ref().is_none_or(|u| u.0 != g) {
+            self.uv = Some((g, quick_uv(&out, 4.0 / 1024.0)));
+            self.maps = None;
+        }
+        let uv_ms = t.elapsed().as_secs_f32() * 1e3;
+        let res = if live { LIVE_MAP.min(self.map_res) } else { self.map_res };
+        let uv = &self.uv.as_ref().unwrap().1;
+        let t = Instant::now();
+        if self.maps.as_ref().is_none_or(|m| m.0 != g || (!live && m.1.res != res)) {
+            let edge = mean_edge(&out);
+            match baker.bake(uv, res, 1.5 * edge, None) {
+                Some(m) => self.maps = Some((g, m)),
+                None => return,
+            }
+        }
+        let bake_ms = t.elapsed().as_secs_f32() * 1e3;
+        let maps = &self.maps.as_ref().unwrap().1;
+        let fit = ((TESS_BUDGET as f32 / out.triangles.len().max(1) as f32).sqrt() as usize).max(1);
+        let level = self.level.min(fit);
+        let t = Instant::now();
+        let tess = tessellate(uv, maps, level, self.strength);
+        let tess_ms = t.elapsed().as_secs_f32() * 1e3;
+        self.tess_note = format!(
+            "{} triangles (level {level}{}), {} charts, map {}²  ·  UV {uv_ms:.1} ms, bake {bake_ms:.0} ms, tessellate {tess_ms:.0} ms",
+            fmt_count(tess.mesh.triangles.len()),
+            if level < self.level { ", held down for size" } else { "" },
+            uv.charts,
+            maps.res,
+        );
+        self.tess = Some(Arc::new(tess.mesh));
+    }
+
+    /// The mesh to show: the tessellated preview when on, else the output.
+    fn shown(&self) -> Option<&Arc<TriMesh>> {
+        if self.displace { self.tess.as_ref().or(self.result.as_ref()) } else { self.result.as_ref() }
     }
 
     /// Measure the output off the frame: closed/manifold, and the surface error against the input.
@@ -322,7 +410,12 @@ impl Decimate {
             match rx.try_recv() {
                 Ok(s) => {
                     self.surface_rx = None;
-                    self.surface = Some(Arc::new(s));
+                    let s = Arc::new(s);
+                    self.baker = Some(Arc::new(Baker::new(s.clone())));
+                    self.surface = Some(s);
+                    if self.displace && self.evenness <= 0.0 && self.result.is_some() {
+                        self.preview(false);
+                    }
                     // Even again, now projected onto the input.
                     if self.evenness > 0.0 && self.base.is_some() {
                         self.refresh(false, false);
@@ -389,6 +482,10 @@ impl Decimate {
         self.input = None;
         self.surface = None;
         self.surface_rx = None;
+        self.baker = None;
+        self.uv = None;
+        self.maps = None;
+        self.tess = None;
         self.cache.clear();
         self.current = None;
         self.base = None;
@@ -488,6 +585,33 @@ impl Decimate {
         }
         prop(ui, "Wireframe", |ui| ui.checkbox(&mut self.wire, ""));
 
+        // Tessellate + displace preview.
+        ui.separator();
+        let r = ui.checkbox(&mut self.displace, "Tessellate + displace preview").on_hover_text(
+            "Quick UVs on the output, a height map baked from the input, and the output split and displaced by it: roughly how the asset looks rendered with displacement",
+        );
+        if r.changed() {
+            self.preview(false);
+        }
+        if self.displace {
+            let r = prop(ui, "Level", |ui| ui.add(egui::Slider::new(&mut self.level, 1..=32))).on_hover_text("Each triangle is split level × level");
+            let r2 = prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut self.strength, 0.0..=2.0).max_decimals(2)));
+            let mut res = self.map_res;
+            prop(ui, "Map size", |ui| {
+                for s in MAP_SIZES {
+                    ui.selectable_value(&mut res, s, if s >= 1024 { format!("{}K", s / 1024) } else { s.to_string() });
+                }
+            });
+            let res_changed = res != self.map_res;
+            self.map_res = res;
+            if r.changed() || r2.changed() {
+                self.preview(r.dragged() || r2.dragged());
+            } else if r.drag_stopped() || r2.drag_stopped() || res_changed {
+                self.preview(false);
+            }
+            ui.label(RichText::new(&self.tess_note).small().color(weak));
+        }
+
         // What came out.
         ui.separator();
         let out = self.result.as_ref().map_or(0, |r| r.triangles.len());
@@ -568,6 +692,11 @@ impl Decimate {
     }
 }
 
+fn mean_edge(m: &TriMesh) -> f32 {
+    let s: f32 = m.triangles.iter().map(|t| (0..3).map(|i| m.positions[t[i] as usize].distance(m.positions[t[(i + 1) % 3] as usize])).sum::<f32>()).sum();
+    s / (3 * m.triangles.len().max(1)) as f32
+}
+
 /// The menu entry that opens the window.
 pub fn menu_item(app: &mut SculptApp, ui: &mut Ui) {
     if ui.button("Decimate…").on_hover_text("Decimate the surface shown and export it (OBJ)").clicked() {
@@ -614,7 +743,7 @@ pub fn window(app: &mut SculptApp, ctx: &egui::Context) {
         d.gpu_dirty = false;
         return;
     };
-    match (d.previewing(), d.result.as_ref()) {
+    match (d.previewing(), d.shown()) {
         (true, Some(out)) => {
             let draw = vp.decimate.get_or_insert_with(|| crate::decimate_draw::DecimateDraw::new(&rs.device, &vp.bgl));
             if d.gpu_dirty {
