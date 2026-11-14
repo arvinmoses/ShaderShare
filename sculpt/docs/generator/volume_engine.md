@@ -3,7 +3,7 @@
 > The code and commands described here were removed from the codebase on 2026-11-13; see git history before that date.
 
 Code: `sculpt-core/src/generator/level_volume.rs` (the field, brushes, history, files, the reference extractor),
-`sculpt-app/src/gpu_levels/` (the GPU copy, extraction, culling), `sculpt-app/src/volume_mode.rs` (the playground),
+`sculpt-app/src/gpu_levels/` (the GPU copy, extraction, culling), `sculpt-app/src/volume_mode/` (the playground),
 `sculpt-app/src/volume_demo.rs` (the scripted review session). Tests: `sculpt-core/tests/level_volume.rs`,
 `sculpt-app --gpu-levels-check` (GPU against the reference), `sculpt-app --gpu-levels-check --bench`.
 Video: `volume/volume_engine_review.mp4` (`sculpt-app --demo-volume DIR`, frames from the app's own framebuffer).
@@ -457,7 +457,7 @@ million faces; the test reports them and fails only on any away from a finer cel
 
 A stroke used to begin by waiting for all the work still landing: the last stroke's carrying, its end, the layers'
 last follow, a generator's job. Now its first dab shows on the next frame, and the stroke ends exactly as it would
-have after waiting (`volume_mode.rs`, `Ahead`):
+have after waiting (`volume_mode/mod.rs`, `Ahead`):
 
 * **Running ahead.** A stroke begun while work it must come after is still landing is drawn at once on a copy of
   what is shown (and of the layers: `LevelVolume::preview_copy`, `Layered::preview_copy`, made in a moment, their
@@ -493,7 +493,7 @@ Frames during such a stroke stay at 6-12 ms, but for the one that takes in the l
 the form stroke, as before when it was part of the wait). The rest at level 3 is covering a million blocks at the
 begin.
 
-Tests (`volume_mode.rs`): strokes run ahead after plain strokes, form strokes over layers (form, detail and mask
+Tests (`volume_mode/tests.rs`): strokes run ahead after plain strokes, form strokes over layers (form, detail and mask
 strokes after them), and generator edits (form strokes taking the generator, detail strokes running ahead until its
 job is in) end exactly as waiting, undo and redo step for step the same, and what the GPU was sent adds up to what
 is shown at every frame. `tests/stress.rs`: form strokes over a generator's job (previewed or joined on the GPU, the
