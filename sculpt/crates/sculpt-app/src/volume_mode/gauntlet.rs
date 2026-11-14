@@ -325,6 +325,7 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
 #[test]
 #[ignore]
 fn gauntlet() {
+    let _one = timing_lock();
     let pick: Option<Vec<String>> = std::env::var("SCULPT_GAUNTLET").ok().map(|v| v.split(',').map(str::to_string).collect());
     let out = std::env::var("SCULPT_GAUNTLET_OUT").ok().map(std::path::PathBuf::from);
     if let Some(d) = &out {

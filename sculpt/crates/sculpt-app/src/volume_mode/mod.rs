@@ -1894,6 +1894,17 @@ impl VolumeMode {
     }
 }
 
+/// Held by the app's heavy tests (each loads every core) and its timing-sensitive ones (bars on frame times): one at
+/// a time, as side by side they slowed each other's frames several times over.
+#[cfg(test)]
+static TIMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`TIMING`] (whatever a test that panicked holding it left).
+#[cfg(test)]
+fn timing_lock() -> std::sync::MutexGuard<'static, ()> {
+    TIMING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod gauntlet;
 

@@ -132,6 +132,7 @@ fn strokes(mode: &mut VolumeMode, what: &str, r: f32, gap: usize) -> Row {
 #[test]
 #[ignore]
 fn form_strokes_at_5m() {
+    let _one = timing_lock();
     let tris: f32 = std::env::var("FORM_TRIS").ok().and_then(|s| s.parse().ok()).unwrap_or(13.2e6);
     let mut alone = VolumeMode::ball(tris);
     let mut solo = Vec::new();
@@ -167,10 +168,15 @@ fn form_strokes_at_5m() {
 }
 
 /// A volume stroke with a mesh layer: no refit starts until the pen has been up `REFIT_AFTER_MS`, then one does; a
-/// layer stroke begun sooner refits first (nothing left waiting), and so does a save.
+/// layer stroke begun sooner refits first (nothing left waiting), and so does a save. (On a loaded machine a stroke's
+/// end can take longer than `REFIT_AFTER_MS` to land, and the refit rightly begins meanwhile: then what is checked is
+/// that it began no sooner.)
 #[test]
 fn refit_waits_for_the_pen_up() {
-    let small = |mode: &mut VolumeMode| {
+    let _one = timing_lock();
+    // A small form stroke, frames going until its end lands. Returns how long after the pen up a refit was first seen
+    // under way (or done), if one began meanwhile.
+    let small = |mode: &mut VolumeMode| -> Option<f64> {
         mode.target = Target::Form;
         mode.begin_stroke();
         for k in 0..12 {
@@ -180,10 +186,32 @@ fn refit_waits_for_the_pen_up() {
             }
         }
         mode.end_stroke();
+        let swaps = mode.mesh.as_ref().unwrap().times.swaps;
+        let mut refit = None;
         // The stroke's end lands.
         while mode.ending || mode.end_job.is_some() || mode.carrying() || mode.ahead.is_some() {
             frame(mode);
+            let m = mode.mesh.as_ref().unwrap();
+            if refit.is_none() && (m.layers.busy() || m.times.swaps > swaps) {
+                refit = Some(ms(mode.pen_up));
+            }
             std::thread::sleep(Duration::from_millis(1));
+        }
+        refit
+    };
+    // Right after `small`: no refit began before its time, and one that has not begun leaves the stroke's blocks
+    // waiting. Returns whether one has begun.
+    let begun = |mode: &VolumeMode, early: Option<f64>| -> bool {
+        let m = mode.mesh.as_ref().unwrap();
+        match early {
+            Some(t) => {
+                assert!(t >= REFIT_AFTER_MS, "a refit began {t:.0} ms after the pen up");
+                true
+            }
+            None => {
+                assert!(!m.dirty.is_empty(), "the volume stroke's blocks wait for the refit");
+                false
+            }
         }
     };
     let mut mode = VolumeMode::ball(2e5);
@@ -191,32 +219,37 @@ fn refit_waits_for_the_pen_up() {
     settle_frames(&mut mode);
     assert!(mode.mesh.is_some(), "{:?}", mode.mesh_note);
 
-    small(&mut mode);
+    let early = small(&mut mode);
     let up = mode.pen_up;
     let swaps = mode.mesh.as_ref().unwrap().times.swaps;
-    let after = loop {
-        frame(&mut mode);
-        let m = mode.mesh.as_ref().unwrap();
-        if m.layers.busy() || m.times.swaps > swaps {
-            break ms(up);
-        }
-        assert!(up.elapsed().as_secs() < 10, "no refit started");
-        std::thread::sleep(Duration::from_millis(2));
+    let after = match early {
+        Some(t) => t,
+        None => loop {
+            frame(&mut mode);
+            let m = mode.mesh.as_ref().unwrap();
+            if m.layers.busy() || m.times.swaps > swaps {
+                break ms(up);
+            }
+            assert!(up.elapsed().as_secs() < 10, "no refit started");
+            std::thread::sleep(Duration::from_millis(2));
+        },
     };
     assert!(after >= REFIT_AFTER_MS, "a refit started {after:.0} ms after the pen up");
     settle_frames(&mut mode);
 
     // A layer stroke right after a volume stroke: everything the volume did is in first.
-    small(&mut mode);
-    assert!(!mode.mesh.as_ref().unwrap().dirty.is_empty(), "the volume stroke's blocks wait for the refit");
+    let early = small(&mut mode);
+    begun(&mode, early);
     mode.target = Target::Detail;
     mode.begin_stroke();
     assert!(!mode.mesh.as_ref().unwrap().pending(), "a layer stroke began with the layers behind the volume");
     mode.end_stroke();
 
     // A save right after a volume stroke: the layers saved are the volume's.
-    small(&mut mode);
-    assert!(mode.mesh.as_ref().unwrap().pending());
+    let early = small(&mut mode);
+    if !begun(&mode, early) {
+        assert!(mode.mesh.as_ref().unwrap().pending());
+    }
     let mut bytes = Vec::new();
     mode.write_to(&mut bytes).unwrap();
     assert!(!mode.mesh.as_ref().unwrap().pending(), "saved with the layers behind the volume");

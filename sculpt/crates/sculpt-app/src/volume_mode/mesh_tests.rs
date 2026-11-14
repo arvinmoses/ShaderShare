@@ -37,13 +37,6 @@ fn settle_frames(mode: &mut VolumeMode) -> usize {
     }
 }
 
-/// These tests one at a time: each loads every core, and side by side they slow the other tests' timing checks.
-static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// A ball with a first mesh layer on it.
 fn ball_with_layer(triangles: f32) -> VolumeMode {
     let mut mode = VolumeMode::ball(triangles);
@@ -146,7 +139,7 @@ fn base_is_fresh(mode: &mut VolumeMode, what: &str) {
 /// the layers' mesh is the volume's surface bit for bit.
 #[test]
 fn refit_never_misses() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     stroke(&mut mode, Target::Detail, Vec3::new(0.2, 0.1, 1.0), 0.08, Brush::Clay);
     stroke(&mut mode, Target::Form, Vec3::new(0.25, 0.1, 1.0), 0.12, Brush::Clay);
@@ -181,7 +174,7 @@ fn refit_never_misses() {
 /// every step.
 #[test]
 fn layer_stroke_then_volume_stroke_under_it_undo_redo() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     let s0 = state(ml(&mut mode));
     stroke(&mut mode, Target::Detail, Vec3::new(0.2, 0.1, 1.0), 0.08, Brush::Clay);
@@ -215,7 +208,7 @@ fn layer_stroke_then_volume_stroke_under_it_undo_redo() {
 /// an error after an opacity edit.
 #[test]
 fn a_stroke_that_misses_adds_no_step() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     let s0 = state(ml(&mut mode));
     stroke(&mut mode, Target::Detail, Vec3::new(0.2, 0.1, 1.0), 0.08, Brush::Clay);
@@ -249,7 +242,7 @@ fn a_stroke_that_misses_adds_no_step() {
 /// the start back bit for bit, redo three times the end.
 #[test]
 fn three_volume_strokes_in_one_swap_undo_redo() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.1, 1.0), 0.15, Brush::Clay);
     stroke(&mut mode, Target::Detail, Vec3::new(0.1, -0.1, 1.0), 0.1, Brush::Trim);
@@ -296,7 +289,7 @@ fn three_volume_strokes_in_one_swap_undo_redo() {
 /// open bit for bit.
 #[test]
 fn masks_opacity_undo_redo_and_save_open() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.1, 1.0), 0.15, Brush::Clay);
     mode.add_mesh_layer();
@@ -437,7 +430,7 @@ fn sides(mode: &VolumeMode) -> (usize, usize) {
 /// stroke under it still undoes and redoes.
 #[test]
 fn layers_survive_the_volume_carved_away() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     // One level, so the carve over the whole ball is quick.
     let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 1.0 / 48.0, 1));
     mode.add_mesh_layer();
@@ -512,7 +505,7 @@ fn layers_survive_the_volume_carved_away() {
 /// the carve: V0's layer data comes back bit for bit both times, and V2's after the redo.
 #[test]
 fn a_failing_state_between_two_undo_redo() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = small_ball_with_stroke();
     let s0 = state(ml(&mut mode));
     carve_all(&mut mode);
@@ -543,7 +536,7 @@ fn a_failing_state_between_two_undo_redo() {
 /// layer data comes back bit for bit.
 #[test]
 fn a_failing_state_then_a_new_step_from_it() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = small_ball_with_stroke();
     let s0 = state(ml(&mut mode));
     carve_all(&mut mode);
@@ -577,7 +570,7 @@ fn first_state(mode: &VolumeMode) -> u64 {
 /// came from). Undone back to V0, the layers are as they were.
 #[test]
 fn patches_of_a_state_gone_go_where_the_layers_first_came_from() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = small_ball_with_stroke();
     let s0 = state(ml(&mut mode));
     carve_all(&mut mode);
@@ -608,7 +601,7 @@ fn patches_of_a_state_gone_go_where_the_layers_first_came_from() {
 /// layers were back at V0 since), so V0 holds only what the second step's swap filed.
 #[test]
 fn an_undone_step_replaced_leaves_no_patches_behind() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = small_ball_with_stroke();
     ball_step(&mut mode, Vec3::new(0.0, 0.0, 1.0), 0.2, false);
     settle_frames(&mut mode);
@@ -624,7 +617,7 @@ fn an_undone_step_replaced_leaves_no_patches_behind() {
 /// running past the end.
 #[test]
 fn damaged_files_open_without_what_is_damaged() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = small_ball_with_stroke();
     let mut good = Vec::new();
     mode.write_to(&mut good).unwrap();
@@ -667,7 +660,7 @@ fn damaged_files_open_without_what_is_damaged() {
 /// new one, so two undos give back the state before it, with no history lost.
 #[test]
 fn a_stroke_before_a_redo_lands_keeps_the_redone_step() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = small_ball_with_stroke();
     let s0 = state(ml(&mut mode));
     ball_step(&mut mode, Vec3::new(0.0, 0.0, 1.0), 0.2, false);
@@ -692,7 +685,7 @@ fn a_stroke_before_a_redo_lands_keeps_the_redone_step() {
 /// A mask fill's undo puts back the fill the panel shows (and the mask's values), its redo the new one.
 #[test]
 fn undoing_a_fill_shows_the_fill_before() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.1, 1.0), 0.15, Brush::Clay);
     mode.set_active_layer(0);
@@ -719,7 +712,7 @@ fn undoing_a_fill_shows_the_fill_before() {
 /// The rows told of every change: a dab's leaves, a swap's blocks, a hidden layer's.
 #[test]
 fn rows_follow_dabs_swaps_and_hiding() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     let r = frame(&mut mode);
     assert!(r.all || r.blocks.is_empty());
@@ -843,7 +836,7 @@ fn bumpiness(ml: &MeshLayers, c: Vec3, r: f32) -> f64 {
 /// Subtract at 50, 100 or 200%, then three smooth strokes: the bumpiness falls with each, no face turns over.
 #[test]
 fn smoothing_smooths_under_every_blend() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
     let c = Vec3::new(0.0, 0.1, 1.0).normalize();
     let mut fails = Vec::new();
@@ -879,7 +872,7 @@ fn smoothing_smooths_under_every_blend() {
 /// it is held to what it does on Add.
 #[test]
 fn strokes_on_subtract_stay_bounded() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
     let (r, strength) = (0.08f32, 0.8f32);
     let h = r * (0.015 + 0.08 * strength);
@@ -910,7 +903,7 @@ fn strokes_on_subtract_stay_bounded() {
 /// Clay + Ctrl lowers and Trim + Ctrl raises.
 #[test]
 fn ctrl_on_a_layer_does_what_it_does_on_the_base() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
     let r = 0.08;
     let mut fails = Vec::new();
@@ -978,7 +971,7 @@ fn sideways_in_edges(ml: &MeshLayers, c: Vec3, r: f32) -> f64 {
 /// radius 280 times and turned the normals 23 times as far.)
 #[test]
 fn smooth_on_a_plain_ball_stores_next_to_nothing() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
     let c = Vec3::new(0.0, 0.1, 1.0).normalize();
     let mut mode = ball_with_layer(2.64e6);
@@ -1032,7 +1025,7 @@ fn rms_between(a: &[f32], b: &[f32]) -> f64 {
 /// left of the bumps is within 15% of each other, at 250k and at 2.5M triangles.
 #[test]
 fn layer_smooth_matches_base_smooth() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
     let mut fails = Vec::new();
     for tris in [6.6e5f32, 6.6e6] {
@@ -1091,7 +1084,7 @@ fn big() -> VolumeMode {
 #[test]
 #[ignore]
 fn layer_dab_times_at_2_5m() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = big();
     let verts_in = |mode: &VolumeMode, c: Vec3, r: f32| mode.mesh.as_ref().unwrap().layers.doc.positions().iter().filter(|p| p.distance(c) < r).count();
     let mut fails = Vec::new();
@@ -1137,7 +1130,7 @@ fn layer_dab_times_at_2_5m() {
 #[test]
 #[ignore]
 fn layer_patch_bytes_at_2_5m() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = big();
     let mut last = mode.mesh.as_ref().unwrap().history_bytes();
     let mut step = |mode: &mut VolumeMode, what: &str| {
@@ -1168,7 +1161,7 @@ fn layer_patch_bytes_at_2_5m() {
 /// (the oldest steps go), and every step it keeps still undoes bit for bit.
 #[test]
 fn wide_strokes_keep_the_history_in_its_budget() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = ball_with_layer(2e5);
     stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.0, 1.0), 0.4, Brush::Clay);
     settle_frames(&mut mode);
@@ -1212,7 +1205,7 @@ fn wide_strokes_keep_the_history_in_its_budget() {
 #[test]
 #[ignore]
 fn session_frames_at_2_5m() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = big();
     // A second layer all over, so every swap carries every vertex.
     mode.add_mesh_layer();
@@ -1334,7 +1327,7 @@ fn memory() -> (f64, f64) {
 #[test]
 #[ignore]
 fn memory_at_2_5m() {
-    let _one = one_at_a_time();
+    let _one = timing_lock();
     let mut mode = VolumeMode::ball(6.6e6);
     for d in [Vec3::new(0.3, 0.2, 1.0), Vec3::new(-0.7, 0.1, 0.5)] {
         stroke(&mut mode, Target::Form, d, 0.1, Brush::Clay);

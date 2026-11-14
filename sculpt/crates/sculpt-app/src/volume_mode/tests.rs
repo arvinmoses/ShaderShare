@@ -493,6 +493,7 @@ fn big(target: Target, a: Vec3, b: Vec3, r: f32) -> Step {
 
 #[test]
 fn strokes_run_ahead_of_a_plain_strokes_end_land_as_waiting() {
+    let _one = timing_lock();
     let (ran, _) = ahead_lands_as_waiting(
         "plain",
         &|_| {},
@@ -534,6 +535,7 @@ fn carrying_ends_as_its_jobs_land_whoever_waits() {
 
 #[test]
 fn strokes_run_ahead_of_a_kept_detail_stroke_land_as_waiting() {
+    let _one = timing_lock();
     // Carrying detail under big strokes: queued, carried in jobs, then the end. Carrying in jobs ends as its jobs
     // happened to land (so as the frames fell), so it is compared as two waiting sessions at different frame
     // rates are: a few in-between blocks on one side only, and the field within a tenth of a step
@@ -556,6 +558,7 @@ fn strokes_run_ahead_of_a_kept_detail_stroke_land_as_waiting() {
 
 #[test]
 fn strokes_run_ahead_over_layers_land_as_waiting() {
+    let _one = timing_lock();
     let (ran, _) = ahead_lands_as_waiting(
         "layers",
         &|m| {
@@ -576,6 +579,7 @@ fn strokes_run_ahead_over_layers_land_as_waiting() {
 
 #[test]
 fn strokes_after_a_generator_edit_land_as_waiting() {
+    let _one = timing_lock();
     let rocks = |m: &mut VolumeMode| {
         patch(m);
         m.make_layer(3);
@@ -763,6 +767,7 @@ pub(super) fn bent(vol: &LevelVolume, c: Vec3, half: f32, px: usize, by: f32) ->
 /// level 3); over where it cut through the middle groove's start, 182 of 39204, 4 now.
 #[test]
 fn a_wide_trim_through_fine_grooves_leaves_no_lattice() {
+    let _one = timing_lock();
     let mut mode = VolumeMode::ball(1e6);
     let strokes: [([f32; 3], [f32; 3], f32, f32, f32, bool, usize); 6] = [
         ([0.1607, 0.3789, 0.9114], [0.4199, 0.3604, 0.8329], 0.0661, 1.0, 0.2, false, 30),
@@ -851,17 +856,13 @@ fn a_big_stroke_mid_stroke_surface() {
 /// A new ball's rocks at `size`, then a five-frame drag of their size: each frame's `set_generator` (ms), and the
 /// release's. Between frames no job composes the rocks at their own level; once the frames after the release
 /// have brought it in, what is shown is the stack composed afresh, and the drag undoes as one step.
-/// Held by the tests making a new ball's rocks big (a few hundred thousand blocks, composed on every core): one at
-/// a time, as several at once slowed each other's frames several times over.
-static BIG_ROCKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn drag_rocks(size: f32, level: Option<usize>) -> (Vec<f64>, f64, usize) {
     drag_rocks_by(size, level, |s, i| s.size = size * (1.0 + 0.01 * i as f32))
 }
 
 /// [`drag_rocks`], each frame's spec changed by `step` (the frame's number from 1).
 fn drag_rocks_by(size: f32, level: Option<usize>, step: impl Fn(&mut GeneratorSpec, usize)) -> (Vec<f64>, f64, usize) {
-    let _one = BIG_ROCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = timing_lock();
     let mut mode = VolumeMode::ball(1e6);
     mode.add_generator();
     let k = mode.layer.as_ref().unwrap().active();
@@ -1027,7 +1028,7 @@ fn released_big_rocks() -> (VolumeMode, usize, GeneratorSpec) {
 /// leaves room for the other tests running beside it.
 #[test]
 fn big_results_land_without_a_long_frame() {
-    let _one = BIG_ROCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = timing_lock();
     let (mut mode, k, spec) = released_big_rocks();
     let before = mode.layer.as_ref().unwrap().history_len();
     let whole = mode.layer.as_ref().unwrap().taken_whole;
@@ -1061,7 +1062,7 @@ fn big_results_land_without_a_long_frame() {
 /// ends as composed afresh.
 #[test]
 fn edits_during_a_big_release_land_as_composed_afresh() {
-    let _one = BIG_ROCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = timing_lock();
     let (mut mode, k, mut spec) = released_big_rocks();
     assert!(mode.gen_job.is_some());
     mode.target = Target::Form;
@@ -1172,6 +1173,7 @@ fn brushes_pick_their_level_from_their_size_on_screen() {
 /// surface stays closed.
 #[test]
 fn a_wide_far_stroke_at_the_new_coarse_level_keeps_the_layers_whole() {
+    let _one = timing_lock();
     wide_far_stroke_over_layers("new ball", VolumeMode::ball(1e6), 1, Brush::Clay);
 }
 
@@ -1179,6 +1181,7 @@ fn a_wide_far_stroke_at_the_new_coarse_level_keeps_the_layers_whole() {
 /// the layers is smoothed (not raised), and the same holds.
 #[test]
 fn a_wide_far_smooth_stroke_keeps_the_layers_whole() {
+    let _one = timing_lock();
     wide_far_stroke_over_layers("new ball, smooth", VolumeMode::ball(1e6), 1, Brush::Smooth);
 }
 
@@ -1186,6 +1189,7 @@ fn a_wide_far_smooth_stroke_keeps_the_layers_whole() {
 /// 0 (level 0 at the step of a million triangles, six levels), as files from then open.
 #[test]
 fn a_wide_far_stroke_on_a_ball_as_before_keeps_the_layers_whole() {
+    let _one = timing_lock();
     wide_far_stroke_over_layers("ball as before", VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(1e6) / 2.0, OPEN_LEVELS)), 0, Brush::Clay);
 }
 
@@ -1357,6 +1361,7 @@ fn scrubbing_turns_the_brush_gently() {
 /// than their neighbours, and the new surface rippled every few steps where the lattice's planes crossed the old.
 #[test]
 fn a_close_trim_leaves_no_stripes() {
+    let _one = timing_lock();
     let mut mode = VolumeMode::ball(1e6);
     let centre = Vec3::new(0.3, -0.05, 0.95).normalize();
     let (t1, t2) = (Vec3::Y.cross(centre).normalize(), centre.cross(Vec3::Y.cross(centre).normalize()));
