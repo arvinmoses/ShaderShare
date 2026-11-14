@@ -56,12 +56,26 @@ const FREE_OLD_AFTER_MS: f64 = 1000.0;
 /// The least time a frame spends on queued dabs (see [`VolumeMode::run_frame_dabs`]).
 const DAB_FRAME_MS: f64 = 9.0;
 
+/// One dab of a stroke, as the pen gives it.
+#[derive(Clone, Copy, Debug)]
+pub struct DabInput {
+    /// The surface point under the pen.
+    pub at: Vec3,
+    /// In world units.
+    pub radius: f32,
+    /// The size of a pixel at the brush: with the radius, it picks the level a volume stroke works at.
+    pub px: f32,
+    pub strength: f32,
+    pub hardness: f32,
+    pub brush: Brush,
+}
+
 /// What a stroke was given, kept to do it again.
 #[derive(Clone, Copy, Debug)]
 enum Event {
     /// A stroke begun on this (routed) target, and when.
     Begin(Target, Instant),
-    Dab { at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush },
+    Dab(DabInput),
     End,
 }
 
@@ -214,7 +228,7 @@ pub struct VolumeMode {
     pen_up: Instant,
     pen_down: bool,
     /// Dabs given but not done yet: (at, radius, px, strength, hardness, brush).
-    queued: std::collections::VecDeque<(Vec3, f32, f32, f32, f32, Brush)>,
+    queued: std::collections::VecDeque<DabInput>,
     /// GPU time of the last surface rebuild.
     pub gpu_ms: f64,
     /// The brush normal of the stroke's last dab, which the next one leans toward.
@@ -390,19 +404,20 @@ impl VolumeMode {
     /// (The app's strokes go through [`Self::brush_dab`]; the tests' clay and trim dabs through here.)
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, carve: bool) {
-        self.brush_dab(at, radius, px, strength, hardness, if carve { Brush::Trim } else { Brush::Clay });
+        self.brush_dab(DabInput { at, radius, px, strength, hardness, brush: if carve { Brush::Trim } else { Brush::Clay } });
     }
 
     /// One dab of `brush`: Clay Buildup and Trim Dynamic as [`Self::dab`], or Smooth (see `LevelVolume::smooth_dab`),
     /// whose strength is how far each dab moves the surface toward its smoothed self.
-    pub fn brush_dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush) {
+    pub fn brush_dab(&mut self, d: DabInput) {
+        let DabInput { at, radius, px, strength, hardness, brush } = d;
         // For replaying a session's strokes (`SCULPT_DAB_LOG`): every dab, as given.
         if std::env::var_os("SCULPT_DAB_LOG").is_some() {
             eprintln!("DAB {} {} {} {radius} {px} {strength} {hardness} {}{}", at.x, at.y, at.z, brush == Brush::Trim, if brush == Brush::Smooth { " smooth" } else { "" });
         }
         // On a mesh layer or its mask: nothing of the volume's.
         if self.mesh_stroke.is_some() {
-            self.mesh_dab(at, radius, strength, hardness, brush);
+            self.mesh_dab(d);
             if let Some(t) = self.begun.take() {
                 self.first_dab_ms = t.elapsed().as_secs_f64() * 1e3;
             }
@@ -410,9 +425,9 @@ impl VolumeMode {
         }
         // Running ahead: kept for the real state, and drawn on the copy.
         if let Some(a) = self.ahead.as_mut() {
-            a.events.push(Event::Dab { at, radius, px, strength, hardness, brush });
+            a.events.push(Event::Dab(d));
         }
-        self.dab_now(at, radius, px, strength, hardness, brush);
+        self.dab_now(d);
         self.note_copy();
         if let Some(t) = self.begun.take() {
             self.first_dab_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -424,8 +439,8 @@ impl VolumeMode {
 
     /// A dab for [`Self::run_dabs`] to do: the app's strokes queue theirs, so a fast drag's many dabs spread over
     /// frames instead of holding one.
-    pub fn queue_dab(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush) {
-        self.queued.push_back((at, radius, px, strength, hardness, brush));
+    pub fn queue_dab(&mut self, d: DabInput) {
+        self.queued.push_back(d);
     }
 
     /// Whether dabs are queued.
@@ -437,8 +452,8 @@ impl VolumeMode {
     pub fn run_dabs(&mut self, budget_ms: f64) -> usize {
         let t = Instant::now();
         let mut n = 0;
-        while let Some((at, radius, px, strength, hardness, brush)) = self.queued.pop_front() {
-            self.brush_dab(at, radius, px, strength, hardness, brush);
+        while let Some(d) = self.queued.pop_front() {
+            self.brush_dab(d);
             n += 1;
             if t.elapsed().as_secs_f64() * 1e3 > budget_ms {
                 break;
@@ -465,7 +480,8 @@ impl VolumeMode {
     }
 
     /// A dab on what `vol` and `layer` hold now: the real state, or while running ahead the copy.
-    fn dab_now(&mut self, at: Vec3, radius: f32, px: f32, strength: f32, hardness: f32, brush: Brush) {
+    fn dab_now(&mut self, d: DabInput) {
+        let DabInput { at, radius, px, strength, hardness, brush } = d;
         let carve = brush == Brush::Trim;
         let t = Instant::now();
         let target = self.layer.is_some().then(|| self.routed());
@@ -510,10 +526,8 @@ impl VolumeMode {
         if along == Vec3::ZERO {
             return;
         }
-        let s = strength.clamp(0.0, 1.0);
-        let height = radius * if carve { 0.015 + 0.06 * s } else { 0.015 + 0.08 * s };
-        // Smooth: each dab moves the surface from a tenth to seven tenths of the way to its smoothed self.
-        let alpha = if brush == Brush::Smooth { 0.1 + 0.6 * s } else { 0.1 + 0.3 * s };
+        let shape = brush.shape(strength);
+        let (height, alpha) = (radius * shape.height, shape.alpha);
         let dabbed = match (form, self.layer.as_mut()) {
             (true, Some(layer)) if brush == Brush::Smooth => layer.smooth_dab(&mut self.vol, self.level, at, along, radius, hardness, alpha),
             (_, _) if brush == Brush::Smooth => self.vol.smooth_dab(self.level, at, along, radius, hardness, alpha),
@@ -632,8 +646,8 @@ impl VolumeMode {
                     m.lag_ms = at.elapsed().as_secs_f64() * 1e3;
                     true
                 }
-                Event::Dab { at, radius, px, strength, hardness, brush } => {
-                    m.dab_now(at, radius, px, strength, hardness, brush);
+                Event::Dab(d) => {
+                    m.dab_now(d);
                     true
                 }
                 Event::End => {
@@ -1818,8 +1832,9 @@ impl VolumeMode {
 
     /// One dab of a stroke on a mesh layer (Clay Buildup, Trim Dynamic or Smooth) or its mask. Ctrl already swapped the
     /// brush (Clay for Trim and back), as on the volume, so the layer brushes are never inverted on top of that.
-    fn mesh_dab(&mut self, at: Vec3, radius: f32, strength: f32, hardness: f32, brush: Brush) {
+    fn mesh_dab(&mut self, d: DabInput) {
         use sculpt_core::brush::{self as b, Brush as _};
+        let DabInput { at, radius, strength, hardness, brush, .. } = d;
         let (Some(m), Some(st)) = (self.mesh.as_mut(), self.mesh_stroke.as_mut().filter(|st| !st.refused)) else { return };
         let t = Instant::now();
         let doc = &mut m.layers.doc;
@@ -1836,12 +1851,12 @@ impl VolumeMode {
             }
             _ => {
                 let dab = b::Dab { center: at, normal: n, direction: st.last.map_or(Vec3::ZERO, |p| at - p), pressure: 1.0 };
-                let settings = |strength: f32| b::BrushSettings { radius, strength, falloff, spacing: 0.12, front_faces_only: true, invert: false };
+                let shape = brush.shape(strength);
+                let settings = b::BrushSettings { radius, strength: shape.alpha, falloff, spacing: 0.12, front_faces_only: true, invert: false };
                 let r = match brush {
-                    Brush::Clay => b::ClayBuildup { height: 0.015 + 0.08 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
-                    Brush::Trim => b::TrimDynamic { depth: 0.015 + 0.06 * s, ..Default::default() }.dab(doc, &dab, &settings(0.1 + 0.3 * s)),
-                    // Each dab moves the surface from a tenth to seven tenths of the way to its smoothed self, as on the volume.
-                    Brush::Smooth => b::FormSmooth.dab(doc, &dab, &settings(0.1 + 0.6 * s)),
+                    Brush::Clay => b::ClayBuildup { height: shape.height, ..Default::default() }.dab(doc, &dab, &settings),
+                    Brush::Trim => b::TrimDynamic { depth: shape.height, ..Default::default() }.dab(doc, &dab, &settings),
+                    Brush::Smooth => b::FormSmooth.dab(doc, &dab, &settings),
                 };
                 if let Err(e) = r {
                     eprintln!("mesh layer dab: {e}");
@@ -2031,9 +2046,9 @@ mod tests {
             for (i, d) in dabs.iter().enumerate() {
                 let (hit, _) = mode.raycast(*d * 3.0, -*d).unwrap();
                 if k == 0 {
-                    mode.brush_dab(hit, 0.08, 0.002, 0.8, 0.3, Brush::Trim);
+                    mode.brush_dab(DabInput { at: hit, radius: 0.08, px: 0.002, strength: 0.8, hardness: 0.3, brush: Brush::Trim });
                 } else {
-                    mode.queue_dab(hit, 0.08, 0.002, 0.8, 0.3, Brush::Trim);
+                    mode.queue_dab(DabInput { at: hit, radius: 0.08, px: 0.002, strength: 0.8, hardness: 0.3, brush: Brush::Trim });
                     // Frames that keep up with only some of what is queued: a dab, or a frame's share.
                     if i % 4 == 3 {
                         assert_eq!(mode.run_dabs(0.0), 1);
@@ -2065,7 +2080,7 @@ mod tests {
         for k in 0..12 {
             let d = Vec3::new(-0.2 + 0.03 * k as f32, 0.05, 1.0).normalize();
             let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
-            mode.brush_dab(hit, 0.08, 0.002, 0.8, 0.3, Brush::Clay);
+            mode.brush_dab(DabInput { at: hit, radius: 0.08, px: 0.002, strength: 0.8, hardness: 0.3, brush: Brush::Clay });
         }
         mode.end_stroke();
         mode.settle();
@@ -3353,7 +3368,7 @@ mod tests {
             let d = Vec3::new(-0.08 + 0.16 * k as f32 / 12.0, 0.01, 1.0).normalize();
             let Some((hit, _)) = mode.raycast(d * 3.0, -d) else { continue };
             let td = Instant::now();
-            mode.brush_dab(hit, r, px, 1.0, 0.5, brush);
+            mode.brush_dab(DabInput { at: hit, radius: r, px, strength: 1.0, hardness: 0.5, brush });
             dab_ms.push(td.elapsed().as_secs_f64() * 1e3);
             mode.tick();
         }

@@ -191,7 +191,7 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
                 let d = (if pass % 2 == 0 { pa.lerp(pb, t) } else { pb.lerp(pa, t) }).normalize();
                 let Some((hit, _)) = mode.raycast(d * 3.0, -d) else { continue };
                 // As the app does: the frame's dabs queued, a frame's share of them done, then the frame's tick.
-                mode.queue_dab(hit, ln.r, ln.px, 0.8, 0.3, ln.brush);
+                mode.queue_dab(DabInput { at: hit, radius: ln.r, px: ln.px, strength: 0.8, hardness: 0.3, brush: ln.brush });
                 n += 1;
                 if n % ln.per_frame == 0 {
                     let t0 = Instant::now();

@@ -16,7 +16,7 @@ use crate::pen::Pen;
 use crate::theme::{Theme, ThemeLibrary};
 use crate::tools::{Brush, Tool, ToolBox};
 use crate::viewport::Viewport;
-use crate::volume_mode::VolumeMode;
+use crate::volume_mode::{DabInput, VolumeMode};
 
 pub struct Options {
     /// A `.svol` file to open instead of a new ball.
@@ -388,11 +388,12 @@ impl SculptApp {
             let px = camera.world_per_pixel(hit, size.y);
             let radius = *size_px * px;
             let spacing = (0.15 * radius).max(mode.voxel());
+            let dab = DabInput { at: hit, radius, px, strength: *strength * s.pressure, hardness: *hardness, brush: *brush };
             let from = match *last {
                 // Re-entering the surface, or jumping across a gap, starts the spacing over.
                 Some(p) if p.distance(hit) < radius * 4.0 => p,
                 _ => {
-                    mode.queue_dab(hit, radius, px, *strength * s.pressure, *hardness, *brush);
+                    mode.queue_dab(dab);
                     *last = Some(hit);
                     *carry = 0.0;
                     continue;
@@ -403,7 +404,7 @@ impl SculptApp {
             let mut along = spacing - *carry;
             while along <= gap {
                 let q = from.lerp(hit, along / gap);
-                mode.queue_dab(q, radius, px, *strength * s.pressure, *hardness, *brush);
+                mode.queue_dab(DabInput { at: q, ..dab });
                 along += spacing;
             }
             *carry = gap - (along - spacing);

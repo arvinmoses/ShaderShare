@@ -63,7 +63,7 @@ fn stroke(mode: &mut VolumeMode, target: Target, dir: Vec3, r: f32, brush: Brush
     for k in 0..16 {
         let d = (dir.normalize() + side * (0.15 * (k as f32 / 15.0 - 0.5))).normalize();
         if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
-            mode.queue_dab(hit, r, 0.002, 0.8, 0.3, brush);
+            mode.queue_dab(DabInput { at: hit, radius: r, px: 0.002, strength: 0.8, hardness: 0.3, brush });
         }
         if k % 4 == 3 {
             frame(mode);
@@ -225,7 +225,7 @@ fn a_stroke_that_misses_adds_no_step() {
     let miss = |mode: &mut VolumeMode| {
         mode.target = Target::Detail;
         mode.begin_stroke();
-        mode.queue_dab(Vec3::new(50.0, 50.0, 50.0), 0.08, 0.002, 0.8, 0.3, Brush::Clay);
+        mode.queue_dab(DabInput { at: Vec3::new(50.0, 50.0, 50.0), radius: 0.08, px: 0.002, strength: 0.8, hardness: 0.3, brush: Brush::Clay });
         frame(mode);
         mode.end_stroke();
         settle_frames(mode);
@@ -264,7 +264,7 @@ fn three_volume_strokes_in_one_swap_undo_redo() {
         for k in 0..12 {
             let dd = (d.normalize() + side * (0.1 * (k as f32 / 11.0 - 0.5))).normalize();
             let (hit, _) = mode.raycast(dd * 3.0, -dd).unwrap();
-            mode.brush_dab(hit, 0.06 + 0.02 * i as f32, 0.002, 0.8, 0.3, if i == 1 { Brush::Trim } else { Brush::Clay });
+            mode.brush_dab(DabInput { at: hit, radius: 0.06 + 0.02 * i as f32, px: 0.002, strength: 0.8, hardness: 0.3, brush: if i == 1 { Brush::Trim } else { Brush::Clay } });
         }
         mode.end_stroke();
     }
@@ -728,7 +728,7 @@ fn rows_follow_dabs_swaps_and_hiding() {
     mode.begin_stroke();
     let d = Vec3::new(0.1, 0.0, 1.0).normalize();
     let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
-    mode.queue_dab(hit, 0.05, 0.002, 0.8, 0.3, Brush::Clay);
+    mode.queue_dab(DabInput { at: hit, radius: 0.05, px: 0.002, strength: 0.8, hardness: 0.3, brush: Brush::Clay });
     let r = frame(&mut mode);
     assert!(!r.all && !r.leaves.is_empty(), "a dab lists its leaves: {r:?}");
     mode.end_stroke();
@@ -768,7 +768,7 @@ fn app_stroke(mode: &mut VolumeMode, target: Target, from: Vec3, to: Vec3, r: f3
             let t = if p % 2 == 0 { t } else { 1.0 - t };
             let d = a.lerp(b, t).normalize();
             if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
-                mode.queue_dab(hit, r, 0.004, strength, 0.3, brush);
+                mode.queue_dab(DabInput { at: hit, radius: r, px: 0.004, strength, hardness: 0.3, brush });
             }
             if k % 3 == 2 {
                 frame(mode);
@@ -1109,7 +1109,7 @@ fn layer_dab_times_at_2_5m() {
                 let d = Vec3::new(-0.4 + 0.8 * i as f32 / 59.0, 0.1 * (s / 3) as f32 - 0.05, 1.0).normalize();
                 let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
                 let t = Instant::now();
-                mode.brush_dab(hit, r, 0.002, 0.7, 0.3, brushes[k]);
+                mode.brush_dab(DabInput { at: hit, radius: r, px: 0.002, strength: 0.7, hardness: 0.3, brush: brushes[k] });
                 times[k].push(t.elapsed().as_secs_f64() * 1e3);
             }
             mode.end_stroke();
@@ -1172,7 +1172,7 @@ fn session_frames_at_2_5m() {
         for k in 0..24 {
             let dd = (d + side * (0.2 * (k as f32 / 23.0 - 0.5))).normalize();
             if let Some((hit, _)) = mode.raycast(dd * 3.0, -dd) {
-                mode.queue_dab(hit, if layer { 0.05 } else { 0.08 }, 0.002, 0.7, 0.3, Brush::Clay);
+                mode.queue_dab(DabInput { at: hit, radius: if layer { 0.05 } else { 0.08 }, px: 0.002, strength: 0.7, hardness: 0.3, brush: Brush::Clay });
             }
             if k % 3 == 2 {
                 timed(&mut mode, "stroke", &mut frames);

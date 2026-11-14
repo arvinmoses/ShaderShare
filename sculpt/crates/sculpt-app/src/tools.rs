@@ -84,6 +84,27 @@ pub enum Brush {
     Smooth,
 }
 
+/// What a dab's strength comes to, the same on the volume and on a mesh layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BrushShape {
+    /// Clay's build up or Trim's cut, as a fraction of the radius.
+    pub height: f32,
+    /// How far each dab goes: toward the brush's plane, or for Smooth from a tenth to seven tenths of the way to the
+    /// surface's smoothed self.
+    pub alpha: f32,
+}
+
+impl Brush {
+    /// The shape of a dab at `strength` (clamped to 0..1).
+    pub fn shape(self, strength: f32) -> BrushShape {
+        let s = strength.clamp(0.0, 1.0);
+        BrushShape {
+            height: if self == Brush::Trim { 0.015 + 0.06 * s } else { 0.015 + 0.08 * s },
+            alpha: if self == Brush::Smooth { 0.1 + 0.6 * s } else { 0.1 + 0.3 * s },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolParams {
     /// Brush radius in screen points (like ZBrush draw size).
@@ -134,6 +155,18 @@ impl ToolBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape gives, bit for bit, what the dabs computed in place before it.
+    #[test]
+    fn brush_shape_keeps_the_dab_numbers() {
+        for k in -2..=12 {
+            let strength = k as f32 * 0.1 + 0.013;
+            let s = strength.clamp(0.0, 1.0);
+            for (b, height, alpha) in [(Brush::Clay, 0.015 + 0.08 * s, 0.1 + 0.3 * s), (Brush::Trim, 0.015 + 0.06 * s, 0.1 + 0.3 * s), (Brush::Smooth, 0.015 + 0.08 * s, 0.1 + 0.6 * s)] {
+                let got = b.shape(strength);
+                assert_eq!((got.height.to_bits(), got.alpha.to_bits()), (height.to_bits(), alpha.to_bits()), "{b:?} at {strength}");            }
+        }
+    }
 
     #[test]
     fn older_settings_keep_the_brushes_they_share() {

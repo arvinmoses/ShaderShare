@@ -68,7 +68,7 @@ fn strokes(mode: &mut VolumeMode, what: &str, r: f32, gap: usize) -> Row {
             while done < upto {
                 let dd = (d + side * (0.15 * r * done as f32 - 0.5 * len)).normalize();
                 if let Some((hit, _)) = mode.raycast(dd * 3.0, -dd) {
-                    mode.queue_dab(hit, r, 0.003, 0.6, 0.3, Brush::Clay);
+                    mode.queue_dab(DabInput { at: hit, radius: r, px: 0.003, strength: 0.6, hardness: 0.3, brush: Brush::Clay });
                 }
                 done += 1;
             }
@@ -175,7 +175,7 @@ fn refit_waits_for_the_pen_up() {
         for k in 0..12 {
             let d = Vec3::new(0.1 * k as f32 / 11.0, 0.0, 1.0).normalize();
             if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
-                mode.queue_dab(hit, 0.1, 0.002, 0.8, 0.3, Brush::Clay);
+                mode.queue_dab(DabInput { at: hit, radius: 0.1, px: 0.002, strength: 0.8, hardness: 0.3, brush: Brush::Clay });
             }
         }
         mode.end_stroke();
