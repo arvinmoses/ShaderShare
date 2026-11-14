@@ -561,6 +561,62 @@ fn a_failing_state_then_a_new_step_from_it() {
     base_is_fresh(&mut mode, "at the end");
 }
 
+/// The state before the first volume step on the history.
+fn first_state(mode: &VolumeMode) -> u64 {
+    mode.mesh.as_ref().unwrap().history.iter().find_map(|e| match e {
+        crate::mesh_stack::Entry::Volume { pre, .. } => Some(*pre),
+        _ => None,
+    }).unwrap()
+}
+
+/// Carve (fails), a ball (V2), a bump on it (V3), undo (back to V2), undo (the volume at V1, failing: the layers stay
+/// at V2), another ball from V1 (V4). The swap out of V2 to V4 files what V2 held under V2, a state no step reaches
+/// now: it goes to V0, where the layers first came to V2 from (the return to V2 from V3 does not count as where it
+/// came from). Undone back to V0, the layers are as they were.
+#[test]
+fn patches_of_a_state_gone_go_where_the_layers_first_came_from() {
+    let _one = one_at_a_time();
+    let mut mode = small_ball_with_stroke();
+    let s0 = state(ml(&mut mode));
+    carve_all(&mut mode);
+    settle_frames(&mut mode);
+    assert!(failed(&mode));
+    let v0 = first_state(&mode);
+    ball_step(&mut mode, Vec3::ZERO, 0.8, false);
+    settle_frames(&mut mode);
+    ball_step(&mut mode, Vec3::new(0.0, 0.0, 0.8), 0.2, false);
+    settle_frames(&mut mode);
+    assert!(!failed(&mode));
+    step(&mut mode, VolumeMode::undo, false, "undo the bump");
+    step(&mut mode, VolumeMode::undo, true, "undo the ball");
+    ball_step(&mut mode, Vec3::new(0.1, 0.0, 0.0), 0.7, false);
+    settle_frames(&mut mode);
+    assert!(!failed(&mode), "the other ball did not refit");
+    assert_eq!(mode.mesh.as_ref().unwrap().filed(), vec![(v0, 2)], "what V0 gets back");
+    step(&mut mode, VolumeMode::undo, true, "undo the other ball");
+    step(&mut mode, VolumeMode::undo, false, "undo the carve");
+    let d = differ(&state(ml(&mut mode)), &s0);
+    eprintln!("V0: {d:?}");
+    assert_eq!(d, (0, 0), "V0's layer data");
+    // (What the other ball's state filed on leaving stays for its redo.)
+    assert!(mode.mesh.as_ref().unwrap().filed().iter().all(|(s, _)| *s != v0), "V0's patches were not all put back");
+}
+
+/// A step, undone, and another in its place: what the first step's state filed on leaving is stale for V0 (the
+/// layers were back at V0 since), so V0 holds only what the second step's swap filed.
+#[test]
+fn an_undone_step_replaced_leaves_no_patches_behind() {
+    let _one = one_at_a_time();
+    let mut mode = small_ball_with_stroke();
+    ball_step(&mut mode, Vec3::new(0.0, 0.0, 1.0), 0.2, false);
+    settle_frames(&mut mode);
+    let v0 = first_state(&mode);
+    step(&mut mode, VolumeMode::undo, false, "undo the bump");
+    ball_step(&mut mode, Vec3::new(0.0, 1.0, 0.0), 0.2, false);
+    settle_frames(&mut mode);
+    assert_eq!(mode.mesh.as_ref().unwrap().filed(), vec![(v0, 1)]);
+}
+
 /// A file whose later chunks are damaged or cut short opens all the same, without them, saying so: the mesh layers
 /// cut inside, their offset back damaged, their volume carved away (no mesh to put them on), a surface noise chunk
 /// running past the end.

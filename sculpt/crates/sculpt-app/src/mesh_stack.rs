@@ -76,9 +76,13 @@ pub struct MeshStack {
     /// What each swap could not carry, filed under the volume state the layers left (newest last): put back when
     /// the layers next arrive at that state, however they get there. A patch belongs to the state left, not to a
     /// step: refits that fail, or that cover several steps, leave the layers at states other than the step's ends.
-    lost: HashMap<u64, Vec<Patch>>,
-    /// Per state the layers arrived at: the state they came from (by the last swap that brought them there).
+    /// Each with the number of the swap that filed it.
+    lost: HashMap<u64, Vec<(u64, Patch)>>,
+    /// Per state the layers arrived at: the state they came from the first time (later arrivals would make cycles of
+    /// it), and the number of the last swap that brought them there.
     came_from: HashMap<u64, u64>,
+    arrived: HashMap<u64, u64>,
+    swap_no: u64,
     /// The volume's state, the state the layers are at (they lag behind while a refit runs or after one failed), and
     /// the state the refit under way goes to.
     vol_state: u64,
@@ -175,6 +179,8 @@ impl MeshStack {
             redo: Vec::new(),
             lost: HashMap::new(),
             came_from: HashMap::new(),
+            arrived: HashMap::new(),
+            swap_no: 0,
             vol_state: 0,
             doc_state: 0,
             job_state: None,
@@ -239,13 +245,18 @@ impl MeshStack {
             }
         }
         // A state no step reaches any more: what its patches hold of vertices the layers carried there by name from the
-        // state they came from is that state's data too (a refit that skipped a failed state can bring the layers
-        // back there straight from a later one), so they go to the nearest such state still reached, newest last.
+        // state they first came from is that state's data too (a refit that skipped a failed state can bring the
+        // layers back there straight from a later one), so they go to the nearest such state still reached. Only
+        // those filed since the layers were last at that state: older ones are stale there (the layers were back
+        // since, and what they hold or filed on leaving is newer).
         let came = &self.came_from;
         let kept_from = |s: u64| -> Option<u64> {
             let mut at = s;
             for _ in 0..=came.len() {
                 let c = *came.get(&at)?;
+                if c == s {
+                    return None;
+                }
                 if keep.contains(&c) {
                     return Some(c);
                 }
@@ -258,11 +269,24 @@ impl MeshStack {
         for (s, to) in gone {
             let patches = self.lost.remove(&s).unwrap_or_default();
             if let Some(c) = to {
-                self.lost.entry(c).or_default().extend(patches);
+                let since = self.arrived.get(&c).copied().unwrap_or(0);
+                let fresh: Vec<(u64, Patch)> = patches.into_iter().filter(|(n, _)| *n > since).collect();
+                if !fresh.is_empty() {
+                    self.lost.entry(c).or_default().extend(fresh);
+                }
             }
         }
         // (Each state still reached keeps where it came from, past the states gone.)
         self.came_from = from.into_iter().filter_map(|(s, c)| Some((s, c?))).collect();
+        self.arrived.retain(|s, _| keep.contains(s));
+    }
+
+    /// (State, patches filed under it), by state.
+    #[cfg(test)]
+    pub(crate) fn filed(&self) -> Vec<(u64, usize)> {
+        let mut out: Vec<(u64, usize)> = self.lost.iter().map(|(s, p)| (*s, p.len())).collect();
+        out.sort_unstable();
+        out
     }
 
     fn new_state(&mut self) -> u64 {
@@ -352,19 +376,24 @@ impl MeshStack {
         let patches = self.layers.take_patches();
         if swapped {
             let left = self.doc_state;
-            let fwd: Vec<Patch> = patches.into_iter().filter(|p| !p.is_empty()).collect();
+            self.swap_no += 1;
+            let n = self.swap_no;
+            let fwd: Vec<(u64, Patch)> = patches.into_iter().filter(|p| !p.is_empty()).map(|p| (n, p)).collect();
             if !fwd.is_empty() {
                 self.lost.entry(left).or_default().extend(fwd);
             }
-            // Newest first: where two hold a vertex, the older (nearer the state as it was) wins.
-            for p in self.lost.remove(&to).unwrap_or_default().iter().rev() {
+            // Newest filed first: where two hold a vertex, the older (nearer the state as it was) wins.
+            let mut back = self.lost.remove(&to).unwrap_or_default();
+            back.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+            for (_, p) in &back {
                 if let Err(e) = self.layers.restore(p) {
                     eprintln!("mesh layers: restore failed: {e}");
                 }
             }
             if to != left {
-                self.came_from.insert(to, left);
+                self.came_from.entry(to).or_insert(left);
             }
+            self.arrived.insert(to, n);
             self.doc_state = to;
             self.failed_keys.clear();
             self.job_keys.clear();
@@ -433,6 +462,10 @@ impl MeshStack {
                     return true;
                 }
                 Some(Entry::Layer { patch, fill }) => {
+                    if self.behind() {
+                        self.history.push(Entry::Layer { patch, fill });
+                        return false;
+                    }
                     return match self.layers.restore_swap(&patch) {
                         Ok(inv) => {
                             let fill = self.swap_fill(fill);
@@ -453,10 +486,12 @@ impl MeshStack {
                 }
                 Some(Entry::Volume { id, pre, post }) => {
                     if vol.last_id() != Some(id) {
-                        // The two histories no longer agree: the older entries can only be wrong.
+                        // The two histories no longer agree: the older entries can only be wrong. With none left in
+                        // the volume's, it dropped its oldest steps (it keeps so many bytes): the start is reached.
+                        let start = vol.last_id().is_none();
                         self.history.clear();
                         self.trim();
-                        self.note = Some(DISAGREE.into());
+                        self.note = Some(if start { "The start of the history is reached".into() } else { DISAGREE.into() });
                         continue;
                     }
                     vol.undo();
@@ -478,6 +513,10 @@ impl MeshStack {
         self.finish(vol);
         match self.redo.pop() {
             None => false,
+            Some(Entry::Layer { patch, fill }) if self.behind() => {
+                self.redo.push(Entry::Layer { patch, fill });
+                false
+            }
             Some(Entry::Layer { patch, fill }) => match self.layers.restore_swap(&patch) {
                 Ok(inv) => {
                     let fill = self.swap_fill(fill);
@@ -511,6 +550,14 @@ impl MeshStack {
                 true
             }
         }
+    }
+
+    /// While the last refit failed, the layers sit on a mesh the volume no longer has: a layer step's patch would go
+    /// back only in part. It waits (the note says why) until a refit succeeds.
+    fn behind(&mut self) -> bool {
+        let Some(f) = self.failure.as_ref() else { return false };
+        self.note = Some(format!("Layer steps wait until the layers follow the volume again: {f}"));
+        true
     }
 
     /// An undo or redo of a layer step that could not be done (nothing of it was): the history goes, as when the two
