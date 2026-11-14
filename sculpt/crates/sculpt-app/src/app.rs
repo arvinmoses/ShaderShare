@@ -30,6 +30,8 @@ pub struct Options {
     pub screenshot: Option<PathBuf>,
     /// Run the scripted session, saving every frame into this folder (`volume_demo.rs`).
     pub demo_volume: Option<PathBuf>,
+    /// `--decimate`: open the Decimate window on the startup mesh at these settings.
+    pub decimate: Option<crate::decimate_ui::Script>,
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +105,7 @@ pub struct SculptApp {
     shot: Option<Shot>,
     /// The GPU surface is still fading levels or landing a big change.
     settling: bool,
+    pub decimate: crate::decimate_ui::Decimate,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -174,6 +177,7 @@ impl SculptApp {
             volume_demo: opts.demo_volume.map(crate::volume_demo::VolumeDemo::new),
             shot: opts.screenshot.map(|path| Shot { path, frames: 0, requested: false }),
             settling: false,
+            decimate: crate::decimate_ui::Decimate::new(cc.wgpu_render_state.clone(), opts.decimate),
         };
         for e in app.themes.errors.iter().chain(&app.keymap.errors) {
             eprintln!("config: {e}");
@@ -419,7 +423,7 @@ impl SculptApp {
         self.pen.update(&events);
         let delta = resp.drag_delta();
         let dv = GVec2::new(delta.x, delta.y);
-        let navigating = mods.alt || resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary);
+        let navigating = self.decimate.previewing() || mods.alt || resp.dragged_by(egui::PointerButton::Middle) || resp.dragged_by(egui::PointerButton::Secondary);
         if navigating {
             if (mods.alt && resp.dragged_by(egui::PointerButton::Primary)) || (!mods.alt && resp.dragged_by(egui::PointerButton::Secondary)) {
                 self.camera.orbit(dv);
@@ -689,7 +693,7 @@ impl SculptApp {
             return;
         }
         shot.frames += 1;
-        let settled = !self.volume.busy() && !self.settling;
+        let settled = !self.volume.busy() && !self.settling && !self.decimate.busy();
         if (shot.frames >= 30 && settled) || shot.frames >= 900 {
             shot.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
@@ -853,6 +857,7 @@ impl eframe::App for SculptApp {
         crate::panels::dialogs(self, &ctx);
         crate::panels::theme_editor(self, &ctx);
         crate::panels::keymap_window(self, &ctx);
+        crate::decimate_ui::window(self, &ctx);
 
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport_ui(ui, frame));
         // A slider let go: what it changed is one undo.

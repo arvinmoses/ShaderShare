@@ -1,11 +1,11 @@
 //! The analysis: collapse the whole mesh down to a floor, in parallel rounds over spatial tiles, and keep the
 //! collapse record that [`Analysis::extract`] replays to any count.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-use glam::{DVec3, IVec3, Vec3};
+use glam::{DVec3, Vec3};
 use rayon::prelude::*;
 
 use super::collapse::{Engine, Params, Rec};
@@ -106,6 +106,10 @@ struct State {
     faces: Vec<[u32; 3]>,
     falive: Vec<bool>,
     valive: Vec<bool>,
+    /// Live faces and vertices (refreshed each round), and a per-vertex scratch for tiles.
+    lf: Vec<u32>,
+    lv: Vec<u32>,
+    vtile: Vec<u32>,
     border: Vec<bool>,
     locked: Vec<bool>,
     death: Vec<u32>,
@@ -233,6 +237,9 @@ impl Analysis {
             faces: mesh.triangles.clone(),
             falive: valid.clone(),
             valive: used.clone(),
+            lf: (0..mesh.triangles.len() as u32).filter(|&f| valid[f as usize]).collect(),
+            lv: (0..nv as u32).filter(|&v| used[v as usize]).collect(),
+            vtile: vec![u32::MAX; nv],
             border,
             locked,
             death: vec![u32::MAX; mesh.triangles.len()],
@@ -424,37 +431,47 @@ fn one_round(
             eprintln!("    {what} {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
     };
-    let nf = st.faces.len();
+    {
+        let (falive, valive) = (&st.falive, &st.valive);
+        st.lf.retain(|&f| falive[f as usize]);
+        st.lv.retain(|&v| valive[v as usize]);
+    }
+    let nl = st.lf.len();
     // Tile of every live face (u32::MAX: crosses tiles).
     let (tiles, face_tile): (usize, Vec<u32>) = match tiled {
-        None => (1, (0..nf).map(|f| if st.falive[f] { 0 } else { u32::MAX }).collect()),
+        None => (1, vec![0; nl]),
         Some(round) => {
-            let want = (alive_faces / tile_faces.max(1)).max(rayon::current_num_threads() * 2);
-            let h = cell_size(st, bounds, want);
+            // Equal-count tiles: live vertices in Morton order, cut into runs. The curve's origin moves every round so
+            // the seams (faces whose vertices fall in two runs) move too.
+            let ext = bounds.extent().max_element().max(1e-12) * 1.5;
             let shift = Vec3::new(0.37, 0.61, 0.23) * (round as f32 + 1.0);
-            let off = (shift - shift.floor()) * h;
-            let cell = |p: Vec3| ((p - bounds.min + off) / h).floor().as_ivec3();
-            let vcell: Vec<IVec3> = st.pos.par_iter().map(|&p| cell(p)).collect();
-            let mut ids: HashMap<IVec3, u32> = HashMap::new();
-            let face_cell: Vec<Option<IVec3>> = (0..nf)
-                .into_par_iter()
-                .map(|f| {
-                    if !st.falive[f] {
-                        return None;
-                    }
-                    let t = st.faces[f];
-                    let c = vcell[t[0] as usize];
-                    (vcell[t[1] as usize] == c && vcell[t[2] as usize] == c).then_some(c)
+            let off = (shift - shift.floor()) * (ext / 3.0);
+            let scale = ((1u32 << 21) - 1) as f32 / ext;
+            let mut order: Vec<(u64, u32)> = st
+                .lv
+                .par_iter()
+                .map(|&v| {
+                    let q = ((st.pos[v as usize] - bounds.min + off) * scale).max(Vec3::ZERO).as_uvec3();
+                    (morton(q.x) | (morton(q.y) << 1) | (morton(q.z) << 2), v)
                 })
                 .collect();
-            let mut ft = vec![u32::MAX; nf];
-            for f in 0..nf {
-                if let Some(c) = face_cell[f] {
-                    let n = ids.len() as u32;
-                    ft[f] = *ids.entry(c).or_insert(n);
-                }
+            order.par_sort_unstable();
+            let per = (tile_faces / 2).max(64);
+            let tiles = order.len().div_ceil(per).max(1);
+            for (i, &(_, v)) in order.iter().enumerate() {
+                st.vtile[v as usize] = (i / per) as u32;
             }
-            (ids.len(), ft)
+            let vtile = &st.vtile;
+            let ft: Vec<u32> = st
+                .lf
+                .par_iter()
+                .map(|&f| {
+                    let t = st.faces[f as usize];
+                    let c = vtile[t[0] as usize];
+                    if vtile[t[1] as usize] == c && vtile[t[2] as usize] == c { c } else { u32::MAX }
+                })
+                .collect();
+            (tiles, ft)
         }
     };
     if tiles == 0 {
@@ -464,14 +481,14 @@ fn one_round(
 
     // Seams: every vertex of a live face that crosses tiles is locked for this round.
     let mut seam = st.locked.clone();
-    for f in 0..nf {
-        if st.falive[f] && face_tile[f] == u32::MAX {
-            for &v in &st.faces[f] {
+    for (i, &f) in st.lf.iter().enumerate() {
+        if face_tile[i] == u32::MAX {
+            for &v in &st.faces[f as usize] {
                 seam[v as usize] = true;
             }
         }
     }
-    let tile_list = Csr::from_pairs(tiles, (0..nf as u32).filter(|&f| face_tile[f as usize] != u32::MAX).map(|f| (face_tile[f as usize], f)));
+    let tile_list = Csr::from_pairs(tiles, st.lf.iter().enumerate().filter(|(i, _)| face_tile[*i] != u32::MAX).map(|(i, &f)| (face_tile[i], f)));
 
     let mut engines: Vec<Engine> = (0..tiles)
         .into_par_iter()
@@ -560,25 +577,15 @@ fn one_round(
     removed
 }
 
-/// A cell size giving about `want` occupied cells.
-fn cell_size(st: &State, bounds: &Aabb, want: usize) -> f32 {
-    let diag = bounds.diagonal().max(1e-12);
-    let sample: Vec<Vec3> = st.pos.iter().zip(&st.valive).filter(|(_, a)| **a).map(|(p, _)| *p).step_by(16).collect();
-    let mut h = diag / (want as f32).sqrt().max(1.0);
-    for _ in 0..4 {
-        let mut set = std::collections::HashSet::new();
-        for p in &sample {
-            set.insert(((*p - bounds.min) / h).floor().as_ivec3());
-        }
-        let got = set.len().max(1) as f32;
-        // A surface fills cells as 1/h².
-        let ratio = (got / want as f32).sqrt();
-        if (0.8..1.25).contains(&ratio) {
-            break;
-        }
-        h *= ratio;
-    }
-    h
+/// Spread the low 21 bits of `x` to every third bit.
+fn morton(x: u32) -> u64 {
+    let mut x = (x as u64) & 0x1f_ffff;
+    x = (x | (x << 32)) & 0x1f00000000ffff;
+    x = (x | (x << 16)) & 0x1f0000ff0000ff;
+    x = (x | (x << 8)) & 0x100f00f00f00f00f;
+    x = (x | (x << 4)) & 0x10c30c30c30c30c3;
+    x = (x | (x << 2)) & 0x1249249249249249;
+    x
 }
 
 #[derive(Clone, Copy, PartialEq)]

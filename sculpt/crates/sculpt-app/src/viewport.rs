@@ -74,7 +74,9 @@ pub struct Viewport {
     /// The volume's vertices as drawn, for checks (made when first needed).
     capture: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     shader: wgpu::ShaderModule,
-    bgl: wgpu::BindGroupLayout,
+    pub(crate) bgl: wgpu::BindGroupLayout,
+    /// The decimation preview, drawn in place of the volume while it shows (`decimate_ui`).
+    pub decimate: Option<crate::decimate_draw::DecimateDraw>,
 }
 
 /// The volume playground's surface on the GPU: built there by `gpu_levels`, and drawn from its buffers, a page of
@@ -248,6 +250,7 @@ impl Viewport {
             capture: None,
             shader,
             bgl,
+            decimate: None,
             texture_id: None,
             last_upload: UploadStats::default(),
         }
@@ -593,7 +596,9 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_pipeline(&self.bg_pipeline);
             pass.draw(0..3, 0..1);
-            if let Some(v) = &self.volume {
+            if let Some(d) = self.decimate.as_ref().filter(|d| d.showing()) {
+                d.draw(&mut pass);
+            } else if let Some(v) = &self.volume {
                 let (pages, draws, status, _, _, _) = v.gpu.buffers_for_draw();
                 pass.set_pipeline(&self.levels_pipeline);
                 pass.set_bind_group(1, &v.group, &[]);

@@ -168,3 +168,20 @@ fn bench() {
     }
     let _ = Vec3::ZERO;
 }
+
+/// A real volume surface: `DECIMATE_SVOL=path cargo test --release -p sculpt-core --test decimate -- --ignored --nocapture svol`.
+#[test]
+#[ignore]
+fn svol() {
+    let Some(path) = std::env::var_os("DECIMATE_SVOL") else { return };
+    let vol = sculpt_core::generator::level_volume::LevelVolume::read_from(&mut std::io::BufReader::new(std::fs::File::open(path).unwrap()), 8).unwrap();
+    let e = sculpt_core::mesh_layers::extract_all(&vol, usize::MAX).unwrap();
+    let m = TriMesh::from_poly(&e.mesh);
+    let r = check_manifold(m.positions.len(), &m.triangles);
+    println!("input {} tris, {} verts: {r:?}", m.triangles.len(), m.positions.len());
+    let t = Instant::now();
+    let a = analyse(&m, 0.0);
+    println!("analysis {:.0} ms {:?}", t.elapsed().as_secs_f64() * 1e3, a.stats);
+    let d = a.extract(Target::KeepPercent(2.0));
+    println!("2%: {:?}", check_manifold(d.mesh.positions.len(), &d.mesh.triangles));
+}

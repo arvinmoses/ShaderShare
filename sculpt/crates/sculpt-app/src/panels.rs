@@ -125,6 +125,7 @@ pub fn menu_bar(app: &mut SculptApp, ui: &mut Ui) {
                     app.dialog = Some(Dialog::SaveAs(app.volume_path.clone().unwrap_or("untitled.svol".into())));
                     ui.close();
                 }
+                crate::decimate_ui::menu_item(app, ui);
             });
             ui.menu_button("Edit", |ui| {
                 cmd_button(app, ui, Command::Undo);

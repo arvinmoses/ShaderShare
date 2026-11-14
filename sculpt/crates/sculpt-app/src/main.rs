@@ -9,6 +9,8 @@
 
 mod app;
 mod camera;
+mod decimate_draw;
+mod decimate_ui;
 mod generator_ui;
 mod gpu_levels;
 mod icons;
@@ -50,6 +52,7 @@ const HELP: &str = "sculpt-app [file.svol] [--triangles M] [--theme NAME] [--zoo
   file.svol        open this volume (otherwise a new ball)
   --triangles M    the new ball's size, in millions of triangles at its level 1 (default 1; fresh, it shows a quarter as many)
   --screenshot P   save the window once the volume has settled, then close
+  --decimate K,E[,wire]  open Decimate on the startup mesh: keep K %, evenness E (0-1), wireframe
   --demo-volume D  run the scripted session (SCULPT_DEMO_SCRIPT picks one), saving every frame into D
 sculpt-app --gpu-levels-check            the GPU surface against the CPU reference
 sculpt-app --gpu-rows-check              mesh layer rows drawn on the GPU surface (gates)
@@ -83,7 +86,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let mut args = std::env::args().skip(1);
-    let mut opts = app::Options { file: None, triangles: 1e6, theme: None, zoom: 1.0, screenshot: None, demo_volume: None };
+    let mut opts = app::Options { file: None, triangles: 1e6, theme: None, zoom: 1.0, screenshot: None, demo_volume: None, decimate: None };
     let mut size = [1600.0f32, 1000.0];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -92,6 +95,7 @@ fn main() -> eframe::Result {
             "--theme" => opts.theme = args.next(),
             "--screenshot" => opts.screenshot = args.next().map(PathBuf::from),
             "--demo-volume" => opts.demo_volume = args.next().map(PathBuf::from),
+            "--decimate" => opts.decimate = args.next().as_deref().and_then(decimate_ui::Script::parse),
             // The volume is all there is; accepted so older scripts still run.
             "--volume" => {}
             "--size" => {
