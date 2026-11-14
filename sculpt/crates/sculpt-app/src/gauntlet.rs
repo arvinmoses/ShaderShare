@@ -7,6 +7,7 @@
 use super::*;
 use rayon::prelude::*;
 use std::time::Instant;
+use crate::ms;
 
 /// One stroke of a scene: the brush, its radius and the pixel size at the brush (which pick its level as in the
 /// app), its path in the scene's patch (offsets along its two axes), passes back and forth, and dabs a frame.
@@ -196,12 +197,12 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
                 if n % ln.per_frame == 0 {
                     let t0 = Instant::now();
                     let k = mode.run_frame_dabs();
-                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    let ms = ms(t0);
                     s.dab_mean += ms;
                     s.dab_worst = s.dab_worst.max(ms / k.max(1) as f64);
                     dabs += k;
                     tick(&mut mode, scene.layer);
-                    s.frame_worst = s.frame_worst.max(t0.elapsed().as_secs_f64() * 1e3);
+                    s.frame_worst = s.frame_worst.max(crate::ms(t0));
                 }
             }
         }
@@ -211,19 +212,19 @@ fn run(scene: &Scene, out: Option<&std::path::Path>) -> Scores {
         while mode.dabs_queued() {
             let t0 = Instant::now();
             let k = mode.run_frame_dabs();
-            s.dab_mean += t0.elapsed().as_secs_f64() * 1e3;
+            s.dab_mean += ms(t0);
             dabs += k;
             tick(&mut mode, scene.layer);
-            s.frame_worst = s.frame_worst.max(t0.elapsed().as_secs_f64() * 1e3);
+            s.frame_worst = s.frame_worst.max(ms(t0));
         }
         let t0 = Instant::now();
         mode.end_stroke();
-        let mut worst = t0.elapsed().as_secs_f64() * 1e3;
+        let mut worst = ms(t0);
         let start = Instant::now();
         while mode.busy() && start.elapsed().as_secs_f64() < 20.0 {
             let t0 = Instant::now();
             tick(&mut mode, scene.layer);
-            worst = worst.max(t0.elapsed().as_secs_f64() * 1e3);
+            worst = worst.max(ms(t0));
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
         mode.settle();

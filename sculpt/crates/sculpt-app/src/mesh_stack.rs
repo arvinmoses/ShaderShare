@@ -15,6 +15,8 @@ use sculpt_core::generator::level_volume::{Key, LevelVolume, key_order};
 use sculpt_core::mesh_layers::{MeshLayers, Patch, SwapStats};
 use sculpt_core::{DirtySet, LayerId, LayerMeta};
 
+use crate::ms;
+
 /// What the GPU rows need redrawn since the last take.
 #[derive(Default, Debug, Clone)]
 pub struct RowsDirty {
@@ -398,7 +400,7 @@ impl MeshStack {
             self.failed_keys.clear();
             self.job_keys.clear();
             self.trim();
-            self.times.swap_frame_ms = t.elapsed().as_secs_f64() * 1e3;
+            self.times.swap_frame_ms = ms(t);
         }
         if self.layers.busy() {
             // A job started again inside (its base changed meanwhile): it goes to the volume's state now.
@@ -420,7 +422,7 @@ impl MeshStack {
             }
         }
         if waited {
-            self.times.wait_ms = t.elapsed().as_secs_f64() * 1e3;
+            self.times.wait_ms = ms(t);
         }
     }
 
@@ -437,7 +439,7 @@ impl MeshStack {
         self.started(keys);
         // Those blocks still wait for the GPU: the next look at the volume's changes leaves them out.
         self.skip = waiting.into_iter().collect();
-        self.times.refit_start_ms = t.elapsed().as_secs_f64() * 1e3;
+        self.times.refit_start_ms = ms(t);
     }
 
     /// Undo the newest step: a layer stroke or setting, or a volume step (`vol.undo`, a refit started, its patches

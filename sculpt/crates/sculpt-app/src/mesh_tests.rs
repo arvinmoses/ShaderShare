@@ -12,6 +12,7 @@ use sculpt_core::LayerBlend;
 use sculpt_core::mesh_layers::{MeshLayerSettings, MeshLayers};
 
 use super::*;
+use crate::ms;
 use crate::layer_ui::{MaskKind, NoiseMask};
 
 /// One frame as the app runs it: a frame's share of the dabs, the tick, the GPU taking the volume's changes, the rows.
@@ -268,7 +269,7 @@ fn three_volume_strokes_in_one_swap_undo_redo() {
         }
         mode.end_stroke();
     }
-    eprintln!("three strokes ended in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    eprintln!("three strokes ended in {:.0} ms", ms(t));
     settle_frames(&mut mode);
     let m = mode.mesh.as_ref().unwrap();
     assert_eq!(m.times.swaps, swaps + 1, "one swap covers the three strokes");
@@ -1110,14 +1111,14 @@ fn layer_dab_times_at_2_5m() {
                 let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
                 let t = Instant::now();
                 mode.brush_dab(DabInput { at: hit, radius: r, px: 0.002, strength: 0.7, hardness: 0.3, brush: brushes[k] });
-                times[k].push(t.elapsed().as_secs_f64() * 1e3);
+                times[k].push(ms(t));
             }
             mode.end_stroke();
             frame(&mut mode);
         }
         let t = Instant::now();
         let rows = frame(&mut mode);
-        let frame_ms = t.elapsed().as_secs_f64() * 1e3;
+        let frame_ms = ms(t);
         for (k, times) in times.iter_mut().enumerate() {
             let max = times.iter().cloned().fold(0.0, f64::max);
             let (med, p95) = (pct(times, 0.5), pct(times, 0.95));
@@ -1151,11 +1152,11 @@ fn session_frames_at_2_5m() {
     let timed = |mode: &mut VolumeMode, what: &'static str, frames: &mut Vec<(f64, f64, &str)>| {
         let t = Instant::now();
         let dabs = mode.run_frame_dabs();
-        let td = t.elapsed().as_secs_f64() * 1e3;
+        let td = ms(t);
         mode.tick();
         mode.vol.drain_dirty();
         let _ = mode.take_rows_dirty();
-        let all = t.elapsed().as_secs_f64() * 1e3;
+        let all = ms(t);
         frames.push((all, all - td, what));
         let _ = dabs;
     };
@@ -1166,7 +1167,7 @@ fn session_frames_at_2_5m() {
         let t = Instant::now();
         mode.begin_stroke();
         if layer {
-            waits.push(t.elapsed().as_secs_f64() * 1e3);
+            waits.push(ms(t));
         }
         let side = d.any_orthonormal_vector();
         for k in 0..24 {
@@ -1181,7 +1182,7 @@ fn session_frames_at_2_5m() {
         }
         let t = Instant::now();
         mode.end_stroke();
-        end_frames.push(t.elapsed().as_secs_f64() * 1e3);
+        end_frames.push(ms(t));
         // The pen up for a while: frames at about 60 a second.
         for _ in 0..30 {
             timed(&mut mode, if layer { "after a layer stroke" } else { "after a volume stroke" }, &mut frames);
@@ -1193,11 +1194,11 @@ fn session_frames_at_2_5m() {
     let mut undo_frames = Vec::new();
     let t = Instant::now();
     assert!(mode.undo());
-    let undo_ms = t.elapsed().as_secs_f64() * 1e3;
+    let undo_ms = ms(t);
     while mode.busy() {
         let t = Instant::now();
         frame(&mut mode);
-        undo_frames.push(t.elapsed().as_secs_f64() * 1e3);
+        undo_frames.push(ms(t));
         std::thread::sleep(Duration::from_millis(14));
     }
     let undo_worst = undo_frames.iter().cloned().fold(0.0, f64::max);

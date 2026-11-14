@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use glam::Vec3;
 
 use super::*;
+use crate::ms;
 
 /// One frame as the app runs it: a frame's share of the dabs, the tick, the GPU taking the volume's changes, the rows.
 fn frame(mode: &mut VolumeMode) {
@@ -59,7 +60,7 @@ fn strokes(mode: &mut VolumeMode, what: &str, r: f32, gap: usize) -> Row {
         mode.target = Target::Form;
         let t = Instant::now();
         mode.begin_stroke();
-        let begin = t.elapsed().as_secs_f64() * 1e3;
+        let begin = ms(t);
         aheads += mode.ahead.is_some() as usize;
         let (len, nf) = (0.6f32, 36usize);
         let mut done = 0usize;
@@ -75,11 +76,11 @@ fn strokes(mode: &mut VolumeMode, what: &str, r: f32, gap: usize) -> Row {
             busy_frames += mode.mesh.as_ref().is_some_and(|m| m.layers.busy()) as usize;
             let t = Instant::now();
             let n = mode.run_frame_dabs();
-            let td = t.elapsed().as_secs_f64() * 1e3;
+            let td = ms(t);
             mode.tick();
             mode.vol.drain_dirty();
             let _ = mode.take_rows_dirty();
-            let all = t.elapsed().as_secs_f64() * 1e3;
+            let all = ms(t);
             let b = if f == 0 { begin } else { 0.0 };
             frames.push(all + b);
             parts.push((i, f, b, td, all - td, mode.ahead.is_some()));
@@ -96,7 +97,7 @@ fn strokes(mode: &mut VolumeMode, what: &str, r: f32, gap: usize) -> Row {
             mode.tick();
             mode.vol.drain_dirty();
             let _ = mode.take_rows_dirty();
-            let all = t.elapsed().as_secs_f64() * 1e3;
+            let all = ms(t);
             frames.push(all);
             parts.push((i, 36 + g, 0.0, 0.0, all, mode.ahead.is_some()));
             std::thread::sleep(Duration::from_millis(14));
@@ -121,7 +122,7 @@ fn strokes(mode: &mut VolumeMode, what: &str, r: f32, gap: usize) -> Row {
     let t = Instant::now();
     settle_frames(mode);
     if let Some(m) = mode.mesh.as_ref() {
-        eprintln!("    settled in {:.0} ms; refits swapped {}", t.elapsed().as_secs_f64() * 1e3, m.times.swaps);
+        eprintln!("    settled in {:.0} ms; refits swapped {}", ms(t), m.times.swaps);
     }
     row
 }
@@ -197,7 +198,7 @@ fn refit_waits_for_the_pen_up() {
         frame(&mut mode);
         let m = mode.mesh.as_ref().unwrap();
         if m.layers.busy() || m.times.swaps > swaps {
-            break up.elapsed().as_secs_f64() * 1e3;
+            break ms(up);
         }
         assert!(up.elapsed().as_secs() < 10, "no refit started");
         std::thread::sleep(Duration::from_millis(2));

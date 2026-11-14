@@ -9,7 +9,7 @@
 //! (`.svol`). Over the volume: the detail and generator stack (`Layered`), and mesh layers on its surface
 //! (`mesh_stack`).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
@@ -25,6 +25,7 @@ use sculpt_core::generator::level_volume::{CarryDone, EndDone, Key, LevelVolume}
 
 use crate::layer_ui::{LayerInfo, MaskInfo, MaskKind};
 use crate::mesh_stack::{MeshStack, RowsDirty};
+use crate::ms;
 
 /// While strokes run ahead of the work still landing: what a frame spends doing them for real is this less what the
 /// frame's own dabs took, at least [`CATCH_UP_MIN_MS`]. The copy is what is drawn, so the pen does not notice; the
@@ -40,6 +41,29 @@ const REFIT_AFTER_MS: f64 = 250.0;
 const FREE_OLD_AFTER_MS: f64 = 1000.0;
 /// The least time a frame spends on queued dabs (see [`VolumeMode::run_frame_dabs`]).
 const DAB_FRAME_MS: f64 = 9.0;
+
+/// Read once: whether the environment variable `name` is set.
+fn env_flag(cell: &'static OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+/// `SCULPT_DAB_LOG`: print every dab, as given (to replay a session's strokes).
+fn dab_log() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    env_flag(&F, "SCULPT_DAB_LOG")
+}
+
+/// `SCULPT_WAIT_LOG`: print how long strokes waited for work landing.
+fn wait_log() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    env_flag(&F, "SCULPT_WAIT_LOG")
+}
+
+/// `SCULPT_LAYER_LOG`: print the time of each form dab under a detail layer.
+fn layer_log() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    env_flag(&F, "SCULPT_LAYER_LOG")
+}
 
 /// One dab of a stroke, as the pen gives it.
 #[derive(Clone, Copy, Debug)]
@@ -397,14 +421,14 @@ impl VolumeMode {
     pub fn brush_dab(&mut self, d: DabInput) {
         let DabInput { at, radius, px, strength, hardness, brush } = d;
         // For replaying a session's strokes (`SCULPT_DAB_LOG`): every dab, as given.
-        if std::env::var_os("SCULPT_DAB_LOG").is_some() {
+        if dab_log() {
             eprintln!("DAB {} {} {} {radius} {px} {strength} {hardness} {}{}", at.x, at.y, at.z, brush == Brush::Trim, if brush == Brush::Smooth { " smooth" } else { "" });
         }
         // On a mesh layer or its mask: nothing of the volume's.
         if self.mesh_stroke.is_some() {
             self.mesh_dab(d);
             if let Some(t) = self.begun.take() {
-                self.first_dab_ms = t.elapsed().as_secs_f64() * 1e3;
+                self.first_dab_ms = ms(t);
             }
             return;
         }
@@ -415,8 +439,8 @@ impl VolumeMode {
         self.dab_now(d);
         self.note_copy();
         if let Some(t) = self.begun.take() {
-            self.first_dab_ms = t.elapsed().as_secs_f64() * 1e3;
-            if std::env::var_os("SCULPT_WAIT_LOG").is_some() {
+            self.first_dab_ms = ms(t);
+            if wait_log() {
                 eprintln!("first dab {:.1} ms after the stroke began{}", self.first_dab_ms, if self.ahead.is_some() { " (ahead of work still landing)" } else { "" });
             }
         }
@@ -440,7 +464,7 @@ impl VolumeMode {
         while let Some(d) = self.queued.pop_front() {
             self.brush_dab(d);
             n += 1;
-            if t.elapsed().as_secs_f64() * 1e3 > budget_ms {
+            if ms(t) > budget_ms {
                 break;
             }
         }
@@ -453,7 +477,7 @@ impl VolumeMode {
         let t = Instant::now();
         let all = self.queued.len() as f64 * self.dab_ms.max(0.05);
         let n = self.run_dabs(DAB_FRAME_MS.max(0.5 * all));
-        self.frame_dab_ms += t.elapsed().as_secs_f64() * 1e3;
+        self.frame_dab_ms += ms(t);
         n
     }
 
@@ -518,8 +542,8 @@ impl VolumeMode {
             (_, _) if brush == Brush::Smooth => self.vol.smooth_dab(self.level, at, along, radius, hardness, alpha),
             (true, Some(layer)) => {
                 let out = layer.plane_dab(&mut self.vol, self.level, at, along, radius, height, hardness, alpha, carve);
-                if std::env::var_os("SCULPT_LAYER_LOG").is_some() {
-                    eprintln!("form dab at level {} r {radius:.3}: {:.1} ms; layer {} blocks; follow {:?}", self.level, t.elapsed().as_secs_f64() * 1e3, layer.blocks(), layer.last);
+                if layer_log() {
+                    eprintln!("form dab at level {} r {radius:.3}: {:.1} ms; layer {} blocks; follow {:?}", self.level, ms(t), layer.blocks(), layer.last);
                 }
                 out
             }
@@ -528,7 +552,7 @@ impl VolumeMode {
         let Some((n, _)) = dabbed else { return };
         // The original surface's plane is steady already; easing it a little more smooths the turn over sharp forms.
         self.stroke_n = if self.stroke_n == Vec3::ZERO { n } else { (self.stroke_n * 0.5 + n * 0.5).try_normalize().unwrap_or(n) };
-        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let ms = ms(t);
         self.last_ms += ms;
         self.last_dabs += 1;
         self.stroke_level = self.level;
@@ -617,7 +641,7 @@ impl VolumeMode {
             let Some(event) = self.ahead.as_ref().and_then(|a| a.events.get(a.done).copied()) else { break };
             let first = !any;
             if let (true, Some(b), Event::Dab { .. }) = (fit, budget_ms, event)
-                && t.elapsed().as_secs_f64() * 1e3 + self.dab_ms > b
+                && ms(t) + self.dab_ms > b
             {
                 break;
             }
@@ -628,7 +652,7 @@ impl VolumeMode {
                     }
                     m.target = target;
                     m.begin_now(true);
-                    m.lag_ms = at.elapsed().as_secs_f64() * 1e3;
+                    m.lag_ms = ms(at);
                     true
                 }
                 Event::Dab(d) => {
@@ -645,7 +669,7 @@ impl VolumeMode {
             }
             any = true;
             self.ahead.as_mut().unwrap().done += 1;
-            if budget_ms.is_some_and(|b| t.elapsed().as_secs_f64() * 1e3 > b) {
+            if budget_ms.is_some_and(|b| ms(t) > b) {
                 break;
             }
         }
@@ -666,8 +690,8 @@ impl VolumeMode {
         // The pen's target stays the one chosen.
         self.target = target;
         self.vol.mark_dirty(changed);
-        self.catch_up_ms = a.since.elapsed().as_secs_f64() * 1e3;
-        if std::env::var_os("SCULPT_WAIT_LOG").is_some() {
+        self.catch_up_ms = ms(a.since);
+        if wait_log() {
             eprintln!("caught up {:.0} ms after running ahead ({} events)", self.catch_up_ms, a.events.len());
         }
     }
@@ -765,7 +789,7 @@ impl VolumeMode {
                 },
             }
         }
-        self.last_ms += t.elapsed().as_secs_f64() * 1e3;
+        self.last_ms += ms(t);
     }
 
     /// Work out the stroke's end off the frame, on the carrying threads (the next stroke's dabs may run beside it).
@@ -882,7 +906,7 @@ impl VolumeMode {
     pub fn begin_stroke(&mut self) {
         self.close_slider_edit();
         while self.run_dabs(f64::INFINITY) > 0 {}
-        if std::env::var_os("SCULPT_DAB_LOG").is_some() {
+        if dab_log() {
             eprintln!("BEGIN");
         }
         let now = Instant::now();
@@ -1034,7 +1058,7 @@ impl VolumeMode {
         };
         let t = Instant::now();
         layer.add_generator(&mut self.vol, &format!("Generator {}", n + 1), level, &spec);
-        self.generator_ms = t.elapsed().as_secs_f64() * 1e3;
+        self.generator_ms = ms(t);
         self.target = Target::Detail;
     }
 
@@ -1116,7 +1140,7 @@ impl VolumeMode {
             Some(plan) => self.gpu_plan = Some(plan),
             None => layer.preview_generator(&mut self.vol, k, spec),
         }
-        self.generator_ms = t.elapsed().as_secs_f64() * 1e3;
+        self.generator_ms = ms(t);
         if !dragging {
             self.end_generator_edit();
         }
@@ -1136,7 +1160,7 @@ impl VolumeMode {
         let t = Instant::now();
         self.work.spawn(move || {
             let mut done = job.run();
-            done.ms = t.elapsed().as_secs_f64() * 1e3;
+            done.ms = ms(t);
             let _ = tx.send(done);
         });
         self.gen_job = Some(rx);
@@ -1743,9 +1767,9 @@ impl VolumeMode {
         self.mesh_take_build(false);
         self.tap();
         // (With a layer or its mask picked the next stroke is on the layers: it would only wait for the refit.)
-        let waited = self.target != Target::Form || self.pen_up.elapsed().as_secs_f64() * 1e3 >= REFIT_AFTER_MS;
+        let waited = self.target != Target::Form || ms(self.pen_up) >= REFIT_AFTER_MS;
         let rest = self.at_rest() && waited;
-        let idle = !self.pen_down && self.pen_up.elapsed().as_secs_f64() * 1e3 >= FREE_OLD_AFTER_MS;
+        let idle = !self.pen_down && ms(self.pen_up) >= FREE_OLD_AFTER_MS;
         let Some(m) = self.mesh.as_mut() else { return };
         if idle && m.layers.old_held_ms().is_some_and(|t| t >= FREE_OLD_AFTER_MS) {
             m.layers.free_old();
@@ -1755,7 +1779,7 @@ impl VolumeMode {
                 let t = Instant::now();
                 let _ = m.layers.doc.refresh_painted_masks();
                 // Over a frame: shown when the stroke ends instead.
-                if t.elapsed().as_secs_f64() * 1e3 > 12.0 {
+                if ms(t) > 12.0 {
                     st.live = false;
                 }
                 st.painted = false;
@@ -1780,7 +1804,7 @@ impl VolumeMode {
         m.close_open();
         let t = Instant::now();
         m.finish(&self.vol);
-        let waited = t.elapsed().as_secs_f64() * 1e3;
+        let waited = ms(t);
         if waited > 50.0 {
             self.mesh_note = Some(format!("Waited {waited:.0} ms for the layers to follow the volume"));
         }
@@ -1849,7 +1873,7 @@ impl VolumeMode {
                 st.last = Some(at);
             }
         }
-        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let ms = ms(t);
         self.last_ms += ms;
         self.last_dabs += 1;
         self.dab_ms = if self.dab_ms == 0.0 { ms } else { self.dab_ms * 0.8 + ms * 0.2 };
@@ -1917,18 +1941,18 @@ mod tests {
             if let Some((hit, _)) = mode.raycast(d * 3.0, -d) {
                 mode.dab(hit, 0.5, 0.05, 1.0, 0.5, false);
             }
-            dab_ms += t.elapsed().as_secs_f64() * 1e3;
+            dab_ms += ms(t);
             let t2 = Instant::now();
             mode.tick();
-            tick_ms += t2.elapsed().as_secs_f64() * 1e3;
-            let ms = t.elapsed().as_secs_f64() * 1e3;
+            tick_ms += ms(t2);
+            let ms = ms(t);
             worst = worst.max(ms);
             total += ms;
             frames += 1;
         }
         let t = Instant::now();
         mode.end_stroke();
-        let pen_up = t.elapsed().as_secs_f64() * 1e3;
+        let pen_up = ms(t);
         let landed = mode.layer.as_ref().map_or(0, |l| l.follows);
         let t = Instant::now();
         let mut ticks = 0;
@@ -1937,7 +1961,7 @@ mod tests {
             ticks += 1;
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let catch_up = t.elapsed().as_secs_f64() * 1e3;
+        let catch_up = ms(t);
         let last = mode.layer.as_ref().map(|l| l.last).unwrap_or_default();
         eprintln!("dabs {:.1} ms, ticks {:.1} ms a frame; {landed} follows landed during the stroke", dab_ms / frames as f64, tick_ms / frames as f64);
         eprintln!("layer {blocks} blocks: a frame (dab and tick) {:.1} ms on average, {worst:.1} at most; pen up {pen_up:.1} ms; caught up {catch_up:.0} ms later ({ticks} ticks); last follow {last:?}", total / frames as f64);
@@ -1994,12 +2018,12 @@ mod tests {
                 mode.dab(hit, r, px, 1.0, 0.5, false);
             }
             if k == 0 {
-                first = t.elapsed().as_secs_f64() * 1e3;
+                first = ms(t);
             }
             mode.tick();
             mode.vol.drain_dirty();
             ahead_frames += mode.ahead.is_some() as usize;
-            let ms = f.elapsed().as_secs_f64() * 1e3;
+            let ms = ms(f);
             if k > 0 {
                 worst = worst.max(ms);
             }
@@ -2012,7 +2036,7 @@ mod tests {
             mode.tick();
             mode.vol.drain_dirty();
             ahead_frames += mode.ahead.is_some() as usize;
-            after = after.max(f.elapsed().as_secs_f64() * 1e3);
+            after = after.max(ms(f));
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         eprintln!("   first dab {first:.1} ms; slowest frame of the stroke after it {worst:.0} ms, after the pen up {after:.0} ms; the stroke began for real {:.0} ms after, ran ahead {ahead_frames} frames, caught up {:.0} ms after", mode.lag_ms, mode.catch_up_ms);
@@ -2529,7 +2553,7 @@ mod tests {
                 let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
                 let t = Instant::now();
                 mode.dab(hit, 0.3, 0.05, 1.0, 0.5, false);
-                ms.push(t.elapsed().as_secs_f64() * 1e3);
+                ms.push(crate::ms(t));
                 mode.vol.drain_dirty();
             }
             eprintln!("ahead {ahead}: dabs {ms:.1?} ms");
@@ -3008,7 +3032,7 @@ mod tests {
             step(&mut spec, i);
             let t = Instant::now();
             mode.set_generator(k, &spec, true);
-            frames.push(t.elapsed().as_secs_f64() * 1e3);
+            frames.push(ms(t));
             // (Taken by the viewport.)
             on_gpu += mode.gpu_plan.take().is_some() as usize;
             mode.tick();
@@ -3017,14 +3041,14 @@ mod tests {
         }
         let t = Instant::now();
         mode.end_generator_edit();
-        let release = t.elapsed().as_secs_f64() * 1e3;
+        let release = ms(t);
         let start = Instant::now();
         while mode.busy() && start.elapsed().as_secs() < 120 {
             mode.tick();
             mode.vol.drain_dirty();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let landed = start.elapsed().as_secs_f64() * 1e3;
+        let landed = ms(start);
         assert!(!mode.busy(), "the rocks never came in at their own level");
         let layer = mode.layer.as_ref().unwrap();
         assert_eq!(layer.generator(k), Some(&spec));
@@ -3106,13 +3130,13 @@ mod tests {
             let put = mode.layer.as_ref().map_or(0, |l| l.put_on_frame);
             let t = Instant::now();
             mode.tick();
-            worst = worst.max(t.elapsed().as_secs_f64() * 1e3);
+            worst = worst.max(ms(t));
             most = most.max(mode.layer.as_ref().map_or(0, |l| l.put_on_frame) - put);
             mode.vol.drain_dirty();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(!mode.busy(), "never settled");
-        (worst, start.elapsed().as_secs_f64() * 1e3, most)
+        (worst, ms(start), most)
     }
 
     /// What is shown is the stack composed afresh (to the tolerance `drag_rocks` holds it to).
@@ -3354,14 +3378,14 @@ mod tests {
             let Some((hit, _)) = mode.raycast(d * 3.0, -d) else { continue };
             let td = Instant::now();
             mode.brush_dab(DabInput { at: hit, radius: r, px, strength: 1.0, hardness: 0.5, brush });
-            dab_ms.push(td.elapsed().as_secs_f64() * 1e3);
+            dab_ms.push(ms(td));
             mode.tick();
         }
         let level = mode.level;
         let te = Instant::now();
         mode.end_stroke();
         mode.settle();
-        let (end_ms, all_ms) = (te.elapsed().as_secs_f64() * 1e3, t.elapsed().as_secs_f64() * 1e3);
+        let (end_ms, all_ms) = (ms(te), ms(t));
         dab_ms.sort_by(f64::total_cmp);
         eprintln!("{name}: the stroke at level {level} (step {:.4}): dabs {:.1} ms median, {:.1} at most; its end and the layers settling {end_ms:.0} ms; all {all_ms:.0} ms", mode.vol.voxel(level), dab_ms[dab_ms.len() / 2], dab_ms[dab_ms.len() - 1]);
         assert_eq!(level, 0, "a wide brush from far did not work at the coarse level 0");

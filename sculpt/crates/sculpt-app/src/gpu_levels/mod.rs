@@ -22,6 +22,8 @@ use rayon::prelude::*;
 use sculpt_core::generator::level_view::LevelView;
 use sculpt_core::generator::level_volume::{HashMap as KeyMap, HashSet as KeySet, Key, LevelVolume, Show, key_order, piece_table, quantize};
 
+use crate::ms;
+
 pub mod check;
 pub mod layer_check;
 mod join;
@@ -629,7 +631,7 @@ impl GpuLevels {
         self.queue.write_buffer(&self.buf.hash, 0, bytemuck::cast_slice(&self.hash));
         self.hash_dirty.clear();
         if std::env::var_os("SCULPT_JOIN_LOG").is_some() {
-            eprintln!("grow: slots {} -> {slots}, pages {} -> {pages}, vertex pages {} -> {vpages}, slot table {} -> {hash_len}: {:.1} ms", old.slots, old.pages, old.vpages, old.hash_len, t.elapsed().as_secs_f64() * 1e3);
+            eprintln!("grow: slots {} -> {slots}, pages {} -> {pages}, vertex pages {} -> {vpages}, slot table {} -> {hash_len}: {:.1} ms", old.slots, old.pages, old.vpages, old.hash_len, ms(t));
         }
     }
 
@@ -713,7 +715,7 @@ impl GpuLevels {
                 Some(Packed { slot: s, hash: h, key: *k, nb, data })
             })
             .collect();
-        let t_pack = t.elapsed().as_secs_f64() * 1e3;
+        let t_pack = ms(t);
         let mut out: Vec<Key> = Vec::new();
         let mut blocks: Vec<(u32, [u32; 7], &[u32; SAMPLE_WORDS as usize])> = Vec::new();
         let mut patched = false;
@@ -730,7 +732,7 @@ impl GpuLevels {
         if blocks.len() >= upload::IN_BULK || patched {
             // Many blocks: one write and a pass that scatters them to their slots, sent later.
             if std::env::var_os("SCULPT_JOIN_LOG").is_some() && blocks.len() > 20000 {
-                eprintln!("upload: {} of {} blocks: pack {t_pack:.1}, list {:.1} ms", blocks.len(), keys.len(), t.elapsed().as_secs_f64() * 1e3 - t_pack);
+                eprintln!("upload: {} of {} blocks: pack {t_pack:.1}, list {:.1} ms", blocks.len(), keys.len(), ms(t) - t_pack);
             }
             drop(blocks);
             return (out, Some(packed));
@@ -757,7 +759,7 @@ impl GpuLevels {
         let sc = scatter.get_or_insert_with(|| upload::Scatter::new(device));
         let laps = sc.send(device, queue, samples, &blocks);
         if std::env::var_os("SCULPT_JOIN_LOG").is_some() && blocks.len() > 20000 {
-            eprintln!("send: {} blocks: list {:.1}, staging {:.1}, slots {:.1}, pass {:.1} ms", blocks.len(), t.elapsed().as_secs_f64() * 1e3 - laps[2], laps[0], laps[1] - laps[0], laps[2] - laps[1]);
+            eprintln!("send: {} blocks: list {:.1}, staging {:.1}, slots {:.1}, pass {:.1} ms", blocks.len(), ms(t) - laps[2], laps[0], laps[1] - laps[0], laps[2] - laps[1]);
         }
         // Freed off this thread (it is large).
         drop(blocks);
@@ -985,7 +987,7 @@ impl GpuLevels {
         let mut laps: Vec<(&str, f64)> = Vec::new();
         let mut lap = |name: &'static str| {
             if log {
-                laps.push((name, t.elapsed().as_secs_f64() * 1e3));
+                laps.push((name, ms(t)));
             }
         };
         self.read_status();
@@ -1047,7 +1049,7 @@ impl GpuLevels {
             self.cap_changed = false;
             self.origin = vol.origin();
             self.rebuild(vol, &mut stats);
-            stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+            stats.cpu_ms = ms(t);
             return stats;
         }
         let mut fade_slots: Vec<u32> = faded.iter().filter_map(|k| self.slot_of.get(k).copied()).collect();
@@ -1184,7 +1186,7 @@ impl GpuLevels {
         lap("extract");
         self.view.unhide(&hid_now);
         self.last_sent = uploads.clone();
-        stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        stats.cpu_ms = ms(t);
         stats.pending = self.pending_set.len();
         if spread {
             // The next sync takes about as many blocks as fit the time this one was meant to cost.

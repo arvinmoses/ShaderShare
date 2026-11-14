@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use sculpt_core::generator::detail_layer::GpuPlan;
 
 use super::{GpuLevels, SAMPLE_WORDS, SyncStats, grid};
+use crate::ms;
 
 const KERNEL: &str = "
 struct JoinP { origin: vec4<f32>, misc: vec4<f32> };
@@ -182,7 +183,7 @@ impl GpuLevels {
             stats.bytes += all.len() * SAMPLE_WORDS as usize * 4;
             join.high += all.len() as u32;
         }
-        let t_fresh = t.elapsed().as_secs_f64() * 1e3;
+        let t_fresh = ms(t);
         if !missing.is_empty() {
             let blocks = &plan.blocks;
             let all: Vec<[u32; 365]> = missing.par_iter().map(|&(i, _)| sculpt_core::generator::detail_layer::pack_f16(&base(blocks[i]))).collect();
@@ -193,7 +194,7 @@ impl GpuLevels {
             stats.bytes += all.len() * SAMPLE_WORDS as usize * 4;
             join.high += all.len() as u32;
         }
-        let t_base = t.elapsed().as_secs_f64() * 1e3;
+        let t_base = ms(t);
         // The pass's work: per joined block, its slot, its ranges and its base.
         let ngens = plan.gens.len() as u32;
         let mut work: Vec<[u32; 4]> = Vec::with_capacity(joined);
@@ -240,14 +241,14 @@ impl GpuLevels {
         for &s in &ex {
             self.sent[s as usize] = 0;
         }
-        let t_pass = t.elapsed().as_secs_f64() * 1e3;
+        let t_pass = ms(t);
         // Rebuilt: the blocks joined, and what the sync before left to be extracted with them (the blocks around
         // them, which read their vertices; the generators change nothing there).
         let (around, released) = self.deferred.take().unwrap_or_default();
         ex.extend(around);
         self.extract_slots(ex, &released, &mut stats);
         stats.uploaded = joined;
-        stats.cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        stats.cpu_ms = ms(t);
         if std::env::var_os("SCULPT_JOIN_LOG").is_some() {
             eprintln!("join: {joined} blocks ({} bases from the plan, {} read): slots and plan bases {t_fresh:.1}, bases read {:.1}, lists and pass {:.1}, extraction {:.1} ms", fresh_take.len(), missing.len(), t_base - t_fresh, t_pass - t_base, stats.cpu_ms - t_pass);
         }

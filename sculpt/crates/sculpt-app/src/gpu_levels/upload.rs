@@ -15,6 +15,7 @@ use eframe::egui_wgpu::wgpu::WriteOnly;
 use rayon::prelude::*;
 
 use super::{SAMPLE_WORDS, grid};
+use crate::ms;
 
 const W: usize = SAMPLE_WORDS as usize;
 
@@ -118,7 +119,7 @@ impl Scatter {
             let handles: Vec<WriteOnly<'_, [u8; W * 4]>> = chunks.into_iter().collect();
             handles.into_par_iter().zip(blocks.par_iter()).for_each(|(w, b)| WriteOnly::<[u8]>::from(w).copy_from_slice(bytemuck::cast_slice(b.2)));
         }
-        let t_staging = t.elapsed().as_secs_f64() * 1e3;
+        let t_staging = ms(t);
         let mut list: Vec<u32> = Vec::with_capacity(n * 8 + 1);
         list.push(n as u32);
         for b in blocks {
@@ -126,7 +127,7 @@ impl Scatter {
             list.extend_from_slice(&b.1);
         }
         queue.write_buffer(&self.slots, 0, bytemuck::cast_slice(&list));
-        let t_slots = t.elapsed().as_secs_f64() * 1e3;
+        let t_slots = ms(t);
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: samples.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: self.data.as_entire_binding() },
@@ -142,7 +143,7 @@ impl Scatter {
             cp.dispatch_workgroups(x, y, 1);
         }
         queue.submit([enc.finish()]);
-        [t_staging, t_slots, t.elapsed().as_secs_f64() * 1e3]
+        [t_staging, t_slots, ms(t)]
     }
 }
 

@@ -105,6 +105,16 @@ impl Patch {
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
+
+    /// The bytes its data holds (what its vectors hold, not their spare capacity): 20 per vertex for the name and
+    /// base, 12 more per layer with offsets there, 4 for the freeze and each channel.
+    pub fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        let n = self.names.len();
+        let layers: usize = self.layers.iter().map(|(_, d)| size_of::<(LayerId, Option<Vec<Vec3>>)>() + d.as_ref().map_or(0, |d| d.len() * size_of::<Vec3>())).sum();
+        let channels: usize = self.channels.iter().map(|(name, v)| size_of::<(String, Vec<f32>)>() + name.len() + v.len() * size_of::<f32>()).sum();
+        size_of::<Self>() + n * (size_of::<u64>() + size_of::<Vec3>()) + layers + self.freeze.as_ref().map_or(0, |f| f.len() * size_of::<f32>()) + channels
+    }
 }
 
 /// Where each vertex sits among the volume's blocks, internal -> canonical, and the base mesh's normals: built with

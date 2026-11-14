@@ -16,6 +16,7 @@ use sculpt_core::generator::level_volume::{Key, key_order};
 use sculpt_core::mesh_layers::MeshLayers;
 
 use crate::gpu_levels::{GpuLevels, Row};
+use crate::ms;
 
 pub use crate::mesh_stack::RowsDirty;
 
@@ -391,7 +392,7 @@ impl LayerRowsSync {
                 self.table = Some((lay, BlockTable::new(ml)));
             }
             let mut ch = self.leaf_index.changes_for(lay, ml, &self.table.as_ref().unwrap().1, &dirty.leaves, &gpu.rows_read());
-            stats.leaf_ms = tl.elapsed().as_secs_f64() * 1e3;
+            stats.leaf_ms = ms(tl);
             stats.leaf_changed = gpu.write_rows(&ch.writes, &ch.changed);
             stats.leaf_rows = ch.made;
             self.dabbed.append(&mut ch.changed);
@@ -423,7 +424,7 @@ impl LayerRowsSync {
         let _ = gpu.take_rows_dropped();
         stats.repointed = if turning_on { 0 } else { gpu.repoint_rows() };
         stats.unshown = gpu.rows_unshown();
-        stats.ms = t.elapsed().as_secs_f64() * 1e3;
+        stats.ms = ms(t);
         self.stats = stats;
         true
     }
@@ -443,10 +444,6 @@ mod tests {
     use sculpt_core::geom::Ray;
     use sculpt_core::mesh_layers::MeshLayerSettings;
     use std::time::Instant;
-
-    fn ms(t: Instant) -> f64 {
-        t.elapsed().as_secs_f64() * 1e3
-    }
 
     fn med(mut v: Vec<f64>) -> f64 {
         v.sort_by(f64::total_cmp);

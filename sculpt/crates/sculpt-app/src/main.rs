@@ -31,6 +31,11 @@ use eframe::egui_wgpu::{SurfaceConfig, WgpuConfiguration, WgpuSetup};
 
 /// The default device, except that it may allocate the adapter's largest buffer and bind the storage buffers the
 /// volume's surface needs.
+/// Milliseconds since `t`.
+pub(crate) fn ms(t: std::time::Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
+
 fn gpu_setup() -> WgpuSetup {
     let WgpuSetup::CreateNew(mut setup) = WgpuConfiguration::default().wgpu_setup else { unreachable!("the default creates its own device") };
     let base = setup.device_descriptor.clone();

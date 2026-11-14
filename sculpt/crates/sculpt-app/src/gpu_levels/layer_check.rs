@@ -26,6 +26,7 @@ use super::rows::{NONE, pack_normal_change};
 use crate::layer_rows::{self, RowsDirty};
 use crate::viewport::Viewport;
 use crate::volume_mode::VolumeMode;
+use crate::ms;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -467,7 +468,7 @@ pub fn run(args: &[String]) -> Res<()> {
         let t = Instant::now();
         sc.vp.sync_layer_rows(Some(&sc.ml), RowsDirty { all: true, ..Default::default() });
         sc.vp.levels().unwrap().flush_rows();
-        all_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        all_ms.push(ms(t));
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
     }
     let st_all = sc.vp.layer_rows.stats;
@@ -491,9 +492,9 @@ pub fn run(args: &[String]) -> Res<()> {
         };
         if k % 2 == 0 {
             sc.vp.sync_layer_rows(Some(&sc.ml), RowsDirty { leaves, ..Default::default() });
-            let t_sync = t.elapsed().as_secs_f64() * 1e3;
+            let t_sync = ms(t);
             sc.vp.levels().unwrap().flush_rows();
-            dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            dab_ms.push(ms(t));
             dab_parts.push((sc.vp.layer_rows.stats.leaf_ms, sc.vp.layer_rows.stats.ms, t_sync));
             dab_rows.push(sc.vp.layer_rows.stats.leaf_rows as f64);
             dab_changed.push(sc.vp.layer_rows.stats.leaf_changed as f64);
@@ -501,7 +502,7 @@ pub fn run(args: &[String]) -> Res<()> {
             let blocks = layer_rows::dab_blocks(&sc.ml, &sculpt_core::DirtySet::Leaves(leaves));
             sc.vp.sync_layer_rows(Some(&sc.ml), RowsDirty { blocks, ..Default::default() });
             sc.vp.levels().unwrap().flush_rows();
-            blk_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            blk_ms.push(ms(t));
             blk_rows.push(sc.vp.layer_rows.stats.rows as f64);
         }
         if k % 10 == 9 {
@@ -526,7 +527,7 @@ pub fn run(args: &[String]) -> Res<()> {
         let t = Instant::now();
         sc.vp.sync_layer_rows(Some(&sc.ml), d);
         sc.vp.levels().unwrap().flush_rows();
-        swap_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        swap_ms.push(ms(t));
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         sc.settle()?;
     }

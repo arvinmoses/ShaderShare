@@ -17,6 +17,7 @@ use crate::theme::{Theme, ThemeLibrary};
 use crate::tools::{Brush, Tool, ToolBox};
 use crate::viewport::Viewport;
 use crate::volume_mode::{DabInput, VolumeMode};
+use crate::ms;
 
 pub struct Options {
     /// A `.svol` file to open instead of a new ball.
@@ -273,7 +274,7 @@ impl SculptApp {
         self.replace_volume(VolumeMode::ball(triangles));
         self.volume_path = None;
         self.frame_volume();
-        self.status = format!("New {:.2}M-triangle ball in {:.0} ms", crate::volume_mode::ball_triangles(triangles) / 1e6, t.elapsed().as_secs_f64() * 1e3);
+        self.status = format!("New {:.2}M-triangle ball in {:.0} ms", crate::volume_mode::ball_triangles(triangles) / 1e6, ms(t));
     }
 
     pub fn open(&mut self, p: String) {

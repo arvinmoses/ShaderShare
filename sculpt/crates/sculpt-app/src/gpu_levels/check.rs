@@ -15,6 +15,7 @@ use glam::Vec3;
 use sculpt_core::generator::level_volume::{BlockSurface, Key, LevelVolume};
 
 use super::{GpuLevels, PAGE_INDICES, SLOT_WORDS, packed_samples};
+use crate::ms;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -380,7 +381,7 @@ fn join_check_at(device: &wgpu::Device, queue: &wgpu::Queue, level: usize) -> Re
     for (step, spec) in [GeneratorSpec { size: 0.15, ..rocks.clone() }, GeneratorSpec { blend: 0.6, ..rocks.clone() }, GeneratorSpec { op: BoolOp::Subtract, lift: 0.0, ..rocks.clone() }, GeneratorSpec { count: 20, ..rocks.clone() }].into_iter().enumerate() {
         let t = Instant::now();
         let plan = layer.gpu_generator(&mut vol, k, &spec).ok_or("the GPU cannot join this stack")?;
-        let plan_ms = t.elapsed().as_secs_f64() * 1e3;
+        let plan_ms = ms(t);
         let keys: Vec<Key> = plan.blocks.clone();
         gpu.sync_for_join(&mut vol, &plan);
         let s = gpu.join(plan, &|k| layer.base_samples(k));
@@ -396,7 +397,7 @@ fn join_check_at(device: &wgpu::Device, queue: &wgpu::Queue, level: usize) -> Re
         while let Some(job) = layer.generator_take_landing(&vol) {
             layer.generator_apply(&mut vol, job.run());
         }
-        let job_ms = tj.elapsed().as_secs_f64() * 1e3;
+        let job_ms = ms(tj);
         let (mut flips, mut worst, mut near) = (0usize, 0.0f32, 0usize);
         for (key, words) in &got {
             let want = packed_samples(&vol, *key, Some(gpu.view.hidden()));
@@ -799,24 +800,24 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             let next = GeneratorSpec { size: size * (1.0 + 0.04 * i as f32), ..spec.clone() };
             let t = Instant::now();
             let plan = layer.gpu_generator(&mut vol, k, &next).ok_or("no GPU join")?;
-            let plan_ms = t.elapsed().as_secs_f64() * 1e3;
+            let plan_ms = ms(t);
             let n = plan.blocks.len();
             let ts = Instant::now();
             gpu.sync_for_join(&mut vol, &plan);
-            let sync_ms = ts.elapsed().as_secs_f64() * 1e3;
+            let sync_ms = ms(ts);
             let s = gpu.join(plan, &|k| layer.base_samples(k));
             let tg = Instant::now();
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            let gpu_ms = tg.elapsed().as_secs_f64() * 1e3;
+            let gpu_ms = ms(tg);
             let tj = Instant::now();
             let mut apply_ms = 0.0;
             while let Some(job) = layer.generator_take_landing(&vol) {
                 let done = job.run();
                 let ta = Instant::now();
                 layer.generator_apply(&mut vol, done);
-                apply_ms += ta.elapsed().as_secs_f64() * 1e3;
+                apply_ms += ms(ta);
             }
-            let job_ms = tj.elapsed().as_secs_f64() * 1e3;
+            let job_ms = ms(tj);
             // The exact field landing: the syncs after the job, as the app's next frames do it, region by region,
             // each frame's GPU work done before the next (as presenting a frame has it).
             let tl = Instant::now();
@@ -824,10 +825,10 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             loop {
                 let tf = Instant::now();
                 let land = gpu.sync(&mut vol);
-                let ms = tf.elapsed().as_secs_f64() * 1e3;
+                let ms = ms(tf);
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
                 worst = worst.max(ms);
-                worst_frame = worst_frame.max(tf.elapsed().as_secs_f64() * 1e3);
+                worst_frame = worst_frame.max(crate::ms(tf));
                 cpu += ms;
                 sent += land.uploaded;
                 extracted += land.extracted;
@@ -836,7 +837,7 @@ fn bench_join(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
                     break;
                 }
             }
-            let land_ms = tl.elapsed().as_secs_f64() * 1e3;
+            let land_ms = ms(tl);
             rows.push(format!(
                 "{n} blocks: plan {plan_ms:.1}, sync {sync_ms:.1}, join {:.1} ms CPU, then the GPU {gpu_ms:.1} ms; the job {job_ms:.0} ms ({apply_ms:.1} taking it in); landing it: {syncs} syncs, the longest {worst:.1} ms CPU ({worst_frame:.1} with its GPU work), {cpu:.1} ms CPU in all ({sent} sent, {extracted} extracted), all done at {land_ms:.1} ms",
                 s.cpu_ms
@@ -896,18 +897,18 @@ fn bench_far(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
                     along = if along == Vec3::ZERO { n } else { (along * 0.5 + n * 0.5).normalize() };
                     changed.push(s.changed + s.carried);
                 }
-                dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                dab_ms.push(ms(t));
                 let t = Instant::now();
                 let s = gpu.sync(&mut vol);
                 sync_ms.push(s.cpu_ms);
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
-                gpu_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                gpu_ms.push(ms(t));
                 sent.push(s.uploaded);
                 extracted.push(s.extracted);
             }
             let t = Instant::now();
             vol.end_stroke();
-            let end_ms = t.elapsed().as_secs_f64() * 1e3;
+            let end_ms = ms(t);
             while gpu.pending() > 0 {
                 gpu.sync(&mut vol);
             }
@@ -928,7 +929,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     let t = Instant::now();
     let mut vol = LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.2, voxel0, 6);
     vol.carry_budget = Some(6.0);
-    println!("ball at level 0 step {voxel0} ({} blocks) in {:.0} ms", vol.keys().len(), t.elapsed().as_secs_f64() * 1e3);
+    println!("ball at level 0 step {voxel0} ({} blocks) in {:.0} ms", vol.keys().len(), ms(t));
     let mut gpu = GpuLevels::new(device, queue, &vol, 5);
     // Seen as the app sees it, from in front, choosing the level by distance (`SCULPT_BENCH_ALL` shows every level).
     gpu.set_eye(Vec3::new(0.0, 0.0, 2.6), 1100.0);
@@ -936,7 +937,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
     let t = Instant::now();
     let s = gpu.sync(&mut vol);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    println!("first sync: {} blocks uploaded and extracted, {:.1} MB, CPU {:.1} ms, total {:.1} ms", s.uploaded, s.bytes as f64 / 1e6, s.cpu_ms, t.elapsed().as_secs_f64() * 1e3);
+    println!("first sync: {} blocks uploaded and extracted, {:.1} MB, CPU {:.1} ms, total {:.1} ms", s.uploaded, s.bytes as f64 / 1e6, s.cpu_ms, ms(t));
     let mut rows = Vec::new();
     for (l, r) in [(0usize, 0.25f32), (1, 0.08), (2, 0.04), (3, 0.015), (4, 0.008), (5, 0.004)] {
         let (mut dab_ms, mut sync_ms, mut gpu_ms) = (Vec::new(), Vec::new(), Vec::new());
@@ -954,17 +955,17 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             if let Some((n, _)) = vol.plane_dab(l, hit, rough, r, r * 0.09, 0.5, 0.4, false) {
                 along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
             }
-            dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            dab_ms.push(ms(t));
             let t = Instant::now();
             let s = gpu.sync(&mut vol);
             sync_ms.push(s.cpu_ms);
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            gpu_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            gpu_ms.push(ms(t));
             most = (most.0.max(s.uploaded), most.1.max(s.extracted));
         }
         let t = Instant::now();
         let end = vol.end_stroke();
-        let end_ms = t.elapsed().as_secs_f64() * 1e3;
+        let end_ms = ms(t);
         let s = gpu.sync(&mut vol);
         rows.push(format!(
             "| {l} | {:.4} | {:.0} | {:.2} | {:.2} | {:.2} | {} / {} | {end_ms:.1} ({} rebased) | {} |",
@@ -1007,7 +1008,7 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
                 });
                 *job = Some(rx);
             }
-            (t.elapsed().as_secs_f64() * 1e3, n)
+            (ms(t), n)
         };
         let (mut frame_ms, mut dab_ms, mut tick_ms, mut sync_ms, mut most) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
         vol.carry_budget = Some(0.0);
@@ -1026,15 +1027,15 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
                     along = if along == Vec3::ZERO { n } else { (along + n).normalize() };
                 }
             }
-            dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            dab_ms.push(ms(t));
             let (ms, n) = tick(&mut vol, &mut job, false);
             tick_ms.push(ms);
             most = most.max(n);
             let s = gpu.sync(&mut vol);
             sync_ms.push(s.cpu_ms);
-            frame_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            frame_ms.push(crate::ms(t));
             // The rest of a frame at 60 fps, when the worker carries on.
-            let left = 16.7 - t.elapsed().as_secs_f64() * 1e3;
+            let left = 16.7 - crate::ms(t);
             if left > 0.0 {
                 std::thread::sleep(std::time::Duration::from_secs_f64(left / 1e3));
             }
@@ -1046,19 +1047,19 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             let tf = Instant::now();
             tick(&mut vol, &mut job, false);
             gpu.sync(&mut vol);
-            after_ms.push(tf.elapsed().as_secs_f64() * 1e3);
+            after_ms.push(ms(tf));
             frames += 1;
-            let left = 16.7 - tf.elapsed().as_secs_f64() * 1e3;
+            let left = 16.7 - ms(tf);
             if left > 0.0 {
                 std::thread::sleep(std::time::Duration::from_secs_f64(left / 1e3));
             }
         }
-        let catch_up = t.elapsed().as_secs_f64() * 1e3;
+        let catch_up = ms(t);
         // Then the stroke's end, as a job on the shared threads, frames going on until it is in.
         let t = Instant::now();
         let take = Instant::now();
         let end_job = vol.end_stroke_take().expect("the stroke changed something");
-        let take_ms = take.elapsed().as_secs_f64() * 1e3;
+        let take_ms = ms(take);
         let (tx, rx) = std::sync::mpsc::channel();
         rayon::spawn(move || {
             let _ = tx.send(end_job.run());
@@ -1069,20 +1070,20 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue) -> Res<()> {
             if let Ok(done) = rx.try_recv() {
                 let ta = Instant::now();
                 let end = vol.end_stroke_apply(done);
-                break (end, ta.elapsed().as_secs_f64() * 1e3);
+                break (end, ms(ta));
             }
             gpu.sync(&mut vol);
-            end_frame_ms.push(tf.elapsed().as_secs_f64() * 1e3);
+            end_frame_ms.push(ms(tf));
             end_frames += 1;
-            let left = 16.7 - tf.elapsed().as_secs_f64() * 1e3;
+            let left = 16.7 - ms(tf);
             if left > 0.0 {
                 std::thread::sleep(std::time::Duration::from_secs_f64(left / 1e3));
             }
         };
-        let end_wall = t.elapsed().as_secs_f64() * 1e3;
+        let end_wall = ms(t);
         let ts = Instant::now();
         gpu.sync(&mut vol);
-        let end_sync = ts.elapsed().as_secs_f64() * 1e3;
+        let end_sync = ms(ts);
         vol.carry_budget = Some(6.0);
         println!("a level 0 stroke (radius 0.3) over the fine work, two dabs a frame, carried on {threads} threads of its own: frame {:.1} ms on the main thread (median: dabs {:.1}, bringing in and starting jobs {:.1}, sync {:.1}; up to {most} finer blocks a job); after the pen lifts the detail was all in after {frames} frames ({catch_up:.0} ms, {:.1} ms a frame)", median(frame_ms), median(dab_ms), median(tick_ms), median(sync_ms), median(after_ms));
         println!("  then the stroke's end as a job: {:.0} ms of its own, in {end_frames} frames ({end_wall:.0} ms, {:.1} ms a frame); on the main thread {take_ms:.1} ms to start it, {apply_ms:.1} ms to take it in and {end_sync:.1} ms to sync what it changed", end.ms, median(end_frame_ms));
@@ -1387,7 +1388,7 @@ pub fn rows_run(args: &[String]) -> Res<()> {
             }
         }
         gpu.flush_rows();
-        t.elapsed().as_secs_f64() * 1e3
+        ms(t)
     };
     let all: Vec<usize> = (0..blocks.len()).collect();
     let dab = near(Vec3::new(0.0, 0.0, 1.0), 3000);

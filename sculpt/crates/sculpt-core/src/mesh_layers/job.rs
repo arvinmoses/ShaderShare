@@ -387,7 +387,7 @@ impl Live {
                             self.free_old();
                         }
                         let swap_ms = ms(t);
-                        Ok(SwapStats { job: stats, swap_ms, apply_ms, recomposite_ms, latency_ms: r.started.elapsed().as_secs_f64() * 1e3, discarded: false, patch_len, blocks: changes })
+                        Ok(SwapStats { job: stats, swap_ms, apply_ms, recomposite_ms, latency_ms: super::ms(r.started), discarded: false, patch_len, blocks: changes })
                     }
                     Err(e) => {
                         self.note(&r.dirty);
