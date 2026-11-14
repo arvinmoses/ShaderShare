@@ -384,20 +384,44 @@ fn masks_opacity_undo_redo_and_save_open() {
 /// stroke's end keeps it.
 fn carve_all(mode: &mut VolumeMode) {
     mode.settle();
+    ball_step(mode, Vec3::ZERO, 2.0, true);
+}
+
+/// A ball of radius `r` at `c` added (or carved) as one step, kept in the layers' history as a stroke's end keeps it.
+/// (Straight on the volume: nothing settles first, so a refit under way is still under way.)
+fn ball_step(mode: &mut VolumeMode, c: Vec3, r: f32, carve: bool) {
     let v = &mut mode.vol;
-    assert_eq!(v.levels(), 1, "a carve over every block of a fine level takes for ever");
+    assert_eq!(v.levels(), 1, "a ball over every block of a fine level takes for ever");
     v.begin_stroke();
-    v.ball_dab(0, Vec3::ZERO, 2.0, 0.05, true);
+    v.ball_dab(0, c, r, 0.05, carve);
     v.end_stroke();
     let id = v.last_id().unwrap();
     mode.mesh.as_mut().unwrap().note_step(id);
 }
 
+/// A one-level ball (so a carve over all of it is quick) with a first mesh layer and a layer stroke on it.
+fn small_ball_with_stroke() -> VolumeMode {
+    let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 1.0 / 48.0, 1));
+    mode.add_mesh_layer();
+    settle_frames(&mut mode);
+    assert!(mode.mesh.is_some(), "{:?}", mode.mesh_note);
+    stroke(&mut mode, Target::Detail, Vec3::new(0.2, 0.1, 1.0), 0.08, Brush::Clay);
+    settle_frames(&mut mode);
+    mode
+}
+
 fn failed(mode: &VolumeMode) -> bool {
     let m = mode.mesh.as_ref().unwrap();
-    let noted = mode.mesh_note.as_ref().is_some_and(|n| n.starts_with("Layers could not follow the volume"));
-    assert_eq!(m.failure.is_some(), noted, "the note and the failure disagree: {:?}", mode.mesh_note);
+    assert_eq!(m.failure.is_some(), mode.mesh_failure().is_some());
     m.failure.is_some()
+}
+
+/// Undo or redo (`f`), frames until it lands, and whether its refit failed as it was meant to.
+fn step(mode: &mut VolumeMode, f: fn(&mut VolumeMode) -> bool, fails: bool, what: &str) {
+    assert!(f(mode), "{what}: nothing done");
+    settle_frames(mode);
+    assert_eq!(failed(mode), fails, "{what}: failed");
+    assert!(mode.mesh_note.as_deref() != Some(crate::mesh_stack::DISAGREE), "{what}: the histories came apart");
 }
 
 fn sides(mode: &VolumeMode) -> (usize, usize) {
@@ -423,6 +447,7 @@ fn layers_survive_the_volume_carved_away() {
     let s1 = state(ml(&mut mode));
     assert!(differ(&s0, &s1).1 > 100, "the layer stroke changed little");
     carve_all(&mut mode);
+    let carved = mode.vol.dirty_keys();
     settle_frames(&mut mode);
     assert!(failed(&mode), "the refit of nothing did not fail");
     let swaps = mode.mesh.as_ref().unwrap().times.swaps;
@@ -430,6 +455,20 @@ fn layers_survive_the_volume_carved_away() {
         frame(&mut mode);
         assert!(!ml(&mut mode).busy() && !mode.busy(), "a failed refit ran again");
     }
+    // The carve's blocks seen again (the GPU not having taken them yet, as in the app): no refit.
+    assert!(!carved.is_empty());
+    let m = mode.mesh.as_mut().unwrap();
+    m.tap(carved);
+    assert!(!m.start_refit(&mode.vol) && !m.pending(), "the failed blocks seen again started a refit");
+    // Layer strokes and fills wait, saying why; another note does not hide the failure.
+    let steps = sides(&mode);
+    stroke(&mut mode, Target::Detail, Vec3::new(-0.2, 0.1, 1.0), 0.08, Brush::Clay);
+    mode.fill_mask(0.0);
+    settle_frames(&mut mode);
+    assert_eq!(sides(&mode), steps, "a layer stroke or fill made a step while the layers could not follow");
+    assert!(mode.mesh_note.as_ref().is_some_and(|n| n.starts_with("No mask fill")), "{:?}", mode.mesh_note);
+    assert!(failed(&mode));
+    assert_eq!(differ(&state(ml(&mut mode)), &s1), (0, 0), "a refused stroke changed the layers");
     mode.mesh.as_mut().unwrap().finish(&mode.vol);
     let mut bytes = Vec::new();
     mode.write_to(&mut bytes).unwrap();
@@ -464,6 +503,132 @@ fn layers_survive_the_volume_carved_away() {
     assert!(mode.undo());
     check(&mut mode, &s1, "undo the carve a third time");
     base_is_fresh(&mut mode, "at the end");
+}
+
+/// Through a state the layers cannot follow (everything carved away, V1) between two they can (V0, V2): carve (fails),
+/// a new ball (V2), undo it (fails), undo the carve (V0), redo the carve (fails), redo the ball, undo it (fails), undo
+/// the carve: V0's layer data comes back bit for bit both times, and V2's after the redo.
+#[test]
+fn a_failing_state_between_two_undo_redo() {
+    let _one = one_at_a_time();
+    let mut mode = small_ball_with_stroke();
+    let s0 = state(ml(&mut mode));
+    carve_all(&mut mode);
+    settle_frames(&mut mode);
+    assert!(failed(&mode));
+    ball_step(&mut mode, Vec3::ZERO, 0.8, false);
+    settle_frames(&mut mode);
+    assert!(!failed(&mode), "the new ball did not refit");
+    let s2 = state(ml(&mut mode));
+    let check = |mode: &mut VolumeMode, want: &HashMap<u64, Vec<u32>>, what: &str| {
+        let d = differ(&state(ml(mode)), want);
+        eprintln!("{what}: {d:?}");
+        assert_eq!(d, (0, 0), "{what}");
+    };
+    step(&mut mode, VolumeMode::undo, true, "undo the ball");
+    step(&mut mode, VolumeMode::undo, false, "undo the carve");
+    check(&mut mode, &s0, "V0 after undoing both");
+    step(&mut mode, VolumeMode::redo, true, "redo the carve");
+    step(&mut mode, VolumeMode::redo, false, "redo the ball");
+    check(&mut mode, &s2, "V2 after redoing both");
+    step(&mut mode, VolumeMode::undo, true, "undo the ball again");
+    step(&mut mode, VolumeMode::undo, false, "undo the carve again");
+    check(&mut mode, &s0, "V0 after undoing both again");
+    base_is_fresh(&mut mode, "at the end");
+}
+
+/// Carve (fails), a new ball, undo it (fails), another ball in its place, undo it (fails), undo the carve: V0's
+/// layer data comes back bit for bit.
+#[test]
+fn a_failing_state_then_a_new_step_from_it() {
+    let _one = one_at_a_time();
+    let mut mode = small_ball_with_stroke();
+    let s0 = state(ml(&mut mode));
+    carve_all(&mut mode);
+    settle_frames(&mut mode);
+    ball_step(&mut mode, Vec3::ZERO, 0.8, false);
+    settle_frames(&mut mode);
+    assert!(!failed(&mode));
+    step(&mut mode, VolumeMode::undo, true, "undo the ball");
+    ball_step(&mut mode, Vec3::new(0.1, 0.0, 0.0), 0.7, false);
+    settle_frames(&mut mode);
+    assert!(!failed(&mode), "the other ball did not refit");
+    step(&mut mode, VolumeMode::undo, true, "undo the other ball");
+    step(&mut mode, VolumeMode::undo, false, "undo the carve");
+    let d = differ(&state(ml(&mut mode)), &s0);
+    eprintln!("V0: {d:?}");
+    assert_eq!(d, (0, 0), "V0's layer data");
+    base_is_fresh(&mut mode, "at the end");
+}
+
+/// A file whose later chunks are damaged or cut short opens all the same, without them, saying so: the mesh layers
+/// cut inside, their offset back damaged, their volume carved away (no mesh to put them on), a surface noise chunk
+/// running past the end.
+#[test]
+fn damaged_files_open_without_what_is_damaged() {
+    let _one = one_at_a_time();
+    let mut mode = small_ball_with_stroke();
+    let mut good = Vec::new();
+    mode.write_to(&mut good).unwrap();
+    let open = |bytes: &[u8], what: &str, gone: &str| -> VolumeMode {
+        let m = VolumeMode::read_from(&mut std::io::Cursor::new(bytes)).unwrap_or_else(|e| panic!("{what}: refused: {e}"));
+        let lossy = m.lossy_open.clone().unwrap_or_else(|| panic!("{what}: no note"));
+        eprintln!("{what}: {lossy}");
+        assert!(lossy.contains(gone), "{what}: {lossy}");
+        assert_eq!(m.mesh_note.as_ref(), Some(&lossy), "{what}");
+        assert!(!m.vol.keys().is_empty(), "{what}: the volume is gone");
+        m
+    };
+    let back = VolumeMode::read_from(&mut std::io::Cursor::new(&good)).unwrap();
+    assert!(back.mesh.is_some() && back.lossy_open.is_none(), "{:?}", back.lossy_open);
+    // Cut inside the mesh layers.
+    let m = open(&good[..good.len() - 40], "cut inside", "mesh layers");
+    assert!(m.mesh.is_none());
+    // The offset back damaged.
+    let mut bad = good.clone();
+    let n = bad.len();
+    bad[n - 12..n - 4].copy_from_slice(&5u64.to_le_bytes());
+    assert!(open(&bad, "offset back", "mesh layers").mesh.is_none());
+    // A surface noise chunk after the volume, running past the end.
+    let mut plain = Vec::new();
+    VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 1.0 / 48.0, 1)).write_to(&mut plain).unwrap();
+    plain.extend_from_slice(b"SNOI");
+    plain.extend_from_slice(&1000u32.to_le_bytes());
+    plain.extend_from_slice(b"{\"on\":true");
+    open(&plain, "noise past the end", "surface noise");
+    // Mesh layers on a volume with no surface left.
+    carve_all(&mut mode);
+    settle_frames(&mut mode);
+    let mut empty = Vec::new();
+    mode.write_to(&mut empty).unwrap();
+    let m = VolumeMode::read_from(&mut std::io::Cursor::new(&empty)).unwrap();
+    assert!(m.mesh.is_none() && m.lossy_open.as_ref().is_some_and(|l| l.contains("mesh layers")), "{:?}", m.lossy_open);
+}
+
+/// A redo whose refit has not landed when a new volume stroke ends: the redone step stays on the history under the
+/// new one, so two undos give back the state before it, with no history lost.
+#[test]
+fn a_stroke_before_a_redo_lands_keeps_the_redone_step() {
+    let _one = one_at_a_time();
+    let mut mode = small_ball_with_stroke();
+    let s0 = state(ml(&mut mode));
+    ball_step(&mut mode, Vec3::new(0.0, 0.0, 1.0), 0.2, false);
+    settle_frames(&mut mode);
+    let s1 = state(ml(&mut mode));
+    assert!(differ(&s0, &s1).0 > 100);
+    step(&mut mode, VolumeMode::undo, false, "undo the bump");
+    assert_eq!(differ(&state(ml(&mut mode)), &s0), (0, 0), "undo the bump");
+    assert!(mode.redo());
+    assert!(mode.mesh.as_ref().unwrap().pending(), "the redo landed at once");
+    // Straight on: no frame lands the redo first.
+    ball_step(&mut mode, Vec3::new(0.0, 1.0, 0.0), 0.2, false);
+    settle_frames(&mut mode);
+    step(&mut mode, VolumeMode::undo, false, "undo the second bump");
+    assert_eq!(differ(&state(ml(&mut mode)), &s1), (0, 0), "after undoing the second bump");
+    step(&mut mode, VolumeMode::undo, false, "undo the redone bump");
+    assert_eq!(differ(&state(ml(&mut mode)), &s0), (0, 0), "after undoing the redone bump");
+    // The layer stroke under them is still there to undo.
+    assert!(matches!(mode.mesh.as_ref().unwrap().history.last(), Some(crate::mesh_stack::Entry::Layer { .. })));
 }
 
 /// A mask fill's undo puts back the fill the panel shows (and the mask's values), its redo the new one.

@@ -696,8 +696,14 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         });
         if app.volume.mesh_building() {
             note(ui, "Making the mesh for layers from the volume...", weak);
-        } else if let Some(n) = app.volume.mesh_note.as_ref() {
-            note(ui, n, weak);
+        } else {
+            // (The failure stands until a refit succeeds; the note beside it is the last one-off.)
+            if let Some(f) = app.volume.mesh_failure() {
+                note(ui, &f, weak);
+            }
+            if let Some(n) = app.volume.mesh_note.as_ref() {
+                note(ui, n, weak);
+            }
         }
     });
     mesh_merge_question(app, ui.ctx());

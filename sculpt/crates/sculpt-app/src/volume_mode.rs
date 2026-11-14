@@ -289,6 +289,9 @@ pub struct VolumeMode {
     rows_none: bool,
     /// A note for the status line about the mesh layers (made, waited for, refused), until read.
     pub mesh_note: Option<String>,
+    /// What the file it was opened from held that could not be read and was left out (saving it over that file would
+    /// lose it for good).
+    pub lossy_open: Option<String>,
     /// Ctrl held for this stroke, as the app sees it. The app already swaps the brush for Ctrl (Clay for Trim and
     /// back), so no brush inverts on top of that.
     pub invert: bool,
@@ -314,6 +317,8 @@ struct MeshStroke {
     /// A mask stroke shows as it goes while refreshing the masks stays under a frame.
     live: bool,
     painted: bool,
+    /// Refused (the layers could not follow the volume): its dabs do nothing and it makes no step.
+    refused: bool,
 }
 
 impl VolumeMode {
@@ -399,6 +404,7 @@ impl VolumeMode {
             mesh_stroke: None,
             rows_none: false,
             mesh_note: None,
+            lossy_open: None,
             invert: false,
         }
     }
@@ -603,25 +609,11 @@ impl VolumeMode {
         }
         self.frame_dab_ms = 0.0;
         self.mesh_tick();
-        self.mesh_failure_note();
     }
 
-    /// While the layers' last refit failed, the note says so (and goes once one succeeds).
-    fn mesh_failure_note(&mut self) {
-        const LEAD: &str = "Layers could not follow the volume";
-        match self.mesh.as_ref().and_then(|m| m.failure.as_ref()) {
-            Some(e) => {
-                let n = format!("{LEAD}: {e}");
-                if self.mesh_note.as_ref() != Some(&n) {
-                    self.mesh_note = Some(n);
-                }
-            }
-            None => {
-                if self.mesh_note.as_ref().is_some_and(|n| n.starts_with(LEAD)) {
-                    self.mesh_note = None;
-                }
-            }
-        }
+    /// While the layers' last refit failed, why (shown beside `mesh_note` until a refit succeeds).
+    pub fn mesh_failure(&self) -> Option<String> {
+        self.mesh.as_ref()?.failure.as_ref().map(|e| format!("Layers could not follow the volume: {e}"))
     }
 
     /// `f` on the real state (while running ahead, the copy's put aside meanwhile).
@@ -1606,6 +1598,10 @@ impl VolumeMode {
         if let Some(m) = self.mesh.as_mut() {
             // (A stroke on the layers: the volume's changes are in first.)
             m.finish(&self.vol);
+            if m.failure.is_some() {
+                self.mesh_note = self.mesh_failure().map(|f| format!("No mask fill until the layers follow the volume again. {f}"));
+                return;
+            }
             m.fill_mask(to);
         } else if let Some(layer) = self.layer.as_mut() {
             layer.fill_mask(&mut self.vol, to);
@@ -1682,29 +1678,66 @@ impl VolumeMode {
     pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<VolumeMode> {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
+        // What could not be read and was left out: the volume opens whatever its later chunks hold.
+        let mut lost: Vec<String> = Vec::new();
         // Mesh layers, if any, are the last chunk: taken off, the rest reads as before.
-        let mlay = crate::mesh_stack::split_mlay(&mut bytes)?;
-        let mut cur = std::io::Cursor::new(&bytes[..]);
-        let (vol, layer) = Layered::read_from(&mut cur, OPEN_LEVELS)?;
-        let pos = cur.position() as usize;
+        let mlay = crate::mesh_stack::split_mlay(&mut bytes).unwrap_or_else(|e| {
+            lost.push(format!("the mesh layers ({e})"));
+            None
+        });
+        let read = |b: &[u8]| -> std::io::Result<_> {
+            let mut cur = std::io::Cursor::new(b);
+            let (vol, layer) = Layered::read_from(&mut cur, OPEN_LEVELS)?;
+            Ok((vol, layer, cur.position() as usize))
+        };
+        let (vol, layer, pos) = match read(&bytes) {
+            Ok(x) => x,
+            Err(e) => {
+                // A mesh layers chunk left on (damaged, or cut short with its closing mark) stops the volume's reader:
+                // the volume is read up to where the chunk starts, if a place its mark sits gives one.
+                let mut to = bytes.len();
+                let mut found = None;
+                for _ in 0..8 {
+                    let Some(i) = bytes[..to].windows(4).rposition(|w| w == b"MLAY") else { break };
+                    if let Ok(x) = read(&bytes[..i]) {
+                        found = Some((i, x));
+                        break;
+                    }
+                    to = i;
+                }
+                let Some((i, x)) = found else { return Err(e) };
+                bytes.truncate(i);
+                if !lost.iter().any(|l| l.starts_with("the mesh layers")) {
+                    lost.push("the mesh layers (the file ends inside them)".into());
+                }
+                x
+            }
+        };
         let mut mode = VolumeMode::new(vol);
         if let Some(mut layer) = layer {
             layer.deferred = true;
             mode.layer = Some(layer);
         }
-        // A chunk's length as the file gives it, checked against the file: a damaged one is an error, not a panic.
+        // A chunk's body as the file gives its length, checked against the file (a cut or damaged file).
         let chunk = |at: usize, len: u64| -> std::io::Result<&[u8]> {
             usize::try_from(len)
                 .ok()
                 .and_then(|len| at.checked_add(len))
                 .and_then(|end| bytes.get(at..end))
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "a chunk runs past the end of the file"))
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "it runs past the end of the file"))
         };
+        // Where the chunks read so far end.
+        let mut end = pos;
         // (The layers' reader took the mark already.)
         if mode.layer.is_none() && pos >= 4 && &bytes[pos - 4..pos] == b"SCLY" && bytes.len() >= pos + 8 {
             let len = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
-            let mut data = chunk(pos + 8, len)?;
-            mode.sculpt = Some(SculptLayers::read_from(&mut data)?);
+            match chunk(pos + 8, len).and_then(|mut data| SculptLayers::read_from(&mut data)) {
+                Ok(s) => {
+                    mode.sculpt = Some(s);
+                    end = pos + 8 + len as usize;
+                }
+                Err(e) => lost.push(format!("the sculpt layers ({e})")),
+            }
         }
         // Surface noise as files before it was a layer kept it: after the layers, or in their place (its mark read
         // already, then). It becomes a layer.
@@ -1719,16 +1752,38 @@ impl VolumeMode {
             && bytes.len() >= at + 4
         {
             let len = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-            let json = chunk(at + 4, len as u64)?;
-            let n: SurfaceNoise = serde_json::from_slice(json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            if n.on {
-                mode.add_noise_with(n);
+            let noise = chunk(at + 4, len as u64)
+                .and_then(|json| serde_json::from_slice::<SurfaceNoise>(json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+            match noise {
+                Ok(n) => {
+                    end = at + 4 + len as usize;
+                    if n.on {
+                        mode.add_noise_with(n);
+                    }
+                }
+                Err(e) => lost.push(format!("the surface noise ({e})")),
             }
         }
-        if let Some(body) = mlay {
-            let stack = MeshStack::read_from(&body, &mode.vol)?;
-            mode.mesh = Some(stack);
-            mode.target = Target::Detail;
+        match mlay {
+            Some(body) => match MeshStack::read_from(&body, &mode.vol) {
+                Ok(mut stack) => {
+                    lost.extend(stack.note.take());
+                    mode.mesh = Some(stack);
+                    mode.target = Target::Detail;
+                }
+                Err(e) => lost.push(format!("the mesh layers ({e})")),
+            },
+            // A mesh layers chunk cut short (its closing mark gone): the file ends inside it.
+            None if bytes.get(end..).is_some_and(|rest| rest.starts_with(b"MLAY")) && !lost.iter().any(|l| l.starts_with("the mesh layers")) => {
+                lost.push("the mesh layers (the file ends inside them)".into());
+            }
+            None => {}
+        }
+        if !lost.is_empty() {
+            let what = format!("Opened without {}", lost.join("; "));
+            eprintln!("{what}");
+            mode.mesh_note = Some(what.clone());
+            mode.lossy_open = Some(what);
         }
         Ok(mode)
     }
@@ -2006,6 +2061,12 @@ impl VolumeMode {
         if waited > 50.0 {
             self.mesh_note = Some(format!("Waited {waited:.0} ms for the layers to follow the volume"));
         }
+        if m.failure.is_some() {
+            // The layers sit on a surface the volume no longer has: a stroke there would be lost or wrong.
+            self.mesh_note = self.mesh_failure().map(|f| format!("No layer strokes until the layers follow the volume again. {f}"));
+            self.mesh_stroke = Some(MeshStroke { target, last: None, n: Vec3::ZERO, channel: None, live: false, painted: false, refused: true });
+            return true;
+        }
         let mut channel = None;
         match target {
             Target::Mask { .. } => channel = m.paint_channel(),
@@ -2024,11 +2085,10 @@ impl VolumeMode {
             }
         }
         m.layers.doc.begin_stroke(if matches!(target, Target::Mask { .. }) { "Paint mask" } else { "Sculpt layer" });
-        self.mesh_stroke = Some(MeshStroke { target, last: None, n: Vec3::ZERO, channel, live: true, painted: false });
+        self.mesh_stroke = Some(MeshStroke { target, last: None, n: Vec3::ZERO, channel, live: true, painted: false, refused: false });
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
         self.lag_ms = 0.0;
-        self.mesh_failure_note();
         true
     }
 
@@ -2036,7 +2096,7 @@ impl VolumeMode {
     /// brush (Clay for Trim and back), as on the volume, so the layer brushes are never inverted on top of that.
     fn mesh_dab(&mut self, at: Vec3, radius: f32, strength: f32, hardness: f32, brush: Brush) {
         use sculpt_core::brush::{self as b, Brush as _};
-        let (Some(m), Some(st)) = (self.mesh.as_mut(), self.mesh_stroke.as_mut()) else { return };
+        let (Some(m), Some(st)) = (self.mesh.as_mut(), self.mesh_stroke.as_mut().filter(|st| !st.refused)) else { return };
         let t = Instant::now();
         let doc = &mut m.layers.doc;
         let s = strength.clamp(0.0, 1.0);
@@ -2073,10 +2133,10 @@ impl VolumeMode {
 
     /// The stroke on a mesh layer or its mask ends: one step of the history.
     fn mesh_end(&mut self) {
-        let Some(_) = self.mesh_stroke.take() else { return };
+        let Some(st) = self.mesh_stroke.take() else { return };
         self.stroke_n = Vec3::ZERO;
         self.chosen = false;
-        let Some(m) = self.mesh.as_mut() else { return };
+        let Some(m) = self.mesh.as_mut().filter(|_| !st.refused) else { return };
         // (A stroke that changed nothing, the pen off the model, is no step.)
         match m.layers.take_stroke_patch() {
             Ok(Some(patch)) => m.push(crate::mesh_stack::Entry::Layer { patch, fill: None }),

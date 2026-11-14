@@ -280,10 +280,20 @@ impl SculptApp {
         let t = Instant::now();
         match std::fs::File::open(&p).and_then(|f| VolumeMode::read_from(&mut std::io::BufReader::new(f))) {
             Ok(mode) => {
+                let lossy = mode.lossy_open.clone();
                 self.replace_volume(mode);
                 self.frame_volume();
-                self.status = format!("Opened {} ({:.2}s)", file_name(&p), t.elapsed().as_secs_f32());
-                self.volume_path = Some(p);
+                match lossy {
+                    // Not saved back over the file by a plain save: what was left out is still in it.
+                    Some(what) => {
+                        self.status = format!("Opened {}: {what}. Save As to keep it.", file_name(&p));
+                        self.volume_path = None;
+                    }
+                    None => {
+                        self.status = format!("Opened {} ({:.2}s)", file_name(&p), t.elapsed().as_secs_f32());
+                        self.volume_path = Some(p);
+                    }
+                }
             }
             Err(e) => self.status = format!("Open failed: {p}: {e}"),
         }
