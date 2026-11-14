@@ -42,6 +42,17 @@ impl RowsDirty {
     }
 }
 
+/// The most steps the history keeps: the oldest past it go.
+pub(crate) const HISTORY_STEPS: usize = 512;
+
+/// The most bytes the history keeps (the patches of its steps, both sides, and those filed under the states they
+/// reach): the oldest steps past it go. The volume keeps its own history to the same 1 GiB (`HISTORY_BYTES` in
+/// `level_volume`), so neither side's undo runs out long before the other's, and the two together stay within 2 GiB. A
+/// layer stroke's patch holds 32 bytes for each vertex of every BVH leaf it touched: at 2.5M triangles an r 0.4 stroke
+/// sweeping across the test ball touches 139k of its 1.24M vertices, 4.4 MB (`layer_patch_bytes_at_2_5m`), so 1 GiB
+/// keeps some 240 of those and the full 512 of ordinary strokes, where 512 sweeps would hold 2.3 GB.
+pub(crate) const HISTORY_BYTES: usize = 1 << 30;
+
 /// One step of the history (and, on the redo side, the step to do again).
 pub(crate) enum Entry {
     /// A step of the volume's own history, named by `LevelVolume::last_id` (on the redo side `redo_id`): only a check
@@ -53,6 +64,17 @@ pub(crate) enum Entry {
     Layer { patch: Patch, fill: Option<(String, Option<f32>)> },
     /// A layer's settings (name, opacity, visibility, blend, masks) before and after.
     Meta { id: LayerId, before: LayerMeta, after: LayerMeta },
+}
+
+impl Entry {
+    /// The bytes it holds (its patch's data; a fill's name; the rest as the entry itself).
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Entry>()
+            + match self {
+                Entry::Layer { patch, fill } => patch.bytes() + fill.as_ref().map_or(0, |(name, _)| name.len()),
+                _ => 0,
+            }
+    }
 }
 
 /// What the last swap, and the last refit's start, cost on the main thread.
@@ -75,6 +97,8 @@ pub struct MeshStack {
     /// GPU (only the next look; any stroke clears it).
     pub(crate) skip: HashSet<Key>,
     pub(crate) history: Vec<Entry>,
+    /// The bytes the history may hold ([`HISTORY_BYTES`]; tests set less).
+    pub(crate) history_budget: usize,
     pub(crate) redo: Vec<Entry>,
     /// What each swap could not carry, filed under the volume state the layers left (newest last): put back when
     /// the layers next arrive at that state, however they get there. A patch belongs to the state left, not to a
@@ -179,6 +203,7 @@ impl MeshStack {
             dirty,
             skip: HashSet::new(),
             history: Vec::new(),
+            history_budget: HISTORY_BYTES,
             redo: Vec::new(),
             lost: HashMap::new(),
             came_from: HashMap::new(),
@@ -235,11 +260,32 @@ impl MeshStack {
         self.trim();
     }
 
-    /// The oldest step past 512 goes, and the patches of states no step reaches any more.
+    /// The oldest steps past [`HISTORY_STEPS`], or past the history's byte budget (down to the newest step), go, and
+    /// the patches of states no step reaches any more. The budget drops steps only while nothing waits to be redone (a
+    /// new step clears the redo side): undoing moves steps to the redo side, and must not cost the older ones.
     fn trim(&mut self) {
-        if self.history.len() > 512 {
-            self.history.remove(0);
+        loop {
+            let bytes_over = self.redo.is_empty() && self.history.len() > 1 && self.history_bytes() > self.history_budget;
+            let over = self.history.len() > HISTORY_STEPS || bytes_over;
+            if over {
+                self.history.remove(0);
+            }
+            self.forget_unreached();
+            if !over {
+                break;
+            }
         }
+    }
+
+    /// The bytes the history holds: its steps, both sides, and the patches filed under the states they reach.
+    pub(crate) fn history_bytes(&self) -> usize {
+        let steps: usize = self.history.iter().chain(&self.redo).map(Entry::bytes).sum();
+        let filed: usize = self.lost.values().flatten().map(|(_, p)| std::mem::size_of::<(u64, Patch)>() + p.bytes()).sum();
+        steps + filed
+    }
+
+    /// Drop the patches of states no step reaches any more (see [`Self::trim`]).
+    fn forget_unreached(&mut self) {
         let mut keep: HashSet<u64> = [self.vol_state, self.doc_state].into_iter().collect();
         keep.extend(self.job_state);
         for e in self.history.iter().chain(&self.redo) {

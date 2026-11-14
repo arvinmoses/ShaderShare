@@ -1132,6 +1132,80 @@ fn layer_dab_times_at_2_5m() {
     assert!(fails.is_empty(), "{fails:?}");
 }
 
+/// What a wide layer stroke's undo step holds at 2.5M triangles (r 0.4: a 16-dab stroke, and a 60-dab sweep across
+/// the ball as in `layer_dab_times_at_2_5m`), for the history's byte budget.
+#[test]
+#[ignore]
+fn layer_patch_bytes_at_2_5m() {
+    let _one = one_at_a_time();
+    let mut mode = big();
+    let mut last = mode.mesh.as_ref().unwrap().history_bytes();
+    let mut step = |mode: &mut VolumeMode, what: &str| {
+        settle_frames(mode);
+        let m = mode.mesh.as_ref().unwrap();
+        let now = m.history_bytes();
+        let verts = match m.history.last() {
+            Some(crate::mesh_stack::Entry::Layer { patch, .. }) => patch.len(),
+            _ => 0,
+        };
+        eprintln!("{what}: the step holds {:.1} MB ({verts} vertices of {})", (now - last) as f64 / 1e6, m.layers.doc.vertex_count());
+        last = now;
+    };
+    stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.0, 1.0), 0.4, Brush::Clay);
+    step(&mut mode, "r 0.4, 16 dabs");
+    mode.target = Target::Detail;
+    mode.begin_stroke();
+    for i in 0..60 {
+        let d = Vec3::new(-0.4 + 0.8 * i as f32 / 59.0, 0.05, 1.0).normalize();
+        let (hit, _) = mode.raycast(d * 3.0, -d).unwrap();
+        mode.queue_dab(DabInput { at: hit, radius: 0.4, px: 0.002, strength: 0.7, hardness: 0.3, brush: Brush::Clay });
+    }
+    mode.end_stroke();
+    step(&mut mode, "r 0.4, 60 dabs across the ball");
+}
+
+/// A long session of wide layer strokes, with volume strokes under them, keeps the history within its byte budget
+/// (the oldest steps go), and every step it keeps still undoes bit for bit.
+#[test]
+fn wide_strokes_keep_the_history_in_its_budget() {
+    let _one = one_at_a_time();
+    let mut mode = ball_with_layer(2e5);
+    stroke(&mut mode, Target::Detail, Vec3::new(0.0, 0.0, 1.0), 0.4, Brush::Clay);
+    settle_frames(&mut mode);
+    // Room for a few such strokes (later ones reach more of the ball).
+    let budget = 10 * mode.mesh.as_ref().unwrap().history_bytes();
+    mode.mesh.as_mut().unwrap().history_budget = budget;
+    let mut states = vec![state(ml(&mut mode))];
+    let (mut filed, n) = (0, 16);
+    for k in 0..n {
+        let a = k as f32 * 0.9;
+        let dir = Vec3::new(a.cos(), 0.4 * a.sin(), a.sin());
+        let form = k % 4 == 3;
+        let (target, r) = if form { (Target::Form, 0.1) } else { (Target::Detail, 0.4) };
+        stroke(&mut mode, target, dir, r, if k % 2 == 0 { Brush::Clay } else { Brush::Trim });
+        settle_frames(&mut mode);
+        let m = mode.mesh.as_ref().unwrap();
+        let bytes = m.history_bytes();
+        filed = filed.max(m.filed().iter().map(|f| f.1).sum());
+        eprintln!("stroke {k}: {} steps, {:.2} MB of {:.2}", m.history.len(), bytes as f64 / 1e6, budget as f64 / 1e6);
+        assert!(m.history.len() == 1 || bytes <= budget, "stroke {k}: the history holds {bytes} bytes, over {budget}");
+        states.push(state(ml(&mut mode)));
+    }
+    let kept = mode.mesh.as_ref().unwrap().history.len();
+    eprintln!("{kept} steps kept of {}; at most {filed} patches filed under states", n + 1);
+    assert!(kept < n, "no step was dropped");
+    assert!(kept >= 2, "the budget keeps next to nothing");
+    for i in 0..kept {
+        assert!(mode.undo(), "undo {i}");
+        settle_frames(&mut mode);
+        // (Undoing moves the step to the redo side: that costs no older step.)
+        assert_eq!(mode.mesh.as_ref().unwrap().history.len(), kept - 1 - i, "undo {i} dropped steps");
+        let d = differ(&state(ml(&mut mode)), &states[n - 1 - i]);
+        assert_eq!(d, (0, 0), "undo {i}");
+    }
+    base_is_fresh(&mut mode, "after the undos");
+}
+
 /// The frames of a session at 2.5M triangles: volume stroke ends with layers (< 2 ms on the frame), 20 mixed strokes
 /// with the pen up a while between them (no frame over 16 ms; the first mesh is made on its thread before), undo of
 /// a volume step (waited for, reported).
