@@ -833,7 +833,19 @@ pub fn save_atomically(path: &std::path::Path, write: impl FnOnce(&mut std::io::
         let _ = std::fs::remove_file(&tmp);
         return Err(SaveError::Write(e));
     }
-    std::fs::rename(&tmp, path).map_err(|e| SaveError::Replace(e, tmp))
+    // A sync client or a virus scanner may hold the target for a moment (access denied, or in use): tried again a few
+    // times before the new file is left beside it.
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if tries < 5 && matches!(e.raw_os_error(), Some(5 | 32)) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(SaveError::Replace(e, tmp)),
+        }
+    }
 }
 
 pub fn file_name(p: &str) -> String {
@@ -931,6 +943,26 @@ mod save_tests {
             Err(SaveError::Replace(_, tmp)) => assert_eq!(std::fs::read(&tmp).unwrap(), b"kept"),
             r => panic!("{r:?}"),
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A target held open for a moment (as a sync client or a scanner holds it): the save waits it out.
+    #[cfg(windows)]
+    #[test]
+    fn a_save_waits_out_a_brief_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = dir("lock");
+        let p = d.join("a.svol");
+        std::fs::write(&p, b"old").unwrap();
+        // Shared with no one: a rename over it fails (in use) while it is open.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&p).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(held);
+        });
+        save_atomically(&p, |w| std::io::Write::write_all(w, b"new")).unwrap();
+        release.join().unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
