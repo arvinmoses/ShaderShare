@@ -5,17 +5,12 @@
 //! sculpt-app --gpu-levels-check [...]                                    (the GPU surface against the CPU reference)
 //! sculpt-app --gpu-rows-check [--old-shader FILE] [--triangles M]         (mesh layer rows on the GPU surface)
 //! sculpt-app --gpu-layer-rows-check [--triangles M]                      (mesh layers fed to those rows)
-//! sculpt-app --gpu-bench [...] | --gpu-volume-bench [...] | --gpu-sdf-bench | --gpu-sdf-check | --gpu-sdf-png <dir>
-//!                                                                         (headless GPU spikes, no window)
 //! ```
 
 mod app;
 mod camera;
 mod generator_ui;
-mod gpu_boolean;
 mod gpu_levels;
-mod gpu_sdf;
-mod gpu_volume;
 mod icons;
 mod keymap;
 mod layer_rows;
@@ -61,16 +56,8 @@ sculpt-app --gpu-rows-check              mesh layer rows drawn on the GPU surfac
 sculpt-app --gpu-layer-rows-check        mesh layers fed to the GPU rows through volume strokes and layer dabs (gates)";
 
 fn main() -> eframe::Result {
-    // Headless GPU checks and benchmarks: no window, their own wgpu device.
+    // Headless GPU checks: no window, their own wgpu device.
     let first = std::env::args().nth(1);
-    if first.as_deref() == Some("--gpu-bench") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        if let Err(e) = gpu_boolean::bench::run(&args) {
-            eprintln!("gpu-bench: {e}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
     if first.as_deref() == Some("--gpu-levels-check") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_levels::check::run(&args) {
@@ -91,22 +78,6 @@ fn main() -> eframe::Result {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_levels::layer_check::run(&args) {
             eprintln!("gpu-layer-rows-check: {e}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    if first.as_deref() == Some("--gpu-volume-bench") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        if let Err(e) = gpu_volume::bench(&args) {
-            eprintln!("gpu-volume-bench: {e}");
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-    let all: Vec<String> = std::env::args().skip(1).collect();
-    if all.first().is_some_and(|a| gpu_sdf::is_gpu_sdf_command(a)) {
-        if let Err(e) = gpu_sdf::cli(&all) {
-            eprintln!("error: {e}");
             std::process::exit(1);
         }
         return Ok(());
