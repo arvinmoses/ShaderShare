@@ -37,7 +37,6 @@ pub mod level_view;
 pub mod level_volume;
 pub mod mapping;
 pub mod place;
-pub mod sculpt_layer;
 pub mod remesh;
 pub mod sdf;
 pub mod volume;
