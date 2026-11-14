@@ -8,8 +8,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use glam::{Mat3, Vec3};
-use sculpt_core::decimate::{Analysis, AnalyzeOptions, Surface, Target, TriMesh, check_manifold, even_out, surface_error};
+use glam::{Mat3, Vec2, Vec3};
+use sculpt_core::decimate::{
+    Analysis, AnalyzeOptions, Baker, Maps, Surface, Target, TriMesh, check_manifold, even_out, quick_uv, surface_error, tessellate,
+};
 use sculpt_core::document::SolidSettings;
 use sculpt_core::generator::layer::{GeneratorKind, GeneratorSpec, NoiseSpec};
 use sculpt_core::generator::{BoolOp, Primitive};
@@ -47,7 +49,7 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
         .collect();
 
     let views = [View::whole(0.6, 0.35), View::close(0.6, 0.35, &input)];
-    let input_tiles: Vec<Vec<u8>> = views.iter().map(|v| draw(&input, v, false)).collect();
+    let input_tiles: Vec<Vec<u8>> = views.iter().map(|v| draw(&input, v, false, None)).collect();
     println!("| keep | evenness | tris | min angle | valence dev | mean err | max err | closed+manifold |");
     println!("|---|---|---|---|---|---|---|---|");
     for pct in [5.0f32, 1.0, 0.25] {
@@ -67,9 +69,114 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
                 100.0 * err.max_rel(),
                 r.closed() && r.manifold()
             );
-            cols.push(views.iter().enumerate().map(|(i, v)| draw(&m, v, i == 1)).collect());
+            cols.push(views.iter().enumerate().map(|(i, v)| draw(&m, v, i == 1, None)).collect());
         }
         save_grid(&cols, &out.join(format!("keep_{}.png", pct.to_string().replace('.', "_"))))?;
+    }
+    Ok(())
+}
+
+/// `sculpt-cli decimate-bake [out_dir] [seed] [voxel]`: the same rock decimated (evenness 0.5), quick UVs, height
+/// and normal maps baked progressively, and the low mesh tessellated and displaced by them.
+///
+/// Writes `bake_<pct>.png` per target (columns: input, low, low + normal map, tessellated + displaced,
+/// tessellated + displaced + normal map; rows: whole, close up), `progressive_<pct>.png` (the last column's close up
+/// from maps at each resolution baked), and `normal_<pct>.png` / `height_<pct>.png` (the largest maps).
+pub(crate) fn run_bake(args: &[String]) -> Res<()> {
+    let out = Path::new(args.first().map_or("decimate_bake", |s| s.as_str()));
+    let seed: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+    let voxel: f32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.006);
+    std::fs::create_dir_all(out)?;
+    let input = Arc::new(build_rock(seed, voxel)?);
+    println!("rock: {} tris", input.triangles.len());
+    let t = Instant::now();
+    let surface = Arc::new(Surface::new(input.clone()));
+    let baker = Baker::new(surface.clone());
+    println!("surface grid + normals: {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    let e = 0.5;
+    let analysis = Analysis::build(&input, &AnalyzeOptions { evenness: e, ..Default::default() }, None).expect("not cancelled");
+    let views = [View::whole(0.6, 0.35), View::close(0.6, 0.35, &input)];
+    let input_tiles: Vec<Vec<u8>> = views.iter().map(|v| draw(&input, v, false, None)).collect();
+    println!("| keep | tris | level | tess tris | charts | uv ms | bake ms (128/256/512/1K/2K) | tess ms | low mean/max err | tess mean/max err |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for (pct, level) in [(1.0f32, 8usize), (0.25, 16)] {
+        let mut m = analysis.extract(Target::KeepPercent(pct)).mesh;
+        even_out(&mut m, Some(&surface), e, 2, true);
+        let edge = mean_edge(&m);
+        let t = Instant::now();
+        let uv = quick_uv(&m, 4.0 / 1024.0);
+        let uv_ms = t.elapsed().as_secs_f64() * 1e3;
+        let mut maps = Vec::new();
+        let mut bake_ms = Vec::new();
+        for res in [128usize, 256, 512, 1024, 2048] {
+            let t = Instant::now();
+            maps.push(baker.bake(&uv, res, 1.5 * edge, None).expect("not cancelled"));
+            bake_ms.push(format!("{:.0}", t.elapsed().as_secs_f64() * 1e3));
+        }
+        let best = maps.last().unwrap();
+        let t = Instant::now();
+        let tess = tessellate(&uv, best, level, 1.0);
+        let tess_ms = t.elapsed().as_secs_f64() * 1e3;
+        let low_err = surface_error(&input, &m, 300_000);
+        let tess_err = surface_error(&input, &tess.mesh, 300_000);
+        println!(
+            "| {pct}% | {} | {level} | {} | {} | {uv_ms:.0} | {} | {tess_ms:.0} | {:.3}% / {:.2}% | {:.3}% / {:.2}% |",
+            m.triangles.len(),
+            tess.mesh.triangles.len(),
+            uv.charts,
+            bake_ms.join(" / "),
+            100.0 * low_err.mean_rel(),
+            100.0 * low_err.max_rel(),
+            100.0 * tess_err.mean_rel(),
+            100.0 * tess_err.max_rel(),
+        );
+        let low_uvs: Vec<[Vec2; 3]> = uv.triangles.iter().map(|t| t.map(|v| uv.uvs[v as usize])).collect();
+        let low = TriMesh { positions: uv.positions.clone(), triangles: uv.triangles.clone() };
+        let cols = vec![
+            input_tiles.clone(),
+            views.iter().enumerate().map(|(i, v)| draw(&low, v, i == 1, None)).collect(),
+            views.iter().enumerate().map(|(i, v)| draw(&low, v, i == 1, Some((&low_uvs, best)))).collect(),
+            views.iter().map(|v| draw(&tess.mesh, v, false, None)).collect(),
+            views.iter().map(|v| draw(&tess.mesh, v, false, Some((&tess.corner_uvs, best)))).collect(),
+        ];
+        let name = pct.to_string().replace('.', "_");
+        save_grid(&cols, &out.join(format!("bake_{name}.png")))?;
+        let prog: Vec<Vec<Vec<u8>>> = maps
+            .iter()
+            .map(|mp| {
+                let t = tessellate(&uv, mp, level, 1.0);
+                vec![draw(&t.mesh, &views[1], false, Some((&t.corner_uvs, mp)))]
+            })
+            .collect();
+        save_grid(&prog, &out.join(format!("progressive_{name}.png")))?;
+        save_maps(best, &out.join(format!("normal_{name}.png")), &out.join(format!("height_{name}.png")))?;
+    }
+    Ok(())
+}
+
+fn mean_edge(m: &TriMesh) -> f32 {
+    let s: f32 = m.triangles.iter().map(|t| (0..3).map(|i| m.positions[t[i] as usize].distance(m.positions[t[(i + 1) % 3] as usize])).sum::<f32>()).sum();
+    s / (3 * m.triangles.len().max(1)) as f32
+}
+
+/// The normal map as RGB and the height map as grey (mid grey zero, black and white at the search distance), with
+/// v = 0 at the bottom.
+fn save_maps(maps: &Maps, normal: &Path, height: &Path) -> Res<()> {
+    let r = maps.res;
+    let mut rgb = vec![0u8; r * r * 3];
+    let mut grey = vec![0u8; r * r];
+    for y in 0..r {
+        for x in 0..r {
+            let (i, o) = ((r - 1 - y) * r + x, y * r + x);
+            rgb[o * 3..o * 3 + 3].copy_from_slice(&maps.normal[i][..3]);
+            grey[o] = ((maps.height[i] / maps.max_dist * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+        }
+    }
+    for (path, data, color) in [(normal, &rgb, png::ColorType::Rgb), (height, &grey, png::ColorType::Grayscale)] {
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path)?), r as u32, r as u32);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(data)?;
     }
     Ok(())
 }
@@ -162,8 +269,9 @@ fn mid(m: &TriMesh) -> Vec3 {
     (lo + hi) * 0.5
 }
 
-/// Clay shading with optional wireframe, `TILE` square, supersampled.
-fn draw(m: &TriMesh, view: &View, wire: bool) -> Vec<u8> {
+/// Clay shading with optional wireframe and an optional object-space normal map (each triangle's corner UVs and the
+/// maps), `TILE` square, supersampled.
+fn draw(m: &TriMesh, view: &View, wire: bool, nmap: Option<(&[[Vec2; 3]], &Maps)>) -> Vec<u8> {
     let s = TILE * SS;
     let (lo, hi) = m.positions.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
     let (center, scale) = if view.scale == 0.0 { ((lo + hi) * 0.5, 1.3 * s as f32 / (hi - lo).length()) } else { (view.center, view.scale * 0.85 * s as f32 / 2.6) };
@@ -186,7 +294,7 @@ fn draw(m: &TriMesh, view: &View, wire: bool) -> Vec<u8> {
     let mut px = vec![Vec3::new(0.16, 0.17, 0.19); s * s];
     let light = Vec3::new(-0.4, 0.6, 0.7).normalize();
     let half = (light + Vec3::Z).normalize();
-    for t in &m.triangles {
+    for (f, t) in m.triangles.iter().enumerate() {
         let [a, b, c] = t.map(|v| v as usize);
         let (pa, pb, pc) = (pts[a], pts[b], pts[c]);
         let area = (pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x);
@@ -217,7 +325,10 @@ fn draw(m: &TriMesh, view: &View, wire: bool) -> Vec<u8> {
                     continue;
                 }
                 depth[i] = z;
-                let n = (nrm[a] * w0 + nrm[b] * w1 + nrm[c] * w2).normalize_or(Vec3::Z);
+                let n = match nmap {
+                    Some((uvs, maps)) => view.rot * maps.normal_at(uvs[f][0] * w0 + uvs[f][1] * w1 + uvs[f][2] * w2),
+                    None => (nrm[a] * w0 + nrm[b] * w1 + nrm[c] * w2).normalize_or(Vec3::Z),
+                };
                 let diff = n.dot(light).max(0.0);
                 let rim = (1.0 - n.z.abs()).powi(3) * 0.3;
                 let spec = n.dot(half).max(0.0).powi(24) * 0.2;

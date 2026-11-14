@@ -21,6 +21,7 @@
 //! with each round's collapses merged by cost into the global order, then one last pass over the whole mesh.
 
 mod analyze;
+mod bake;
 mod collapse;
 mod even;
 mod manifold;
@@ -30,11 +31,12 @@ mod replay;
 mod surface;
 
 pub use analyze::{Analysis, AnalyzeOptions, Progress};
+pub use bake::{Baker, Maps, Tessellated, UvMesh, quick_uv, tessellate, vertex_normals};
 pub use even::{even_out, relax};
 pub use manifold::{ManifoldReport, check_manifold};
 pub use metric::{SurfaceError, surface_error};
 pub use replay::Decimated;
-pub use surface::Surface;
+pub use surface::{Hit, Surface};
 
 use glam::Vec3;
 
