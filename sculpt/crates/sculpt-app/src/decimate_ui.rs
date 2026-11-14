@@ -15,7 +15,8 @@
 //! * Closed/manifold and the surface error are measured off the frame when a slider is let go.
 //! * **Tessellate + displace** previews the final asset: quick UVs on the output, a height map baked from the input
 //!   (low resolution while a slider drags, the size set when let go), and the output split `level`² per triangle and
-//!   displaced by it. Shown in place of the output; geometry only for now (no normal map in the viewport).
+//!   displaced by it, shown in place of the output. **Normal map** shades the low or tessellated mesh from an
+//!   object-space normal map baked with the height map.
 //! * Closing the window drops the preview (and the analyses) and shows the volume again.
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use sculpt_core::decimate::{
     Analysis, AnalyzeOptions, Baker, ManifoldReport, Maps, Progress, Surface, SurfaceError, Target, TriMesh, UvMesh, check_manifold, even_out, quick_uv,
     surface_error, tessellate,
 };
+use glam::Vec2;
 
 use crate::app::{SculptApp, fmt_count};
 use crate::panels::prop;
@@ -120,8 +122,11 @@ pub struct Decimate {
     /// The export dialog's path while it is open.
     export: Option<String>,
     note: String,
-    /// Tessellate + displace preview: on, level, map size, strength.
+    /// Tessellate + displace preview: on, normal map on, level, map size, strength.
     displace: bool,
+    nmap: bool,
+    /// The maps changed since the GPU's copy.
+    map_dirty: bool,
     level: usize,
     map_res: usize,
     strength: f32,
@@ -129,7 +134,7 @@ pub struct Decimate {
     /// UVs and maps of output `generation` (maps at the size given), the tessellated mesh shown, and its timings.
     uv: Option<(u64, UvMesh)>,
     maps: Option<(u64, Maps)>,
-    tess: Option<Arc<TriMesh>>,
+    tess: Option<(Arc<TriMesh>, Arc<Vec<[Vec2; 3]>>)>,
     tess_note: String,
 }
 
@@ -196,6 +201,8 @@ impl Decimate {
             export: None,
             note: String::new(),
             displace: false,
+            nmap: false,
+            map_dirty: false,
             level: 8,
             map_res: 1024,
             strength: 1.0,
@@ -344,7 +351,7 @@ impl Decimate {
     fn preview(&mut self, live: bool) {
         self.tess = None;
         self.gpu_dirty = true;
-        if !self.displace {
+        if !self.displace && !self.nmap {
             return;
         }
         let (Some(out), Some(baker)) = (self.result.clone(), self.baker.clone()) else {
@@ -364,12 +371,22 @@ impl Decimate {
         if self.maps.as_ref().is_none_or(|m| m.0 != g || (!live && m.1.res != res)) {
             let edge = mean_edge(&out);
             match baker.bake(uv, res, 1.5 * edge, None) {
-                Some(m) => self.maps = Some((g, m)),
+                Some(m) => {
+                    self.maps = Some((g, m));
+                    self.map_dirty = true;
+                }
                 None => return,
             }
         }
         let bake_ms = t.elapsed().as_secs_f32() * 1e3;
         let maps = &self.maps.as_ref().unwrap().1;
+        if !self.displace {
+            let low = TriMesh { positions: uv.positions.clone(), triangles: uv.triangles.clone() };
+            let corners: Vec<[Vec2; 3]> = uv.triangles.iter().map(|t| t.map(|v| uv.uvs[v as usize])).collect();
+            self.tess_note = format!("{} charts, map {}²  ·  UV {uv_ms:.1} ms, bake {bake_ms:.0} ms", uv.charts, maps.res);
+            self.tess = Some((Arc::new(low), Arc::new(corners)));
+            return;
+        }
         let fit = ((TESS_BUDGET as f32 / out.triangles.len().max(1) as f32).sqrt() as usize).max(1);
         let level = self.level.min(fit);
         let t = Instant::now();
@@ -382,12 +399,16 @@ impl Decimate {
             uv.charts,
             maps.res,
         );
-        self.tess = Some(Arc::new(tess.mesh));
+        self.tess = Some((Arc::new(tess.mesh), Arc::new(tess.corner_uvs)));
     }
 
-    /// The mesh to show: the tessellated preview when on, else the output.
-    fn shown(&self) -> Option<&Arc<TriMesh>> {
-        if self.displace { self.tess.as_ref().or(self.result.as_ref()) } else { self.result.as_ref() }
+    /// The mesh to show and its corner UVs: the preview when one is on (the tessellated mesh, or the output split
+    /// along its UV seams for the normal map), else the output.
+    fn shown(&self) -> Option<(Arc<TriMesh>, Option<Arc<Vec<[Vec2; 3]>>>)> {
+        match self.tess.as_ref() {
+            Some((m, uv)) if self.displace || self.nmap => Some((m.clone(), Some(uv.clone()))),
+            _ => self.result.as_ref().map(|m| (m.clone(), None)),
+        }
     }
 
     /// Measure the output off the frame: closed/manifold, and the surface error against the input.
@@ -413,7 +434,7 @@ impl Decimate {
                     let s = Arc::new(s);
                     self.baker = Some(Arc::new(Baker::new(s.clone())));
                     self.surface = Some(s);
-                    if self.displace && self.evenness <= 0.0 && self.result.is_some() {
+                    if (self.displace || self.nmap) && self.evenness <= 0.0 && self.result.is_some() {
                         self.preview(false);
                     }
                     // Even again, now projected onto the input.
@@ -590,12 +611,13 @@ impl Decimate {
         let r = ui.checkbox(&mut self.displace, "Tessellate + displace preview").on_hover_text(
             "Quick UVs on the output, a height map baked from the input, and the output split and displaced by it: roughly how the asset looks rendered with displacement",
         );
-        if r.changed() {
+        let r2 = ui.checkbox(&mut self.nmap, "Normal map").on_hover_text("Shade from a normal map baked from the input (on the tessellated mesh, or on the output when tessellation is off)");
+        if r.changed() || r2.changed() {
             self.preview(false);
         }
-        if self.displace {
-            let r = prop(ui, "Level", |ui| ui.add(egui::Slider::new(&mut self.level, 1..=32))).on_hover_text("Each triangle is split level × level");
-            let r2 = prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut self.strength, 0.0..=2.0).max_decimals(2)));
+        if self.displace || self.nmap {
+            let r = ui.add_enabled_ui(self.displace, |ui| prop(ui, "Level", |ui| ui.add(egui::Slider::new(&mut self.level, 1..=32))).on_hover_text("Each triangle is split level × level")).inner;
+            let r2 = ui.add_enabled_ui(self.displace, |ui| prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut self.strength, 0.0..=2.0).max_decimals(2)))).inner;
             let mut res = self.map_res;
             prop(ui, "Map size", |ui| {
                 for s in MAP_SIZES {
@@ -744,12 +766,19 @@ pub fn window(app: &mut SculptApp, ctx: &egui::Context) {
         return;
     };
     match (d.previewing(), d.shown()) {
-        (true, Some(out)) => {
+        (true, Some((out, uvs))) => {
             let draw = vp.decimate.get_or_insert_with(|| crate::decimate_draw::DecimateDraw::new(&rs.device, &vp.bgl));
             if d.gpu_dirty {
-                draw.upload(&rs.device, &rs.queue, out);
+                draw.upload(&rs.device, &rs.queue, &out, uvs.as_deref().map(|u| u.as_slice()));
                 d.gpu_dirty = false;
             }
+            if d.map_dirty
+                && let Some((_, maps)) = d.maps.as_ref()
+            {
+                draw.upload_map(&rs.device, &rs.queue, maps);
+                d.map_dirty = false;
+            }
+            draw.use_nmap = d.nmap;
             draw.wire = d.wire;
             draw.shown = true;
         }
