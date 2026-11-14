@@ -77,7 +77,7 @@ impl Scene<'_> {
         self.gather();
         let more = self.vp.sync_volume_on(self.device, self.queue, &mut self.mode, self.eye, 1000.0, Some(1000.0));
         let d = std::mem::take(&mut self.dirty);
-        self.vp.sync_layer_rows_on(Some(&self.ml), d);
+        self.vp.sync_layer_rows(Some(&self.ml), d);
         Ok(more)
     }
 
@@ -88,8 +88,7 @@ impl Scene<'_> {
         keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
         keys.dedup();
         if !keys.is_empty() {
-            let b = MeshLayers::changed_box(&self.mode.vol, &keys);
-            self.ml.refit_async(&self.mode.vol, &keys, b);
+            self.ml.refit_async(&self.mode.vol, &keys);
         }
     }
 
@@ -386,7 +385,7 @@ pub fn run(args: &[String]) -> Res<()> {
         }
         if i == 12 {
             // No visible layer (rows off), then back.
-            sc.vp.sync_layer_rows_on(Some(&sc.ml), RowsDirty { none: true, ..Default::default() });
+            sc.vp.sync_layer_rows(Some(&sc.ml), RowsDirty { none: true, ..Default::default() });
             if sc.vp.layers_shown || sc.vp.levels().unwrap().has_rows() {
                 fails.push("rows not off with `none`".into());
             }
@@ -466,7 +465,7 @@ pub fn run(args: &[String]) -> Res<()> {
     for k in 0..7 {
         sc.ml.doc.set_layer_opacity(ids[0], 1.0 + 0.1 * k as f32)?;
         let t = Instant::now();
-        sc.vp.sync_layer_rows_on(Some(&sc.ml), RowsDirty { all: true, ..Default::default() });
+        sc.vp.sync_layer_rows(Some(&sc.ml), RowsDirty { all: true, ..Default::default() });
         sc.vp.levels().unwrap().flush_rows();
         all_ms.push(t.elapsed().as_secs_f64() * 1e3);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -491,7 +490,7 @@ pub fn run(args: &[String]) -> Res<()> {
             _ => return Err("a dab marked everything".into()),
         };
         if k % 2 == 0 {
-            sc.vp.sync_layer_rows_on(Some(&sc.ml), RowsDirty { leaves, ..Default::default() });
+            sc.vp.sync_layer_rows(Some(&sc.ml), RowsDirty { leaves, ..Default::default() });
             let t_sync = t.elapsed().as_secs_f64() * 1e3;
             sc.vp.levels().unwrap().flush_rows();
             dab_ms.push(t.elapsed().as_secs_f64() * 1e3);
@@ -500,7 +499,7 @@ pub fn run(args: &[String]) -> Res<()> {
             dab_changed.push(sc.vp.layer_rows.stats.leaf_changed as f64);
         } else {
             let blocks = layer_rows::dab_blocks(&sc.ml, &sculpt_core::DirtySet::Leaves(leaves));
-            sc.vp.sync_layer_rows_on(Some(&sc.ml), RowsDirty { blocks, ..Default::default() });
+            sc.vp.sync_layer_rows(Some(&sc.ml), RowsDirty { blocks, ..Default::default() });
             sc.vp.levels().unwrap().flush_rows();
             blk_ms.push(t.elapsed().as_secs_f64() * 1e3);
             blk_rows.push(sc.vp.layer_rows.stats.rows as f64);
@@ -525,7 +524,7 @@ pub fn run(args: &[String]) -> Res<()> {
         let d = std::mem::take(&mut sc.dirty);
         swap_blocks.push(d.blocks.len() as f64);
         let t = Instant::now();
-        sc.vp.sync_layer_rows_on(Some(&sc.ml), d);
+        sc.vp.sync_layer_rows(Some(&sc.ml), d);
         sc.vp.levels().unwrap().flush_rows();
         swap_ms.push(t.elapsed().as_secs_f64() * 1e3);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());

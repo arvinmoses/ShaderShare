@@ -3299,10 +3299,6 @@ impl LevelVolume {
         !self.history.is_empty()
     }
 
-    pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
-    }
-
     fn swap_in(&mut self, entry: Shared<Key, Was>) -> Shared<Key, Was> {
         let mut back = Shared::default();
         for (&k, was) in entry.iter() {
@@ -4044,13 +4040,8 @@ impl LevelVolume {
     /// The stored blocks whose 9x9x9 samples ([`Self::gather9`]) changed when the blocks `changed` changed (samples or
     /// existence): each of those still stored, the blocks just below it at its level (whose first layer past them is its
     /// samples), and the finer blocks near it (whose first layer past them may fall where their level has no block and
-    /// so read its level, interpolated).
-    pub fn upload_set(&self, changed: &[Key]) -> Vec<Key> {
-        self.upload_set_in(changed, &Show::upto(self.levels() - 1))
-    }
-
-    /// [`Self::upload_set`] for a view `v` (whose samples are [`Self::gather9_hiding`] with its hidden blocks):
-    /// `changed` may also name blocks it began or stopped showing. Only blocks it shows are listed.
+    /// so read its level, interpolated). For a view `v` (whose samples are [`Self::gather9_hiding`] with its hidden
+    /// blocks), `changed` may also name blocks it began or stopped showing; only blocks it shows are listed.
     pub fn upload_set_in(&self, changed: &[Key], v: &Show) -> Vec<Key> {
         let levels = self.levels();
         // At each changed block's level: it and the seven below it, named once however many changed blocks name them.

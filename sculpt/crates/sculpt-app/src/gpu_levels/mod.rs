@@ -4,7 +4,7 @@
 //! block on the GPU (its 9x9x9 samples at 16 bits) and extracts the surface there, block by block, straight into the
 //! buffers the viewport draws from: nothing about the surface crosses the bus. Each block of any level has a slot; a
 //! hash table on the GPU finds the slot of a (level, block). A stroke uploads the samples of the blocks it changed and
-//! re-extracts the blocks around them ([`LevelVolume::upload_set`], [`LevelVolume::extract_set`]), by the same rules as
+//! re-extracts the blocks around them ([`LevelVolume::upload_set_in`], [`LevelVolume::extract_set`]), by the same rules as
 //! the CPU's reference extractor, which `--gpu-levels-check` compares it against exactly.
 //!
 //! Each block's surface is a cluster: its quads in pages of 64 (as triangle indices naming cell and piece, resolved to

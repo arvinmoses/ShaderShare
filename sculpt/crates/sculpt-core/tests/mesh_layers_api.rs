@@ -144,13 +144,13 @@ fn c0a_vertex_places_match_the_block_surfaces() {
     column(&mut ml.doc, 2, 0.12);
     vol.drain_dirty();
     for (i, c) in [Vec3::new(0.2, 0.1, -1.0), Vec3::new(-0.8, 0.3, 0.4)].into_iter().enumerate() {
-        let stroke = vol_stroke(&mut vol, c, 0.12);
+        vol_stroke(&mut vol, c, 0.12);
         let dirty = vol.drain_dirty();
-        ml.refit_cached(&vol, &dirty, stroke).unwrap();
+        ml.refit_cached(&vol, &dirty).unwrap();
         check_places(&ml, &vol, &format!("after swap {i}"));
     }
-    let stroke = vol_stroke(&mut vol, Vec3::new(0.0, -1.0, 0.0), 0.1);
-    ml.refit(&vol, stroke).unwrap();
+    vol_stroke(&mut vol, Vec3::new(0.0, -1.0, 0.0), 0.1);
+    ml.refit(&vol).unwrap();
     // (The plain refit keeps no cache: compare with a fresh one.)
     let fresh_ml = MeshLayers::from_volume(&vol, MeshLayerSettings::default()).unwrap();
     assert_eq!(ml.blocks(), fresh_ml.blocks(), "plain refit: blocks");
@@ -202,11 +202,11 @@ fn c0b_swap_lists_every_block_whose_rows_changed() {
         let c = [Vec3::new(0.2, 0.1, -1.0), Vec3::new(-0.8, 0.3, -0.4), Vec3::new(0.25, 0.1, 1.0), Vec3::new(0.9, -0.3, 0.2), Vec3::new(0.0, 0.8, -0.6), Vec3::new(0.25, 0.1, 1.0)][i];
         // Every other stroke at the finer level (new blocks), the rest at the coarser one.
         let l = if i % 2 == 0 { 1 } else { 0 };
-        let dabs = vol_stroke_on(&mut vol, c.normalize() * R, c, 0.1, l, 0.01, 0.06, 1);
+        vol_stroke_on(&mut vol, c.normalize() * R, c, 0.1, l, 0.01, 0.06, 1);
         let dirty = vol.drain_dirty();
         let before = rows(&ml);
         let old_blocks: HashSet<Key> = ml.blocks().iter().map(|b| b.0).collect();
-        ml.refit_async(&vol, &dirty, dabs.bounds());
+        ml.refit_async(&vol, &dirty);
         let st: SwapStats = loop {
             if let Some(r) = ml.poll(&vol) {
                 break r.unwrap();
@@ -367,15 +367,15 @@ fn c0c_stroke_patches_hold_across_a_refit_swap() {
         vol.drain_dirty();
         // Undone: beside the strokes on top. Left in place: underneath, away from them.
         let at = if undo_volume { Vec3::new(-0.3, 0.2, 0.9) } else { Vec3::new(0.3, 0.2, -0.9) };
-        let stroke = vol_stroke(&mut vol, at, 0.1);
+        vol_stroke(&mut vol, at, 0.1);
         let dirty = vol.drain_dirty();
-        let (_, vp) = ml.refit_cached_patch(&vol, &dirty, stroke).unwrap();
+        let (_, vp) = ml.refit_cached_patch(&vol, &dirty).unwrap();
         assert!(!ml.doc.can_undo(), "the swap kept the document's undo");
         let after_volume = state(&ml);
         if undo_volume {
             assert!(vol.undo());
             let dirty = vol.drain_dirty();
-            ml.refit_cached(&vol, &dirty, MeshLayers::changed_box(&vol, &dirty)).unwrap();
+            ml.refit_cached(&vol, &dirty).unwrap();
             ml.restore(&vp).unwrap();
             fresh(&mut ml.doc);
             assert_eq!(differ(&state(&ml), &s[2], &|_| true), (0, 0), "volume undo");

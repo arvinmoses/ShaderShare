@@ -6,7 +6,8 @@
 //! finer than a 48th of its radius, so a big brush works on coarse form (and the finer detail under it rides along)
 //! and a small one zoomed in carves detail as fine as the screen shows. The viewport keeps the surface on the GPU
 //! (`gpu_levels`), built there from the blocks a stroke changed. Strokes can be undone, and the volume saved and opened
-//! (`.svol`); layers and the procedural stack are not here yet.
+//! (`.svol`). Over the volume: the detail and generator stack (`Layered`), and mesh layers on its surface
+//! (`mesh_stack`).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -1633,6 +1634,7 @@ impl VolumeMode {
     }
 
     /// Whether a visible mesh layer exists.
+    #[cfg(test)]
     pub fn layers_shown(&self) -> bool {
         self.mesh.as_ref().is_some_and(|m| m.layers_shown())
     }
@@ -3660,7 +3662,7 @@ mod tests {
     /// names the `.svol` written): a scene to look at for marks (`SCULPT_DEMO_SCRIPT=look`, `SCULPT_LOOK_AT=0.3,-0.05,0.95`).
     #[test]
     #[ignore]
-    fn sculpt_rows_then_trim_file() {
+    fn clay_rows_then_trim_file() {
         let Ok(out) = std::env::var("SCULPT_ROWS_OUT") else { return };
         let mut mode = VolumeMode::ball(1e6);
         let centre = Vec3::new(0.3, -0.05, 0.95).normalize();

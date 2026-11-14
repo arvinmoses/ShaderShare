@@ -77,10 +77,9 @@ enum Act {
     /// A new layer at this level, and showing or hiding a layer.
     AddLayer(usize),
     LayerVisible(usize, bool),
-    /// Hold a layer at another level; remove a layer; make a layer active.
+    /// Hold a layer at another level; remove a layer.
     LayerLevel(usize, usize),
     RemoveLayer(usize),
-    ActiveLayer(usize),
     /// The active layer's whole mask: 0 hides it everywhere, 1 shows it.
     FillMask(f32),
     /// Bake the surface noise into a detail layer at this level.
@@ -753,7 +752,6 @@ impl VolumeDemo {
                         Act::LayerVisible(k, on) => f.layer_visible = Some((k, on)),
                         Act::LayerLevel(k, l) => f.layer_level = Some((k, l)),
                         Act::RemoveLayer(k) => f.remove_layer = Some(k),
-                        Act::ActiveLayer(k) => f.active_layer = Some(k),
                         Act::FillMask(to) => f.fill_mask = Some(to),
                         Act::BakeNoise(l) => f.bake_noise = Some(l),
                         Act::SaveOpen => f.save_open = true,

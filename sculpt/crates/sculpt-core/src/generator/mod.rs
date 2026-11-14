@@ -1,15 +1,17 @@
-//! Generator Boolean layer: spike code.
+//! The volume and the detail and generator stack over it.
 //!
-//! * [`sdf`]: analytic primitive signed distance fields.
-//! * [`instances`]: instance transforms and the spatial hash over their AABBs.
-//! * [`place`]: mask-weighted surface sampling and sharp-edge sampling.
-//! * [`voxel`]: SPIKE B timing code (sparse brick SDF + surface nets). Measurement
-//!   only, not a feature implementation.
+//! * [`level_volume`]: the sculpted solid, a distance field at several resolutions (the form); [`level_view`]: which
+//!   of its levels a view draws.
+//! * [`detail_layer`]: detail layers over the form, and the generator layers among them; [`volume_gen`]: a generator
+//!   layer joined to or cut from the field.
+//! * [`layer`], [`density`], [`mapping`], [`place`], [`instances`], [`sdf`]: what a generator layer scatters, where, and
+//!   how each instance looks.
+//! * [`volume`]: the single-resolution volume of version 1 `.svol` files; [`remesh`]: a field to a quad surface.
+//! * [`voxel`]: timing code (sparse brick SDF + surface nets), measurement only.
 //!
-//! Spike A (this file): the **displacement boolean**. Each vertex near an
-//! instance is moved onto the instance surface, producing a per-vertex delta
-//! relative to the input positions, so topology, per-vertex layers, masks and
-//! undo are untouched.
+//! This file also holds the **displacement boolean** of a generator layer on a mesh document (the older mesh path,
+//! reached from sculpt-cli and tests): each vertex near an instance is moved onto the instance surface, producing a
+//! per-vertex delta relative to the input positions, so topology, per-vertex layers, masks and undo are untouched.
 //!
 //! Per-op rules (all in world space, `p` input position, `n` input normal):
 //!

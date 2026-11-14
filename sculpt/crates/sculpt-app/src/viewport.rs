@@ -422,13 +422,8 @@ impl Viewport {
     /// removed, and turns [`Self::layers_shown`] on with the first rows and off with `dirty.none` or no `ml`. A block
     /// the GPU extracted again for a volume edit after `ml`'s mesh was taken shows the plain volume until a later
     /// `dirty.blocks` lists it; one extracted for the view only shows its rows again by itself.
-    #[allow(dead_code)] // (called from app.rs once mesh layers are wired in)
-    pub fn sync_layer_rows(&mut self, _rs: &egui_wgpu::RenderState, ml: Option<&sculpt_core::mesh_layers::MeshLayers>, dirty: crate::layer_rows::RowsDirty) {
-        self.sync_layer_rows_on(ml, dirty);
-    }
-
-    /// [`Self::sync_layer_rows`] with no window (the rows go up with the next draw or capture).
-    pub fn sync_layer_rows_on(&mut self, ml: Option<&sculpt_core::mesh_layers::MeshLayers>, dirty: crate::layer_rows::RowsDirty) {
+    /// The rows go up with the next draw or capture.
+    pub fn sync_layer_rows(&mut self, ml: Option<&sculpt_core::mesh_layers::MeshLayers>, dirty: crate::layer_rows::RowsDirty) {
         match self.volume.as_mut() {
             Some(v) => self.layers_shown = self.layer_rows.sync(&mut v.gpu, self.volumes_made, ml, dirty, self.layers_shown),
             None => {

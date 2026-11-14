@@ -173,9 +173,8 @@ fn b2_async_refit_matches_the_plain_refit_and_keeps_edits_made_meanwhile() {
     for (i, c) in [Vec3::new(0.2, 0.1, -1.0), Vec3::new(-0.8, 0.3, -0.4), Vec3::new(0.1, -0.9, 0.3)].into_iter().enumerate() {
         let stroke = vol_stroke(&mut vol, c, 0.1);
         let dirty = vol.drain_dirty();
-        let region = MeshLayers::changed_box(&vol, &dirty);
-        let (_, plain_patch) = plain.refit_patch(&vol, region).unwrap();
-        let (st, patch) = live.refit_cached_patch(&vol, &dirty, region).unwrap();
+        let (_, plain_patch) = plain.refit_patch(&vol).unwrap();
+        let (st, patch) = live.refit_cached_patch(&vol, &dirty).unwrap();
         eprintln!("B2 small {i}: {st:?}");
         assert!(!st.discarded);
         assert_eq!((st.patch_len, patch.len()), (plain_patch.len(), plain_patch.len()), "stroke {i}: patch");
@@ -192,7 +191,7 @@ fn b2_async_refit_matches_the_plain_refit_and_keeps_edits_made_meanwhile() {
     let stroke = vol_stroke(&mut vol, Vec3::new(0.3, 0.3, -1.0), 0.1);
     let dirty = vol.drain_dirty();
     let region = MeshLayers::changed_box(&vol, &dirty);
-    let spent = live.refit_async(&vol, &dirty, region);
+    let spent = live.refit_async(&vol, &dirty);
     assert!(live.busy());
     layer_dab(&mut live.doc, Vec3::new(0.2, 0.0, 1.0), 0.06);
     let id2 = live.doc.add_layer("meanwhile");
@@ -256,9 +255,8 @@ fn b2_a_failed_refit_is_not_run_again_and_undo_brings_the_layers_back() {
     carve_all(&mut vol);
     let dirty = vol.drain_dirty();
     assert!(!dirty.is_empty());
-    let region = MeshLayers::changed_box(&vol, &dirty);
     // refit_cached waits while the job is busy: with the job run again on every poll it never returned.
-    let r = ml.refit_cached(&vol, &dirty, region);
+    let r = ml.refit_cached(&vol, &dirty);
     eprintln!("refit of nothing: {:?}", r.as_ref().err());
     assert!(r.is_err(), "a refit of an empty volume succeeded");
     assert!(!ml.busy() && ml.refit_failed());
@@ -268,17 +266,17 @@ fn b2_a_failed_refit_is_not_run_again_and_undo_brings_the_layers_back() {
     // The volume's undo brings new blocks: the job runs and the layers are as they were.
     assert!(vol.undo());
     let dirty = vol.drain_dirty();
-    let st = ml.refit_cached(&vol, &dirty, MeshLayers::changed_box(&vol, &dirty)).unwrap();
+    let st = ml.refit_cached(&vol, &dirty).unwrap();
     assert!(!st.discarded && !ml.refit_failed());
     assert!(by_key(&ml, id) == before, "the layers came back changed");
     // Redo fails again, and undo after it brings them back again.
     assert!(vol.redo());
     let dirty = vol.drain_dirty();
-    assert!(ml.refit_cached(&vol, &dirty, MeshLayers::changed_box(&vol, &dirty)).is_err());
+    assert!(ml.refit_cached(&vol, &dirty).is_err());
     assert!(!ml.busy());
     assert!(vol.undo());
     let dirty = vol.drain_dirty();
-    ml.refit_cached(&vol, &dirty, MeshLayers::changed_box(&vol, &dirty)).unwrap();
+    ml.refit_cached(&vol, &dirty).unwrap();
     assert!(by_key(&ml, id) == before, "the layers came back changed after the second undo");
 }
 
@@ -318,10 +316,10 @@ fn b2_at_2_5m(everywhere: bool) {
     vol.drain_dirty();
     let (mut worst_end, mut worst_swap, mut worst_frame, mut worst_latency) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for (i, c) in [Vec3::new(0.2, 0.1, -1.0), Vec3::new(-0.3, 0.8, -0.2), Vec3::new(1.0, -0.2, 0.1), Vec3::new(-0.6, -0.6, -0.3)].into_iter().enumerate() {
-        let stroke = vol_stroke(&mut vol, c, 0.1);
+        vol_stroke(&mut vol, c, 0.1);
         let dirty = vol.drain_dirty();
         let t0 = Instant::now();
-        let start_ms = ml.refit_async(&vol, &dirty, stroke);
+        let start_ms = ml.refit_async(&vol, &dirty);
         let end_ms = t0.elapsed().as_secs_f64() * 1e3;
         // The artist goes on with the layers while the job runs (the first time).
         let mut edit_ms = 0.0;
@@ -407,9 +405,9 @@ fn c0d_at_2_5m(max: bool) {
     vol.drain_dirty();
     let mut worst = 0.0f64;
     for (i, c) in [Vec3::new(0.2, 0.1, -1.0), Vec3::new(-0.3, 0.8, -0.2), Vec3::new(1.0, -0.2, 0.1)].into_iter().enumerate() {
-        let stroke = vol_stroke(&mut vol, c, 0.1);
+        vol_stroke(&mut vol, c, 0.1);
         let dirty = vol.drain_dirty();
-        ml.refit_async(&vol, &dirty, stroke);
+        ml.refit_async(&vol, &dirty);
         let (st, frame_ms) = loop {
             let t = Instant::now();
             if let Some(r) = ml.poll(&vol) {

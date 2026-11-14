@@ -100,7 +100,7 @@ fn g2(mut vol: LevelVolume, mut ml: MeshLayers, by_blocks: bool) {
     let dirty = vol.drain_dirty();
     let blocks = MeshLayers::changed_box(&vol, &dirty);
     let region = if by_blocks { blocks } else { stroke };
-    let st = ml.refit(&vol, region).unwrap();
+    let st = ml.refit(&vol).unwrap();
     eprintln!("G2: {st:?}");
     eprintln!("G2: stroke box {:?}, changed blocks' box {:?}", stroke, blocks);
     let after = by_key(&ml, id);
@@ -173,8 +173,8 @@ fn g3_carry_speed_at_2_5m_triangles() {
     eprintln!("G3: column {:.0} ms, layer |d| {:?}", t.elapsed().as_secs_f64() * 1e3, delta_stats(&ml, id));
     let mut worst = 0.0f64;
     for (i, c) in [Vec3::new(0.2, 0.1, -1.0), Vec3::new(-0.3, 0.8, -0.2), Vec3::new(1.0, -0.2, 0.1)].into_iter().enumerate() {
-        let stroke = vol_stroke(&mut vol, c, 0.1);
-        let st = ml.refit(&vol, stroke).unwrap();
+        vol_stroke(&mut vol, c, 0.1);
+        let st = ml.refit(&vol).unwrap();
         eprintln!(
             "G3 stroke {i}: {} tris; extract {:.0} ms, document build (BVH, topology, normals) {:.0} ms, carry {:.1} ms (names {:.1}, closest point {:.1}, recomposite {:.1}); copied {}, projected {}, searched {} faces",
             st.triangles, st.extract_ms, st.build_ms, st.carry_ms, st.match_ms, st.project_ms, st.recomposite_ms, st.copied, st.projected, st.search_faces
@@ -197,8 +197,8 @@ fn g4_far_layer_survives_50_volume_strokes() {
         // Around the lower half, away from the column on top.
         let a = i as f32 * 2.4;
         let c = Vec3::new(a.cos(), a.sin(), -0.6 - 0.4 * ((i * 7 % 5) as f32 / 4.0));
-        let stroke = vol_stroke(&mut vol, c, 0.08);
-        let st = ml.refit(&vol, stroke).unwrap();
+        vol_stroke(&mut vol, c, 0.08);
+        let st = ml.refit(&vol).unwrap();
         copied += st.copied;
         projected += st.projected;
         ms += st.extract_ms + st.build_ms + st.carry_ms;
@@ -421,7 +421,7 @@ fn g7_noise_layer_through_50_volume_strokes() {
         let a = i as f32 * 2.399963;
         let c = Vec3::new(a.cos() * (1.0 - z * z).sqrt(), a.sin() * (1.0 - z * z).sqrt(), z);
         let d = vol_stroke_dabs(&mut vol, c, 0.08);
-        let st = ml.refit(&vol, d.bounds()).unwrap();
+        let st = ml.refit(&vol).unwrap();
         copied += st.copied;
         projected += st.projected;
         dabs.push(d);
@@ -513,8 +513,8 @@ fn g8_coarse_layer_beside_a_finest_level_stroke() {
     };
     let sum0 = mean(&ml, &|c| near(c, &dabs));
     let all0 = mean(&ml, &|c| outside(c, &dabs));
-    let dirty = vol.drain_dirty();
-    let st = ml.refit(&vol, MeshLayers::changed_box(&vol, &dirty)).unwrap();
+    vol.drain_dirty();
+    let st = ml.refit(&vol).unwrap();
     let sum1 = mean(&ml, &|c| near(c, &dabs));
     let all1 = mean(&ml, &|c| outside(c, &dabs));
     eprintln!(
@@ -544,9 +544,9 @@ fn g10_noise_layer_rides_a_tall_volume_stroke() {
     let id = fill_layer(&mut ml.doc, "noise", |doc, v| ball_noise(doc.base_positions()[v], step));
     let before = by_key(&ml, id);
     let top = Vec3::new(0.0, 0.0, R);
-    let dabs = vol_stroke_on(&mut vol, top, Vec3::Z, 0.1, 0, 0.08, 0.06, 12);
+    vol_stroke_on(&mut vol, top, Vec3::Z, 0.1, 0, 0.08, 0.06, 12);
     let height = vol.raycast(Vec3::new(0.0, 0.0, 3.0), -Vec3::Z, 0, false).unwrap().0.z - R;
-    let st = ml.refit(&vol, dabs.bounds()).unwrap();
+    let st = ml.refit(&vol).unwrap();
     let d = ml.layer_deltas(id).unwrap();
     let to_c = ml.internal_to_canonical();
     let key = |v: usize| ml.keys()[to_c[v] as usize];
@@ -624,11 +624,11 @@ fn g9(mut vol: LevelVolume, what: &str) {
     let (channel0, composite0) = (channel(&ml), composite(&ml));
     // A stroke over the side of the column, where both layers and the channel's edge lie.
     vol.drain_dirty();
-    let stroke = vol_stroke(&mut vol, Vec3::new(0.25, 0.1, 1.0), 0.1);
-    let (st, patch) = ml.refit_patch(&vol, stroke).unwrap();
+    vol_stroke(&mut vol, Vec3::new(0.25, 0.1, 1.0), 0.1);
+    let (st, patch) = ml.refit_patch(&vol).unwrap();
     assert!(vol.undo(), "nothing to undo");
-    let dirty = vol.drain_dirty();
-    let st2 = ml.refit(&vol, MeshLayers::changed_box(&vol, &dirty)).unwrap();
+    vol.drain_dirty();
+    let st2 = ml.refit(&vol).unwrap();
     let differing = |ml: &MeshLayers| -> (usize, usize, usize) {
         let (mut names, mut base, mut delta) = (0, 0, 0);
         for (was, lid) in before.iter().zip([id, id2]) {

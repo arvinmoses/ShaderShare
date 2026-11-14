@@ -33,6 +33,7 @@ pub struct RowsDirty {
     pub leaves: Vec<u32>,
 }
 
+#[cfg(test)]
 impl RowsDirty {
     pub fn is_empty(&self) -> bool {
         !self.all && !self.none && self.blocks.is_empty() && self.removed.is_empty() && self.leaves.is_empty()
@@ -320,8 +321,7 @@ impl MeshStack {
         }
         let mut keys: Vec<Key> = self.dirty.drain().collect();
         keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
-        let b = MeshLayers::changed_box(vol, &keys);
-        self.times.refit_start_ms = self.layers.refit_async(vol, &keys, b);
+        self.times.refit_start_ms = self.layers.refit_async(vol, &keys);
         self.started(keys);
         true
     }
@@ -432,8 +432,7 @@ impl MeshStack {
         let mut keys: Vec<Key> = waiting.iter().copied().chain(self.dirty.drain()).collect();
         keys.sort_unstable_by_key(|k| (k.0, k.1.z, k.1.y, k.1.x));
         keys.dedup();
-        let b = MeshLayers::changed_box(vol, &keys);
-        self.layers.refit_async(vol, &keys, b);
+        self.layers.refit_async(vol, &keys);
         // (Not started when the last refit failed and the step changed no block: the layers stay where they are.)
         self.started(keys);
         // Those blocks still wait for the GPU: the next look at the volume's changes leaves them out.

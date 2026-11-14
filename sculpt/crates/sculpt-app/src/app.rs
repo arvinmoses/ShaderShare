@@ -502,7 +502,7 @@ impl SculptApp {
             let eye = demo.and_then(|d| d.level_eye).unwrap_or(self.camera.eye());
             self.settling = vp.sync_volume(rs, mode, eye, focal_px, demo.map(|d| d.clock()));
             let rows = mode.take_rows_dirty();
-            vp.sync_layer_rows(rs, mode.mesh_layers(), rows);
+            vp.sync_layer_rows(mode.mesh_layers(), rows);
             if self.settling {
                 ctx.request_repaint();
             }

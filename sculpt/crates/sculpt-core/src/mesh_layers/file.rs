@@ -122,7 +122,7 @@ impl MeshLayers {
             format: FORMAT.into(),
             version: 1,
             cap: self.settings.cap,
-            margin_steps: self.settings.margin_steps,
+            margin_steps: MARGIN_STEPS,
             step: self.settings.step,
             keys: keys_blob,
             freeze,
@@ -154,7 +154,7 @@ impl MeshLayers {
         if m.format != FORMAT {
             return Err(Error::Format(format!("not a {FORMAT} manifest")));
         }
-        let settings = MeshLayerSettings { cap: m.cap, margin_steps: m.margin_steps, step: m.step };
+        let settings = MeshLayerSettings { cap: m.cap, step: m.step };
         let mut out = MeshLayers::from_volume(vol, settings)?;
         let saved_keys: Vec<u64> = read_blob(dir, &m.keys, "u64")?;
         // Saved canonical index -> internal index of the new document.
@@ -281,6 +281,9 @@ struct Manifest {
     format: String,
     version: u32,
     cap: usize,
+    /// Not read: a setting the carry no longer has. Still written (as it always was) so older versions read the file,
+    /// and optional so files without it read too.
+    #[serde(default = "margin_steps")]
     margin_steps: f32,
     step: Option<f32>,
     /// Vertex names in the order of every per-vertex blob.
@@ -292,6 +295,13 @@ struct Manifest {
     solo: Option<u32>,
     next_layer_id: u32,
     metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// What [`Manifest::margin_steps`] always held.
+const MARGIN_STEPS: f32 = 2.0;
+
+fn margin_steps() -> f32 {
+    MARGIN_STEPS
 }
 
 fn write_blob<T: bytemuck::Pod>(blobs: &mut Vec<(String, Vec<u8>)>, name: &str, dtype: &str, data: &[T]) -> Result<Blob> {

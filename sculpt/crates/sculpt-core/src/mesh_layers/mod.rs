@@ -44,8 +44,6 @@ use glam::Vec3;
 pub struct MeshLayerSettings {
     /// The finest volume level the mesh shows (as `Show::upto`).
     pub cap: usize,
-    /// Not used: a vertex whose name and position survived is always copied. (Kept for saved files.)
-    pub margin_steps: f32,
     /// What [`MeshLayers::step`] gives; `None` takes the finest shown level's voxel that holds blocks. The carry
     /// measures each vertex's distances in its own level's step.
     pub step: Option<f32>,
@@ -53,7 +51,7 @@ pub struct MeshLayerSettings {
 
 impl Default for MeshLayerSettings {
     fn default() -> Self {
-        MeshLayerSettings { cap: usize::MAX, margin_steps: 2.0, step: None }
+        MeshLayerSettings { cap: usize::MAX, step: None }
     }
 }
 
@@ -234,15 +232,15 @@ impl MeshLayers {
         b
     }
 
-    /// Re-extract the surface after a volume edit and carry the layers, channels and freeze onto it. (`changed`, the
-    /// edit's world box, is not read: what changed is told from the vertex names and positions.)
-    pub fn refit(&mut self, vol: &LevelVolume, changed: Aabb) -> Result<CarryStats> {
-        Ok(self.refit_patch(vol, changed)?.0)
+    /// Re-extract the surface after a volume edit and carry the layers, channels and freeze onto it. What changed is
+    /// told from the vertex names and positions.
+    pub fn refit(&mut self, vol: &LevelVolume) -> Result<CarryStats> {
+        Ok(self.refit_patch(vol)?.0)
     }
 
     /// [`Self::refit`], also giving what the carry did not copy: kept beside the volume's undo step, it lets
     /// [`Self::restore`] put that data back once the edit is undone.
-    pub fn refit_patch(&mut self, vol: &LevelVolume, _changed: Aabb) -> Result<(CarryStats, Patch)> {
+    pub fn refit_patch(&mut self, vol: &LevelVolume) -> Result<(CarryStats, Patch)> {
         let mut st = CarryStats::default();
         let t = Instant::now();
         let ex = extract_all(vol, self.settings.cap)?;
@@ -284,9 +282,8 @@ impl MeshLayers {
 impl MeshLayers {
     /// After a volume edit: count the blocks `dirty` (as [`LevelVolume::drain_dirty`] gives them) as changed, and
     /// start a refit job on another thread if none runs (one that runs takes them when it ends). Costs the main thread
-    /// two snapshots of the volume. (`changed`, the edit's world box, is not read, as in [`Self::refit`].) Returns the
-    /// milliseconds spent here.
-    pub fn refit_async(&mut self, vol: &LevelVolume, dirty: &[Key], _changed: Aabb) -> f64 {
+    /// two snapshots of the volume. Returns the milliseconds spent here.
+    pub fn refit_async(&mut self, vol: &LevelVolume, dirty: &[Key]) -> f64 {
         let t = Instant::now();
         self.live.note(dirty);
         self.live.start(vol, &self.pre, &self.doc, &self.keys, &self.layout, self.settings);
@@ -345,12 +342,12 @@ impl MeshLayers {
     }
 
     /// [`Self::refit_async`] and wait for it (and for any job under way first): the block-cached refit, at once.
-    pub fn refit_cached(&mut self, vol: &LevelVolume, dirty: &[Key], changed: Aabb) -> Result<SwapStats> {
+    pub fn refit_cached(&mut self, vol: &LevelVolume, dirty: &[Key]) -> Result<SwapStats> {
         let mut last = None;
         while self.busy() {
             last = self.wait(vol);
         }
-        self.refit_async(vol, dirty, changed);
+        self.refit_async(vol, dirty);
         if !self.busy() && self.refit_failed() {
             // No new blocks after a failed refit: none ran, and the layers are not at `vol`.
             return Err(crate::Error::InvalidData("the last refit failed and no new blocks came".into()));
@@ -363,12 +360,12 @@ impl MeshLayers {
 
     /// [`Self::refit_cached`], also giving its own swap's patch (as [`Self::refit_patch`]); patches of jobs that were
     /// under way before stay for [`Self::take_patches`].
-    pub fn refit_cached_patch(&mut self, vol: &LevelVolume, dirty: &[Key], changed: Aabb) -> Result<(SwapStats, Patch)> {
+    pub fn refit_cached_patch(&mut self, vol: &LevelVolume, dirty: &[Key]) -> Result<(SwapStats, Patch)> {
         while self.busy() {
             let _ = self.wait(vol);
         }
         let before = self.live.patches.len();
-        let st = self.refit_cached(vol, dirty, changed)?;
+        let st = self.refit_cached(vol, dirty)?;
         let patch = if self.live.patches.len() > before { self.live.patches.pop().unwrap_or_default() } else { Patch::default() };
         Ok((st, patch))
     }

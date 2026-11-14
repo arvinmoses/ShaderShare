@@ -1,7 +1,8 @@
-//! Sculpting engine core: dense-mesh storage, Mudbox-style layers,
-//! Substance-style mask stacks, ZBrush-feel brushes and posing, and a
-//! data-driven project format. Headless by design; UI and GPU rendering
-//! live in separate crates on top of this one.
+//! Sculpting engine core. The form is a volume ([`generator::level_volume`], a distance field at several resolutions)
+//! with the detail and generator stack over it ([`generator::detail_layer`]), and mesh layers ride on its surface
+//! ([`mesh_layers`]: per-vertex offsets on a mesh taken from the volume, with masks). The mesh document under those
+//! ([`document`], [`layers`], [`mask`], [`brush`]) also carries the older mesh-sculpting path that sculpt-cli and the
+//! tests still use. Headless by design; UI and GPU rendering live in separate crates on top of this one.
 
 pub mod bake;
 pub mod brush;
