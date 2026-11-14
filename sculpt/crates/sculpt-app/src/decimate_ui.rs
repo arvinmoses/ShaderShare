@@ -5,8 +5,9 @@
 //!   volume's own surface at the levels shown (`mesh_layers::extract_all`).
 //! * **Analyze** builds a [`Analysis`] on a thread of its own (progress, cancel). The count slider (triangles or % kept)
 //!   then extracts from it live, every change while dragging: a pass over the output only.
-//! * **Even triangles** `e` in 0..1 is a gradient. The shown mesh is always `relax(extract(analysis), e, iterations(e))`.
-//!   While the slider drags, the analysis stays the one already built and the relaxation alone follows `e` (fewer
+//! * **Even triangles** `e` in 0..1 is a gradient. The shown mesh is always `even_out(extract(analysis), e)`: edge
+//!   flips toward valence 6 and relaxation projected back onto the input (built once per input, off the frame).
+//!   While the slider drags, the analysis stays the one already built and the evening alone follows `e` (fewer
 //!   iterations on big outputs, to stay interactive): the bridge. When it is let go, the analysis built at `e` (rounded
 //!   to 0.05) is used: from the cache at once if it was built before, else built in the background and switched to when
 //!   ready. Relaxing on top stays, at strength `e`, so the drag and the exact result look alike and `e` evens vertex
@@ -21,7 +22,7 @@ use std::time::Instant;
 
 use eframe::egui_wgpu;
 use egui::{RichText, Ui};
-use sculpt_core::decimate::{Analysis, AnalyzeOptions, ManifoldReport, Progress, SurfaceError, Target, TriMesh, check_manifold, relax, surface_error};
+use sculpt_core::decimate::{Analysis, AnalyzeOptions, ManifoldReport, Progress, Surface, SurfaceError, Target, TriMesh, check_manifold, even_out, surface_error};
 
 use crate::app::{SculptApp, fmt_count};
 use crate::panels::prop;
@@ -76,6 +77,9 @@ pub struct Decimate {
     input: Option<Arc<TriMesh>>,
     input_from: &'static str,
     input_ms: f32,
+    /// The input ready for projection (built off the frame after Analyze), and its build while under way.
+    surface: Option<Arc<Surface>>,
+    surface_rx: Option<Receiver<Surface>>,
     /// Finished analyses by evenness key (`round(e * 20)`), most recently used last.
     cache: Vec<(i32, Arc<Analysis>)>,
     /// The analysis the output comes from.
@@ -147,6 +151,8 @@ impl Decimate {
             input: None,
             input_from: "",
             input_ms: 0.0,
+            surface: None,
+            surface_rx: None,
             cache: Vec::new(),
             current: None,
             job: None,
@@ -176,7 +182,7 @@ impl Decimate {
 
     /// Work still under way that a screenshot should wait for.
     pub fn busy(&self) -> bool {
-        self.job.is_some() || self.check.is_some() || self.gpu_dirty || (self.script.is_some() && !self.script_started)
+        self.job.is_some() || self.surface_rx.is_some() || self.check.is_some() || self.gpu_dirty || (self.script.is_some() && !self.script_started)
     }
 
     fn target(&self) -> Target {
@@ -189,7 +195,14 @@ impl Decimate {
         match take_input(mode) {
             Ok((mesh, from)) if !mesh.triangles.is_empty() => {
                 self.input_ms = t.elapsed().as_secs_f32() * 1e3;
-                self.input = Some(Arc::new(mesh));
+                let mesh = Arc::new(mesh);
+                self.input = Some(mesh.clone());
+                self.surface = None;
+                let (tx, rx) = channel();
+                let spawned = std::thread::Builder::new().name("decimate surface".into()).spawn(move || {
+                    let _ = tx.send(Surface::new(mesh));
+                });
+                self.surface_rx = spawned.ok().map(|_| rx);
                 self.input_from = from;
                 self.cache.clear();
                 self.current = None;
@@ -278,7 +291,8 @@ impl Decimate {
         let t = Instant::now();
         let mut out = base.clone();
         let iterations = relax_iterations(self.evenness, out.triangles.len(), live);
-        relax(&mut out, self.evenness, iterations);
+        let flips = !live || out.triangles.len() <= 1_000_000;
+        even_out(&mut out, self.surface.as_deref(), self.evenness, iterations, flips);
         self.relax_ms = t.elapsed().as_secs_f32() * 1e3;
         self.result = Some(Arc::new(out));
         self.generation += 1;
@@ -304,6 +318,20 @@ impl Decimate {
 
     /// Take in finished jobs.
     fn poll(&mut self) {
+        if let Some(rx) = self.surface_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(s) => {
+                    self.surface_rx = None;
+                    self.surface = Some(Arc::new(s));
+                    // Even again, now projected onto the input.
+                    if self.evenness > 0.0 && self.base.is_some() {
+                        self.refresh(false, false);
+                    }
+                }
+                Err(TryRecvError::Disconnected) => self.surface_rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         if let Some(j) = self.job.as_ref() {
             match j.rx.try_recv() {
                 Ok(Some(a)) => {
@@ -359,6 +387,8 @@ impl Decimate {
         self.cancel_job();
         self.open = false;
         self.input = None;
+        self.surface = None;
+        self.surface_rx = None;
         self.cache.clear();
         self.current = None;
         self.base = None;
@@ -610,7 +640,7 @@ mod tests {
     use super::*;
 
     /// The default ball's surface is one closed manifold mesh, and analysing then extracting it round-trips: the full
-    /// count gives the input back, a share kept stays closed and manifold near its count, and relaxing keeps it so.
+    /// count gives the input back, a share kept stays closed and manifold near its count, and evening keeps it so.
     #[test]
     fn ball_analyse_extract_round_trip() {
         let mut mode = VolumeMode::ball(2e5);
@@ -637,9 +667,10 @@ mod tests {
         assert!(err.max_rel() < 0.02, "error {err:?}");
 
         let iterations = relax_iterations(1.0, d.triangles.len(), false);
-        relax(&mut d, 1.0, iterations);
+        let surface = Surface::new(Arc::new(input.clone()));
+        even_out(&mut d, Some(&surface), 1.0, iterations, true);
         let r = check_manifold(d.positions.len(), &d.triangles);
-        assert!(r.closed() && r.manifold(), "relaxed: {r:?}");
+        assert!(r.closed() && r.manifold(), "evened: {r:?}");
         assert_eq!(crate::decimate_draw::vertex_normals(&d).len(), d.positions.len());
     }
 

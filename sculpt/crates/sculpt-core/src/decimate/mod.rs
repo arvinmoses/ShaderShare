@@ -10,7 +10,8 @@
 //! `qem^(1-e) * len^e` of the quadric error (mean squared distance to the planes the collapse merges) and the edge's
 //! squared length, and the new point minimises `Q(x)/A + w(e)|x - mid|^2`. At 0 that is pure quadric error metrics
 //! (dense where the shape bends, coarse where it is flat); at 1 the shortest edge goes first, to its midpoint, which
-//! evens the edges out. [`relax`] adds a tangential smoothing pass of strength `e` on the output, live.
+//! evens the edges out. [`even_out`] then flips edges toward valence 6 and relaxes the output tangentially, projected
+//! back onto the original [`Surface`], at strength `e`, live.
 //!
 //! Every collapse is guarded so the result stays manifold: link condition, no tetrahedron collapse, no flipped or
 //! folded face, no sliver, border vertices only slide along the border, and capped valence. [`check_manifold`]
@@ -26,12 +27,14 @@ mod manifold;
 mod metric;
 mod quadric;
 mod replay;
+mod surface;
 
 pub use analyze::{Analysis, AnalyzeOptions, Progress};
-pub use even::relax;
+pub use even::{even_out, relax};
 pub use manifold::{ManifoldReport, check_manifold};
 pub use metric::{SurfaceError, surface_error};
 pub use replay::Decimated;
+pub use surface::Surface;
 
 use glam::Vec3;
 

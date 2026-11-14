@@ -3,7 +3,9 @@
 use std::time::Instant;
 
 use glam::Vec3;
-use sculpt_core::decimate::{Analysis, AnalyzeOptions, Target, TriMesh, check_manifold, relax, surface_error};
+use std::sync::Arc;
+
+use sculpt_core::decimate::{Analysis, AnalyzeOptions, Surface, Target, TriMesh, check_manifold, even_out, relax, surface_error};
 use sculpt_core::primitives::{grid, quad_sphere_res};
 
 /// A closed, lumpy ball with a sharp-ish ridge: something with a silhouette to keep.
@@ -28,6 +30,29 @@ fn edge_len_cv(m: &TriMesh) -> f32 {
     let mean = l.iter().sum::<f32>() / l.len() as f32;
     let var = l.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / l.len() as f32;
     var.sqrt() / mean
+}
+
+/// Shape of the output: share of slivers (quality under 0.2), smallest angle in degrees, and the mean squared
+/// deviation of interior valences from 6.
+fn shape(m: &TriMesh) -> (f32, f32, f32) {
+    let mut slivers = 0;
+    let mut min_angle = 180.0f32;
+    for t in &m.triangles {
+        let p = t.map(|v| m.positions[v as usize]);
+        let s = p[0].distance_squared(p[1]) + p[1].distance_squared(p[2]) + p[2].distance_squared(p[0]);
+        let q = 2.0 * 3f32.sqrt() * (p[1] - p[0]).cross(p[2] - p[0]).length() / s.max(1e-30);
+        if q < 0.2 {
+            slivers += 1;
+        }
+        for i in 0..3 {
+            let (a, b) = (p[(i + 1) % 3] - p[i], p[(i + 2) % 3] - p[i]);
+            min_angle = min_angle.min(a.angle_between(b).to_degrees());
+        }
+    }
+    let mut val = vec![0i32; m.positions.len()];
+    m.triangles.iter().flatten().for_each(|&v| val[v as usize] += 1);
+    let dev = val.iter().map(|&n| ((n - 6) * (n - 6)) as f32).sum::<f32>() / val.len().max(1) as f32;
+    (slivers as f32 / m.triangles.len().max(1) as f32, min_angle, dev)
 }
 
 fn analyse(m: &TriMesh, e: f32) -> Analysis {
@@ -144,6 +169,34 @@ fn relax_keeps_topology_and_evens() {
     assert!(r.manifold() && r.closed());
 }
 
+#[test]
+fn even_out_clears_slivers_and_fans() {
+    let m = Arc::new(lumpy(120));
+    let surface = Surface::new(m.clone());
+    for (e, n) in [(1.0f32, 6000usize), (0.5, 6000), (1.0, 1500)] {
+        let a = analyse(&m, e);
+        let base = a.extract(Target::Triangles(n)).mesh;
+        let mut old = base.clone();
+        relax(&mut old, e, 3);
+        let mut new = base.clone();
+        even_out(&mut new, Some(&surface), e, 3, true);
+        for (name, d) in [("extract", &base), ("relax", &old), ("even_out", &new)] {
+            let (sl, ma, dev) = shape(d);
+            let err = surface_error(&m, d, 50_000);
+            let r = check_manifold(d.positions.len(), &d.triangles);
+            println!("e {e} {n}: {name:8} slivers {:.2}% min angle {ma:.1} valence dev {dev:.2} err mean {:.4}% max {:.3}% closed {} manifold {}", 100.0 * sl, 100.0 * err.mean_rel(), 100.0 * err.max_rel(), r.closed(), r.manifold());
+        }
+        let r = check_manifold(new.positions.len(), &new.triangles);
+        assert!(r.closed() && r.manifold(), "{r:?}");
+        assert_eq!(new.triangles.len(), base.triangles.len());
+        let (s_old, _, d_old) = shape(&old);
+        let (s_new, _, d_new) = shape(&new);
+        assert!(s_new <= s_old && d_new < d_old, "slivers {s_new} vs {s_old}, valence {d_new} vs {d_old}");
+        let (e_old, e_new) = (surface_error(&m, &old, 50_000), surface_error(&m, &new, 50_000));
+        assert!(e_new.mean <= e_old.mean * 1.1, "error {} vs {}", e_new.mean, e_old.mean);
+    }
+}
+
 /// Speed: analysis and live extraction. Ignored by default; run with
 /// `cargo test --release -p sculpt-core --test decimate -- --ignored --nocapture bench`.
 #[test]
@@ -184,4 +237,25 @@ fn svol() {
     println!("analysis {:.0} ms {:?}", t.elapsed().as_secs_f64() * 1e3, a.stats);
     let d = a.extract(Target::KeepPercent(2.0));
     println!("2%: {:?}", check_manifold(d.mesh.positions.len(), &d.mesh.triangles));
+    let m = Arc::new(m);
+    let t = Instant::now();
+    let surface = Surface::new(m.clone());
+    println!("surface grid {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+    for (e, pct) in [(1.0f32, 2.0f32), (1.0, 0.5), (0.5, 2.0)] {
+        let a = analyse(&m, e);
+        let base = a.extract(Target::KeepPercent(pct)).mesh;
+        let mut old = base.clone();
+        relax(&mut old, e, 3);
+        let mut new = base.clone();
+        let t = Instant::now();
+        even_out(&mut new, Some(&surface), e, 3, true);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        for (name, d) in [("extract", &base), ("relax", &old), ("even_out", &new)] {
+            let (sl, ma, dev) = shape(d);
+            let err = surface_error(&m, d, 200_000);
+            let r = check_manifold(d.positions.len(), &d.triangles);
+            println!("e {e} {pct}% {} tris: {name:8} slivers {:.2}% min angle {ma:.1} valence dev {dev:.2} err mean {:.4}% max {:.3}% closed {} manifold {}", d.triangles.len(), 100.0 * sl, 100.0 * err.mean_rel(), 100.0 * err.max_rel(), r.closed(), r.manifold());
+        }
+        println!("  even_out {ms:.0} ms");
+    }
 }
