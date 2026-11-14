@@ -236,6 +236,52 @@ fn b2_async_refit_matches_the_plain_refit_and_keeps_edits_made_meanwhile() {
     let _ = stroke;
 }
 
+/// Carve the whole ball away, as one stroke: the mesh it leaves has no faces.
+fn carve_all(vol: &mut LevelVolume) {
+    vol.begin_stroke();
+    for l in 0..vol.levels() {
+        vol.ball_dab(l, Vec3::ZERO, 2.0, 0.05, true);
+    }
+    vol.end_stroke();
+}
+
+/// A refit that cannot succeed (everything carved away: no faces) fails once: the job is not started again until new
+/// blocks come, so waiting for it ends; undone, the layers come back bit for bit.
+#[test]
+fn b2_a_failed_refit_is_not_run_again_and_undo_brings_the_layers_back() {
+    let (mut vol, mut ml) = small();
+    let id = column(&mut ml.doc, 2, 0.12);
+    vol.drain_dirty();
+    let before = by_key(&ml, id);
+    carve_all(&mut vol);
+    let dirty = vol.drain_dirty();
+    assert!(!dirty.is_empty());
+    let region = MeshLayers::changed_box(&vol, &dirty);
+    // refit_cached waits while the job is busy: with the job run again on every poll it never returned.
+    let r = ml.refit_cached(&vol, &dirty, region);
+    eprintln!("refit of nothing: {:?}", r.as_ref().err());
+    assert!(r.is_err(), "a refit of an empty volume succeeded");
+    assert!(!ml.busy() && ml.refit_failed());
+    // Polled and waited for again with no new blocks: nothing runs.
+    assert!(ml.poll(&vol).is_none() && ml.wait(&vol).is_none());
+    assert!(!ml.busy());
+    // The volume's undo brings new blocks: the job runs and the layers are as they were.
+    assert!(vol.undo());
+    let dirty = vol.drain_dirty();
+    let st = ml.refit_cached(&vol, &dirty, MeshLayers::changed_box(&vol, &dirty)).unwrap();
+    assert!(!st.discarded && !ml.refit_failed());
+    assert!(by_key(&ml, id) == before, "the layers came back changed");
+    // Redo fails again, and undo after it brings them back again.
+    assert!(vol.redo());
+    let dirty = vol.drain_dirty();
+    assert!(ml.refit_cached(&vol, &dirty, MeshLayers::changed_box(&vol, &dirty)).is_err());
+    assert!(!ml.busy());
+    assert!(vol.undo());
+    let dirty = vol.drain_dirty();
+    ml.refit_cached(&vol, &dirty, MeshLayers::changed_box(&vol, &dirty)).unwrap();
+    assert!(by_key(&ml, id) == before, "the layers came back changed after the second undo");
+}
+
 #[test]
 #[ignore]
 fn b2_async_refit_at_2_5m_triangles() {

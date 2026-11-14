@@ -262,6 +262,10 @@ pub(super) struct Live {
     /// else free it at once.
     pub(super) hold_old: bool,
     old: Option<(Box<dyn Send + Sync>, Instant)>,
+    /// The last job failed (an empty mesh, a block too far out, a panic): its blocks wait, but no job starts again
+    /// until new ones come. Run again on the same volume it would fail again, every frame, and anything waiting for
+    /// the layers to follow would wait forever.
+    failed: bool,
 }
 
 struct Running {
@@ -272,7 +276,7 @@ struct Running {
 
 impl Live {
     pub(super) fn new(cache: BlockCache, geom: Geom) -> Live {
-        Live { cache: Some(cache), geom: Some(Arc::new(geom)), running: None, pending: Vec::new(), has_pending: false, patches: Vec::new(), hold_old: false, old: None }
+        Live { cache: Some(cache), geom: Some(Arc::new(geom)), running: None, pending: Vec::new(), has_pending: false, patches: Vec::new(), hold_old: false, old: None, failed: false }
     }
 
     pub(super) fn busy(&self) -> bool {
@@ -296,11 +300,19 @@ impl Live {
     pub(super) fn note(&mut self, dirty: &[Key]) {
         self.pending.extend_from_slice(dirty);
         self.has_pending = true;
+        if !dirty.is_empty() {
+            self.failed = false;
+        }
+    }
+
+    /// Whether the last job failed and no new blocks came since.
+    pub(super) fn failed(&self) -> bool {
+        self.failed
     }
 
     /// Start a job for what is waiting, if any and none runs. `pre` is the volume `doc`'s mesh was extracted from.
     pub(super) fn start(&mut self, vol: &LevelVolume, pre: &LevelVolume, doc: &Document, keys: &[u64], layout: &Arc<Layout>, settings: MeshLayerSettings) {
-        if self.running.is_some() || !self.has_pending {
+        if self.running.is_some() || !self.has_pending || self.failed {
             return;
         }
         // A document whose base changed by other means (a plain refit, a bake): take its geometry again, and extract
@@ -330,7 +342,7 @@ impl Live {
 
     /// Take in the finished job, if one finished (with `wait`, waiting for it): apply its plan to `doc`'s layers as
     /// they are now, swap the new document in (`pre` becoming the volume it was extracted from) and keep the carry's
-    /// patch; then start the next job if changes are waiting.
+    /// patch; then start the next job if changes are waiting (unless this one failed: see [`Self::failed`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn poll(
         &mut self,
@@ -354,9 +366,10 @@ impl Live {
         };
         self.cache = cache;
         let out = match done {
-            // Nothing was swapped in: its change goes with the next job.
+            // Nothing was swapped in: its change goes with the next job, once new blocks come.
             Err(e) => {
                 self.note(&r.dirty);
+                self.failed = true;
                 Err(e)
             }
             // Made for another base than the document holds now (changed by other means meanwhile): again.
@@ -393,6 +406,7 @@ impl Live {
                     }
                     Err(e) => {
                         self.note(&r.dirty);
+                        self.failed = true;
                         Err(e)
                     }
                 }

@@ -317,6 +317,12 @@ impl MeshLayers {
         self.live.busy()
     }
 
+    /// Whether the last refit job failed (its error came from [`Self::poll`]): its blocks are kept, and the next job
+    /// starts only when [`Self::refit_async`] brings new ones.
+    pub fn refit_failed(&self) -> bool {
+        self.live.failed()
+    }
+
     /// With `hold`, what a swap replaces (the old mesh, its document and volume) is kept until [`Self::free_old`] or
     /// the next refit job's start (which frees it beside the job) rather than freed at once off the thread: freeing
     /// it slows work on every core for a moment (70 to 80 ms at 5M), so a caller can choose when. At most one swap's
