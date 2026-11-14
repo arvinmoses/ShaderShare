@@ -812,28 +812,9 @@ fn turned_over(ml: &MeshLayers, c: Vec3, r: f32) -> (usize, usize) {
     (over, n)
 }
 
-/// Bumpiness of what is shown within `r` of `c`: the mean size of (ring average - position) along the base normal.
-fn bumpiness(ml: &MeshLayers, c: Vec3, r: f32) -> f64 {
-    let doc = &ml.doc;
-    let (p, n, topo) = (doc.positions(), ml.base_normals(), doc.topology());
-    let (mut s, mut k) = (0.0f64, 0usize);
-    for v in 0..p.len() {
-        if doc.base_positions()[v].distance(c) > r {
-            continue;
-        }
-        let ring = topo.vert_verts.row(v);
-        if ring.is_empty() {
-            continue;
-        }
-        let avg = ring.iter().map(|&u| p[u as usize]).sum::<Vec3>() / ring.len() as f32;
-        s += (avg - p[v]).dot(n[v]).abs() as f64;
-        k += 1;
-    }
-    s / k.max(1) as f64
-}
-
 /// Smoothing smooths whatever the layer's blend and strength: a clay stroke on a layer, the layer set to Add or
-/// Subtract at 50, 100 or 200%, then three smooth strokes: the bumpiness falls with each, no face turns over.
+/// Subtract at 50, 100 or 200%, then three smooth strokes: the bumpiness of what the layer holds (what a layer's smooth
+/// works on) falls with each, no face turns over.
 #[test]
 fn smoothing_smooths_under_every_blend() {
     let _one = timing_lock();
@@ -848,11 +829,11 @@ fn smoothing_smooths_under_every_blend() {
             mode.set_layer_opacity(0, opacity);
             mode.close_slider_edit();
             settle_frames(&mut mode);
-            let mut last = bumpiness(ml(&mut mode), c, 0.2);
+            let mut last = offset_bumpiness(ml(&mut mode), c, 0.2);
             let mut line = format!("{} {:.0}%: bumpiness {last:.3e}", blend.label(), opacity * 100.0);
             for pass in 0..3 {
                 app_stroke(&mut mode, Target::Detail, from, to, 0.1, 0.5, Brush::Smooth, 2);
-                let b = bumpiness(ml(&mut mode), c, 0.2);
+                let b = offset_bumpiness(ml(&mut mode), c, 0.2);
                 let (over, nf) = turned_over(ml(&mut mode), c, 0.2);
                 line += &format!(" -> {b:.3e} ({over} of {nf} faces turned over)");
                 if b >= last || over > 0 {
@@ -897,6 +878,35 @@ fn strokes_on_subtract_stay_bounded() {
         }
     }
     assert!(fails.is_empty(), "{fails:?}");
+}
+
+/// Clay and trim on a layer make the same shape as on the base: one stroke and a stroke scrubbed three times, small
+/// and wide (the form curving away under it), across the stroke's middle: the tallest change within 15% of the base's
+/// and the two profiles within 20% of it (rms).
+#[test]
+fn layer_clay_and_trim_match_the_base() {
+    let _one = timing_lock();
+    let (from, to) = (Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0));
+    let mut fails = Vec::new();
+    for brush in [Brush::Clay, Brush::Trim] {
+        for (r, passes) in [(0.06f32, 1usize), (0.06, 3), (0.35, 1)] {
+            let mut prof: Vec<Vec<f32>> = Vec::new();
+            for layer in [false, true] {
+                let mut mode = if layer { ball_with_layer(2.64e6) } else { VolumeMode::ball(2.64e6) };
+                let before = across(&mut mode, layer, from, to, r);
+                app_stroke(&mut mode, if layer { Target::Detail } else { Target::Form }, from, to, r, 0.8, brush, passes);
+                prof.push(across(&mut mode, layer, from, to, r).iter().zip(&before).map(|(a, b)| a - b).collect());
+            }
+            let peak = |p: &[f32]| p.iter().fold(0.0f32, |m, x| if x.abs() > m.abs() { *x } else { m });
+            let (pb, pl) = (peak(&prof[0]), peak(&prof[1]));
+            let rms = (prof[0].iter().zip(&prof[1]).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / prof[0].len() as f64).sqrt() as f32;
+            eprintln!("{brush:?} r {r} x{passes}: base {:.4} r, layer {:.4} r, profiles {:.0}% apart", pb / r, pl / r, 100.0 * rms / pb.abs());
+            if !((pl - pb).abs() <= 0.15 * pb.abs() && rms <= 0.2 * pb.abs()) {
+                fails.push(format!("{brush:?} r {r} x{passes}: base {:.4} r, layer {:.4} r, {:.0}% apart", pb / r, pl / r, 100.0 * rms / pb.abs()));
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
 }
 
 /// Ctrl on a layer does what it does on the base: the app swaps the brush (Clay + Ctrl sends Trim) and sets `invert`;
@@ -1021,8 +1031,9 @@ fn rms_between(a: &[f32], b: &[f32]) -> f64 {
     (a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum::<f64>() / a.len() as f64).sqrt()
 }
 
-/// A field of small bumps on the volume, then the same smooth stroke on the volume and on a mesh layer over it: what is
-/// left of the bumps is within 15% of each other, at 250k and at 2.5M triangles.
+/// A field of small bumps on the volume, and the same on a mesh layer, then the same smooth stroke on each (a layer's
+/// smooth smooths what the layer holds): what is left of the bumps is within 15% of each other, at 250k and at 2.5M
+/// triangles.
 #[test]
 fn layer_smooth_matches_base_smooth() {
     let _one = timing_lock();
@@ -1033,15 +1044,15 @@ fn layer_smooth_matches_base_smooth() {
         for (k, layer) in [false, true].into_iter().enumerate() {
             let mut mode = VolumeMode::ball(tris);
             let plain = patch(&mut mode, false);
-            for j in 0..3 {
-                for i in 0..5 {
-                    let d = Vec3::new(-0.2 + 0.1 * i as f32 + 0.03 * j as f32, 0.05 + 0.05 * j as f32, 1.0);
-                    app_stroke(&mut mode, Target::Form, d, d, 0.03, 1.0, Brush::Clay, 1);
-                }
-            }
             if layer {
                 mode.add_mesh_layer();
                 settle_frames(&mut mode);
+            }
+            for j in 0..3 {
+                for i in 0..5 {
+                    let d = Vec3::new(-0.2 + 0.1 * i as f32 + 0.03 * j as f32, 0.05 + 0.05 * j as f32, 1.0);
+                    app_stroke(&mut mode, if layer { Target::Detail } else { Target::Form }, d, d, 0.03, 1.0, Brush::Clay, 1);
+                }
             }
             let bumps = patch(&mut mode, layer);
             app_stroke(&mut mode, if layer { Target::Detail } else { Target::Form }, from, to, 0.1, 0.5, Brush::Smooth, 2);
@@ -1358,4 +1369,78 @@ fn memory_at_2_5m() {
         peak - volume_only
     );
     assert!(peak - volume_only < 1500.0, "{:.0} MB above the volume alone", peak - volume_only);
+}
+
+/// Layer `0`'s own offsets along the base normals, by vertex name.
+fn offsets(ml: &MeshLayers) -> HashMap<u64, f32> {
+    let id = ml.doc.layers()[0].id;
+    let d = ml.layer_deltas(id).unwrap();
+    let (n, to_c) = (ml.base_normals(), ml.internal_to_canonical());
+    (0..d.len()).map(|v| (ml.keys()[to_c[v] as usize], d[v].dot(n[v]))).collect()
+}
+
+/// Bumpiness of layer `0`'s own offsets within `r` of `c`: the mean size of (ring average - offset) along the base normal.
+fn offset_bumpiness(ml: &MeshLayers, c: Vec3, r: f32) -> f64 {
+    let doc = &ml.doc;
+    let id = doc.layers()[0].id;
+    let d = ml.layer_deltas(id).unwrap();
+    let (n, topo) = (ml.base_normals(), doc.topology());
+    let h = |v: usize| d[v].dot(n[v]);
+    let (mut s, mut k) = (0.0f64, 0usize);
+    for v in 0..d.len() {
+        let ring = topo.vert_verts.row(v);
+        if doc.base_positions()[v].distance(c) > r || ring.is_empty() {
+            continue;
+        }
+        let avg = ring.iter().map(|&u| h(u as usize)).sum::<f32>() / ring.len() as f32;
+        s += (avg - h(v)).abs() as f64;
+        k += 1;
+    }
+    s / k.max(1) as f64
+}
+
+/// Smooth on a layer smooths the layer's own offsets, the same whatever its blend: on a base with clay ridges of its
+/// own, clay ridges on a layer smoothed in Add and in Subtract come out alike (within 5% of the tallest offset), each
+/// far less bumpy, the base untouched; and a layer smoothed in Add then set to Subtract shows the smoothed offsets
+/// flipped (the base's ridges not doubled, as when smoothing worked on what was shown).
+#[test]
+fn layer_smooth_is_the_same_on_add_and_subtract() {
+    let _one = timing_lock();
+    let c = Vec3::new(0.0, 0.1, 1.0).normalize();
+    let mut runs = Vec::new();
+    for blend in [LayerBlend::Add, LayerBlend::Subtract] {
+        let mut mode = ball_with_layer(2.64e6);
+        for y in [0.0f32, 0.1, 0.2] {
+            app_stroke(&mut mode, Target::Form, Vec3::new(-0.3, y, 1.0), Vec3::new(0.3, y, 1.0), 0.04, 0.8, Brush::Clay, 1);
+        }
+        for y in [0.05f32, 0.15] {
+            app_stroke(&mut mode, Target::Detail, Vec3::new(-0.3, y, 1.0), Vec3::new(0.3, y, 1.0), 0.04, 0.8, Brush::Clay, 1);
+        }
+        mode.set_layer_blend(0, blend);
+        settle_frames(&mut mode);
+        let base: Vec<Vec3> = ml(&mut mode).doc.base_positions().to_vec();
+        let before = offset_bumpiness(ml(&mut mode), c, 0.15);
+        for _ in 0..3 {
+            app_stroke(&mut mode, Target::Detail, Vec3::new(-0.3, 0.1, 1.0), Vec3::new(0.3, 0.1, 1.0), 0.12, 0.5, Brush::Smooth, 2);
+        }
+        let after = offset_bumpiness(ml(&mut mode), c, 0.15);
+        eprintln!("{}: layer bumpiness {before:.3e} -> {after:.3e}", blend.label());
+        assert!(after < 0.5 * before, "{}: {before:.3e} -> {after:.3e}", blend.label());
+        assert!(ml(&mut mode).doc.base_positions() == base.as_slice(), "the base moved");
+        if blend == LayerBlend::Add {
+            // Set to Subtract: the base less the layer, exactly.
+            mode.set_layer_blend(0, LayerBlend::Subtract);
+            settle_frames(&mut mode);
+            let ml = ml(&mut mode);
+            let id = ml.doc.layers()[0].id;
+            let d = ml.layer_deltas(id).unwrap();
+            let worst = (0..d.len()).map(|v| (ml.doc.positions()[v] - (ml.doc.base_positions()[v] - d[v])).length()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-5, "Subtract shows the base less the layer: off by {worst:.2e}");
+        }
+        runs.push(offsets(ml(&mut mode)));
+    }
+    let tallest = runs[0].values().fold(0.0f32, |m, x| m.max(x.abs()));
+    let worst = runs[0].iter().filter_map(|(k, a)| runs[1].get(k).map(|b| (a - b).abs())).fold(0.0f32, f32::max);
+    eprintln!("Add against Subtract: worst {worst:.2e} of the tallest offset {tallest:.2e}");
+    assert!(worst < 0.05 * tallest, "smoothed on Add and on Subtract differ by {worst:.2e} (tallest {tallest:.2e})");
 }

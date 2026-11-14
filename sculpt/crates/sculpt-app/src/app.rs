@@ -576,6 +576,12 @@ impl SculptApp {
         if let Some(l) = f.add_layer {
             m.add_layer(l);
         }
+        if f.add_mesh_layer {
+            m.add_mesh_layer();
+        }
+        if let Some((k, b)) = f.blend {
+            m.set_layer_blend(k, b);
+        }
         if let Some((k, on)) = f.layer_visible {
             m.set_layer_visible(k, on);
         }

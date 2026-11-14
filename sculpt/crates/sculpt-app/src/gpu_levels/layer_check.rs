@@ -178,6 +178,23 @@ impl Scene<'_> {
         }
     }
 
+    /// Smooth dabs on layer `id` about `dir`, told by their leaves as the app's are.
+    fn layer_smooth(&mut self, id: LayerId, dir: Vec3, radius: f32) -> Res<()> {
+        self.wait()?;
+        self.ml.doc.set_active_layer(Some(id))?;
+        let d = dir.normalize();
+        let Some(h) = self.ml.doc.raycast(&Ray::new(d * 3.0, -d)) else { return Ok(()) };
+        let s = BrushSettings { radius, strength: 0.5, ..Default::default() };
+        let side = d.any_orthonormal_vector();
+        brush::stroke(&mut self.ml.doc, &mut brush::LayerSmooth, &s, &[(h.point, 1.0), (h.point + side * radius * 0.5, 1.0)])?;
+        match self.ml.doc.take_geometry_dirty() {
+            sculpt_core::DirtySet::Leaves(l) => self.dirty.leaves.extend(l),
+            sculpt_core::DirtySet::All => self.dirty.all = true,
+            sculpt_core::DirtySet::None => {}
+        }
+        Ok(())
+    }
+
     fn set_blend(&mut self, id: LayerId, blend: LayerBlend) -> Res<()> {
         let mut m = self.ml.doc.layer(id).ok_or("no layer")?.meta();
         m.blend = blend;
@@ -406,7 +423,29 @@ pub fn run(args: &[String]) -> Res<()> {
     // A volume stroke under way while a swap lands: then all settled.
     sc.settle()?;
     let what = format!("settled after 20 strokes, {dabs} layer dabs, {} swaps", sc.swaps);
-    let last = check(&mut sc, &what, true, &mut fails)?;
+    let mut last = check(&mut sc, &what, true, &mut fails)?;
+
+    // Smoothing on a layer, then its blend switched as the app does it: only the leaves that moved are told.
+    sc.ml.doc.set_layer_opacity(ids[0], 1.0)?;
+    sc.dirty.all = true;
+    sc.frame()?;
+    for k in 0..6 {
+        sc.layer_smooth(ids[0], Vec3::new(-0.1 + 0.04 * k as f32, 0.05, 1.0), 0.12)?;
+        sc.frame()?;
+    }
+    check(&mut sc, "a layer smoothed", false, &mut fails)?;
+    for blend in [LayerBlend::Subtract, LayerBlend::Add] {
+        let mut m = sc.ml.doc.layer(ids[0]).ok_or("no layer")?.meta();
+        m.blend = blend;
+        sc.ml.doc.set_layer_meta(ids[0], m, false)?;
+        if let sculpt_core::DirtySet::Leaves(l) = sc.ml.doc.take_geometry_dirty() {
+            sc.dirty.leaves.extend(l);
+        } else {
+            sc.dirty.all = true;
+        }
+        sc.frame()?;
+        last = check(&mut sc, &format!("the smoothed layer set to {}", blend.label()), false, &mut fails)?;
+    }
 
     // ---- 2. the normal change: the same vertices drawn with the layers' rows, with offsets only, and with no rows
     let with: Vec<f32> = last.normals.iter().map(|(d, c, _)| angle(*d, *c)).collect();

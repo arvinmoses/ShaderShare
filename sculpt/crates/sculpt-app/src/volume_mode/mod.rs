@@ -1863,9 +1863,9 @@ impl VolumeMode {
                 let shape = brush.shape(strength);
                 let settings = b::BrushSettings { radius, strength: shape.alpha, falloff, spacing: 0.12, front_faces_only: true, invert: false };
                 let r = match brush {
-                    Brush::Clay => b::ClayBuildup { height: shape.height, ..Default::default() }.dab(doc, &dab, &settings),
-                    Brush::Trim => b::TrimDynamic { depth: shape.height, ..Default::default() }.dab(doc, &dab, &settings),
-                    Brush::Smooth => b::FormSmooth.dab(doc, &dab, &settings),
+                    // (As the base's: `height` is a share of the radius there too.)
+                    Brush::Clay | Brush::Trim => b::PlaneBrush { height: radius * shape.height, trim: brush == Brush::Trim }.dab(doc, &dab, &settings),
+                    Brush::Smooth => b::LayerSmooth.dab(doc, &dab, &settings),
                 };
                 if let Err(e) = r {
                     eprintln!("mesh layer dab: {e}");

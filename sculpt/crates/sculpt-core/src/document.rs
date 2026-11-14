@@ -30,6 +30,9 @@ pub use solid::{Extra, SolidInput, SolidSettings, SolidStats, StackField};
 #[derive(Debug, Default)]
 pub struct Displacements {
     pub(crate) leaves: Vec<(u32, Vec<(u32, Vec3)>)>,
+    /// The values are changes to the active layer's own offsets (before its weight and blend), not to the surface as
+    /// shown (see [`Displacements::raw`]).
+    pub(crate) raw: bool,
 }
 
 impl Displacements {
@@ -38,6 +41,12 @@ impl Displacements {
     }
     pub fn vertex_count(&self) -> usize {
         self.leaves.iter().map(|(_, l)| l.len()).sum()
+    }
+    /// The same values as changes to the active layer's own offsets: added to them as they are, whatever the layer's
+    /// opacity, mask and blend (the surface shown moves by them through those). On the base, as they are.
+    pub fn raw(mut self) -> Displacements {
+        self.raw = true;
+        self
     }
 }
 
@@ -736,6 +745,18 @@ impl Document {
 
     // ------------------------------------------------------- brush pipeline
 
+    /// The active sculpt layer's offsets, leaf by leaf (see [`Document::layer_offset`]); `None` with no layer active.
+    pub(crate) fn active_layer_chunks(&self) -> Option<&[crate::layers::Chunk]> {
+        Some(&self.layers[self.layer_index(self.active?).ok()?].chunks)
+    }
+
+    /// A layer's offset at vertex `v`, from its `chunks` (zero where it holds none).
+    #[inline]
+    pub(crate) fn layer_offset(&self, chunks: &[crate::layers::Chunk], v: usize) -> Vec3 {
+        let l = self.bvh.vert_leaf[v] as usize;
+        chunks.get(l).and_then(|c| c.as_deref()).map_or(Vec3::ZERO, |o| o[v - self.bvh.leaves[l].owned.start as usize])
+    }
+
     /// Where vertex `v` was when the current stroke began.
     #[inline]
     pub fn stroke_origin(&self, v: usize) -> Vec3 {
@@ -781,7 +802,13 @@ impl Document {
                 (!list.is_empty()).then_some((l, list))
             })
             .collect();
-        Displacements { leaves }
+        Displacements { leaves, raw: false }
+    }
+
+    /// The active sculpt layer's own offsets in leaf `l` (its owned vertices in order), if it holds any there.
+    pub fn active_layer_offsets(&self, l: u32) -> Option<&[Vec3]> {
+        let i = self.layer_index(self.active?).ok()?;
+        self.layers[i].chunks.get(l as usize)?.as_deref()
     }
 
     fn sculpt_target(&self) -> Result<SculptTarget> {
@@ -864,12 +891,23 @@ impl Document {
                 // rather than storing offsets far larger than what shows; under `MIN_WEIGHT` nothing is stored.
                 const MAX_GAIN: f32 = 4.0;
                 const MIN_WEIGHT: f32 = 0.02;
-                let through_weight = blend.is_linear() || blend.uses_normal();
+                let through_weight = !disp.raw && (blend.is_linear() || blend.uses_normal());
                 disp.leaves.par_iter().zip(chunk_refs).zip(pos_slices).zip(ranges.par_iter()).for_each(
                     |((((_, list), chunk), pos), r)| {
                         for &(k, d) in list {
                             let v = r.start + k as usize;
                             if !through_weight {
+                                if disp.raw && (blend.is_linear() || blend.uses_normal()) {
+                                    // Where the layer shows too little for a change to be seen, none is made (as a
+                                    // brush's on what is shown).
+                                    let w = scale * mask_values.map_or(1.0, |m| m[v]);
+                                    if w.abs() < MIN_WEIGHT {
+                                        continue;
+                                    }
+                                    if blend.is_linear() {
+                                        pos[k as usize] += d * (w * sign);
+                                    }
+                                }
                                 chunk[k as usize] += d;
                                 continue;
                             }

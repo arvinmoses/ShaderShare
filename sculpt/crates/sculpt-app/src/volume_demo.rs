@@ -90,6 +90,9 @@ enum Act {
     Redo,
     /// A caption for `dur` seconds.
     Caption(&'static str),
+    /// A mesh layer added (it is built off the frame), and a mesh layer's blend.
+    AddMeshLayer,
+    Blend(usize, sculpt_core::LayerBlend),
 }
 
 struct Item {
@@ -131,6 +134,8 @@ pub struct Frame {
     pub generator_release: bool,
     pub undo: bool,
     pub redo: bool,
+    pub add_mesh_layer: bool,
+    pub blend: Option<(usize, sculpt_core::LayerBlend)>,
 }
 
 pub struct VolumeDemo {
@@ -531,6 +536,31 @@ impl VolumeDemo {
             at(15.0, 2.0, Camera(Pose::at((patch + Vec3::new(0.08, -0.05, 0.0)).normalize(), 0.7)));
             end = 18.0;
         }
+        // `SCULPT_DEMO_SCRIPT=flip`: clay strokes on a mesh layer, smoothed with Shift, then the layer set to Subtract and
+        // back (what a stroke smoothed on Add shows on Subtract).
+        if std::env::var("SCULPT_DEMO_SCRIPT").as_deref() == Ok("flip") {
+            items.clear();
+            let mut at = |t: f32, dur: f32, act: Act| items.push(Item { at: t, dur, act });
+            at(0.0, 0.0, Camera(Pose::at(patch, 1.4)));
+            at(0.1, 0.0, AddMeshLayer);
+            at(1.5, 0.0, Target(crate::volume_mode::Target::Detail));
+            for k in 0..4 {
+                let y = 0.36 + 0.08 * k as f32;
+                at(1.6 + 0.9 * k as f32, 0.7, Stroke { tool: Tool::ClayBuildup, size: 40.0, strength: 1.0, path: line((0.30, y), (0.70, y + 0.02), 0.02, 12) });
+            }
+            at(5.5, 0.0, Blend(0, sculpt_core::LayerBlend::Subtract));
+            at(6.5, 0.0, Blend(0, sculpt_core::LayerBlend::Add));
+            let mut path = Vec::new();
+            for k in 0..5 {
+                let y = 0.32 + 0.1 * k as f32;
+                path.push(if k % 2 == 0 { (0.30, y) } else { (0.70, y) });
+            }
+            at(7.0, 3.0, ShiftStroke { tool: Tool::ClayBuildup, size: 90.0, strength: 0.6, path: path.clone() });
+            at(10.5, 3.0, ShiftStroke { tool: Tool::ClayBuildup, size: 90.0, strength: 0.6, path });
+            at(14.0, 0.0, Blend(0, sculpt_core::LayerBlend::Subtract));
+            at(15.0, 0.0, Blend(0, sculpt_core::LayerBlend::Add));
+            end = 16.0;
+        }
         // `SCULPT_DEMO_SCRIPT=stress`: the stress test's kinds of edits in the app, for looking at the frames: strokes
         // of every size at every level on the form and on layers, layers added, moved between levels, hidden and
         // removed, masks, a generator edited, noise baked, a file round trip, undo and redo, and the camera moving
@@ -749,6 +779,8 @@ impl VolumeDemo {
                         Act::MakeLayer(from) => f.make_layer = Some(from),
                         Act::Target(t) => f.target = Some(t),
                         Act::AddLayer(l) => f.add_layer = Some(l),
+                        Act::AddMeshLayer => f.add_mesh_layer = true,
+                        Act::Blend(k, b) => f.blend = Some((k, b)),
                         Act::LayerVisible(k, on) => f.layer_visible = Some((k, on)),
                         Act::LayerLevel(k, l) => f.layer_level = Some((k, l)),
                         Act::RemoveLayer(k) => f.remove_layer = Some(k),

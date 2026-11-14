@@ -147,6 +147,151 @@ impl Brush for ClayBuildup {
     }
 }
 
+// ----------------------------------------------------------------- Plane brush
+
+/// Clay and trim on a mesh as the volume's do them (`LevelVolume::plane_dab`), so a layer's strokes look as the base's
+/// do: a round brush whose plane is set by the surface as the stroke found it (each vertex's [`Document::stroke_origin`])
+/// and what the stroke has laid since. Clay's plane stands `height` over that surface, and over what is laid by at least
+/// [`crate::generator::level_volume::BUILD_STEP`] of it, so scrubbing keeps building, slowly; trim's stands `height`
+/// under it. Each dab moves what lies below the plane (above it, trimming) its `strength` of the way there, fully out
+/// to the falloff's hardness and easing to nothing at the rim. Under a brush wide enough that the form curves away
+/// under it, clay follows the surface as the stroke found it instead of a flat plane (as the volume's does).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PlaneBrush {
+    /// How far the plane stands over (under, trimming) the surface, in world units.
+    pub height: f32,
+    pub trim: bool,
+}
+
+impl Brush for PlaneBrush {
+    fn name(&self) -> &'static str {
+        if self.trim { "Trim" } else { "Clay" }
+    }
+
+    fn dab(&mut self, doc: &mut Document, dab: &Dab, s: &BrushSettings) -> Result<()> {
+        use crate::generator::level_volume::BUILD_STEP;
+        use rayon::prelude::*;
+        let n = dab.normal.normalize_or_zero();
+        if n == Vec3::ZERO {
+            return Ok(());
+        }
+        let (c, r, h) = (dab.center, s.radius, self.height * dab.pressure);
+        if !(r > 0.0 && h > 0.0 && s.strength * dab.pressure > 0.0) {
+            return Ok(());
+        }
+        let (t1, t2) = n.any_orthonormal_pair();
+        // Over the disc: the surface as the stroke found it, and as it is, along `n` from the dab's centre; and a
+        // quadratic fitted to the first, the form at the brush's scale. The centre's own (within a quarter of the
+        // radius) is where the stroke found the surface under the dab.
+        let mut leaves = Vec::new();
+        doc.bvh.query_sphere(c, 1.5 * r, &mut leaves);
+        type Sums = ([f64; 5], [[f64; 6]; 6], [f64; 6]);
+        let terms = |x: f64, y: f64| [1.0, x, y, x * x, x * y, y * y];
+        let zero: Sums = ([0.0; 5], [[0.0; 6]; 6], [0.0; 6]);
+        let (a, m, mv) = leaves
+            .par_iter()
+            .map(|&l| {
+                let (mut a, mut m, mut mv) = zero;
+                for v in doc.bvh.leaves[l as usize].owned_range() {
+                    if doc.normals[v].dot(n) <= 0.0 {
+                        continue;
+                    }
+                    let (was, now) = (doc.stroke_origin(v) - c, doc.positions[v] - c);
+                    let t = (now - n * now.dot(n)).length() / r;
+                    if t > 0.95 || now.dot(n).abs() > r {
+                        continue;
+                    }
+                    let (hw, hn) = (was.dot(n) as f64, now.dot(n) as f64);
+                    a[0] += hw;
+                    a[1] += hn - hw;
+                    a[2] += 1.0;
+                    if t < 0.25 {
+                        a[3] += hw;
+                        a[4] += 1.0;
+                    }
+                    let f = terms((was.dot(t1) / r) as f64, (was.dot(t2) / r) as f64);
+                    for j in 0..6 {
+                        mv[j] += f[j] * hw;
+                        for k in 0..6 {
+                            m[j][k] += f[j] * f[k];
+                        }
+                    }
+                }
+                (a, m, mv)
+            })
+            .reduce(
+                || zero,
+                |x, y| (std::array::from_fn(|i| x.0[i] + y.0[i]), std::array::from_fn(|j| std::array::from_fn(|k| x.1[j][k] + y.1[j][k])), std::array::from_fn(|i| x.2[i] + y.2[i])),
+            );
+        if a[2] == 0.0 {
+            return Ok(());
+        }
+        let on = if a[4] > 0.0 { a[3] / a[4] } else { a[0] / a[2] } as f32;
+        let (base, added) = ((a[0] / a[2]) as f32 - on, (a[1] / a[2]) as f32);
+        // (A small ridge keeps a fit over a coarse or one-sided disc from running wild; too few samples, none.)
+        let fit = (a[2] >= 30.0)
+            .then(|| {
+                let mut m = m;
+                let ridge = 1e-6 * (0..6).map(|j| m[j][j]).sum::<f64>();
+                (0..6).for_each(|j| m[j][j] += ridge);
+                crate::height_grid::solve(m, mv)
+            })
+            .flatten()
+            .unwrap_or([0.0; 6]);
+        // How far the form falls away under the brush, on average (a quadratic's mean over a disc is its centre plus
+        // half its rim's fall).
+        let mean_fall = ((1..6).map(|j| fit[j] * m[0][j] / a[2]).sum::<f64>() as f32).clamp(-r, 0.0);
+        // The share of that fall the plane is laid over (see `fall`). The rest of the lift a flat plane gets over a
+        // curved form is kept, as the volume's dabs keep it (matched stroke for stroke in the app's
+        // `layer_clay_and_trim_match_the_base`): about a third of it where the form falls a third of `h` at the rim,
+        // 85% once it falls twice `h`.
+        let rim = (-2.0 * mean_fall).max(0.0) / h.max(1e-9);
+        let x = ((rim - 0.4) / 1.6).clamp(0.0, 1.0);
+        let lay = 0.65 - 0.5 * x * x * (3.0 - 2.0 * x);
+        let bumps = base - lay * mean_fall.min(0.0);
+        let plane = if self.trim {
+            bumps.min(0.0) - h
+        } else {
+            let ground = bumps.max(0.0);
+            (ground + h).max(ground + added + BUILD_STEP * h)
+        };
+        // How far the form curves away under the brush (the volume's measure): clay follows the surface the stroke
+        // found, flat under a small brush, mixed between.
+        let follow = if self.trim {
+            0.0
+        } else {
+            let x = ((-base / r - 0.14) / 0.1).clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        // The form's fall away from the centre (where it curves down only): the plane is laid over it, so what a dab
+        // lays is as thick at its rim as at its centre, as the volume's is (a flat plane over a curved form stood
+        // higher above it toward the rim, and overlapping dabs built a stroke's middle a third of `h` too high).
+        let fall = move |x: f32, y: f32| {
+            let f = terms(x as f64, y as f64);
+            // (With its tilt: the dab's normal is the surface's as it is, not as the stroke found it.)
+            lay * ((1..6).map(|j| f[j] * fit[j]).sum::<f64>() as f32).clamp(-r, 0.0)
+        };
+        let (alpha, falloff, trim) = ((s.strength * dab.pressure).clamp(0.0, 1.0), s.falloff, self.trim);
+        let disp = doc.compute_displacements(c, 1.2 * r, |doc, v, _| {
+            if doc.normals[v].dot(n) <= 0.0 {
+                return None;
+            }
+            let q = doc.positions[v] - c;
+            let u = q.dot(n);
+            let w = falloff.eval((q - n * u).length() / r) * alpha;
+            if w <= 0.0 {
+                return None;
+            }
+            let was = doc.stroke_origin(v) - c;
+            let under = was.dot(n) - on;
+            let target = on + plane + follow * under + (1.0 - follow) * fall(was.dot(t1) / r, was.dot(t2) / r);
+            let d = target - u;
+            ((if trim { d < 0.0 } else { d > 0.0 }) && d.abs() < 2.0 * r).then(|| n * (d * w))
+        });
+        doc.apply_displacements(&disp)
+    }
+}
+
 /// How squarely a vertex with normal `normal` faces a plane with normal `n`: 1 face on, falling to 0 edge on.
 fn facing(normal: Vec3, n: Vec3) -> f32 {
     normal.normalize_or_zero().dot(n).clamp(0.0, 1.0)
@@ -301,6 +446,44 @@ impl Brush for FormSmooth {
     }
 }
 
+/// Smoothing on a layer: [`FormSmooth`] on the active layer's own offsets, apart from the base and the other layers.
+/// Each offset's part along the brush normal goes toward the same at its neighbours (the form at the brush's scale
+/// kept), and the change is the layer's whatever its blend, opacity or mask: a layer smoothed in Add shows smoothed in
+/// Subtract, and smoothing in either does the same to it. Bumps the base or other layers hold are left alone.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LayerSmooth;
+
+impl Brush for LayerSmooth {
+    fn name(&self) -> &'static str {
+        "Smooth"
+    }
+
+    fn dab(&mut self, doc: &mut Document, dab: &Dab, s: &BrushSettings) -> Result<()> {
+        let n = dab.normal.normalize_or_zero();
+        if n == Vec3::ZERO || doc.active_layer().is_none() {
+            return Ok(());
+        }
+        let r = s.radius;
+        let Some(target) = SmoothTarget::of_layer(doc, dab.center, n, r) else { return Ok(()) };
+        let (fade, falloff) = ((s.strength * dab.pressure).clamp(0.0, 1.0), s.falloff);
+        let (base, chunks) = (doc.base_positions(), doc.active_layer_chunks().unwrap_or(&[]));
+        let disp = doc.compute_displacements(dab.center, r, |doc, v, _| {
+            if doc.normals[v].dot(n) <= 0.0 {
+                return None;
+            }
+            let q = doc.positions[v] - dab.center;
+            let t = (q - n * q.dot(n)).length() / r;
+            let f = falloff.eval(t) * fade;
+            if f <= 0.0 {
+                return None;
+            }
+            let p = SmoothTarget::layer_point(base[v], doc.layer_offset(chunks, v), dab.center, n) - dab.center;
+            target.toward(p).map(|d| n * (d * f))
+        });
+        doc.apply_displacements(&disp.raw())
+    }
+}
+
 /// The smoothed surface under a dab (see [`FormSmooth`]), as how far each point under it is from its smoothed self
 /// along the brush normal.
 pub struct SmoothTarget {
@@ -321,31 +504,61 @@ impl SmoothTarget {
     const HALF: f32 = 20.0;
 
     pub fn new(doc: &Document, center: Vec3, n: Vec3, r: f32) -> Option<SmoothTarget> {
-        use crate::height_grid::{blur, quartic_terms, solve};
+        Self::gather(doc, center, n, r, |v, _| doc.positions[v])
+    }
+
+    /// The same for the active layer's own offsets alone (see [`LayerSmooth`]): each vertex's height is its offset
+    /// along `n`, across from where it sits on the base, so nothing the base or other layers hold is smoothed. Its
+    /// point is [`Self::layer_point`].
+    pub fn of_layer(doc: &Document, center: Vec3, n: Vec3, r: f32) -> Option<SmoothTarget> {
+        let base = doc.base_positions();
+        Self::gather(doc, center, n, r, |v, off| Self::layer_point(base[v], off.unwrap_or(Vec3::ZERO), center, n))
+    }
+
+    /// A layer vertex's point for [`Self::of_layer`]: on the plane through `center` across `n` above its base place
+    /// `base`, raised by its offset `off` along `n`.
+    #[inline]
+    pub fn layer_point(base: Vec3, off: Vec3, center: Vec3, n: Vec3) -> Vec3 {
+        base - n * (base - center).dot(n) + n * off.dot(n)
+    }
+
+    /// Samples of the surface facing along `n` over the disc out to 1.75 r about `center`, of the vertices shown from
+    /// 0.35 r above it to 0.7 r below (as the volume's columns reach; a sheet behind, a fold or a far wall, is left out),
+    /// as (across, across, height): each vertex's point from `point(v, the active layer's offset at v)`.
+    fn gather(doc: &Document, center: Vec3, n: Vec3, r: f32, point: impl Fn(usize, Option<Vec3>) -> Vec3 + Sync) -> Option<SmoothTarget> {
         use rayon::prelude::*;
         let (t1, t2) = n.any_orthonormal_pair();
-        let (out, depth) = (1.75 * r, 0.35 * r);
-        // The surface facing along `n` over the disc out to 1.75 r, from `depth` above the centre to twice that below (as the volume's
-        // columns reach): (across, across, height) from the centre.
+        let out = 1.75 * r;
         let mut leaves = Vec::new();
+        // (The vertices shown near the dab: what a layer's offsets hold may sit far above or below that.)
+        let depth = 0.35 * r;
         doc.bvh.query_sphere(center, (out * out + 4.0 * depth * depth).sqrt(), &mut leaves);
         let samples: Vec<Vec<[f32; 3]>> = leaves
             .par_iter()
             .map(|&l| {
                 let mut list = Vec::new();
-                for v in doc.bvh.leaves[l as usize].owned_range() {
-                    if doc.normals[v].dot(n) <= 0.0 {
+                let range = doc.bvh.leaves[l as usize].owned_range();
+                let offs = doc.active_layer_offsets(l);
+                for v in range.clone() {
+                    let shown = (doc.positions[v] - center).dot(n);
+                    if doc.normals[v].dot(n) <= 0.0 || shown > depth || shown < -2.0 * depth {
                         continue;
                     }
-                    let q = doc.positions[v] - center;
+                    let q = point(v, offs.map(|o| o[v - range.start])) - center;
                     let (a, b, h) = (q.dot(t1), q.dot(t2), q.dot(n));
-                    if a * a + b * b <= out * out && h <= depth && h >= -2.0 * depth {
+                    if a * a + b * b <= out * out {
                         list.push([a, b, h]);
                     }
                 }
                 list
             })
             .collect();
+        Self::from_samples(samples, n, t1, t2, r)
+    }
+
+    fn from_samples(samples: Vec<Vec<[f32; 3]>>, n: Vec3, t1: Vec3, t2: Vec3, r: f32) -> Option<SmoothTarget> {
+        use crate::height_grid::{blur, quartic_terms, solve};
+        let out = 1.75 * r;
         // The columns are no closer than the mesh's edges, so each holds a vertex or two: the vertices under the radius
         // tell the spacing (an even triangle mesh has 2 / (sqrt 3 e^2) of them per unit of area).
         let inside = samples.iter().flatten().filter(|p| p[0] * p[0] + p[1] * p[1] < r * r).count();
@@ -550,7 +763,7 @@ impl MoveBrush {
                 (*l, list)
             })
             .collect();
-        doc.apply_displacements(&Displacements { leaves })
+        doc.apply_displacements(&Displacements { leaves, raw: false })
     }
 
     pub fn end(&mut self) {
