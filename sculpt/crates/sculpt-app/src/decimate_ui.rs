@@ -27,7 +27,8 @@ use std::time::Instant;
 use eframe::egui_wgpu;
 use egui::{RichText, Ui};
 use sculpt_core::decimate::{
-    Analysis, AnalyzeOptions, Baker, ManifoldReport, Maps, Progress, Surface, SurfaceError, Target, TriMesh, UvMesh, check_manifold, even_out, quick_uv,
+    Analysis, AnalyzeOptions, Baker, ManifoldReport, Maps, Progress, Surface, SurfaceError, Target, TriMesh, UvMesh, bad_faces, check_manifold, even_out,
+    quick_uv,
     surface_error, tessellate,
 };
 use glam::Vec2;
@@ -124,6 +125,10 @@ pub struct Decimate {
     generation: u64,
     extract_ms: f32,
     relax_ms: f32,
+    /// Tint thin and knotted triangles of the output red, and which they are.
+    show_bad: bool,
+    bad: Arc<Vec<bool>>,
+    bad_count: usize,
     check: Option<Check>,
     /// The last measurement, and the output generation it is of.
     measured: Option<(u64, ManifoldReport, SurfaceError, f32)>,
@@ -208,6 +213,9 @@ impl Decimate {
             generation: 0,
             extract_ms: 0.0,
             relax_ms: 0.0,
+            show_bad: true,
+            bad: Arc::new(Vec::new()),
+            bad_count: 0,
             check: None,
             measured: None,
             gpu_dirty: false,
@@ -354,6 +362,9 @@ impl Decimate {
         let flips = !live || out.triangles.len() <= 1_000_000;
         even_out(&mut out, self.surface.as_deref(), self.evenness, iterations, flips);
         self.relax_ms = t.elapsed().as_secs_f32() * 1e3;
+        let bad = bad_faces(&out);
+        self.bad_count = bad.iter().filter(|x| **x).count();
+        self.bad = Arc::new(bad);
         self.result = Some(Arc::new(out));
         self.generation += 1;
         self.gpu_dirty = true;
@@ -675,6 +686,13 @@ impl Decimate {
             self.refresh(false, true);
         }
         prop(ui, "Wireframe", |ui| ui.checkbox(&mut self.wire, ""));
+        let label = if self.result.is_some() { format!("{} found", fmt_count(self.bad_count)) } else { String::new() };
+        if prop(ui, "Bad triangles", |ui| ui.checkbox(&mut self.show_bad, label))
+            .on_hover_text("Tint red the output's triangles with an angle under 10° or an edge under a tenth of the mean (knots); not shown on the tessellated preview")
+            .changed()
+        {
+            self.gpu_dirty = true;
+        }
 
         // Tessellate + displace preview.
         ui.separator();
@@ -839,7 +857,8 @@ pub fn window(app: &mut SculptApp, ctx: &egui::Context) {
         (true, Some((out, uvs))) => {
             let draw = vp.decimate.get_or_insert_with(|| crate::decimate_draw::DecimateDraw::new(&rs.device, &vp.bgl));
             if d.gpu_dirty {
-                draw.upload(&rs.device, &rs.queue, &out, uvs.as_deref().map(|u| u.as_slice()));
+                let bad = (d.show_bad && uvs.is_none()).then(|| d.bad.as_slice());
+                draw.upload(&rs.device, &rs.queue, &out, uvs.as_deref().map(|u| u.as_slice()), bad);
                 d.gpu_dirty = false;
             }
             if d.map_dirty

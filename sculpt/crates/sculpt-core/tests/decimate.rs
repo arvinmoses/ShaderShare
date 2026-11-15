@@ -259,3 +259,46 @@ fn svol() {
         println!("  even_out {ms:.0} ms");
     }
 }
+
+/// A knot like those decimation can leave: faces split around a point again and again, so tiny edges and needles
+/// bunch together. Evening at 1 clears it and keeps the counts and the mesh closed.
+#[test]
+fn even_out_clears_knots() {
+    let m = Arc::new(lumpy(120));
+    let surface = Surface::new(m.clone());
+    let a = analyse(&m, 1.0);
+    let mut d = a.extract(Target::Triangles(3000)).mesh;
+    // Plant knots: in a few faces, split 1-to-3 about a point near a corner, five times over the newest face, and
+    // once about a point just past an edge, which folds a sliver over (relaxation will not move a vertex that would
+    // turn a face that far, so a fold holds the knot in place).
+    for seed in [7usize, 500, 1300, 2200] {
+        let mut f = seed;
+        for k in 0..6 {
+            let t = d.triangles[f];
+            let p = t.map(|v| d.positions[v as usize]);
+            let w = 0.03 + 0.02 * k as f32;
+            let c = if k == 5 { (p[0] + p[1]) * 0.5 * 1.01 - p[2] * 0.01 } else { p[0] * (1.0 - 2.0 * w) + (p[1] + p[2]) * w };
+            let v = d.positions.len() as u32;
+            d.positions.push(c);
+            d.triangles[f] = [t[0], t[1], v];
+            d.triangles.push([t[1], t[2], v]);
+            d.triangles.push([t[2], t[0], v]);
+            f = d.triangles.len() - 1;
+        }
+    }
+    let tiny = |m: &TriMesh| {
+        let e = m.triangles.iter().flat_map(|t| (0..3).map(|i| m.positions[t[i] as usize].distance(m.positions[t[(i + 1) % 3] as usize]))).sum::<f32>() / (3 * m.triangles.len()) as f32;
+        m.triangles.iter().flat_map(|t| (0..3).map(|i| m.positions[t[i] as usize].distance(m.positions[t[(i + 1) % 3] as usize]))).filter(|l| *l < 0.1 * e).count() / 2
+    };
+    let (n_t, n_v, before) = (d.triangles.len(), d.positions.len(), tiny(&d));
+    let (_, a0, _) = shape(&d);
+    even_out(&mut d, Some(&surface), 1.0, 3, true);
+    let (_, a1, _) = shape(&d);
+    let after = tiny(&d);
+    println!("knots: tiny edges {before} -> {after}, min angle {a0:.1} -> {a1:.1}");
+    assert!(before >= 4 && after == 0, "{before} -> {after}");
+    assert!(a1 > 15.0, "min angle {a1}");
+    assert_eq!((d.triangles.len(), d.positions.len()), (n_t, n_v));
+    let r = check_manifold(d.positions.len(), &d.triangles);
+    assert!(r.closed() && r.manifold(), "{r:?}");
+}

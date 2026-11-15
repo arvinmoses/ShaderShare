@@ -50,8 +50,8 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
 
     let views = [View::whole(0.6, 0.35), View::close(0.6, 0.35, &input)];
     let input_tiles: Vec<Vec<u8>> = views.iter().map(|v| draw(&input, v, false, None)).collect();
-    println!("| keep | evenness | tris | min angle | valence dev | mean err | max err | closed+manifold |");
-    println!("|---|---|---|---|---|---|---|---|");
+    println!("| keep | evenness | tris | min angle | faces < 10° | edges < 0.1 mean | valence dev | mean err | max err | closed+manifold |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
     for pct in [5.0f32, 1.0, 0.25] {
         let mut cols = vec![input_tiles.clone()];
         for (a, &e) in analyses.iter().zip(&evens) {
@@ -59,11 +59,11 @@ pub(crate) fn run(args: &[String]) -> Res<()> {
             if e > 0.0 {
                 even_out(&mut m, Some(&surface), e, (e * 3.0).ceil() as usize, true);
             }
-            let (ma, dev) = shape(&m);
+            let (ma, dev, thin, tiny) = shape(&m);
             let err = surface_error(&input, &m, 300_000);
             let r = check_manifold(m.positions.len(), &m.triangles);
             println!(
-                "| {pct}% | {e} | {} | {ma:.1}° | {dev:.2} | {:.4}% | {:.3}% | {} |",
+                "| {pct}% | {e} | {} | {ma:.1}° | {thin} | {tiny} | {dev:.2} | {:.4}% | {:.3}% | {} |",
                 m.triangles.len(),
                 100.0 * err.mean_rel(),
                 100.0 * err.max_rel(),
@@ -222,17 +222,25 @@ fn build_rock(seed: u64, voxel: f32) -> Res<TriMesh> {
 }
 
 /// Smallest angle in degrees, and the mean squared deviation of valences from 6.
-fn shape(m: &TriMesh) -> (f32, f32) {
+/// Smallest angle, valence deviation from 6, faces with an angle under 10 degrees, and edges under a tenth of the mean.
+fn shape(m: &TriMesh) -> (f32, f32, usize, usize) {
     let mut min_angle = 180.0f32;
+    let mut thin = 0;
+    let edge = mean_edge(m);
+    let mut tiny = 0;
     for t in &m.triangles {
         let p = t.map(|v| m.positions[v as usize]);
+        let mut lo = 180.0f32;
         for i in 0..3 {
-            min_angle = min_angle.min((p[(i + 1) % 3] - p[i]).angle_between(p[(i + 2) % 3] - p[i]).to_degrees());
+            lo = lo.min((p[(i + 1) % 3] - p[i]).angle_between(p[(i + 2) % 3] - p[i]).to_degrees());
+            tiny += (p[i].distance(p[(i + 1) % 3]) < 0.1 * edge) as usize;
         }
+        thin += (lo < 10.0) as usize;
+        min_angle = min_angle.min(lo);
     }
     let mut val = vec![0i32; m.positions.len()];
     m.triangles.iter().flatten().for_each(|&v| val[v as usize] += 1);
-    (min_angle, val.iter().map(|&n| ((n - 6) * (n - 6)) as f32).sum::<f32>() / val.len().max(1) as f32)
+    (min_angle, val.iter().map(|&n| ((n - 6) * (n - 6)) as f32).sum::<f32>() / val.len().max(1) as f32, thin, tiny / 2)
 }
 
 struct View {

@@ -7,6 +7,8 @@
 //! pipelines share group 0 (the viewport's uniforms: camera, clay colour) with the volume's and bind the mesh at
 //! group 2.
 //!
+//! A corner's top bit marks its triangle as bad (thin or knotted); those are tinted red.
+//!
 //! With corner UVs and a normal map (an object-space map baked by `decimate::Baker`), the shading normal comes from
 //! the map instead of the mesh.
 
@@ -36,10 +38,12 @@ struct DecimOut {
     @location(1) normal: vec3<f32>,
     @location(2) bary: vec3<f32>,
     @location(3) uv: vec2<f32>,
+    @location(4) @interpolate(flat) bad: u32,
 };
 
 fn decim_vert(idx: u32) -> DecimOut {
-    let v = dm_corner[idx];
+    let raw = dm_corner[idx];
+    let v = raw & 0x7fffffffu;
     let p = vec3<f32>(dm_pos[3u * v], dm_pos[3u * v + 1u], dm_pos[3u * v + 2u]);
     let n = vec3<f32>(dm_nrm[3u * v], dm_nrm[3u * v + 1u], dm_nrm[3u * v + 2u]);
     var o: DecimOut;
@@ -49,6 +53,7 @@ fn decim_vert(idx: u32) -> DecimOut {
     let c = idx % 3u;
     o.bary = vec3<f32>(f32(c == 0u), f32(c == 1u), f32(c == 2u));
     o.uv = vec2<f32>(0.0);
+    o.bad = raw >> 31u;
     return o;
 }
 
@@ -79,7 +84,8 @@ fn decim_lit(i: DecimOut) -> vec4<f32> {
     m.base = i.world;
     let l2 = dot(i.normal, i.normal);
     let n = select(vec3<f32>(0.0, 1.0, 0.0), i.normal * inverseSqrt(max(l2, 1e-30)), l2 > 1e-30);
-    return lit(m, n, u.clay.rgb);
+    let c = lit(m, n, u.clay.rgb);
+    return select(c, vec4<f32>(mix(c.rgb, vec3<f32>(0.95, 0.12, 0.08), 0.7), c.a), i.bad != 0u);
 }
 
 @fragment
@@ -234,13 +240,20 @@ impl DecimateDraw {
         );
     }
 
-    /// Send `mesh` (with its vertex normals, and each triangle's corner UVs if any) up, in place of what was there.
-    /// Buffers are kept when they are big enough.
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &TriMesh, corner_uvs: Option<&[[Vec2; 3]]>) {
+    /// Send `mesh` (with its vertex normals, each triangle's corner UVs if any, and the triangles to tint as bad if
+    /// any) up, in place of what was there. Buffers are kept when they are big enough.
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &TriMesh, corner_uvs: Option<&[[Vec2; 3]]>, bad: Option<&[bool]>) {
         let normals = vertex_normals(mesh);
         let pos: &[f32] = bytemuck::cast_slice(&mesh.positions);
         let nrm: &[f32] = bytemuck::cast_slice(&normals);
-        let corner: &[u32] = bytemuck::cast_slice(&mesh.triangles);
+        let flagged: Vec<[u32; 3]>;
+        let corner: &[u32] = match bad {
+            Some(b) if b.len() == mesh.triangles.len() && b.iter().any(|x| *x) => {
+                flagged = mesh.triangles.par_iter().zip(b).map(|(t, &x)| if x { t.map(|v| v | 1 << 31) } else { *t }).collect();
+                bytemuck::cast_slice(&flagged)
+            }
+            _ => bytemuck::cast_slice(&mesh.triangles),
+        };
         let bytes = |n: usize| ((n.max(1) * 4) as u64).next_multiple_of(16);
         let uv: &[f32] = corner_uvs.map_or(&[], |u| bytemuck::cast_slice(u));
         let fits = self.mesh.as_ref().is_some_and(|m| m.pos.size() >= bytes(pos.len()) && m.corner.size() >= bytes(corner.len()) && m.uv.size() >= bytes(uv.len()));
@@ -374,7 +387,7 @@ mod tests {
         let mut vp = crate::viewport::Viewport::with_device(&device, include_str!("viewport.wgsl"));
         let empty = vp.render_offscreen(&device, &queue, size, &cam, &theme);
         let mut draw = DecimateDraw::new(&device, &vp.bgl);
-        draw.upload(&device, &queue, &mesh, None);
+        draw.upload(&device, &queue, &mesh, None, None);
         draw.shown = true;
         draw.wire = false;
         vp.decimate = Some(draw);
@@ -402,7 +415,7 @@ mod tests {
         {
             let d = vp.decimate.as_mut().unwrap();
             d.wire = false;
-            d.upload(&device, &queue, &low, Some(&corners));
+            d.upload(&device, &queue, &low, Some(&corners), None);
             d.upload_map(&device, &queue, &maps);
         }
         let plain = vp.render_offscreen(&device, &queue, size, &cam, &theme);

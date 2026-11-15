@@ -32,7 +32,7 @@ mod surface;
 
 pub use analyze::{Analysis, AnalyzeOptions, Progress};
 pub use bake::{Baker, Maps, Tessellated, UvMesh, quick_uv, tessellate, vertex_normals};
-pub use even::{even_out, relax};
+pub use even::{bad_faces, even_out, relax};
 pub use manifold::{ManifoldReport, check_manifold};
 pub use metric::{SurfaceError, surface_error};
 pub use replay::Decimated;

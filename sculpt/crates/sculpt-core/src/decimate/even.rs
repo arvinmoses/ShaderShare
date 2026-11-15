@@ -1,5 +1,5 @@
-//! Live evening of the output, after isotropic remeshing (Botsch & Kobbelt 2004; Dunyach et al. 2013) without the
-//! split and collapse steps: edge flips toward valence 6 (4 on borders) that also clear slivers, then tangential
+//! Live evening of the output, after isotropic remeshing (Botsch & Kobbelt 2004; Dunyach et al. 2013): short-edge
+//! collapses paired with long-edge splits (so the counts stay as set) to clear knots the decimation left, edge flips toward valence 6 (4 on borders) that also clear slivers, then tangential
 //! relaxation toward the area-weighted centre of each ring, projected back onto the original surface.
 //!
 //! Flips never cut across a crease (the new edge may not be sharper than the old one, past a small angle, nor stray
@@ -24,6 +24,12 @@ const MOVE_MIN_QUALITY: f32 = 0.1;
 /// A ring whose faces all lie within about 10 degrees of its normal is flat; one with a face 35 degrees off is a crease.
 const FLAT_COS: f32 = 0.985;
 const CREASE_COS: f32 = 0.82;
+/// Knot clearing: edges shorter than (KNOT_EDGE + KNOT_EDGE_EVEN·evenness) × the mean edge are collapsed, as is the
+/// short edge of a face below KNOT_QUALITY; a collapse may not leave a vertex with more than KNOT_MAX_VALENCE edges.
+const KNOT_EDGE: f32 = 0.1;
+const KNOT_EDGE_EVEN: f32 = 0.25;
+const KNOT_QUALITY: f32 = 0.1;
+const KNOT_MAX_VALENCE: usize = 10;
 
 /// Even out `mesh` at strength `evenness` (0 does nothing): `iterations` rounds of flips (when `flips`) and one
 /// relaxation step each, projected onto `surface` when given. Border vertices stay; flips keep every vertex.
@@ -32,11 +38,15 @@ pub fn even_out(mesh: &mut TriMesh, surface: Option<&Surface>, evenness: f32, it
     if e <= 0.0 || iterations == 0 || mesh.triangles.is_empty() {
         return;
     }
-    let border = border_vertices(mesh);
+    let mut border = border_vertices(mesh);
     // Projection reaches a few mean edges at most (a vertex never moves farther in one step).
     let reach = 4.0 * mean_edge(mesh);
     for _ in 0..iterations {
         if flips {
+            let nv = mesh.positions.len();
+            if clear_knots(mesh, surface, &border, e, reach) > 0 && mesh.positions.len() != nv {
+                border = border_vertices(mesh);
+            }
             let mut vf = vertex_faces(mesh);
             for _ in 0..3 {
                 if flip_pass(mesh, &mut vf, &border, surface, e, reach) == 0 {
@@ -303,4 +313,201 @@ fn relax_step(m: &mut TriMesh, surface: Option<&Surface>, border: &[bool], e: f3
         })
         .collect();
     m.positions = next;
+}
+
+/// Knots: short edges the decimation left (a collapse it refused), often bunched where thin faces meet. Flips and
+/// relaxation alone cannot clear them, so collapse edges much shorter than the mean (and the short edge of a sliver)
+/// to their midpoint on the surface, then split as many of the longest edges so the face and vertex counts stay
+/// as set (the freed slots are reused). Returns the number of collapses.
+fn clear_knots(m: &mut TriMesh, surface: Option<&Surface>, border: &[bool], e: f32, reach: f32) -> usize {
+    let mean = mean_edge(m);
+    let short = (KNOT_EDGE + KNOT_EDGE_EVEN * e) * mean;
+    let p = &m.positions;
+    // Candidates: (length, a, b) with a < b.
+    let mut cand: Vec<(f32, u32, u32)> = m
+        .triangles
+        .par_iter()
+        .flat_map_iter(|t| {
+            let q = t.map(|v| p[v as usize]);
+            let bad = quality(q[0], q[1], q[2]) < KNOT_QUALITY;
+            let lens = [0, 1, 2].map(|i| q[i].distance(q[(i + 1) % 3]));
+            let lo = (0..3).min_by(|&i, &j| lens[i].total_cmp(&lens[j])).unwrap();
+            let t = *t;
+            (0..3).filter_map(move |i| {
+                let (a, b) = (t[i], t[(i + 1) % 3]);
+                ((lens[i] < short || (bad && i == lo && lens[i] < mean)) && a < b).then_some((lens[i], a, b))
+            })
+        })
+        .collect();
+    if cand.is_empty() {
+        return 0;
+    }
+    cand.sort_unstable_by(|x, y| x.0.total_cmp(&y.0));
+    let mut vf = vertex_faces(m);
+    let mut free_v: Vec<u32> = Vec::new();
+    let mut free_f: Vec<u32> = Vec::new();
+    for &(_, a, b) in &cand {
+        if let Some((fa, fb)) = try_collapse(m, &mut vf, border, surface, reach, a, b) {
+            free_v.push(b);
+            free_f.extend([fa, fb]);
+        }
+    }
+    let n = free_v.len();
+    if n == 0 {
+        return 0;
+    }
+    // Split the longest interior edges, one per collapse.
+    let p = &m.positions;
+    let mut long: Vec<(f32, u32, u32)> = m
+        .triangles
+        .iter()
+        .flat_map(|t| (0..3).map(move |i| (t[i], t[(i + 1) % 3])))
+        .filter(|&(a, b)| a < b && !(border[a as usize] && border[b as usize]))
+        .map(|(a, b)| (p[a as usize].distance(p[b as usize]), a, b))
+        .collect();
+    let k = (4 * n).min(long.len());
+    if k > 0 {
+        long.select_nth_unstable_by(k - 1, |x, y| y.0.total_cmp(&x.0));
+        long.truncate(k);
+        long.sort_unstable_by(|x, y| y.0.total_cmp(&x.0));
+    }
+    for &(_, a, b) in &long {
+        if free_v.is_empty() {
+            break;
+        }
+        // Still an edge with one face each way (an earlier split may have cut it).
+        let fs: SmallVec<[u32; 2]> = vf[a as usize].iter().copied().filter(|&f| m.triangles[f as usize].contains(&b)).collect();
+        if fs.len() != 2 {
+            continue;
+        }
+        let v = free_v.pop().unwrap();
+        let (g1, g2) = (free_f.pop().unwrap(), free_f.pop().unwrap());
+        let mid = (m.positions[a as usize] + m.positions[b as usize]) * 0.5;
+        m.positions[v as usize] = surface.and_then(|s| s.closest(mid, reach)).unwrap_or(mid);
+        vf[v as usize].clear();
+        for (f, g) in [(fs[0], g1), (fs[1], g2)] {
+            let t = m.triangles[f as usize];
+            // The edge's direction in this face.
+            let i = (0..3).find(|&i| (t[i] == a && t[(i + 1) % 3] == b) || (t[i] == b && t[(i + 1) % 3] == a)).unwrap();
+            let (x, y, c) = (t[i], t[(i + 1) % 3], t[(i + 2) % 3]);
+            m.triangles[f as usize] = [x, v, c];
+            m.triangles[g as usize] = [v, y, c];
+            vf[y as usize].retain(|h| *h != f);
+            vf[y as usize].push(g);
+            vf[c as usize].push(g);
+            vf[v as usize].extend([f, g]);
+        }
+    }
+    // Collapses whose slots found no edge to split (rare): drop the dead faces and vertices.
+    if !free_v.is_empty() {
+        compact(m, &free_f, &free_v);
+    }
+    n
+}
+
+/// Collapse edge a-b to its midpoint (kept in `a`) when that is safe and leaves the faces around it no worse.
+/// Returns the two faces freed.
+fn try_collapse(m: &mut TriMesh, vf: &mut [SmallVec<[u32; 8]>], border: &[bool], surface: Option<&Surface>, reach: f32, a: u32, b: u32) -> Option<(u32, u32)> {
+    if border[a as usize] || border[b as usize] {
+        return None;
+    }
+    let shared: SmallVec<[u32; 2]> = vf[a as usize].iter().copied().filter(|&f| m.triangles[f as usize].contains(&b)).collect();
+    if shared.len() != 2 {
+        return None;
+    }
+    let other = |f: u32| m.triangles[f as usize].iter().copied().find(|&u| u != a && u != b).unwrap();
+    let (c, d) = (other(shared[0]), other(shared[1]));
+    if c == d {
+        return None;
+    }
+    // Link condition: a and b share exactly the neighbours c and d.
+    let ring = |v: u32| -> SmallVec<[u32; 16]> {
+        let mut r: SmallVec<[u32; 16]> = vf[v as usize].iter().flat_map(|&f| m.triangles[f as usize]).filter(|&u| u != v).collect();
+        r.sort_unstable();
+        r.dedup();
+        r
+    };
+    let (ra, rb) = (ring(a), ring(b));
+    if ra.iter().filter(|u| rb.contains(u)).count() != 2 {
+        return None;
+    }
+    let valence = ra.len() + rb.len() - 4;
+    if valence > KNOT_MAX_VALENCE || vf[c as usize].len() <= 3 || vf[d as usize].len() <= 3 {
+        return None;
+    }
+    let p = &m.positions;
+    let mid = (p[a as usize] + p[b as usize]) * 0.5;
+    let x = surface.and_then(|s| s.closest(mid, reach)).unwrap_or(mid);
+    // Faces that stay: no turn past the limit, nothing degenerate, and the worst of them no worse than before.
+    let (mut q_old, mut q_new) = (f32::MAX, f32::MAX);
+    for &f in vf[a as usize].iter().chain(vf[b as usize].iter()) {
+        let t = m.triangles[f as usize];
+        let o = t.map(|u| p[u as usize]);
+        q_old = q_old.min(quality(o[0], o[1], o[2]));
+        if shared.contains(&f) {
+            continue;
+        }
+        let q = t.map(|u| if u == a || u == b { x } else { p[u as usize] });
+        let (n0, n1) = ((o[1] - o[0]).cross(o[2] - o[0]), (q[1] - q[0]).cross(q[2] - q[0]));
+        let (l0, l1) = (n0.length(), n1.length());
+        if l1 <= 1e-20 || (l0 > 1e-20 && n0.dot(n1) < MOVE_TURN_COS * l0 * l1) {
+            return None;
+        }
+        q_new = q_new.min(quality(q[0], q[1], q[2]));
+    }
+    if q_new < q_old.min(MOVE_MIN_QUALITY) {
+        return None;
+    }
+    // Apply: b's faces go to a; the two shared faces die (left as degenerate [a, a, a] until reused).
+    let (f1, f2) = (shared[0], shared[1]);
+    m.positions[a as usize] = x;
+    let bf = std::mem::take(&mut vf[b as usize]);
+    for &f in &bf {
+        if f == f1 || f == f2 {
+            continue;
+        }
+        for u in &mut m.triangles[f as usize] {
+            if *u == b {
+                *u = a;
+            }
+        }
+        vf[a as usize].push(f);
+    }
+    for v in [a, c, d] {
+        vf[v as usize].retain(|h| *h != f1 && *h != f2);
+    }
+    m.triangles[f1 as usize] = [a, a, a];
+    m.triangles[f2 as usize] = [a, a, a];
+    Some((f1, f2))
+}
+
+/// Remove dead faces and vertices, renumbering the rest.
+fn compact(m: &mut TriMesh, dead_f: &[u32], dead_v: &[u32]) {
+    let mut keep_f = vec![true; m.triangles.len()];
+    dead_f.iter().for_each(|&f| keep_f[f as usize] = false);
+    let mut keep_v = vec![true; m.positions.len()];
+    dead_v.iter().for_each(|&v| keep_v[v as usize] = false);
+    let mut map = vec![u32::MAX; m.positions.len()];
+    let mut pos = Vec::with_capacity(m.positions.len());
+    for (v, &k) in keep_v.iter().enumerate() {
+        if k {
+            map[v] = pos.len() as u32;
+            pos.push(m.positions[v]);
+        }
+    }
+    m.triangles = m.triangles.iter().zip(&keep_f).filter(|(_, k)| **k).map(|(t, _)| t.map(|v| map[v as usize])).collect();
+    m.positions = pos;
+}
+
+/// Faces worth a look: an angle under 10 degrees, or an edge under a tenth of the mean edge (a knot).
+pub fn bad_faces(m: &TriMesh) -> Vec<bool> {
+    let short = 0.1 * mean_edge(m);
+    let thin = 10f32.to_radians();
+    m.triangles
+        .par_iter()
+        .map(|t| {
+            let p = t.map(|v| m.positions[v as usize]);
+            (0..3).any(|i| p[i].distance(p[(i + 1) % 3]) < short || (p[(i + 1) % 3] - p[i]).angle_between(p[(i + 2) % 3] - p[i]) < thin)
+        })
+        .collect()
 }
