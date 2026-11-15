@@ -847,10 +847,11 @@ fn smoothing_smooths_under_every_blend() {
     assert!(fails.is_empty(), "{fails:#?}");
 }
 
-/// Clay and trim on a Subtract layer, three passes in one stroke, do what they do on an Add layer (they ran away: clay
-/// 0.68 r deep, trim 1.9 r high). Clay stays within 1.3 clay steps of where it began. Trim on any layer still runs on
-/// (its plane follows the cut down each dab, about 4.9 clay steps here): that is the trim's own matter, so on Subtract
-/// it is held to what it does on Add.
+/// Clay and trim on a Subtract layer, three passes in one stroke, show flipped what they do on an Add layer: clay
+/// digs, trim raises, as deep (within 2%), the layer holding what it would on Add (they once ran away: clay 0.68 r
+/// deep, trim 1.9 r high). Clay stays within 1.3 clay steps of where it began. Trim on any layer still runs on (its
+/// plane follows the cut down each dab, about 4.9 clay steps here): that is the trim's own matter, so on Subtract it
+/// is held to what it does on Add.
 #[test]
 fn strokes_on_subtract_stay_bounded() {
     let _one = timing_lock();
@@ -870,8 +871,8 @@ fn strokes_on_subtract_stay_bounded() {
             eprintln!("{brush:?} on a {} layer, three passes: {:.3} r ({:.2} h)", blend.label(), on[i] / r, on[i] / h);
         }
         let [add, sub] = on;
-        if !((sub - add).abs() <= 0.02 * add.abs()) {
-            fails.push(format!("{brush:?}: {:.3} r on Subtract against {:.3} r on Add", sub / r, add / r));
+        if !((sub + add).abs() <= 0.02 * add.abs()) {
+            fails.push(format!("{brush:?}: {:.3} r on Subtract against {:.3} r on Add (flipped)", sub / r, add / r));
         }
         if brush == Brush::Clay && !(sub.abs() <= 1.3 * h) {
             fails.push(format!("{brush:?}: {:.3} r, {:.2} h", sub / r, sub / h));
@@ -1443,4 +1444,69 @@ fn layer_smooth_is_the_same_on_add_and_subtract() {
     let worst = runs[0].iter().filter_map(|(k, a)| runs[1].get(k).map(|b| (a - b).abs())).fold(0.0f32, f32::max);
     eprintln!("Add against Subtract: worst {worst:.2e} of the tallest offset {tallest:.2e}");
     assert!(worst < 0.05 * tallest, "smoothed on Add and on Subtract differ by {worst:.2e} (tallest {tallest:.2e})");
+}
+
+/// A ridge beside a groove on a layer at 55%, clay and trim strokes over each other, then smoothed by strokes across
+/// and along them from either side: no face turns over and no offset steps sideways by over 5 edges, building or
+/// smoothing. (Layer strokes once moved offsets along the shown surface's normal, which in a groove or on a steep side
+/// points sideways: dab by dab the offsets folded into shards, 13 faces over and 30 shards while building here, and
+/// smoothing did not take them out.)
+#[test]
+fn layer_strokes_on_steep_sides_make_no_shards() {
+    let _one = timing_lock();
+    let mut mode = ball_with_layer(1e6);
+    mode.set_layer_opacity(0, 0.55);
+    mode.mesh.as_mut().unwrap().close_open();
+    let c = Vec3::new(0.63, 0.33, 0.7).normalize();
+    let along = c.cross(Vec3::Y).normalize().cross(c);
+    for k in 0..30 {
+        let brush = if k % 2 == 0 { Brush::Clay } else { Brush::Trim };
+        let at = (c + along * (0.02 * (k % 5) as f32 - 0.04) + c.cross(along) * if brush == Brush::Trim { 0.03 } else { -0.01 }).normalize();
+        stroke(&mut mode, Target::Detail, at, 0.04, brush);
+    }
+    settle_frames(&mut mode);
+    let start = (turned_over(ml(&mut mode), c, 0.2).0, sideways_steps(&mut mode).0);
+    let side = c.cross(Vec3::Y).normalize();
+    let mut worst = start;
+    for k in 0..24 {
+        let tilt = [-0.12, -0.05, 0.05, 0.12][k % 4];
+        let d = (c + side * tilt + Vec3::Y * (0.04 * (k % 3) as f32 - 0.04)).normalize();
+        stroke(&mut mode, Target::Detail, d, [0.02, 0.04, 0.08][k % 3], Brush::Smooth);
+        let now = (turned_over(ml(&mut mode), c, 0.2).0, sideways_steps(&mut mode).0);
+        worst = (worst.0.max(now.0), worst.1.max(now.1));
+    }
+    settle_frames(&mut mode);
+    eprintln!("faces turned over, shards: {start:?} after the ridge and groove, at worst {worst:?} smoothing them");
+    assert_eq!(worst, (0, 0), "layer strokes on steep sides turned faces over or made shards");
+}
+
+/// Edges where the layers' offsets step by over 5 edges' length (shards), how many offsets over 0.01 point more
+/// than 60 degrees off the ball's normal, and the longest of those.
+fn sideways_steps(mode: &mut VolumeMode) -> (usize, usize, f32) {
+    let doc = &ml(mode).doc;
+    let (pos, base) = (doc.positions(), doc.base_positions());
+    let mut big = 0;
+    for f in doc.faces() {
+        let corners = if f[3] == u32::MAX { 3 } else { 4 };
+        for k in 0..corners {
+            let (a, b) = (f[k] as usize, f[(k + 1) % corners] as usize);
+            if a == b {
+                continue;
+            }
+            let e = (base[a] - base[b]).length().max(1e-9);
+            if ((pos[a] - base[a]) - (pos[b] - base[b])).length() / e > 5.0 {
+                big += 1;
+            }
+        }
+    }
+    let (mut side, mut most) = (0, 0.0f32);
+    for v in 0..pos.len() {
+        let o = pos[v] - base[v];
+        let l = o.length();
+        if l > 0.01 && o.dot(base[v].normalize()).abs() < 0.5 * l {
+            side += 1;
+            most = most.max(l);
+        }
+    }
+    (big, side, most)
 }

@@ -187,6 +187,8 @@ pub struct Document {
     pub(crate) baked_sculpt: Option<(Aabb, f32)>,
     pub(crate) solid_cache: std::sync::Arc<std::sync::Mutex<solid::SolidCaches>>,
     pub(crate) gen_basis: Option<(u64, u64, std::sync::Arc<crate::generator::layer::SurfaceBasis>)>,
+    /// The base's vertex normals, for the topology and base they were made for (layer strokes steer by them).
+    base_normals: Option<(u64, u64, std::sync::Arc<Vec<Vec3>>)>,
     /// Level-of-detail tree for dense meshes, and the topology it was built for.
     pub(crate) lod: Option<(u64, std::sync::Arc<crate::lod::LodTree>)>,
     /// Free-form, round-tripped by the file format (UI state, app metadata).
@@ -226,6 +228,7 @@ impl Document {
             topology_id: new_topology_id(),
             base_epoch: 0,
             gen_basis: None,
+            base_normals: None,
             remesh_source: None,
             remesh_voxel: 0.0,
             baked_sculpt: None,
@@ -1067,6 +1070,23 @@ impl Document {
     }
 
     /// The shared stage-0 data for generator layers, built the first time it is needed after the base or topology changed.
+    /// The base's vertex normals (made once per topology and base).
+    pub(crate) fn base_normals(&mut self) -> std::sync::Arc<Vec<Vec3>> {
+        let now = (self.topology_id, self.base_epoch);
+        if let Some((t, e, n)) = &self.base_normals
+            && (*t, *e) == now
+        {
+            return n.clone();
+        }
+        let n = match &self.gen_basis {
+            Some((t, e, b)) if (*t, *e) == now => b.normals().to_vec(),
+            _ => mesh::compute_normals(&self.base, &self.faces, &self.topo),
+        };
+        let n = std::sync::Arc::new(n);
+        self.base_normals = Some((now.0, now.1, n.clone()));
+        n
+    }
+
     pub(crate) fn generator_basis(&mut self) -> std::sync::Arc<crate::generator::layer::SurfaceBasis> {
         if let Some((topology, epoch, basis)) = &self.gen_basis
             && (*topology, *epoch) == (self.topology_id, self.base_epoch)
