@@ -52,7 +52,7 @@ const HELP: &str = "sculpt-app [file.svol] [--triangles M] [--theme NAME] [--zoo
   file.svol        open this volume (otherwise a new ball)
   --triangles M    the new ball's size, in millions of triangles at its level 1 (default 1; fresh, it shows a quarter as many)
   --screenshot P   save the window once the volume has settled, then close
-  --decimate K,E[,wire]  open Decimate on the startup mesh: keep K %, evenness E (0-1), wireframe
+  --decimate K,E[,wire][,source][,dock]  open Decimate on the startup mesh: keep K %, evenness E (0-1), wireframe, show the source, docked
   --demo-volume D  run the scripted session (SCULPT_DEMO_SCRIPT picks one), saving every frame into D
 sculpt-app --gpu-levels-check            the GPU surface against the CPU reference
 sculpt-app --gpu-rows-check              mesh layer rows drawn on the GPU surface (gates)

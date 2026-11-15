@@ -857,7 +857,7 @@ impl eframe::App for SculptApp {
         crate::panels::dialogs(self, &ctx);
         crate::panels::theme_editor(self, &ctx);
         crate::panels::keymap_window(self, &ctx);
-        crate::decimate_ui::window(self, &ctx);
+        crate::decimate_ui::window(self, ui);
 
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport_ui(ui, frame));
         // A slider let go: what it changed is one undo.

@@ -50,13 +50,15 @@ const PREVIEW_MAX: usize = 1_000_000;
 /// Points sampled on each mesh for the surface error.
 const ERROR_SAMPLES: usize = 100_000;
 
-/// `--decimate KEEP_PERCENT,EVENNESS[,wire]`: open the window, analyse the startup mesh at that evenness and show it at
-/// that share kept (for `--screenshot`).
+/// `--decimate KEEP_PERCENT,EVENNESS[,wire][,source][,dock]`: open the window, analyse the startup mesh at that evenness
+/// and show it at that share kept (for `--screenshot`); `source` shows the input instead, `dock` docks the window.
 #[derive(Clone, Copy, Debug)]
 pub struct Script {
     pub keep: f32,
     pub evenness: f32,
     pub wire: bool,
+    pub source: bool,
+    pub dock: bool,
 }
 
 impl Script {
@@ -67,8 +69,15 @@ impl Script {
             Some(e) => e.parse().ok()?,
             None => 0.0,
         };
-        let wire = matches!(it.next(), Some("wire" | "1" | "on" | "true"));
-        Some(Script { keep: keep.clamp(0.01, 100.0), evenness: evenness.clamp(0.0, 1.0), wire })
+        let flags: Vec<&str> = it.collect();
+        let has = |f: &[&str]| flags.iter().any(|x| f.contains(x));
+        Some(Script {
+            keep: keep.clamp(0.01, 100.0),
+            evenness: evenness.clamp(0.0, 1.0),
+            wire: has(&["wire", "1", "on", "true"]),
+            source: has(&["source"]),
+            dock: has(&["dock"]),
+        })
     }
 }
 
@@ -125,6 +134,10 @@ pub struct Decimate {
     generation: u64,
     extract_ms: f32,
     relax_ms: f32,
+    /// Show the input (the source surface) in place of the output, to compare.
+    show_source: bool,
+    /// The controls sit in a panel beside the right dock instead of a floating window.
+    pub docked: bool,
     /// Tint thin and knotted triangles of the output red, and which they are.
     show_bad: bool,
     bad: Arc<Vec<bool>>,
@@ -213,6 +226,8 @@ impl Decimate {
             generation: 0,
             extract_ms: 0.0,
             relax_ms: 0.0,
+            show_source: false,
+            docked: false,
             show_bad: true,
             bad: Arc::new(Vec::new()),
             bad_count: 0,
@@ -466,9 +481,12 @@ impl Decimate {
         }
     }
 
-    /// The mesh to show and its corner UVs: the preview when one is on (the tessellated mesh, or the output split
+    /// The mesh to show and its corner UVs: the input when the source is asked for, the preview when one is on (the tessellated mesh, or the output split
     /// along its UV seams for the normal map), else the output.
     fn shown(&self) -> Option<(Arc<TriMesh>, Option<Arc<Vec<[Vec2; 3]>>>)> {
+        if self.show_source && self.result.is_some() {
+            return self.input.as_ref().map(|m| (m.clone(), None));
+        }
         match self.tess.as_ref() {
             Some((m, uv)) if self.displace || self.nmap => Some((m.clone(), Some(uv.clone()))),
             _ => self.result.as_ref().map(|m| (m.clone(), None)),
@@ -685,6 +703,18 @@ impl Decimate {
         } else if r.changed() {
             self.refresh(false, true);
         }
+        let src = self.input.as_ref().map_or(0, |m| m.triangles.len());
+        let mut show_source = self.show_source;
+        prop(ui, "Show", |ui| {
+            ui.selectable_value(&mut show_source, false, format!("Decimated {}", fmt_count(shown)))
+                .on_hover_text("The decimated output (with the preview, when one is on)");
+            ui.selectable_value(&mut show_source, true, format!("Source {}", fmt_count(src)))
+                .on_hover_text("The surface it was made from, to compare (same view, same wireframe)");
+        });
+        if show_source != self.show_source {
+            self.show_source = show_source;
+            self.gpu_dirty = true;
+        }
         prop(ui, "Wireframe", |ui| ui.checkbox(&mut self.wire, ""));
         let label = if self.result.is_some() { format!("{} found", fmt_count(self.bad_count)) } else { String::new() };
         if prop(ui, "Bad triangles", |ui| ui.checkbox(&mut self.show_bad, label))
@@ -816,7 +846,9 @@ pub fn menu_item(app: &mut SculptApp, ui: &mut Ui) {
 }
 
 /// The window, once a frame (before the viewport draws): sliders, jobs taken in, the preview sent to the GPU.
-pub fn window(app: &mut SculptApp, ctx: &egui::Context) {
+pub fn window(app: &mut SculptApp, ui: &mut Ui) {
+    let ctx = ui.ctx().clone();
+    let ctx = &ctx;
     let d = &mut app.decimate;
     if let Some(s) = d.script
         && !d.script_started
@@ -826,13 +858,53 @@ pub fn window(app: &mut SculptApp, ctx: &egui::Context) {
         d.keep = s.keep;
         d.evenness = s.evenness;
         d.wire = s.wire;
+        d.show_source = s.source;
+        d.docked = s.dock;
         d.analyze(&mut app.volume);
     }
     d.poll();
     if d.open {
-        let mut open = true;
-        let mode = &mut app.volume;
-        egui::Window::new("Decimate").open(&mut open).default_width(360.0).resizable(false).show(ctx, |ui| d.controls(ui, mode));
+        let (mut open, mut dock) = (true, d.docked);
+        if d.docked {
+            let fill = app.theme.ui.panel.0;
+            egui::Panel::right("decimate_dock")
+                .resizable(true)
+                .default_size(360.0)
+                .min_size(320.0)
+                .frame(egui::Frame::side_top_panel(ui.style()).fill(fill).inner_margin(0))
+                .show(ui, |ui| {
+                    crate::panels::panel_header(ui, app, "DECIMATE", |ui| {
+                        if ui.small_button("Close").on_hover_text("Close (the volume shows again)").clicked() {
+                            open = false;
+                        }
+                        if ui.small_button("Float").on_hover_text("Undock into a floating window").clicked() {
+                            dock = false;
+                        }
+                    });
+                    let (d, mode) = (&mut app.decimate, &mut app.volume);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                            // Fixed: sizing from the available width would feed back into the panel's width.
+                            ui.spacing_mut().slider_width = 150.0;
+                            d.controls(ui, mode);
+                        });
+                    });
+                });
+        } else {
+            let mode = &mut app.volume;
+            egui::Window::new("Decimate").open(&mut open).default_width(360.0).resizable(false).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Dock").on_hover_text("Dock beside the Layers panel").clicked() {
+                            dock = true;
+                        }
+                    });
+                });
+                d.controls(ui, mode);
+            });
+        }
+        let d = &mut app.decimate;
+        d.docked = dock;
         if !open {
             d.open = false;
         }
@@ -857,7 +929,7 @@ pub fn window(app: &mut SculptApp, ctx: &egui::Context) {
         (true, Some((out, uvs))) => {
             let draw = vp.decimate.get_or_insert_with(|| crate::decimate_draw::DecimateDraw::new(&rs.device, &vp.bgl));
             if d.gpu_dirty {
-                let bad = (d.show_bad && uvs.is_none()).then(|| d.bad.as_slice());
+                let bad = (d.show_bad && !d.show_source && uvs.is_none()).then(|| d.bad.as_slice());
                 draw.upload(&rs.device, &rs.queue, &out, uvs.as_deref().map(|u| u.as_slice()), bad);
                 d.gpu_dirty = false;
             }
@@ -927,6 +999,8 @@ mod tests {
         assert_eq!((s.keep, s.evenness, s.wire), (25.0, 0.5, true));
         let s = Script::parse("10").unwrap();
         assert_eq!((s.keep, s.evenness, s.wire), (10.0, 0.0, false));
+        let s = Script::parse("1,1,source,dock").unwrap();
+        assert!(s.source && s.dock && !s.wire);
         assert!(Script::parse("x,1").is_none());
         assert_eq!(key_of(0.52), 10);
         assert_eq!(key_of(0.53), 11);
