@@ -160,6 +160,8 @@ pub struct GpuLevels {
     grow_vpages: bool,
     /// Set when the pages ran out (quads were dropped): the next sync grows them and rebuilds.
     out_of_pages: bool,
+    /// Blocks left undrawn as every slot a binding can hold was taken (counted up).
+    pub slots_full: usize,
     out_of_vpages: bool,
     cap_changed: bool,
     /// Changed blocks left for later syncs (see `LAND_FIRST`): the set of them, and the same in the order they are
@@ -310,6 +312,7 @@ impl GpuLevels {
             grow_pages: false,
             grow_vpages: false,
             out_of_pages: false,
+            slots_full: 0,
             out_of_vpages: false,
             buffers_made: 1,
             cap_changed: false,
@@ -530,8 +533,8 @@ impl GpuLevels {
         // Everything goes up: nothing is left for later.
         self.pending.clear();
         self.pending_set.clear();
-        let blocks: Vec<Key> = vol.keys().into_iter().filter(|k| !self.view.hides(*k)).collect();
-        let slots = ((blocks.len() as u32) * 2).max(self.buf.slots).max(4096);
+        let mut blocks: Vec<Key> = vol.keys().into_iter().filter(|k| !self.view.hides(*k)).collect();
+        let slots = ((blocks.len() as u32) * 2).max(self.buf.slots).max(4096).min(self.most_slots());
         let mut pages = self.buf.pages.max(slots / SLOTS_PER_QUAD_PAGE);
         let mut vpages = self.buf.vpages.max(slots / SLOTS_PER_VERT_PAGE);
         if self.grow_pages || self.out_of_pages {
@@ -559,6 +562,12 @@ impl GpuLevels {
         self.high = 0;
         for k in &blocks {
             self.take_slot(*k);
+        }
+        if self.slot_of.len() < blocks.len() {
+            let left_out = blocks.len() - self.slot_of.len();
+            blocks.retain(|k| self.slot_of.contains_key(k));
+            self.slots_full += left_out;
+            eprintln!("levels: {left_out} blocks not drawn, every one of {slots} slots taken");
         }
         self.hash.clear();
         self.hash_fit(0);
@@ -591,6 +600,12 @@ impl GpuLevels {
     }
 
     /// Page counts no bigger than one binding may be.
+    /// The most slots the buffers can have: a slot's cells (its biggest share of any buffer) within one binding.
+    fn most_slots(&self) -> u32 {
+        let most = self.device.limits().max_storage_buffer_binding_size as u64;
+        (most / (512 * 4).max(SAMPLE_WORDS * 4).max(SLOT_WORDS * 4)).min(u32::MAX as u64) as u32
+    }
+
     fn fit_pools(&self, pages: u32, vpages: u32) -> (u32, u32) {
         let most = self.device.limits().max_storage_buffer_binding_size as u64;
         (pages.min((most / (PAGE_INDICES * 4)) as u32), vpages.min((most / (VPAGE * 8)) as u32))
@@ -640,7 +655,8 @@ impl GpuLevels {
         let spare = self.free.len() + (self.buf.slots - self.high) as usize;
         let mut slots = self.buf.slots;
         if blocks > spare {
-            slots = ((self.slot_of.len() + blocks) as u32 * 2).max(slots * 2);
+            // (No more than a binding holds: past that, what does not fit stays out, as pages do.)
+            slots = ((self.slot_of.len() + blocks) as u32 * 2).max(slots * 2).min(self.most_slots()).max(slots);
         }
         // Pages: as the status last read them, a block taking about one of each at most.
         let (mut pages, mut vpages) = (self.buf.pages, self.buf.vpages);
@@ -1108,11 +1124,20 @@ impl GpuLevels {
         let coming = uploads.iter().filter(|k| !self.slot_of.contains_key(k)).count();
         self.make_room(coming);
         let mut placed = Vec::with_capacity(coming);
+        let mut left_out = 0;
         for k in &uploads {
             if !self.slot_of.contains_key(k) {
-                self.take_slot(*k).expect("room was made");
-                placed.push(*k);
+                match self.take_slot(*k) {
+                    Some(_) => placed.push(*k),
+                    None => left_out += 1,
+                }
             }
+        }
+        if left_out > 0 {
+            // Every slot a binding can hold is taken: these blocks are not drawn (the volume keeps them).
+            uploads.retain(|k| self.slot_of.contains_key(k));
+            self.slots_full += left_out;
+            eprintln!("levels: {left_out} blocks not drawn, every one of {} slots taken", self.buf.slots);
         }
         // The table sized for them before they go in: more blocks coming at once than it had room for (a big
         // generator's blocks, over a hundred thousand on a table of a few thousand) filled it, and the next insert
