@@ -1480,6 +1480,54 @@ fn layer_strokes_on_steep_sides_make_no_shards() {
     assert_eq!(worst, (0, 0), "layer strokes on steep sides turned faces over or made shards");
 }
 
+/// A layer works over the layers below it as it would were they merged into the base: trim and smooth strokes on a
+/// second layer over a ridge and a groove the first holds come out as on a new layer over the first flattened, to
+/// within 5% of what they changed (rms) and 15% at most.
+#[test]
+fn a_layer_works_over_the_layers_below_as_merged() {
+    let _one = timing_lock();
+    let c = Vec3::new(0.63, 0.33, 0.7).normalize();
+    let along = c.cross(Vec3::Y).normalize().cross(c);
+    let side = c.cross(along);
+    let mut runs = Vec::new();
+    for merged in [false, true] {
+        let mut mode = ball_with_layer(1e6);
+        for k in 0..12 {
+            let brush = if k % 2 == 0 { Brush::Clay } else { Brush::Trim };
+            let at = (c + along * (0.02 * (k % 5) as f32 - 0.04) + side * if brush == Brush::Trim { 0.04 } else { -0.03 }).normalize();
+            stroke(&mut mode, Target::Detail, at, 0.05, brush);
+        }
+        settle_frames(&mut mode);
+        if merged {
+            let id = ml(&mut mode).doc.layers()[0].id;
+            ml(&mut mode).doc.flatten_layer(id).unwrap();
+        }
+        mode.add_mesh_layer();
+        settle_frames(&mut mode);
+        let before = ml(&mut mode).doc.positions().to_vec();
+        for k in 0..6 {
+            let at = (c + side * (0.035 * (k % 3) as f32 - 0.035)).normalize();
+            stroke(&mut mode, Target::Detail, at, 0.07, if k < 4 { Brush::Trim } else { Brush::Smooth });
+        }
+        settle_frames(&mut mode);
+        runs.push((before, ml(&mut mode).doc.positions().to_vec()));
+    }
+    let ((b0, a0), (b1, a1)) = (&runs[0], &runs[1]);
+    assert_eq!(a0.len(), a1.len());
+    let (mut moved, mut most, mut off, mut worst) = (0.0f64, 0.0f32, 0.0f64, 0.0f32);
+    for v in 0..a0.len() {
+        let (d0, d1) = (a0[v] - b0[v], a1[v] - b1[v]);
+        moved += d1.length_squared() as f64;
+        most = most.max(d1.length());
+        off += (d0 - d1).length_squared() as f64;
+        worst = worst.max((d0 - d1).length());
+    }
+    let (rms, err) = (moved.sqrt(), off.sqrt());
+    eprintln!("over the layer below against over it merged: {:.1}% of the change (rms), {:.1}% of the most at worst (the most {most:.4})", 100.0 * err / rms, 100.0 * worst / most);
+    assert!(most > 0.005, "the strokes changed nothing");
+    assert!(err <= 0.05 * rms && worst <= 0.15 * most, "a layer did not work over the one below as over it merged");
+}
+
 /// Edges where the layers' offsets step by over 5 edges' length (shards), how many offsets over 0.01 point more
 /// than 60 degrees off the ball's normal, and the longest of those.
 fn sideways_steps(mode: &mut VolumeMode) -> (usize, usize, f32) {

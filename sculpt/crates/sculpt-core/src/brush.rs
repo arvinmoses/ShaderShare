@@ -9,7 +9,7 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-use crate::document::{Displacements, Document, PaintTarget, SurfaceHit};
+use crate::document::{Displacements, Document, PaintTarget, SurfaceHit, Under};
 use crate::geom::smoothstep;
 use crate::Result;
 
@@ -175,12 +175,12 @@ impl Brush for PlaneBrush {
         if seed == Vec3::ZERO {
             return Ok(());
         }
-        // On a layer, along the base's normal there (as layer Smooth): the shown surface's turns toward a groove's or a
-        // ridge's walls, and dabs along it moved offsets sideways until faces folded (shards).
+        // On a layer, along the normal of the surface under it there (as layer Smooth): the shown surface's turns toward
+        // a groove's or a ridge's walls, and dabs along it moved offsets sideways until faces folded (shards).
         let n = match doc.active_layer() {
             Some(_) => {
-                let bn = doc.base_normals();
-                LayerSmooth::base_about(doc, &bn, dab.center, seed, s.radius).map_or(seed, |b| b.0)
+                let under = doc.under(dab.center, s.radius);
+                LayerSmooth::base_about(doc, &under, dab.center, seed, s.radius).map_or(seed, |b| b.0)
             }
             None => seed,
         };
@@ -498,18 +498,18 @@ pub struct LayerSmooth;
 
 impl LayerSmooth {
 
-    /// Whether vertex `v`'s base place is near the dab and faces `n`, the base's own normal there. What the layer
-    /// shows plays no part: on a layer's steep or folded sides the shown surface turns sideways, and smoothing along
-    /// that pushed offsets sideways (shards).
-    fn base_facing(doc: &Document, bn: &[Vec3], v: usize, center: Vec3, n: Vec3, r: f32) -> bool {
+    /// Whether vertex `v`'s place on the surface under the layer ([`Under`]) is near the dab and faces `n`, that
+    /// surface's normal there. What the layer itself shows plays no part: on a layer's steep or folded sides the shown
+    /// surface turns sideways, and smoothing along that pushed offsets sideways (shards).
+    fn base_facing(doc: &Document, under: &Under, v: usize, center: Vec3, n: Vec3, r: f32) -> bool {
         let depth = 0.35 * r;
-        let h = (doc.base[v] - center).dot(n);
-        h <= depth && h >= -2.0 * depth && bn[v].dot(n) > 0.2
+        let h = (under.pos(doc, v) - center).dot(n);
+        h <= depth && h >= -2.0 * depth && under.normal(doc, v).dot(n) > 0.2
     }
 
-    /// The base about the dab: its normal (its vertices' shown within `r` of `center` facing `seed`'s way), and the
-    /// dab's centre on it (`center` less what the layers move those vertices by).
-    pub(crate) fn base_about(doc: &Document, normals: &[Vec3], center: Vec3, seed: Vec3, r: f32) -> Option<(Vec3, Vec3)> {
+    /// The surface under the layer about the dab: its normal (at its vertices shown within `r` of `center` facing
+    /// `seed`'s way), and the dab's centre on it (`center` less what the active layer and those above move them by).
+    pub(crate) fn base_about(doc: &Document, under: &Under, center: Vec3, seed: Vec3, r: f32) -> Option<(Vec3, Vec3)> {
         use rayon::prelude::*;
         let mut leaves = Vec::new();
         doc.bvh.query_sphere(center, r, &mut leaves);
@@ -523,11 +523,11 @@ impl LayerSmooth {
                     if d2 > r2 {
                         continue;
                     }
-                    let bn = normals[v];
+                    let bn = under.normal(doc, v);
                     if bn.dot(seed) > 0.0 {
                         let w = 1.0 - d2 / r2;
                         acc.0 += bn * w;
-                        acc.1 += (doc.positions[v] - doc.base[v]) * w;
+                        acc.1 += (doc.positions[v] - under.pos(doc, v)) * w;
                         acc.2 += w;
                     }
                 }
@@ -552,19 +552,22 @@ impl Brush for LayerSmooth {
             return Ok(());
         }
         let r = s.radius;
-        let bn = doc.base_normals();
-        let Some((n, c)) = LayerSmooth::base_about(doc, &bn, dab.center, seed, r) else { return Ok(()) };
-        // (Shown, the vertices whose base is under the dab sit about as far off as the layers move the centre, or
-        // twice that where they hold more than about it.)
+        let under = doc.under(dab.center, r);
+        let Some((n, c)) = LayerSmooth::base_about(doc, &under, dab.center, seed, r) else { return Ok(()) };
+        // (Shown, the vertices whose place under the layer is under the dab sit about as far off as the layers move
+        // the centre, or twice that where they hold more than about it.)
         let shift = 2.0 * dab.center.distance(c);
-        let Some(target) = SmoothTarget::of_layer(doc, &bn, c, n, r, 1.9 * r + shift) else { return Ok(()) };
+        drop(under);
+        let under = doc.under(c, 1.9 * r + shift);
+        let Some(target) = SmoothTarget::of_layer(doc, &under, c, n, r, 1.9 * r + shift) else { return Ok(()) };
         let (fade, falloff) = ((s.strength * dab.pressure).clamp(0.0, 1.0), s.falloff);
-        let (base, chunks) = (doc.base_positions(), doc.active_layer_chunks().unwrap_or(&[]));
+        let chunks = doc.active_layer_chunks().unwrap_or(&[]);
         let across = |o: Vec3| o - n * o.dot(n);
         let disp = doc.compute_displacements(c, 1.15 * r + shift, |doc, v, _| {
-            let q = base[v] - c;
+            let at = under.pos(doc, v);
+            let q = at - c;
             let t = (q - n * q.dot(n)).length() / r;
-            if t >= 1.0 || !LayerSmooth::base_facing(doc, &bn, v, c, n, r) {
+            if t >= 1.0 || !LayerSmooth::base_facing(doc, &under, v, c, n, r) {
                 return None;
             }
             let f = falloff.eval(t) * fade;
@@ -572,7 +575,7 @@ impl Brush for LayerSmooth {
                 return None;
             }
             let off = doc.layer_offset(chunks, v);
-            let p = SmoothTarget::layer_point(base[v], off, c, n) - c;
+            let p = SmoothTarget::layer_point(at, off, c, n) - c;
             let along = n * (target.toward(p).unwrap_or(0.0) * f);
             // The part across, where there is one (strokes along the base's normal make none): toward the mean of the
             // neighbours' (each vertex's ring through its faces).
@@ -632,13 +635,13 @@ impl SmoothTarget {
     }
 
     /// The same for the active layer's own offsets alone (see [`LayerSmooth`]): each vertex's height is its offset
-    /// along `n`, across from where it sits on the base, so nothing the base or other layers hold is smoothed. Its
+    /// along `n`, across from where it sits under the layer, so nothing the base or other layers hold is smoothed. Its
     /// point is [`Self::layer_point`].
-    /// `n` is the base's normal there, and only the base near the dab facing it counts (see [`LayerSmooth`]).
-    pub fn of_layer(doc: &Document, normals: &[Vec3], center: Vec3, n: Vec3, r: f32, reach: f32) -> Option<SmoothTarget> {
-        let base = doc.base_positions();
-        let keep = |v: usize| LayerSmooth::base_facing(doc, normals, v, center, n, r);
-        Self::gather(doc, center, n, r, reach, keep, |v, off| Self::layer_point(base[v], off.unwrap_or(Vec3::ZERO), center, n))
+    /// `n` is the normal of the surface under the layer there, and only that surface near the dab facing it counts (see
+    /// [`LayerSmooth`]); each vertex sits where that surface has it.
+    pub(crate) fn of_layer(doc: &Document, under: &Under, center: Vec3, n: Vec3, r: f32, reach: f32) -> Option<SmoothTarget> {
+        let keep = |v: usize| LayerSmooth::base_facing(doc, under, v, center, n, r);
+        Self::gather(doc, center, n, r, reach, keep, |v, off| Self::layer_point(under.pos(doc, v), off.unwrap_or(Vec3::ZERO), center, n))
     }
 
     /// A layer vertex's point for [`Self::of_layer`]: on the plane through `center` across `n` above its base place

@@ -23,6 +23,8 @@ use crate::{Error, Result};
 
 mod remesh_layer;
 mod solid;
+mod under;
+pub(crate) use under::Under;
 pub use solid::{Extra, SolidInput, SolidSettings, SolidStats, StackField};
 
 /// Per-leaf sparse vertex displacements produced by a brush kernel.
@@ -189,6 +191,8 @@ pub struct Document {
     pub(crate) gen_basis: Option<(u64, u64, std::sync::Arc<crate::generator::layer::SurfaceBasis>)>,
     /// The base's vertex normals, for the topology and base they were made for (layer strokes steer by them).
     base_normals: Option<(u64, u64, std::sync::Arc<Vec<Vec3>>)>,
+    /// The surface under the active layer, as far as the open stroke has worked it out (see [`Under`]).
+    under_cache: Option<under::UnderCache>,
     /// Level-of-detail tree for dense meshes, and the topology it was built for.
     pub(crate) lod: Option<(u64, std::sync::Arc<crate::lod::LodTree>)>,
     /// Free-form, round-tripped by the file format (UI state, app metadata).
@@ -229,6 +233,7 @@ impl Document {
             base_epoch: 0,
             gen_basis: None,
             base_normals: None,
+            under_cache: None,
             remesh_source: None,
             remesh_voxel: 0.0,
             baked_sculpt: None,
@@ -1414,6 +1419,7 @@ impl Document {
     /// Finish the open operation and refresh masks fed by painted channels.
     pub fn end_stroke(&mut self) {
         self.stroke_origin.iter_mut().for_each(|c| *c = None);
+        self.under_cache = None;
         self.undo.commit();
         // Mask stacks only fail on missing data, which painting cannot cause.
         let _ = self.refresh_dependent_masks();
