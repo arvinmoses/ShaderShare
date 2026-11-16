@@ -34,7 +34,7 @@ use sculpt_core::decimate::{
 use glam::Vec2;
 
 use crate::app::{SculptApp, fmt_count};
-use crate::panels::prop;
+use crate::panels::{prop, section};
 use crate::volume_mode::VolumeMode;
 
 /// Analyses kept for evenness values let go before (each is several times the input's size).
@@ -42,6 +42,8 @@ const CACHE: usize = 3;
 /// Map sizes offered, and the size baked while a slider drags.
 const MAP_SIZES: [usize; 5] = [256, 512, 1024, 2048, 4096];
 const LIVE_MAP: usize = 256;
+/// Height of the panel's main buttons.
+const BUTTON_H: f32 = 24.0;
 /// The tessellated preview is held to about this many triangles (the level drops on big outputs).
 const TESS_BUDGET: usize = 3_000_000;
 /// Outputs bigger than this are not previewed (UVs and tessellation run on the frame).
@@ -627,47 +629,84 @@ impl Decimate {
 
     fn controls(&mut self, ui: &mut Ui, mode: &mut VolumeMode) {
         let weak = ui.visuals().weak_text_color();
+        let fs = ui.style().text_styles[&egui::TextStyle::Body].size;
+        let note = |ui: &mut Ui, text: &str| {
+            if !text.is_empty() {
+                ui.add(egui::Label::new(RichText::new(text).small().color(weak)).wrap());
+            }
+        };
         // Analyse (again), or the analysis under way.
-        if let Some(j) = self.job.as_ref() {
-            let what = if self.current.is_some() { format!("Building the analysis at evenness {:.2}…", evenness_of(j.key)) } else { "Analysing…".to_string() };
-            let frac = j.progress.fraction();
-            ui.add(egui::ProgressBar::new(frac).text(format!("{what} {:.0}%", frac * 100.0)));
-            ui.ctx().request_repaint();
-            if ui.button("Cancel analysis").clicked() {
-                self.cancel_job();
-                self.note = "Analysis cancelled".into();
-            }
-        } else {
-            let label = if self.input.is_some() { "Analyze again" } else { "Analyze" };
-            ui.horizontal(|ui| {
-                if ui.button(label).on_hover_text("Take the surface shown and work out every collapse once; the sliders then decimate it live").clicked() {
-                    self.analyze(mode);
+        section(ui, fs, "decimate_source", "SOURCE", |ui| {
+            if let Some(j) = self.job.as_ref() {
+                let what = if self.current.is_some() { format!("Building evenness {:.2}", evenness_of(j.key)) } else { "Analysing".to_string() };
+                let frac = j.progress.fraction();
+                ui.add(egui::ProgressBar::new(frac).desired_height(18.0).text(RichText::new(format!("{what}…  {:.0}%", frac * 100.0)).small()));
+                ui.ctx().request_repaint();
+                ui.add_space(2.0);
+                if ui.add(egui::Button::new("Cancel analysis").min_size(egui::vec2(0.0, BUTTON_H))).clicked() {
+                    self.cancel_job();
+                    self.note = "Analysis cancelled".into();
                 }
-                let r = ui.checkbox(&mut self.freeze_borders, "Freeze borders").on_hover_text("Keep every border vertex where it is (open meshes keep their outline). The volume's surface is closed, so it rarely matters.");
-                // The analyses were built with the other setting: build again at the evenness set.
-                if r.changed() && self.input.is_some() {
-                    self.cache.clear();
-                    // What is shown stays as a bridge only (no key matches it).
-                    if let Some(c) = self.current.as_mut() {
-                        c.0 = -1;
+            } else {
+                let label = if self.input.is_some() { "Analyze again" } else { "Analyze" };
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(label).min_size(egui::vec2(110.0, BUTTON_H)))
+                        .on_hover_text("Take the surface shown and work out every collapse once; the sliders then decimate it live")
+                        .clicked()
+                    {
+                        self.analyze(mode);
                     }
-                    self.start_job(key_of(self.evenness));
-                }
-            });
-        }
-        let Some((_, a)) = self.current.clone() else {
-            if !self.note.is_empty() {
-                ui.label(RichText::new(&self.note).small().color(weak));
+                    ui.add_space(6.0);
+                    let r = ui.checkbox(&mut self.freeze_borders, "Freeze borders").on_hover_text("Keep every border vertex where it is (open meshes keep their outline). The volume's surface is closed, so it rarely matters.");
+                    // The analyses were built with the other setting: build again at the evenness set.
+                    if r.changed() && self.input.is_some() {
+                        self.cache.clear();
+                        // What is shown stays as a bridge only (no key matches it).
+                        if let Some(c) = self.current.as_mut() {
+                            c.0 = -1;
+                        }
+                        self.start_job(key_of(self.evenness));
+                    }
+                });
             }
+            if self.current.is_none() {
+                note(ui, &self.note);
+            }
+        });
+        let Some((_, a)) = self.current.clone() else {
             return;
         };
-        ui.separator();
 
         // The target: triangles or a share kept.
         let (input, floor) = (a.input_triangles(), a.min_triangles());
         let shown = self.result.as_ref().map_or(0, |r| r.triangles.len());
+        section(ui, fs, "decimate_target", "TARGET", |ui| self.target_rows(ui, input, floor, shown));
+        section(ui, fs, "decimate_display", "DISPLAY", |ui| self.display_rows(ui, shown));
+        section(ui, fs, "decimate_preview", "RENDER PREVIEW", |ui| self.preview_rows(ui));
+        section(ui, fs, "decimate_result", "RESULT", |ui| self.result_rows(ui, &a, input));
+
+        // Export and close.
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(2.0);
+        let out = self.result.as_ref().map_or(0, |r| r.triangles.len());
+        ui.horizontal(|ui| {
+            if ui.add_enabled(out > 0, egui::Button::new(RichText::new("Export OBJ…").strong()).min_size(egui::vec2(110.0, BUTTON_H))).clicked() {
+                self.export = Some(self.export.clone().unwrap_or_else(|| "decimated.obj".into()));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new("Close").min_size(egui::vec2(70.0, BUTTON_H))).on_hover_text("Drop the preview and show the volume again").clicked() {
+                    self.open = false;
+                }
+            });
+        });
+    }
+
+    /// The target (a share kept or a triangle count) and evenness.
+    fn target_rows(&mut self, ui: &mut Ui, input: usize, floor: usize, shown: usize) {
         let mut by_count = self.by_count;
-        prop(ui, "Target", |ui| {
+        prop(ui, "Count by", |ui| {
             ui.selectable_value(&mut by_count, false, "% kept");
             ui.selectable_value(&mut by_count, true, "Triangles");
         });
@@ -695,14 +734,17 @@ impl Decimate {
             self.refresh(true, true);
         }
 
-        // Evenness.
-        let r = prop(ui, "Even triangles", |ui| ui.add(egui::Slider::new(&mut self.evenness, 0.0..=1.0).max_decimals(2)))
+        let r = prop(ui, "Evenness", |ui| ui.add(egui::Slider::new(&mut self.evenness, 0.0..=1.0).max_decimals(2)))
             .on_hover_text("0 keeps detail where the shape bends (fewer triangles where it is flat); 1 evens the triangles out. Dragging relaxes the result live; letting go builds the analysis at this evenness (kept for next time).");
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
             self.evenness_released();
         } else if r.changed() {
             self.refresh(false, true);
         }
+    }
+
+    /// What the viewport shows: the output or its source, wireframe, bad triangles.
+    fn display_rows(&mut self, ui: &mut Ui, shown: usize) {
         let src = self.input.as_ref().map_or(0, |m| m.triangles.len());
         let mut show_source = self.show_source;
         prop(ui, "Show", |ui| {
@@ -715,29 +757,39 @@ impl Decimate {
             self.show_source = show_source;
             self.gpu_dirty = true;
         }
-        prop(ui, "Wireframe", |ui| ui.checkbox(&mut self.wire, ""));
-        let label = if self.result.is_some() { format!("{} found", fmt_count(self.bad_count)) } else { String::new() };
-        if prop(ui, "Bad triangles", |ui| ui.checkbox(&mut self.show_bad, label))
-            .on_hover_text("Tint red the output's triangles with an angle under 10° or an edge under a tenth of the mean (knots); not shown on the tessellated preview")
-            .changed()
-        {
+        prop(ui, "", |ui| ui.checkbox(&mut self.wire, "Wireframe"));
+        let weak = ui.visuals().weak_text_color();
+        let r = prop(ui, "", |ui| {
+            let r = ui.checkbox(&mut self.show_bad, "Bad triangles");
+            if self.result.is_some() {
+                let found = RichText::new(format!("{} found", fmt_count(self.bad_count))).small();
+                ui.label(if self.bad_count > 0 && self.show_bad { found.color(egui::Color32::from_rgb(230, 110, 100)) } else { found.color(weak) });
+            }
+            r
+        });
+        if r.on_hover_text("Tint red the output's triangles with an angle under 10° or an edge under a tenth of the mean (knots); not shown on the tessellated preview").changed() {
             self.gpu_dirty = true;
         }
+    }
 
-        // Tessellate + displace preview.
-        ui.separator();
-        let r = ui.checkbox(&mut self.displace, "Tessellate + displace preview").on_hover_text(
+    /// Tessellate + displace and the normal map: roughly how the asset renders.
+    fn preview_rows(&mut self, ui: &mut Ui) {
+        let weak = ui.visuals().weak_text_color();
+        let r = prop(ui, "", |ui| ui.checkbox(&mut self.displace, "Tessellate + displace")).on_hover_text(
             "Quick UVs on the output, a height map baked from the input, and the output split and displaced by it: roughly how the asset looks rendered with displacement",
         );
-        let r2 = ui.checkbox(&mut self.nmap, "Normal map").on_hover_text("Shade from a normal map baked from the input (on the tessellated mesh, or on the output when tessellation is off)");
+        let r2 = prop(ui, "", |ui| ui.checkbox(&mut self.nmap, "Normal map"))
+            .on_hover_text("Shade from a normal map baked from the input (on the tessellated mesh, or on the output when tessellation is off)");
         if r.changed() || r2.changed() {
             self.preview(false);
         }
         if self.displace || self.nmap {
+            ui.add_space(2.0);
             let r = ui.add_enabled_ui(self.displace, |ui| prop(ui, "Level", |ui| ui.add(egui::Slider::new(&mut self.level, 1..=32))).on_hover_text("Each triangle is split level × level")).inner;
             let r2 = ui.add_enabled_ui(self.displace, |ui| prop(ui, "Strength", |ui| ui.add(egui::Slider::new(&mut self.strength, 0.0..=2.0).max_decimals(2)))).inner;
             let mut res = self.map_res;
             prop(ui, "Map size", |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
                 for s in MAP_SIZES {
                     ui.selectable_value(&mut res, s, if s >= 1024 { format!("{}K", s / 1024) } else { s.to_string() });
                 }
@@ -749,57 +801,50 @@ impl Decimate {
             } else if r.drag_stopped() || r2.drag_stopped() || res_changed {
                 self.preview(false);
             }
-            ui.label(RichText::new(&self.tess_note).small().color(weak));
+            if !self.tess_note.is_empty() {
+                ui.add(egui::Label::new(RichText::new(&self.tess_note).small().color(weak)).wrap());
+            }
         }
+    }
 
-        // What came out.
-        ui.separator();
+    /// What came out: counts, the mesh's shape and error, then the timings.
+    fn result_rows(&mut self, ui: &mut Ui, a: &Analysis, input: usize) {
+        let weak = ui.visuals().weak_text_color();
         let out = self.result.as_ref().map_or(0, |r| r.triangles.len());
-        ui.label(format!("Input {} triangles ({}), output {} ({:.2}%)", fmt_count(input), self.input_from, fmt_count(out), 100.0 * out as f64 / input.max(1) as f64));
-        let measured = self.measured.as_ref().filter(|m| m.0 == self.generation);
-        match measured {
+        stat(ui, "Input", RichText::new(fmt_count(input)).strong(), Some(&format!("triangles · {}", self.input_from)));
+        stat(ui, "Output", RichText::new(fmt_count(out)).strong(), Some(&format!("triangles · {:.2}%", 100.0 * out as f64 / input.max(1) as f64)));
+        match self.measured.as_ref().filter(|m| m.0 == self.generation) {
             Some((_, report, err, _)) => {
                 let shape = match (report.closed(), report.manifold()) {
-                    (true, true) => "closed, manifold".to_string(),
-                    (false, true) => format!("manifold, {} border edges", fmt_count(report.border_edges)),
-                    _ => format!("not manifold: {} edges, {} vertices", fmt_count(report.nonmanifold_edges), fmt_count(report.nonmanifold_vertices)),
+                    (true, true) => "Closed, manifold".to_string(),
+                    (false, true) => format!("Manifold, {} border edges", fmt_count(report.border_edges)),
+                    _ => format!("Not manifold: {} edges, {} vertices", fmt_count(report.nonmanifold_edges), fmt_count(report.nonmanifold_vertices)),
                 };
-                ui.label(format!("{shape}  ·  error mean {:.3}%, max {:.3}% of the diagonal", err.mean_rel() * 100.0, err.max_rel() * 100.0));
+                stat(ui, "Surface", RichText::new(shape), None);
+                stat(ui, "Error", RichText::new(format!("{:.3}% mean  ·  {:.3}% max", err.mean_rel() * 100.0, err.max_rel() * 100.0)), None)
+                    .on_hover_text("Distance from the input, as a share of its bounding box diagonal");
             }
             None if self.check.is_some() => {
-                ui.label(RichText::new("Measuring…").color(weak));
+                stat(ui, "Surface", RichText::new("Measuring…").color(weak), None);
             }
             None => {
-                ui.label(RichText::new("Measured when the slider is let go").color(weak));
+                stat(ui, "Surface", RichText::new("Measured when the slider is let go").color(weak), None);
             }
-        }
-        let relaxed = if self.relax_ms > 0.05 { format!(" + relax {:.1} ms", self.relax_ms) } else { String::new() };
-        ui.label(
-            RichText::new(format!(
-                "Analysis at {:.2}: {:.0} ms ({} rounds){}  ·  extract {:.1} ms{relaxed}  ·  surface taken in {:.0} ms",
-                a.evenness(),
-                a.stats.ms,
-                a.stats.rounds,
-                if key_of(self.evenness) != key_of(a.evenness()) { ", relaxed toward the evenness set until its own is built" } else { "" },
-                self.extract_ms,
-                self.input_ms
-            ))
-            .small()
-            .color(weak),
-        );
-        if !self.note.is_empty() {
-            ui.label(RichText::new(&self.note).small().color(weak));
         }
 
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(out > 0, egui::Button::new("Export OBJ…")).clicked() {
-                self.export = Some(self.export.clone().unwrap_or_else(|| "decimated.obj".into()));
-            }
-            if ui.button("Close").on_hover_text("Drop the preview and show the volume again").clicked() {
-                self.open = false;
-            }
-        });
+        // Timings, quieter.
+        ui.add_space(4.0);
+        let relaxed = if self.relax_ms > 0.05 { format!(" + relax {:.1} ms", self.relax_ms) } else { String::new() };
+        let lag = if key_of(self.evenness) != key_of(a.evenness()) { "  (relaxed toward the evenness set until its own is built)" } else { "" };
+        let small = |ui: &mut Ui, s: String| {
+            ui.add(egui::Label::new(RichText::new(s).small().color(weak)).wrap());
+        };
+        small(ui, format!("Analysis at {:.2}: {:.0} ms, {} rounds{lag}", a.evenness(), a.stats.ms, a.stats.rounds));
+        small(ui, format!("Extract {:.1} ms{relaxed}  ·  surface taken in {:.0} ms", self.extract_ms, self.input_ms));
+        if !self.note.is_empty() {
+            ui.add_space(2.0);
+            small(ui, self.note.clone());
+        }
     }
 
     /// The export dialog (a path, as the app's Open and Save As take one).
@@ -807,14 +852,15 @@ impl Decimate {
         let path = self.export.as_mut()?;
         let (mut ok, mut cancel) = (false, false);
         egui::Window::new("Export decimated mesh (.obj)").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label("Path:");
+            ui.label(RichText::new("Path").small().color(ui.visuals().weak_text_color()));
             let r = ui.add(egui::TextEdit::singleline(path).desired_width(380.0));
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 ok = true;
             }
-            ui.horizontal(|ui| {
-                ok |= ui.button("OK").clicked();
-                cancel = ui.button("Cancel").clicked();
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(egui::vec2(380.0, BUTTON_H), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                cancel = ui.add(egui::Button::new("Cancel").min_size(egui::vec2(70.0, BUTTON_H))).clicked();
+                ok |= ui.add(egui::Button::new(RichText::new("Export").strong()).min_size(egui::vec2(70.0, BUTTON_H))).clicked();
             });
         });
         if ok {
@@ -830,6 +876,17 @@ impl Decimate {
         }
         None
     }
+}
+
+/// A result row: the label column, a value, and a quieter unit after it.
+fn stat(ui: &mut Ui, label: &str, value: RichText, unit: Option<&str>) -> egui::Response {
+    prop(ui, label, |ui| {
+        let r = ui.label(value);
+        if let Some(u) = unit {
+            ui.label(RichText::new(u).small().color(ui.visuals().weak_text_color()));
+        }
+        r
+    })
 }
 
 fn mean_edge(m: &TriMesh) -> f32 {
@@ -883,7 +940,7 @@ pub fn window(app: &mut SculptApp, ui: &mut Ui) {
                     });
                     let (d, mode) = (&mut app.decimate, &mut app.volume);
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
                             // Fixed: sizing from the available width would feed back into the panel's width.
                             ui.spacing_mut().slider_width = 150.0;
                             d.controls(ui, mode);
