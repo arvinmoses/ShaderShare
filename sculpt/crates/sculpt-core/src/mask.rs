@@ -292,6 +292,34 @@ impl SourceValues {
         Ok(SourceValues(out))
     }
 
+    /// Hold the values of exactly the sources of `stacks` that read no channel: those held already are kept, missing
+    /// ones worked out, and any no stack reads let go. (Values of a different mesh's size are worked out again.)
+    pub fn keep_only(&mut self, stacks: &[MaskStack], ctx: &MaskContext) -> Result<()> {
+        let mut want: Vec<MaskSource> = Vec::new();
+        for s in stacks.iter().filter(|s| s.enabled) {
+            s.free_sources(&mut want);
+        }
+        let n = ctx.positions.len();
+        self.0.retain(|(s, v)| v.len() == n && want.contains(s));
+        for src in want {
+            if self.get(&src).is_some() || (matches!(src, MaskSource::Direction { .. }) && ctx.normals.len() != n) {
+                continue;
+            }
+            let v = evaluate_source(&src, ctx)?;
+            self.0.push((src, std::sync::Arc::new(v)));
+        }
+        Ok(())
+    }
+
+    /// Hold also the values `other` holds for a mesh of `n` vertices that these do not (shared, not copied).
+    pub fn adopt(&mut self, other: &SourceValues, n: usize) {
+        for (s, v) in &other.0 {
+            if v.len() == n && self.get(s).is_none() {
+                self.0.push((s.clone(), v.clone()));
+            }
+        }
+    }
+
     fn get(&self, src: &MaskSource) -> Option<&[f32]> {
         self.0.iter().find(|(s, _)| s == src).map(|(_, v)| v.as_slice())
     }
@@ -349,6 +377,71 @@ pub fn evaluate_with(stack: &MaskStack, ctx: &MaskContext, pre: &SourceValues) -
         });
     }
     Ok(out)
+}
+
+impl MaskStack {
+    /// Whether a vertex's value depends only on that vertex's own sources (nothing blurred, nested masks too), so it
+    /// can be worked out for some vertices alone ([`evaluate_vertices`]).
+    pub fn is_local(&self) -> bool {
+        self.layers.iter().filter(|l| l.enabled && l.opacity > 0.0).all(|l| l.blur == 0 && l.mask.as_ref().is_none_or(|m| m.is_local()))
+    }
+}
+
+/// [`evaluate_with`] at `verts` only (bit for bit what it gives there), for a stack that [`MaskStack::is_local`].
+pub fn evaluate_vertices(stack: &MaskStack, ctx: &MaskContext, pre: &SourceValues, verts: &[u32]) -> Result<Vec<f32>> {
+    debug_assert!(stack.is_local());
+    let n = ctx.positions.len();
+    let mut out = vec![stack.base.clamp(0.0, 1.0); verts.len()];
+    for layer in stack.layers.iter().filter(|l| l.enabled && l.opacity > 0.0) {
+        let src: Vec<f32> = match pre.get(&layer.source).filter(|v| v.len() == n) {
+            Some(v) => verts.par_iter().map(|&i| v[i as usize]).collect(),
+            None => source_at(&layer.source, ctx, verts)?,
+        };
+        let opacity = match &layer.mask {
+            Some(m) => Some(evaluate_vertices(m, ctx, pre, verts)?),
+            None => None,
+        };
+        out.par_iter_mut().enumerate().for_each(|(j, a)| {
+            let mut b = layer.levels.apply(src[j]);
+            if layer.invert {
+                b = 1.0 - b;
+            }
+            let o = layer.opacity * opacity.as_ref().map_or(1.0, |m| m[j]);
+            let blended = layer.blend.blend(*a, b);
+            *a = (*a + (blended - *a) * o).clamp(0.0, 1.0);
+        });
+    }
+    Ok(out)
+}
+
+/// [`evaluate_source`] at `verts` only.
+fn source_at(src: &MaskSource, ctx: &MaskContext, verts: &[u32]) -> Result<Vec<f32>> {
+    let n = ctx.positions.len();
+    let channel = |name: &str| -> Result<Vec<f32>> {
+        let c = ctx.channels.get(name).ok_or_else(|| Error::MissingChannel(name.to_string()))?;
+        if c.len() != n {
+            return Err(Error::MissingChannel(format!("{name} has {} values, mesh has {n}", c.len())));
+        }
+        Ok(verts.iter().map(|&i| c[i as usize]).collect())
+    };
+    Ok(match src {
+        MaskSource::Fill { value } => vec![value.clamp(0.0, 1.0); verts.len()],
+        MaskSource::Channel { name } => channel(name)?,
+        MaskSource::Mesh { attribute } => channel(attribute.channel_name())?,
+        MaskSource::Noise(params) => {
+            let noise = Noise::new(params);
+            verts.par_iter().map(|&i| noise.sample(ctx.positions[i as usize])).collect()
+        }
+        MaskSource::Direction { axis, sharpness } => {
+            let a = axis.normalize_or(Vec3::Y);
+            verts.par_iter().map(|&i| ctx.normals[i as usize].dot(a).clamp(0.0, 1.0).powf(sharpness.max(1e-3))).collect()
+        }
+        MaskSource::Gradient { axis, from, to } => {
+            let a = axis.normalize_or(Vec3::Y);
+            let span = if (to - from).abs() < 1e-9 { 1e-9 } else { to - from };
+            verts.par_iter().map(|&i| ((ctx.positions[i as usize].dot(a) - from) / span).clamp(0.0, 1.0)).collect()
+        }
+    })
 }
 
 fn evaluate_source(src: &MaskSource, ctx: &MaskContext) -> Result<Vec<f32>> {

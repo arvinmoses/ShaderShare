@@ -657,15 +657,23 @@ impl VolumeGen {
             .collect();
         boxes.par_sort_unstable_by_key(|c| (c.z, c.y, c.x));
         boxes.dedup();
-        if l == 0 {
-            return boxes.into_iter().collect();
-        }
         let out = boxes;
         let half = 0.5 * 3f32.sqrt() * size;
+        // Level 0 keeps its blocks out to its band past the surface, as `LevelVolume::from_field` makes them; blocks
+        // inside an instance are composed too (shown as wholly inside, see `put_shown_in`), with the form's own under
+        // one. The rest of an instance's box is far outside it: most of a big instance's box, a million blocks or more.
+        let reach0 = half + pad + band;
         let keep = |bc: &IVec3| -> bool {
+            if l == 0 && form.exists(0, *bc) {
+                return true;
+            }
             let lo = origin + (*bc * B).as_vec3() * v;
             let c = lo + Vec3::splat(0.5 * size);
             let mut near = Vec::new();
+            if l == 0 {
+                self.near(lo, lo + Vec3::splat(size), reach0, &mut near);
+                return near.iter().any(|&i| self.set.sdf(i, c) <= reach0);
+            }
             self.near(lo, lo + Vec3::splat(size), pad, &mut near);
             near.iter().any(|&i| self.set.sdf(i, c).abs() <= half + pad)
         };

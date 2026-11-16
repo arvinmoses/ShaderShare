@@ -455,3 +455,81 @@ fn c0e_refresh_painted_masks_shows_a_mask_stroke_while_open() {
     assert_ne!(live, before, "the refresh did not show the stroke");
     assert_eq!(live, ended, "the refresh is not what the stroke's end gives");
 }
+
+/// Probe (by hand): what a mask dab's live refresh costs on a big mesh with a painted and a noise mask, the layer
+/// holding something everywhere. `PROBE_VOXEL` sets the ball's step (0.0007 is about 13M triangles).
+#[test]
+#[ignore]
+fn probe_paint_over_noise_mask() {
+    let voxel: f32 = std::env::var("PROBE_VOXEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0007);
+    let t = std::time::Instant::now();
+    let vol = ball(voxel, 1, R);
+    let mut ml = MeshLayers::from_volume(&vol, MeshLayerSettings::default()).unwrap();
+    let tris = ml.doc.face_count() * 2;
+    eprintln!("built {} vertices, ~{} triangles in {:.1} s", ml.doc.vertex_count(), tris, t.elapsed().as_secs_f64());
+    let step = ml.step();
+    let id = fill_layer(&mut ml.doc, "bumps", |doc, v| doc.normals()[v].normalize_or_zero() * (0.5 * step * noise(doc.base_positions()[v])));
+    let stack = MaskStack::new(1.0)
+        .with(MaskLayer::new("paint", MaskSource::Channel { name: "paint.p".into() }).blend(BlendMode::Multiply))
+        .with(MaskLayer::new("noise", MaskSource::Noise(NoiseParams::default())).blend(BlendMode::Multiply).opacity(0.5));
+    ml.doc.set_channel("paint.p", vec![1.0; ml.doc.vertex_count()]).unwrap();
+    ml.doc.set_layer_mask(id, Some(stack)).unwrap();
+    fresh(&mut ml.doc);
+    ml.doc.begin_stroke("Paint");
+    let mut dab = Vec::new();
+    let mut refresh = Vec::new();
+    for i in 0..20 {
+        let x = -0.2 + 0.02 * i as f32;
+        let h = ml.doc.raycast(&Ray::new(Vec3::new(x, 0.0, 3.0), -Vec3::Z)).unwrap();
+        let t = std::time::Instant::now();
+        ml.doc.paint(&PaintTarget::Channel("paint.p".into()), h.point, 0.05, &Falloff::default(), 0.8, 0.0, None);
+        dab.push(t.elapsed().as_secs_f64() * 1e3);
+        let t = std::time::Instant::now();
+        ml.doc.refresh_painted_masks().unwrap();
+        refresh.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    let t = std::time::Instant::now();
+    ml.doc.end_stroke();
+    let end = t.elapsed().as_secs_f64() * 1e3;
+    let stack = ml.doc.layer(id).unwrap().mask.clone().unwrap();
+    let t = std::time::Instant::now();
+    let _ = ml.doc.evaluate_mask(&stack).unwrap();
+    let old_weigh = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
+    fresh(&mut ml.doc);
+    let old_comp = t.elapsed().as_secs_f64() * 1e3 / 2.0;
+    eprintln!("as before: weighing the whole mask {old_weigh:.0} ms + recompositing the layer {old_comp:.0} ms, per refresh");
+    let med = |v: &mut Vec<f64>| { v.sort_by(f64::total_cmp); v[v.len() / 2] };
+    eprintln!("paint dab median {:.2} ms; live refresh median {:.1} ms, worst {:.1}; stroke end {end:.1} ms", med(&mut dab), med(&mut refresh.clone()), refresh.iter().cloned().fold(0.0, f64::max));
+}
+
+/// A mask dab weighs the mask again only where it painted: bit for bit what weighing the whole mask gives, with the
+/// noise in the stack, after several dabs, at the stroke's end, and after undoing it.
+#[test]
+fn a_painted_mask_reweighed_where_painted_matches_the_whole() {
+    let (_vol, mut ml, id) = c0c_scene();
+    let whole = |ml: &mut MeshLayers| {
+        let stack = ml.doc.layer(id).unwrap().mask.clone().unwrap();
+        ml.doc.mask_values_for(&stack).unwrap().unwrap()
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let before = ml.doc.layer(id).unwrap().mask_values().unwrap().to_vec();
+    ml.doc.begin_stroke("Paint");
+    for i in 0..4 {
+        let h = ml.doc.raycast(&Ray::new(Vec3::new(0.02 * i as f32, 0.03, 3.0), -Vec3::Z)).unwrap();
+        ml.doc.paint(&PaintTarget::Channel("paint.half".into()), h.point, 0.08, &Falloff::default(), 0.8, 0.0, None);
+        ml.doc.refresh_painted_masks().unwrap();
+        let live = ml.doc.layer(id).unwrap().mask_values().unwrap().to_vec();
+        assert_eq!(bits(&live), bits(&whole(&mut ml)), "dab {i}: weighed where painted differs from the whole");
+    }
+    ml.doc.end_stroke();
+    let ended = ml.doc.layer(id).unwrap().mask_values().unwrap().to_vec();
+    assert_ne!(ended, before);
+    assert_eq!(bits(&ended), bits(&whole(&mut ml)));
+    let composite = ml.doc.positions().to_vec();
+    fresh(&mut ml.doc);
+    assert_eq!(bits(&composite.iter().flat_map(|p| p.to_array()).collect::<Vec<_>>()), bits(&ml.doc.positions().iter().flat_map(|p| p.to_array()).collect::<Vec<_>>()), "the composite was left stale");
+    assert!(ml.doc.undo());
+    let undone = ml.doc.layer(id).unwrap().mask_values().unwrap().to_vec();
+    assert_eq!(bits(&undone), bits(&before), "undo did not bring the mask back");
+}

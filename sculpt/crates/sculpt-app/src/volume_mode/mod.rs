@@ -210,6 +210,8 @@ pub struct VolumeMode {
     /// of its parameters is under way.
     pub generator_ms: f64,
     pub generator_full_ms: f64,
+    /// Why the last generator edit was refused (too many blocks for the volume), if it was.
+    pub generator_note: Option<String>,
     generator_edit: bool,
     /// A generator being composed at its own level on another thread (its preview shown meanwhile).
     gen_job: Option<Receiver<GenDone>>,
@@ -349,6 +351,7 @@ impl VolumeMode {
             budget_m: 6.0,
             generator_ms: 0.0,
             generator_full_ms: 0.0,
+            generator_note: None,
             generator_edit: false,
             gen_job: None,
             gpu_plan: None,
@@ -1135,10 +1138,19 @@ impl VolumeMode {
         // the frames going on meanwhile.
         let t = Instant::now();
         // At its own level on the GPU where the stack lets it; else no finer than level 1 here.
+        layer.refused = None;
         match layer.gpu_generator(&mut self.vol, k, spec) {
             Some(plan) => self.gpu_plan = Some(plan),
+            None if layer.refused.is_some() => {}
             None => layer.preview_generator(&mut self.vol, k, spec),
         }
+        self.generator_note = layer.refused.take().map(|need| {
+            format!(
+                "Too big for this volume: it would need about {:.1}M blocks, and the most is {:.1}M. Lower the size or the count.",
+                need as f64 / 1e6,
+                layer.block_budget as f64 / 1e6
+            )
+        });
         self.generator_ms = ms(t);
         if !dragging {
             self.end_generator_edit();

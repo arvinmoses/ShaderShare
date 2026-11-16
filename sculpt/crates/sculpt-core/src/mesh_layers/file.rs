@@ -226,6 +226,7 @@ impl MeshLayers {
         }
         doc.recomposite_all();
         doc.dirty_channels.clear();
+        doc.painted_leaves.clear();
         doc.undo.clear();
         Ok((out, lost))
     }

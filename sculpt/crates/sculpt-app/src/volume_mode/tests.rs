@@ -996,7 +996,12 @@ fn shown_as_afresh(mode: &VolumeMode, what: &str) {
     let (mut live, mut fresh) = (mode.vol.keys(), afresh.keys());
     live.sort_by_key(|k| (k.0, k.1.to_array()));
     fresh.sort_by_key(|k| (k.0, k.1.to_array()));
-    assert!(live == fresh, "{what}: shown holds other blocks than composed afresh: {} against {}", live.len(), fresh.len());
+    if live != fresh {
+        let (a, b): (std::collections::HashSet<_>, std::collections::HashSet<_>) = (live.iter().copied().collect(), fresh.iter().copied().collect());
+        let only_live: Vec<_> = a.difference(&b).take(8).map(|k| (*k, mode.layer.as_ref().unwrap().form().exists(k.0 as usize, k.1), mode.vol.block(*k).map(|s| (s.iter().cloned().fold(f32::MAX, f32::min), s.iter().cloned().fold(f32::MIN, f32::max))))).collect();
+        let only_fresh: Vec<_> = b.difference(&a).take(8).collect();
+        panic!("{what}: shown holds other blocks than composed afresh: {} against {}; only shown (key, in form, min/max) {only_live:?}; only afresh {only_fresh:?}; band0 {}", live.len(), fresh.len(), mode.vol.band(0));
+    }
     let round0 = 2.0 * mode.vol.band(0) / 32767.0;
     for &key in &live {
         let a = mode.vol.block(key).unwrap().iter().zip(afresh.block(key).unwrap().iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -1420,4 +1425,126 @@ fn a_close_trim_leaves_no_stripes() {
     eprintln!("ripple over the close trim's end: {rms:.4} of a step (rms, {cnt} points)");
     // 0.013 blended from the bound.
     assert!(rms < 0.009, "the close trim's surface ripples by {rms:.4} of a step");
+}
+
+/// Probe (by hand): a generator on the 13M ball with its size stepped up to the slider's top, the blocks each level
+/// holds after each size lands, and how long it took.
+#[test]
+#[ignore]
+fn big_generator_sizes_probe() {
+    let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(13.2e6), OPEN_LEVELS));
+    mode.add_generator();
+    let k = mode.layer.as_ref().unwrap().active();
+    let spec0 = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+    let levels = mode.vol.levels();
+    eprintln!("layer level {}  size {:.3}", mode.layer.as_ref().unwrap().layers()[k].level, spec0.size);
+    for size in [0.08f32, 0.12, 0.18, 0.25, 0.35, 0.5] {
+        let mut spec = spec0.clone();
+        spec.size = size;
+        spec.min_spacing = 3.0 * size;
+        let t = Instant::now();
+        mode.set_generator(k, &spec, false);
+        while mode.busy() && t.elapsed().as_secs() < 600 {
+            mode.tick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let per: Vec<usize> = (0..levels).map(|l| mode.vol.level_len(l)).collect();
+        eprintln!("size {size:.2}: {:.1} s, blocks per level {per:?}, total {}", t.elapsed().as_secs_f64(), per.iter().sum::<usize>());
+    }
+}
+
+/// Wait out the generator jobs (at most a minute).
+fn generator_landed(mode: &mut VolumeMode) {
+    let t = Instant::now();
+    while mode.busy() && t.elapsed().as_secs() < 60 {
+        mode.tick();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(!mode.busy(), "the generator never landed");
+}
+
+/// Rocks at the Size slider's top on a fine ball: only the blocks near their surfaces are kept with samples (their
+/// boxes were all kept once, a million blocks and a crash); inside them reads inside, past them outside, and what is
+/// shown is what composing afresh gives.
+#[test]
+fn big_rocks_keep_blocks_near_their_surface_only() {
+    let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(4e6), OPEN_LEVELS));
+    let ball: usize = (0..mode.vol.levels()).map(|l| mode.vol.level_len(l)).sum();
+    mode.add_generator();
+    let k = mode.layer.as_ref().unwrap().active();
+    let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+    spec.size = 0.5;
+    spec.min_spacing = 1.5;
+    spec.size_var = 0.0;
+    spec.stretch_var = 0.0;
+    mode.set_generator(k, &spec, false);
+    generator_landed(&mut mode);
+    assert!(mode.generator_note.is_none(), "refused: {:?}", mode.generator_note);
+    let layer = mode.layer.as_ref().unwrap();
+    assert_eq!(layer.generator(k), Some(&spec));
+    let rocks = layer.generator_instances(k);
+    assert!(!rocks.is_empty());
+    let shown: usize = (0..mode.vol.levels()).map(|l| mode.vol.level_len(l)).sum();
+    // Each rock's box grown by its blend: what was kept before (a sphere's radius is its scale).
+    let step = mode.vol.voxel(0) * 8.0;
+    let boxes: f32 = rocks.iter().map(|r| (2.0 * r.scale.max_element() * (1.0 + spec.blend) / step).powi(3)).sum();
+    eprintln!("ball {ball} blocks; with {} rocks {shown} (their boxes {boxes:.0})", rocks.len());
+    assert!(((shown - ball) as f32) < 0.75 * boxes, "big rocks kept {} blocks, near their boxes' {boxes:.0}", shown - ball);
+    let block = |p: Vec3| ((p - mode.vol.origin()) / step).floor().as_ivec3();
+    let (mut checked, mut hollow) = (0, 0);
+    for r in &rocks {
+        let c = r.translation;
+        assert!(mode.vol.value(c) < 0.0, "a rock's centre reads outside");
+        // Inside it, past the ball's own band: read inside, held without samples somewhere.
+        for t in [0.3f32, 0.5, 0.7] {
+            let p = c + c.normalize() * t * r.scale.max_element();
+            assert!(mode.vol.value(p) < 0.0, "inside a rock reads outside");
+            if !mode.vol.exists(0, block(p)) {
+                hollow += 1;
+            }
+        }
+        // Its box's corners (grown by the blend): far outside it, unless the ball or another rock is near.
+        let rad = r.scale.max_element();
+        for q in 0..8 {
+            let d = Vec3::new(if q & 1 == 1 { 1.0 } else { -1.0 }, if q & 2 == 2 { 1.0 } else { -1.0 }, if q & 4 == 4 { 1.0 } else { -1.0 });
+            let p = c + d * rad * (1.0 + spec.blend);
+            let clear = (p.length() - 1.0).abs() > 0.3 && rocks.iter().all(|o| (p - o.translation).length() > o.scale.max_element() + 0.4);
+            if clear {
+                assert!(!mode.vol.exists(0, block(p)), "a block far outside a rock holds samples");
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0, "no box corner was clear to check");
+    assert!(hollow > 0, "every block inside the rocks holds samples");
+    shown_as_afresh(&mode, "big rocks");
+}
+
+/// An edit needing more blocks than the budget is refused with a note: the layer keeps its parameters and what is
+/// shown stays as it was; the next edit that fits clears the note.
+#[test]
+fn a_generator_edit_past_the_block_budget_is_refused() {
+    let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, 0.02, 5));
+    mode.add_generator();
+    generator_landed(&mut mode);
+    let k = mode.layer.as_ref().unwrap().active();
+    let before = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+    let shown: usize = (0..mode.vol.levels()).map(|l| mode.vol.level_len(l)).sum();
+    mode.layer.as_mut().unwrap().block_budget = shown + 200;
+    let undo = mode.layer.as_ref().unwrap().history_len();
+    let mut big = before.clone();
+    big.size = 0.5;
+    mode.set_generator(k, &big, false);
+    generator_landed(&mut mode);
+    assert!(mode.generator_note.as_deref().is_some_and(|n| n.contains("Too big")), "no note: {:?}", mode.generator_note);
+    assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&before), "the refused edit was taken");
+    assert_eq!(mode.layer.as_ref().unwrap().history_len(), undo, "the refused edit left an undo step");
+    shown_as_afresh(&mode, "refused");
+    let mut small = before.clone();
+    small.seed += 1;
+    mode.layer.as_mut().unwrap().block_budget = sculpt_core::generator::detail_layer::BLOCK_BUDGET;
+    mode.set_generator(k, &small, false);
+    generator_landed(&mut mode);
+    assert!(mode.generator_note.is_none());
+    assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&small));
 }

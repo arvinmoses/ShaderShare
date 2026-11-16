@@ -156,6 +156,12 @@ pub struct Document {
     /// Composite positions at stroke start, captured lazily per touched leaf.
     pub(crate) stroke_origin: Vec<Option<Box<[Vec3]>>>,
     pub(crate) dirty_channels: BTreeSet<String>,
+    /// Channels changed only in some leaves since the masks were last weighed (by painting, or undoing a paint), and
+    /// those leaves: the masks reading them are weighed again there alone. (A channel in `dirty_channels` counts whole.)
+    pub(crate) painted_leaves: BTreeMap<String, BTreeSet<u32>>,
+    /// The values of the layer masks' sources that read no channel (noise, direction, gradient), on the rest pose, kept
+    /// so a mask is weighed again without working them out again. Dropped when the rest pose changes.
+    mask_sources: mask::SourceValues,
     pub(crate) level: u32,
     /// Positions/normals changed (renderer upload tracking).
     pub(crate) geometry_dirty: DirtyTracker,
@@ -226,6 +232,8 @@ impl Document {
             undo: UndoStack::default(),
             stroke_origin: Vec::new(),
             dirty_channels: BTreeSet::new(),
+            painted_leaves: BTreeMap::new(),
+            mask_sources: Default::default(),
             level: 0,
             geometry_dirty: DirtyTracker::all(),
             scalar_dirty: DirtyTracker::all(),
@@ -270,6 +278,7 @@ impl Document {
     /// Make the current base mesh the new rest pose (re-anchors procedural masks).
     pub fn store_rest_pose(&mut self) -> Result<()> {
         self.rest = self.base.clone();
+        self.mask_sources = Default::default();
         self.refresh_layer_masks()
     }
     pub fn normals(&self) -> &[Vec3] {
@@ -557,18 +566,41 @@ impl Document {
     }
 
     fn refresh_dependent_masks(&mut self) -> Result<()> {
-        if self.dirty_channels.is_empty() {
+        if self.dirty_channels.is_empty() && self.painted_leaves.is_empty() {
             return Ok(());
         }
-        let dirty = std::mem::take(&mut self.dirty_channels);
+        let painted = std::mem::take(&mut self.painted_leaves);
+        let whole = std::mem::take(&mut self.dirty_channels);
+        let mut dirty = whole.clone();
+        dirty.extend(painted.keys().cloned());
         let mut leaves = BTreeSet::new();
+        let n = self.vertex_count();
         for i in 0..self.layers.len() {
             let Some(stack) = self.layers[i].mask.clone() else { continue };
             let mut used = Vec::new();
             stack.channels(&mut used);
-            if used.iter().any(|c| dirty.contains(c)) {
+            if !used.iter().any(|c| dirty.contains(c)) {
+                continue;
+            }
+            // Painted in some leaves only, and each vertex's weight its own: weighed again in those leaves alone.
+            let partial = !used.iter().any(|c| whole.contains(c))
+                && stack.enabled
+                && stack.is_local()
+                && self.layers[i].mask_values.as_ref().is_some_and(|m| m.len() == n);
+            if partial {
+                let mut at: BTreeSet<u32> = BTreeSet::new();
+                for c in &used {
+                    if let Some(l) = painted.get(c) {
+                        at.extend(l);
+                    }
+                }
+                self.weigh_mask_at(i, &stack, &at)?;
+                let touched: BTreeSet<u32> = self.layers[i].touched_leaves().into_iter().collect();
+                leaves.extend(at.intersection(&touched));
+            } else {
                 self.scalar_dirty.mark_all();
-                let values = self.mask_values_for(&stack)?;
+                let pre = self.mask_sources_for(&stack)?;
+                let values = self.mask_values_with(&stack, &pre)?;
                 self.layers[i].mask_values = values;
                 leaves.extend(self.layers[i].touched_leaves());
             }
@@ -639,7 +671,9 @@ impl Document {
         if !stack.enabled {
             return Ok(None);
         }
-        self.evaluate_mask(stack).map(Some)
+        // (Its sources kept, so a mask stroke later weighs it again where it paints without working them out.)
+        let pre = self.mask_sources_for(stack)?;
+        self.evaluate_mask_with(stack, &pre).map(Some)
     }
 
     pub fn evaluate_mask(&mut self, stack: &MaskStack) -> Result<Vec<f32>> {
@@ -651,7 +685,40 @@ impl Document {
         if !stack.enabled {
             return Ok(None);
         }
+        self.mask_sources.adopt(pre, self.rest.len());
         self.evaluate_mask_with(stack, pre).map(Some)
+    }
+
+    /// The kept values of `stack`'s sources that read no channel, worked out now for those not kept yet; sources no
+    /// layer's mask reads any more are let go.
+    fn mask_sources_for(&mut self, stack: &MaskStack) -> Result<mask::SourceValues> {
+        let mut want: Vec<MaskStack> = self.layers.iter().filter_map(|l| l.mask.clone()).collect();
+        want.push(stack.clone());
+        let normals = if want.iter().any(|s| s.uses_normals()) { mesh::compute_normals(&self.rest, &self.faces, &self.topo) } else { Vec::new() };
+        let ctx = MaskContext { positions: &self.rest, normals: &normals, topology: &self.topo, channels: &self.channels };
+        self.mask_sources.keep_only(&want, &ctx)?;
+        Ok(self.mask_sources.clone())
+    }
+
+    /// Weigh layer `i`'s mask `stack` (one that [`MaskStack::is_local`]) again at the vertices of `leaves` alone.
+    fn weigh_mask_at(&mut self, i: usize, stack: &MaskStack, leaves: &BTreeSet<u32>) -> Result<()> {
+        let verts: Vec<u32> = leaves.iter().flat_map(|&l| self.bvh.leaves[l as usize].owned_range()).map(|v| v as u32).collect();
+        if verts.is_empty() {
+            return Ok(());
+        }
+        let pre = self.mask_sources_for(stack)?;
+        let normals = if pre.needs_normals(stack) { mesh::compute_normals(&self.rest, &self.faces, &self.topo) } else { Vec::new() };
+        let ctx = MaskContext { positions: &self.rest, normals: &normals, topology: &self.topo, channels: &self.channels };
+        let values = mask::evaluate_vertices(stack, &ctx, &pre, &verts)?;
+        let m = self.layers[i].mask_values.as_mut().expect("a weighed mask");
+        for (v, x) in verts.iter().zip(values) {
+            m[*v as usize] = x;
+        }
+        let nleaves = self.bvh.leaves.len();
+        for &l in leaves {
+            self.scalar_dirty.mark(l, nleaves);
+        }
+        Ok(())
     }
 
     fn evaluate_mask_with(&mut self, stack: &MaskStack, pre: &mask::SourceValues) -> Result<Vec<f32>> {
@@ -997,7 +1064,7 @@ impl Document {
         let values = match target {
             PaintTarget::Freeze => &mut self.freeze,
             PaintTarget::Channel(n) => {
-                self.dirty_channels.insert(n.clone());
+                self.painted_leaves.entry(n.clone()).or_default().extend(updates.iter().map(|(l, _)| *l));
                 self.channels.get_mut(n).unwrap()
             }
         };
@@ -1507,7 +1574,7 @@ impl Document {
                     let cur: Box<[f32]> = ch[r.clone()].into();
                     ch[r].copy_from_slice(&s);
                     self.scalar_dirty.mark(leaf, self.bvh.leaves.len());
-                    self.dirty_channels.insert(n.clone());
+                    self.painted_leaves.entry(n.clone()).or_default().insert(leaf);
                     undo::Data::Scalars(cur)
                 }
                 _ => unreachable!("undo record kind mismatch"),
@@ -1566,6 +1633,7 @@ impl Document {
         self.base = base;
         self.base_epoch += 1;
         self.rest = rest;
+        self.mask_sources = Default::default();
         self.positions = positions;
         self.normals = normals;
         self.topo = topo;
@@ -1645,6 +1713,7 @@ impl Document {
         doc.rebuild_generator_caches();
         doc.recomposite_all();
         doc.dirty_channels.clear();
+        doc.painted_leaves.clear();
         Ok(doc)
     }
 }

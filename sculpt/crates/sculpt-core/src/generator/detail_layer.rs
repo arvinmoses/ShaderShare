@@ -1144,7 +1144,15 @@ pub struct Layered {
     /// Blocks shown that the stroke's last follow composes besides its own: those of generator jobs a form stroke
     /// made stale.
     recompose: Vec<(usize, IVec3)>,
+    /// The most blocks a generator edit may leave shown and composing (what is shown plus the blocks it composes):
+    /// an edit past it is refused, the layer left as it was, and what it needed noted in `refused`.
+    pub block_budget: usize,
+    pub refused: Option<usize>,
 }
+
+/// The most blocks a generator edit may leave shown and composing, by default (the GPU draws about a million; this
+/// counts blocks composed wholly inside too, which are held without samples).
+pub const BLOCK_BUDGET: usize = 1_500_000;
 
 /// A follow to work out on another thread: copies of what it reads (see [`Layered::follow_take`]).
 pub struct FollowJob {
@@ -1595,6 +1603,9 @@ fn put_shown_in(stack: &[Layer], shown: &mut LevelVolume, mut blocks: Vec<(usize
     let mut parents = Vec::new();
     for (l, bc, s) in blocks {
         match s {
+            // (A level 0 block the form has not, composed wholly inside or outside, is held as the form holds one: no
+            // samples. The form's own stay as it holds them.)
+            Some(s) if l == 0 && !form.exists(0, bc) && shown.put_far0(bc, &s) => {}
             Some(s) => shown.put_stored(l, bc, s),
             None => shown.mirror(form, (l as u8, bc)),
         }
@@ -1772,6 +1783,8 @@ impl Layered {
             noise_epoch: 0,
             taken: None,
             recompose: Vec::new(),
+            block_budget: BLOCK_BUDGET,
+            refused: None,
         }
     }
 
@@ -2038,10 +2051,6 @@ impl Layered {
         if !self.gpu_can_join() {
             return None;
         }
-        if self.edit.is_none() && old.g.spec != *spec {
-            self.history.push(Undo::Layers(self.stack.clone(), self.active));
-            self.redo.clear();
-        }
         let log = std::env::var_os("SCULPT_JOIN_LOG").is_some();
         let t0 = std::time::Instant::now();
         let mut laps: Vec<(&str, f64)> = Vec::new();
@@ -2055,6 +2064,14 @@ impl Layered {
         lap("build");
         let mut part = GenPart::new(&self.form, built, own);
         lap("part");
+        if !self.fits(shown, &part) {
+            // (Refused: the caller's preview is refused the same way.)
+            return None;
+        }
+        if self.edit.is_none() && old.g.spec != *spec {
+            self.history.push(Undo::Layers(self.stack.clone(), self.active));
+            self.redo.clear();
+        }
         // Shown by the GPU: the job brings the field at its own level.
         part.upto = usize::MAX;
         self.stack[k].scatter = Some(part);
@@ -2221,16 +2238,33 @@ impl Layered {
         if old.g.spec == *spec && old.upto == upto {
             return;
         }
+        let mut part = GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), upto);
+        if !self.fits(shown, &part) {
+            return;
+        }
         if self.edit.is_none() && old.g.spec != *spec {
             self.history.push(Undo::Layers(self.stack.clone(), self.active));
             self.redo.clear();
         }
         let mut changes = self.stack[k].all_keys();
-        let mut part = GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), upto);
         part.upto = upto;
         self.stack[k].scatter = Some(part);
         changes.extend(self.stack[k].all_keys());
         self.compose(shown, &changes);
+    }
+
+    /// Whether a generator scatter `part` keeps what is shown plus the blocks it composes within the budget; if not,
+    /// noted in `refused`.
+    fn fits(&mut self, shown: &LevelVolume, part: &GenPart) -> bool {
+        let shown_n: usize = (0..shown.levels()).map(|l| shown.level_len(l)).sum();
+        // (Blocks it composes that are shown already are counted once; those composed wholly inside are counted
+        // though they end up held without samples, as composing them takes room for a moment.)
+        let need: usize = part.blocks.iter().enumerate().map(|(l, b)| b.par_iter().filter(|bc| !shown.exists(l, **bc)).count()).sum();
+        if shown_n + need > self.block_budget {
+            self.refused = Some(shown_n + need);
+            return false;
+        }
+        true
     }
 
     /// Remove layer `k`.

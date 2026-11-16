@@ -1436,6 +1436,29 @@ impl LevelVolume {
         }
     }
 
+    /// If level 0 block `bc`'s samples `s` are all at the band, inside or out, hold it as [`Self::from_field`] holds
+    /// such a block (wholly inside, or not at all) and return true; false (nothing done) otherwise, or while finer
+    /// blocks hang from it.
+    pub(crate) fn put_far0(&mut self, bc: IVec3, s: &[f32; N]) -> bool {
+        let band = self.band(0);
+        let inside = s[0] < 0.0;
+        if !s.iter().all(|&x| if inside { x <= -band } else { x >= band }) {
+            return false;
+        }
+        if self.levels() > 1 && (0..8).any(|q| self.blocks[1].contains_key(&(bc * 2 + IVec3::new(q & 1, (q >> 1) & 1, (q >> 2) & 1)))) {
+            return false;
+        }
+        self.keep((0, bc));
+        self.blocks[0].remove(&bc);
+        if inside {
+            self.inside0.insert(bc);
+        } else {
+            self.inside0.remove(&bc);
+        }
+        self.dirty.insert((0, bc));
+        true
+    }
+
     /// Make block `bc` of level `l` again from the coarser level, outside any stroke (a block held only as a parent,
     /// whose coarser level changed).
     pub(crate) fn refill(&mut self, l: usize, bc: IVec3) {

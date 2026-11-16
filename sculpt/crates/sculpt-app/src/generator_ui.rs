@@ -193,6 +193,9 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
             }
             Density::Even => {}
         }
+        if let Some(note) = &m.generator_note {
+            ui.label(RichText::new(note).small().color(ui.visuals().warn_fg_color));
+        }
         if placed < spec.count as usize {
             ui.label(RichText::new(format!("{placed} of {} placed: the places that take them are full or few.", spec.count)).small().color(weak));
         }

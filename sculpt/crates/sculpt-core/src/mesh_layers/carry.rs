@@ -374,6 +374,7 @@ pub(super) fn apply(old: &Document, old_keys: &[u64], mut new: Document, plan: &
     new.recomposite(&touched);
     let recomposite_ms = ms(t);
     new.dirty_channels.clear();
+    new.painted_leaves.clear();
     new.undo.clear();
     Ok((new, patch, recomposite_ms))
 }
@@ -515,6 +516,7 @@ fn restore_to(doc: &mut Document, patch: &Patch, to: &[u32]) -> Result<usize> {
         }
         doc.scalar_dirty.mark_all();
         doc.dirty_channels.clear();
+        doc.painted_leaves.clear();
     }
     let mut touched: Vec<u32> = touched.into_iter().collect();
     touched.sort_unstable();
