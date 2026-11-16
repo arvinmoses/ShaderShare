@@ -1548,3 +1548,33 @@ fn a_generator_edit_past_the_block_budget_is_refused() {
     assert!(mode.generator_note.is_none());
     assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&small));
 }
+
+/// A drag of the Size slider from its default to the top with every other setting at its default, frame by frame as
+/// the panel sends it, then let go: nothing panics and the edit lands or is refused with a note.
+#[test]
+#[ignore]
+fn probe_size_drag_to_top() {
+    let tris: f32 = std::env::var("PROBE_TRIS").ok().and_then(|s| s.parse().ok()).unwrap_or(13.2e6);
+    let mut mode = VolumeMode::new(LevelVolume::from_field(&|p: Vec3| p.length() - 1.0, 1.3, ball_voxel0(tris), OPEN_LEVELS));
+    mode.add_generator();
+    let k = mode.layer.as_ref().unwrap().active();
+    let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+    eprintln!("default spec {spec:?}");
+    let steps = 40;
+    let (a, b) = (spec.size.ln(), 0.5f32.ln());
+    for i in 1..=steps {
+        spec.size = (a + (b - a) * i as f32 / steps as f32).exp();
+        let t = Instant::now();
+        mode.set_generator(k, &spec, true);
+        mode.tick();
+        eprintln!("size {:.3}: {:.0} ms note {:?}", spec.size, t.elapsed().as_secs_f64() * 1e3, mode.generator_note);
+    }
+    let t = Instant::now();
+    mode.set_generator(k, &spec, false);
+    while mode.busy() && t.elapsed().as_secs() < 300 {
+        mode.tick();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let per: Vec<usize> = (0..mode.vol.levels()).map(|l| mode.vol.level_len(l)).collect();
+    eprintln!("landed in {:.1} s, blocks {per:?}, note {:?}", t.elapsed().as_secs_f64(), mode.generator_note);
+}

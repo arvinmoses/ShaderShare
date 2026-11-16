@@ -75,6 +75,14 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    if first.as_deref() == Some("--gpu-size-drag-probe") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = gpu_levels::check::size_drag_probe(&args) {
+            eprintln!("gpu-size-drag-probe: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if first.as_deref() == Some("--gpu-rows-check") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = gpu_levels::check::rows_run(&args) {

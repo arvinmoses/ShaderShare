@@ -599,7 +599,12 @@ impl GpuLevels {
         self.hash_dirty.clear();
     }
 
-    /// Page counts no bigger than one binding may be.
+    /// The most blocks a generator edit may leave shown: the slots the buffers can have, less a tenth for strokes and
+    /// the frames of a drag (past them, blocks would go undrawn).
+    pub fn block_budget(&self) -> usize {
+        self.most_slots() as usize / 10 * 9
+    }
+
     /// The most slots the buffers can have: a slot's cells (its biggest share of any buffer) within one binding.
     fn most_slots(&self) -> u32 {
         let most = self.device.limits().max_storage_buffer_binding_size as u64;

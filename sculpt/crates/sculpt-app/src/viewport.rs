@@ -324,6 +324,10 @@ impl Viewport {
         }
         let v = self.volume.as_mut().unwrap();
         v.gpu.set_cap(mode.cap);
+        // A generator edit leaves no more blocks shown than the GPU can hold (it is refused with a note past that).
+        if let Some(layer) = mode.layer.as_mut() {
+            layer.block_budget = sculpt_core::generator::detail_layer::BLOCK_BUDGET.min(v.gpu.block_budget());
+        }
         // With mesh layers shown every block is at its finest level: layers are rows on those blocks' vertices.
         v.gpu.view.on = mode.by_distance && !self.layers_shown;
         v.gpu.view.tau_px = mode.level_px;

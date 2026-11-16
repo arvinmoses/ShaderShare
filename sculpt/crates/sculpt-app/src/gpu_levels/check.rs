@@ -1415,3 +1415,41 @@ pub fn rows_run(args: &[String]) -> Res<()> {
     println!("mesh layer rows: every gate passes");
     Ok(())
 }
+
+/// Probe: the Size slider dragged from its default to the top with every other setting at its default, through the
+/// GPU as the viewport has it, then let go and landed.
+pub fn size_drag_probe(args: &[String]) -> Res<()> {
+    let (device, queue, adapter) = device()?;
+    println!("adapter: {adapter}, max binding {}", device.limits().max_storage_buffer_binding_size);
+    let tris: f32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(13.2);
+    let mut mode = crate::volume_mode::VolumeMode::ball(tris);
+    mode.add_generator();
+    let mut gpu = GpuLevels::new(&device, &queue, &mode.vol, mode.vol.levels() - 1);
+    mode.layer.as_mut().unwrap().block_budget = gpu.block_budget();
+    println!("block budget {}", gpu.block_budget());
+    rocks_frame(&mut gpu, &mut mode);
+    let k = mode.layer.as_ref().unwrap().active();
+    let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+    let (a, b) = (spec.size.ln(), 0.5f32.ln());
+    for i in 1..=40 {
+        spec.size = (a + (b - a) * i as f32 / 40.0).exp();
+        let t = Instant::now();
+        mode.set_generator(k, &spec, true);
+        rocks_frame(&mut gpu, &mut mode);
+        println!("size {:.3}: {:.0} ms, slots {} of {}, note {:?}", spec.size, t.elapsed().as_secs_f64() * 1e3, gpu.slot_of.len(), gpu.buf.slots, mode.generator_note);
+    }
+    mode.end_generator_edit();
+    let start = Instant::now();
+    loop {
+        let quiet = rocks_frame(&mut gpu, &mut mode);
+        if quiet && !mode.busy() && mode.vol.dirty_keys().is_empty() {
+            break;
+        }
+        if start.elapsed().as_secs() > 300 {
+            return Err("never landed".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    println!("landed in {:.1} s: {} blocks, slots {} of {}", start.elapsed().as_secs_f64(), mode.vol.keys().len(), gpu.slot_of.len(), gpu.buf.slots);
+    Ok(())
+}
