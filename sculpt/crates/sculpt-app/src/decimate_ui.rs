@@ -894,6 +894,44 @@ fn mean_edge(m: &TriMesh) -> f32 {
     s / (3 * m.triangles.len().max(1)) as f32
 }
 
+#[derive(Clone, Copy)]
+enum Icon {
+    Dock,
+    Float,
+    Close,
+}
+
+/// A 20 px icon button drawn with lines (the UI font has no symbol glyphs): a window with a panel docked on its
+/// right, a window with one floating over it, or a cross.
+fn icon_button(ui: &mut Ui, icon: Icon) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    let v = ui.style().interact(&resp);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 3.0, v.bg_fill);
+    }
+    let c = v.fg_stroke.color;
+    let st = egui::Stroke::new(1.2, c);
+    let p = ui.painter();
+    let frame = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 11.0));
+    match icon {
+        Icon::Dock => {
+            p.rect_stroke(frame, 1.5, st, egui::StrokeKind::Inside);
+            p.rect_filled(egui::Rect::from_min_max(egui::pos2(frame.right() - 5.0, frame.top()), frame.max), 1.0, c);
+        }
+        Icon::Float => {
+            p.rect_stroke(frame, 1.5, st, egui::StrokeKind::Inside);
+            let w = egui::Rect::from_min_size(frame.min + egui::vec2(3.0, 3.0), egui::vec2(7.0, 5.0));
+            p.rect_filled(w, 1.0, c);
+        }
+        Icon::Close => {
+            let r = egui::Rect::from_center_size(rect.center(), egui::vec2(9.0, 9.0));
+            p.line_segment([r.left_top(), r.right_bottom()], st);
+            p.line_segment([r.right_top(), r.left_bottom()], st);
+        }
+    }
+    resp
+}
+
 /// The menu entry that opens the window.
 pub fn menu_item(app: &mut SculptApp, ui: &mut Ui) {
     if ui.button("Decimate…").on_hover_text("Decimate the surface shown and export it (OBJ)").clicked() {
@@ -931,10 +969,10 @@ pub fn window(app: &mut SculptApp, ui: &mut Ui) {
                 .frame(egui::Frame::side_top_panel(ui.style()).fill(fill).inner_margin(0))
                 .show(ui, |ui| {
                     crate::panels::panel_header(ui, app, "DECIMATE", |ui| {
-                        if ui.small_button("Close").on_hover_text("Close (the volume shows again)").clicked() {
+                        if icon_button(ui, Icon::Close).on_hover_text("Close (the volume shows again)").clicked() {
                             open = false;
                         }
-                        if ui.small_button("Float").on_hover_text("Undock into a floating window").clicked() {
+                        if icon_button(ui, Icon::Float).on_hover_text("Undock into a floating window").clicked() {
                             dock = false;
                         }
                     });
@@ -949,16 +987,24 @@ pub fn window(app: &mut SculptApp, ui: &mut Ui) {
                 });
         } else {
             let mode = &mut app.volume;
-            egui::Window::new("Decimate").open(&mut open).default_width(360.0).resizable(false).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Dock").on_hover_text("Dock beside the Layers panel").clicked() {
+            let shown = egui::Window::new("Decimate").open(&mut open).default_width(360.0).resizable(false).show(ctx, |ui| {
+                let top = ui.min_rect().top();
+                d.controls(ui, mode);
+                top
+            });
+            // The dock icon in the title bar, left of the close button (a window's title bar takes no widgets).
+            if let Some(r) = shown.as_ref().and_then(|s| s.inner.map(|top| (s.response.rect, top))) {
+                let (rect, top) = r;
+                let y = (rect.top() + top) * 0.5 - 5.0;
+                egui::Area::new(egui::Id::new("decimate_dock_icon"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(rect.right() - 62.0, y - 10.0))
+                    .show(ctx, |ui| {
+                        if icon_button(ui, Icon::Dock).on_hover_text("Dock beside the Layers panel").clicked() {
                             dock = true;
                         }
                     });
-                });
-                d.controls(ui, mode);
-            });
+            }
         }
         let d = &mut app.decimate;
         d.docked = dock;
