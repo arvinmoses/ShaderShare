@@ -1431,25 +1431,44 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
     let k = mode.layer.as_ref().unwrap().active();
     let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
     let (a, b) = (spec.size.ln(), 0.5f32.ln());
-    for i in 1..=40 {
-        spec.size = (a + (b - a) * i as f32 / 40.0).exp();
-        let t = Instant::now();
-        mode.set_generator(k, &spec, true);
-        rocks_frame(&mut gpu, &mut mode);
-        println!("size {:.3}: {:.0} ms, slots {} of {}, note {:?}", spec.size, t.elapsed().as_secs_f64() * 1e3, gpu.slot_of.len(), gpu.buf.slots, mode.generator_note);
-    }
-    mode.end_generator_edit();
-    let start = Instant::now();
-    loop {
-        let quiet = rocks_frame(&mut gpu, &mut mode);
-        if quiet && !mode.busy() && mode.vol.dirty_keys().is_empty() {
-            break;
+    let mut worst = 0.0f64;
+    for sweep in 0..10 {
+        let (from, to) = if sweep % 2 == 0 { (a, b) } else { (b, a) };
+        for i in 1..=40 {
+            spec.size = (from + (to - from) * i as f32 / 40.0).exp();
+            // Rocks somewhere else each frame: blocks come and go, so slots are freed and given to others.
+            spec.seed = 1 + (sweep * 40 + i) as u64;
+            let t = Instant::now();
+            mode.set_generator(k, &spec, true);
+            rocks_frame(&mut gpu, &mut mode);
+            if std::mem::take(&mut gpu.join_refused) {
+                mode.generator_note = Some("join refused".into());
+            }
+            let f = t.elapsed().as_secs_f64() * 1e3;
+            worst = worst.max(f);
+            let (cap, high, free) = gpu.join_pool();
+            if i % 10 == 0 {
+                println!("sweep {sweep} size {:.3}: {f:.0} ms, slots {} of {}, pool {high} used ({free} free) of {cap}, note {:?}", spec.size, gpu.slot_of.len(), gpu.buf.slots, mode.generator_note);
+            }
+            if high as usize > gpu.buf.slots as usize {
+                return Err(format!("the join pool holds {high} places for {} slots", gpu.buf.slots).into());
+            }
         }
-        if start.elapsed().as_secs() > 300 {
-            return Err("never landed".into());
+        mode.end_generator_edit();
+        let start = Instant::now();
+        loop {
+            let quiet = rocks_frame(&mut gpu, &mut mode);
+            if quiet && !mode.busy() && mode.vol.dirty_keys().is_empty() {
+                break;
+            }
+            if start.elapsed().as_secs() > 300 {
+                return Err("never landed".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        println!("sweep {sweep} landed in {:.1} s", start.elapsed().as_secs_f64());
     }
-    println!("landed in {:.1} s: {} blocks, slots {} of {}", start.elapsed().as_secs_f64(), mode.vol.keys().len(), gpu.slot_of.len(), gpu.buf.slots);
+    println!("worst drag frame {worst:.0} ms");
+    println!("end: {} blocks, slots {} of {}", mode.vol.keys().len(), gpu.slot_of.len(), gpu.buf.slots);
     Ok(())
 }

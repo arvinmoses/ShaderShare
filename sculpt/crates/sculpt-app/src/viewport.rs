@@ -139,8 +139,18 @@ fn linear(c: egui::Color32) -> [f32; 4] {
     [r, g, b, a]
 }
 
+/// The last GPU error not yet shown (see [`Viewport::new`]).
+pub static GPU_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 impl Viewport {
     pub fn new(rs: &egui_wgpu::RenderState) -> Viewport {
+        // A GPU error (a buffer past the device's limits, say) is noted and the app goes on: by default it ends the app.
+        rs.device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+            eprintln!("GPU error: {e}");
+            if let Ok(mut last) = GPU_ERROR.lock() {
+                *last = Some(e.to_string());
+            }
+        }));
         Self::with_device(&rs.device, include_str!("viewport.wgsl"))
     }
 
@@ -348,6 +358,12 @@ impl Viewport {
         if let (Some(plan), Some(layer)) = (plan, mode.layer.as_ref()) {
             let j = v.gpu.join(plan, &|k| layer.base_samples(k));
             mode.join_ms = j.cpu_ms;
+        }
+        if std::mem::take(&mut v.gpu.join_refused) {
+            mode.generator_note = Some("Too big to preview on the GPU while dragging: it is shown once let go. Lower the size or the count.".into());
+        }
+        if let Some(e) = GPU_ERROR.lock().ok().and_then(|mut e| e.take()) {
+            mode.generator_note = Some(format!("The GPU refused part of this edit, so some of it may not show: {}", e.lines().next().unwrap_or("")));
         }
         // The surface noise shown, and its mask (sent again when the noise changed).
         let noise = mode.shown_noise();

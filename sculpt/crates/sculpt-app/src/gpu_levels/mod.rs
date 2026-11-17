@@ -160,6 +160,8 @@ pub struct GpuLevels {
     grow_vpages: bool,
     /// Set when the pages ran out (quads were dropped): the next sync grows them and rebuilds.
     out_of_pages: bool,
+    /// Set when a generator edit was too big to join on the GPU (nothing was joined; the CPU's job brings it).
+    pub join_refused: bool,
     /// Blocks left undrawn as every slot a binding can hold was taken (counted up).
     pub slots_full: usize,
     out_of_vpages: bool,
@@ -312,6 +314,7 @@ impl GpuLevels {
             grow_pages: false,
             grow_vpages: false,
             out_of_pages: false,
+            join_refused: false,
             slots_full: 0,
             out_of_vpages: false,
             buffers_made: 1,

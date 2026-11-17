@@ -89,6 +89,9 @@ pub(super) struct Join {
     /// Per slot, its block's base's place in the pool, for the epoch the bases were read at.
     base_slot: Vec<u32>,
     high: u32,
+    /// Places in the pool below `high` whose slot was given to another block: taken again before the pool grows (so
+    /// it never holds more bases than there are slots).
+    free: Vec<u32>,
     epoch: u64,
     lists: [wgpu::Buffer; LISTS],
 }
@@ -101,7 +104,7 @@ impl Join {
         let lists = std::array::from_fn(|i| Self::list(device, i, 1024));
         // The pool holds a base per slot to begin with (it grows past that, as bases outlive their blocks).
         let cap = slots.max(1024);
-        Join { pipe, base: Self::pool(device, cap), cap, base_slot: Vec::new(), high: 0, epoch: u64::MAX, lists }
+        Join { pipe, base: Self::pool(device, cap), cap, base_slot: Vec::new(), high: 0, free: Vec::new(), epoch: u64::MAX, lists }
     }
 
     fn pool(device: &wgpu::Device, cap: u32) -> wgpu::Buffer {
@@ -113,22 +116,64 @@ impl Join {
         device.create_buffer(&wgpu::BufferDescriptor { label: Some("levels join lists"), size: size.max(16), usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
     }
 
-    /// Send list `i`, in a buffer large enough for it (grown to the next power of two when it is not).
-    fn send(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, i: usize, data: &[u8]) {
+    /// Send list `i`, in a buffer large enough for it (grown to the next power of two when it is not, no larger than
+    /// one binding may be). False if it cannot fit in one.
+    fn send(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, i: usize, data: &[u8]) -> bool {
         let need = (data.len() as u64).max(16);
+        if need > most_bytes(device) {
+            return false;
+        }
         if self.lists[i].size() < need {
-            self.lists[i] = Self::list(device, i, need.next_power_of_two());
+            self.lists[i] = Self::list(device, i, need.next_power_of_two().min(most_bytes(device)));
         }
         if !data.is_empty() {
             queue.write_buffer(&self.lists[i], 0, data);
         }
+        true
     }
 
-    /// Slot `s` was given to another block: its base is not held.
+    /// Slot `s` was given to another block: its base is not held, and its place in the pool is free.
     pub(super) fn slot_taken(&mut self, s: u32) {
         if let Some(b) = self.base_slot.get_mut(s as usize) {
+            if *b != NONE {
+                self.free.push(*b);
+            }
             *b = NONE;
         }
+    }
+
+    /// Places in the pool for `n` more bases: the free ones first (lowest first, so writes to them run together),
+    /// then past `high`.
+    fn places(&mut self, n: usize) -> Vec<u32> {
+        let reuse = n.min(self.free.len());
+        self.free.sort_unstable_by(|a, b| b.cmp(a));
+        let mut out: Vec<u32> = self.free.split_off(self.free.len() - reuse);
+        out.reverse();
+        out.extend(self.high..self.high + (n - reuse) as u32);
+        self.high += (n - reuse) as u32;
+        out
+    }
+}
+
+/// The most bytes one buffer bound whole may hold on `device`.
+fn most_bytes(device: &wgpu::Device) -> u64 {
+    let l = device.limits();
+    (l.max_storage_buffer_binding_size as u64).min(l.max_buffer_size)
+}
+
+/// Write `bases` to the pool at `places`, places that follow one another in one write each.
+fn write_bases(queue: &wgpu::Queue, pool: &wgpu::Buffer, places: &[u32], bases: &[[u32; 365]]) {
+    let mut order: Vec<usize> = (0..places.len()).collect();
+    order.sort_unstable_by_key(|&i| places[i]);
+    let mut i = 0;
+    while i < order.len() {
+        let mut j = i + 1;
+        while j < order.len() && places[order[j]] == places[order[j - 1]] + 1 {
+            j += 1;
+        }
+        let run: Vec<[u32; 365]> = order[i..j].iter().map(|&k| bases[k]).collect();
+        queue.write_buffer(pool, places[order[i]] as u64 * SAMPLE_WORDS * 4, bytemuck::cast_slice(&run));
+        i = j;
     }
 }
 
@@ -144,6 +189,7 @@ impl GpuLevels {
         if plan.epoch != join.epoch {
             join.base_slot.clear();
             join.high = 0;
+            join.free.clear();
             join.epoch = plan.epoch;
         }
         if join.base_slot.len() < self.key_of.len() {
@@ -159,17 +205,26 @@ impl GpuLevels {
         // Bases the pool lacks: the plan's new blocks come with theirs; the rest are read.
         let fresh_slots: Vec<u32> = plan.fresh.iter().map(|k| slot_of.get(k).copied().unwrap_or(NONE)).collect();
         let mut fresh_take: Vec<usize> = Vec::with_capacity(plan.fresh.len());
+        let mut fresh_seen = vec![false; join.base_slot.len()];
         for (i, &s) in fresh_slots.iter().enumerate() {
-            if s != NONE && join.base_slot[s as usize] == NONE {
-                join.base_slot[s as usize] = join.high + fresh_take.len() as u32;
+            if s != NONE && join.base_slot[s as usize] == NONE && !fresh_seen[s as usize] {
+                fresh_seen[s as usize] = true;
                 fresh_take.push(i);
             }
         }
-        let missing: Vec<(usize, u32)> = slots.iter().enumerate().filter(|(_, s)| **s != NONE && join.base_slot[**s as usize] == NONE).map(|(i, s)| (i, *s)).collect();
+        let missing: Vec<(usize, u32)> = slots.iter().enumerate().filter(|(_, s)| **s != NONE && join.base_slot[**s as usize] == NONE && !fresh_seen[**s as usize]).map(|(i, s)| (i, *s)).collect();
         let more = fresh_take.len() + missing.len();
-        if join.high as usize + more > join.cap as usize {
+        // No more places than one binding holds (it never needs more than a place per slot: freed places are taken
+        // again first). Past that, nothing is joined: the CPU's job brings the field.
+        let most = (most_bytes(&device) / (SAMPLE_WORDS * 4)) as usize;
+        let after = join.high as usize + more.saturating_sub(join.free.len());
+        if after > most {
+            self.join_refused = true;
+            return stats;
+        }
+        if after > join.cap as usize {
             // A larger pool, the bases it held copied across.
-            let cap = (join.high + more as u32).next_power_of_two();
+            let cap = (after.next_power_of_two().min(most)) as u32;
             let pool = Join::pool(&device, cap);
             let mut enc = device.create_command_encoder(&Default::default());
             enc.copy_buffer_to_buffer(&join.base, 0, &pool, 0, join.high as u64 * SAMPLE_WORDS * 4);
@@ -178,21 +233,24 @@ impl GpuLevels {
             join.cap = cap;
         }
         if !fresh_take.is_empty() {
+            let places = join.places(fresh_take.len());
             let all: Vec<[u32; 365]> = fresh_take.par_iter().map(|&i| plan.bases[i]).collect();
-            self.queue.write_buffer(&join.base, join.high as u64 * SAMPLE_WORDS * 4, bytemuck::cast_slice(&all));
+            for (&i, &at) in fresh_take.iter().zip(&places) {
+                join.base_slot[fresh_slots[i] as usize] = at;
+            }
+            write_bases(&self.queue, &join.base, &places, &all);
             stats.bytes += all.len() * SAMPLE_WORDS as usize * 4;
-            join.high += all.len() as u32;
         }
         let t_fresh = ms(t);
         if !missing.is_empty() {
             let blocks = &plan.blocks;
             let all: Vec<[u32; 365]> = missing.par_iter().map(|&(i, _)| sculpt_core::generator::detail_layer::pack_f16(&base(blocks[i]))).collect();
-            for (n, &(_, s)) in missing.iter().enumerate() {
-                join.base_slot[s as usize] = join.high + n as u32;
+            let places = join.places(missing.len());
+            for (&(_, s), &at) in missing.iter().zip(&places) {
+                join.base_slot[s as usize] = at;
             }
-            self.queue.write_buffer(&join.base, join.high as u64 * SAMPLE_WORDS * 4, bytemuck::cast_slice(&all));
+            write_bases(&self.queue, &join.base, &places, &all);
             stats.bytes += all.len() * SAMPLE_WORDS as usize * 4;
-            join.high += all.len() as u32;
         }
         let t_base = ms(t);
         // The pass's work: per joined block, its slot, its ranges and its base.
@@ -207,13 +265,18 @@ impl GpuLevels {
         }
         let params: [f32; 8] = [self.origin.x, self.origin.y, self.origin.z, 0.0, self.voxel0, work.len() as f32, 0.0, 0.0];
         let queue = self.queue.clone();
-        join.send(&device, &queue, 0, bytemuck::cast_slice(&params));
-        join.send(&device, &queue, 1, bytemuck::cast_slice(&plan.instances));
-        join.send(&device, &queue, 2, bytemuck::cast_slice(&plan.cands));
-        join.send(&device, &queue, 3, bytemuck::cast_slice(&plan.gens));
-        join.send(&device, &queue, 4, bytemuck::cast_slice(&plan.ranges));
-        join.send(&device, &queue, 5, bytemuck::cast_slice(&work));
-        join.send(&device, &queue, 6, bytemuck::cast_slice(&plan.masks));
+        let sent = join.send(&device, &queue, 0, bytemuck::cast_slice(&params))
+            && join.send(&device, &queue, 1, bytemuck::cast_slice(&plan.instances))
+            && join.send(&device, &queue, 2, bytemuck::cast_slice(&plan.cands))
+            && join.send(&device, &queue, 3, bytemuck::cast_slice(&plan.gens))
+            && join.send(&device, &queue, 4, bytemuck::cast_slice(&plan.ranges))
+            && join.send(&device, &queue, 5, bytemuck::cast_slice(&work))
+            && join.send(&device, &queue, 6, bytemuck::cast_slice(&plan.masks));
+        if !sent {
+            // A list longer than a binding may be: nothing is joined (the CPU's job brings the field).
+            self.join_refused = true;
+            return stats;
+        }
         stats.bytes += (plan.instances.len() * 80 + plan.cands.len() * 4 + plan.ranges.len() * 16 + work.len() * 16 + plan.masks.len() * SAMPLE_WORDS as usize * 4) as usize;
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: join.lists[0].as_entire_binding() },
@@ -253,5 +316,12 @@ impl GpuLevels {
             eprintln!("join: {joined} blocks ({} bases from the plan, {} read): slots and plan bases {t_fresh:.1}, bases read {:.1}, lists and pass {:.1}, extraction {:.1} ms", fresh_take.len(), missing.len(), t_base - t_fresh, t_pass - t_base, stats.cpu_ms - t_pass);
         }
         stats
+    }
+}
+
+impl GpuLevels {
+    /// The join's pool: bases it holds room for, places used (free ones included), places free.
+    pub(super) fn join_pool(&self) -> (u32, u32, usize) {
+        self.join.as_ref().map_or((0, 0, 0), |j| (j.cap, j.high, j.free.len()))
     }
 }
