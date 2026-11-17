@@ -631,6 +631,17 @@ impl VolumeGen {
     /// The blocks of level `l` this layer changes, when it lives at level `own`: level 0's through each instance's box,
     /// a shell around the instances' surface at levels up to `own`, and past it the form's own blocks within reach.
     pub fn blocks(&self, form: &LevelVolume, l: usize, own: usize) -> HashSet<IVec3> {
+        self.blocks_in(form, l, own, false)
+    }
+
+    /// [`Self::blocks`] for a drag's preview on the GPU: at level 0 only the blocks where its surface can show (the
+    /// form's own, and those near the surface of the instances joined, not inside the form it adds to). The blocks
+    /// past that, held out to level 0's band, come once the drag is over.
+    pub fn blocks_thin(&self, form: &LevelVolume, l: usize, own: usize) -> HashSet<IVec3> {
+        self.blocks_in(form, l, own, true)
+    }
+
+    fn blocks_in(&self, form: &LevelVolume, l: usize, own: usize, thin: bool) -> HashSet<IVec3> {
         let (v, band, origin) = (form.voxel(l), form.band(l), form.origin());
         let k = self.pad();
         // Level 0 keeps distances out to a wide band, but what shows is near the surface: two of its steps past the
@@ -670,6 +681,16 @@ impl VolumeGen {
             let lo = origin + (*bc * B).as_vec3() * v;
             let c = lo + Vec3::splat(0.5 * size);
             let mut near = Vec::new();
+            if l == 0 && thin {
+                // Wholly inside the form it adds to: nothing of it shows there.
+                if !self.subtracts() && form.inside0_has(*bc) {
+                    return false;
+                }
+                // Near the surface of the instances joined (the nearest one's, within a block and the blend).
+                self.near(lo, lo + Vec3::splat(size), half + pad, &mut near);
+                let d = near.iter().map(|&i| self.set.sdf(i, c)).fold(f32::INFINITY, f32::min);
+                return d.abs() <= half + pad;
+            }
             if l == 0 {
                 self.near(lo, lo + Vec3::splat(size), reach0, &mut near);
                 return near.iter().any(|&i| self.set.sdf(i, c) <= reach0);

@@ -1223,6 +1223,11 @@ impl LevelVolume {
         self.blocks[l].get(&bc).map(|b| &**b)
     }
 
+    /// Whether level 0 block `bc` is held as wholly inside (no samples).
+    pub fn inside0_has(&self, bc: IVec3) -> bool {
+        self.inside0.contains(&bc)
+    }
+
     fn inside0_at(&self, bc: IVec3, base: bool) -> bool {
         if base && let Some(was) = self.stroke.as_ref().and_then(|s| s.get(&(0, bc))) {
             return matches!(was, Was::Inside);

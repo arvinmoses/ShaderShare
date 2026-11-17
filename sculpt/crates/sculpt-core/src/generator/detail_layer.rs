@@ -97,7 +97,19 @@ impl GenPart {
         let blocks = (0..form.levels()).into_par_iter().map(|l| g.blocks(form, l, own)).collect();
         GenPart { g, blocks: std::sync::Arc::new(blocks), upto: own }
     }
+
+    /// Its blocks for a drag's preview on the GPU (see [`VolumeGen::blocks_thin`]), marked [`THIN`]: once the drag is
+    /// over, its job finds them all and composes them.
+    fn thin(form: &LevelVolume, g: VolumeGen, own: usize) -> GenPart {
+        let g = g.fitted(form.voxel(own));
+        let blocks = (0..form.levels()).into_par_iter().map(|l| g.blocks_thin(form, l, own)).collect();
+        GenPart { g, blocks: std::sync::Arc::new(blocks), upto: THIN }
+    }
 }
+
+/// A generator's `upto` while a drag shows it on the GPU with only the blocks near its surface (see
+/// [`GenPart::thin`]); `usize::MAX` when shown on the GPU with all of them.
+const THIN: usize = usize::MAX - 1;
 
 impl Layer {
     fn new(name: &str, level: usize) -> Layer {
@@ -2062,9 +2074,17 @@ impl Layered {
         let own = self.stack[k].level;
         let built = VolumeGen::build(&self.form, spec, Some(&old.g));
         lap("build");
-        let mut part = GenPart::new(&self.form, built, own);
+        // Mid-drag, only the blocks its surface can show in; all of them once it is over.
+        let thin = self.edit.is_some();
+        let full = GenPart::new(&self.form, built.clone(), own);
         lap("part");
-        if !self.fits(shown, &part) {
+        // (What it keeps once the drag is over is what must fit.)
+        if !self.fits(shown, k, &full) {
+            return None;
+        }
+        let mut part = if thin { GenPart::thin(&self.form, built, own) } else { full };
+        lap("thin");
+        if thin && !self.fits(shown, k, &part) {
             // (Refused: the caller's preview is refused the same way.)
             return None;
         }
@@ -2073,7 +2093,7 @@ impl Layered {
             self.redo.clear();
         }
         // Shown by the GPU: the job brings the field at its own level.
-        part.upto = usize::MAX;
+        part.upto = if thin { THIN } else { usize::MAX };
         self.stack[k].scatter = Some(part);
         let (mut targets, own_n) = affected_generator(&self.stack, k, Some(&old));
         lap("affected");
@@ -2239,7 +2259,7 @@ impl Layered {
             return;
         }
         let mut part = GenPart::new(&self.form, VolumeGen::build(&self.form, spec, Some(&old.g)), upto);
-        if !self.fits(shown, &part) {
+        if !self.fits(shown, k, &part) {
             return;
         }
         if self.edit.is_none() && old.g.spec != *spec {
@@ -2255,13 +2275,19 @@ impl Layered {
 
     /// Whether a generator scatter `part` keeps what is shown plus the blocks it composes within the budget; if not,
     /// noted in `refused`.
-    fn fits(&mut self, shown: &LevelVolume, part: &GenPart) -> bool {
+    /// An edit that leaves fewer blocks shown than now always fits (so one past the budget can be made smaller).
+    fn fits(&mut self, shown: &LevelVolume, k: usize, part: &GenPart) -> bool {
         let shown_n: usize = (0..shown.levels()).map(|l| shown.level_len(l)).sum();
         // (Blocks it composes that are shown already are counted once; those composed wholly inside are counted
         // though they end up held without samples, as composing them takes room for a moment.)
         let need: usize = part.blocks.iter().enumerate().map(|(l, b)| b.par_iter().filter(|bc| !shown.exists(l, **bc)).count()).sum();
-        if shown_n + need > self.block_budget {
-            self.refused = Some(shown_n + need);
+        // The layer's blocks it no longer has, and the form not either: let go of.
+        let form = &self.form;
+        let gone: usize = self.stack.get(k).and_then(|x| x.scatter.as_ref()).map_or(0, |old| {
+            old.blocks.iter().enumerate().map(|(l, b)| b.par_iter().filter(|bc| !part.blocks.get(l).is_some_and(|n| n.contains(*bc)) && !form.exists(l, **bc)).count()).sum()
+        });
+        if shown_n + need > self.block_budget && need > gone {
+            self.refused = Some(shown_n + need - gone);
             return false;
         }
         true
@@ -3037,7 +3063,7 @@ impl Layered {
         };
         stack[k].scatter = Some(part.clone());
         self.taken = Some((k, preview.blocks.clone(), part.clone(), targets.clone()));
-        Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets, cancel: Default::default(), land: None, joined })
+        Some(GenJob { form: self.form.snapshot(), stack, from: self.from, k, part, preview: preview.blocks, targets, cancel: Default::default(), land: None, joined: joined || preview.upto == THIN })
     }
 
     /// Take what a [`GenJob`] composed, unless the layer changed meanwhile (then a later job brings it), or a form

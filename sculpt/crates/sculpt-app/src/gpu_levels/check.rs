@@ -593,7 +593,15 @@ fn big_rocks_check(device: &wgpu::Device, queue: &wgpu::Queue, triangles: f32, s
     let samples = read(device, queue, &gpu.buf.samples);
     let stale: Vec<Key> = mode.vol.keys().into_iter().filter(|k| gpu.slot_of.get(k).is_some_and(|&sl| samples[sl as usize * 365..sl as usize * 365 + 365] != packed_samples(&mode.vol, *k, Some(gpu.view.hidden()))[..])).collect();
     if !stale.is_empty() {
-        return Err(format!("{when}: once landed, {} blocks on the GPU hold other samples than the CPU's", stale.len()).into());
+        let mut per = [0usize; 8];
+        for k in &stale {
+            per[k.0 as usize] += 1;
+        }
+        let k = stale[0];
+        let sl = gpu.slot_of[&k] as usize;
+        let cpu = packed_samples(&mode.vol, k, Some(gpu.view.hidden()));
+        let diff = (0..365).filter(|&i| samples[sl * 365 + i] != cpu[i]).count();
+        return Err(format!("{when}: once landed, {} blocks on the GPU hold other samples than the CPU's (per level {per:?}; first {k:?}: {diff} words differ, inside0 {})", stale.len(), mode.vol.inside0_has(k.1)).into());
     }
     let (eyes, bad, blocks) = wrongly_culled(device, queue, &gpu, &mode.vol);
     println!("{when}: from {eyes} eyes, {bad} quads facing the eye left out as facing away");
@@ -1437,7 +1445,9 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
         for i in 1..=40 {
             spec.size = (from + (to - from) * i as f32 / 40.0).exp();
             // Rocks somewhere else each frame: blocks come and go, so slots are freed and given to others.
-            spec.seed = 1 + (sweep * 40 + i) as u64;
+            if std::env::var_os("PROBE_SEEDS").is_some() {
+                spec.seed = 1 + (sweep * 40 + i) as u64;
+            }
             let t = Instant::now();
             mode.set_generator(k, &spec, true);
             rocks_frame(&mut gpu, &mut mode);
