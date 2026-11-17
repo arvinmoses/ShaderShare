@@ -931,16 +931,13 @@ impl GpuLevels {
             return now;
         }
         // Each block's region: its level 0 block, in Morton order (descending: the next to take is last). Blocks that
-        // went all go now (the GPU would hold them while their neighbours read them as gone).
-        let order = |k: &Key| -> u64 {
-            let c = k.1.div_euclid(IVec3::splat(1 << k.0)) + IVec3::splat(1 << 19);
-            let mut m: u64 = 0;
-            for b in 0..20 {
-                m |= (((c.x >> b) & 1) as u64) << (3 * b) | (((c.y >> b) & 1) as u64) << (3 * b + 1) | (((c.z >> b) & 1) as u64) << (3 * b + 2);
-            }
-            !m
-        };
-        let (mut now, there): (Vec<Key>, Vec<Key>) = drained.into_par_iter().partition(|k| vol.block(*k).is_none());
+        // went and the GPU holds go now (it would hold them while their neighbours read them as gone: left for later,
+        // a block of another level beside one had its quads dropped). Those it does not hold wait their region's turn
+        // like the rest (nothing on the GPU changes with them): taken at once, the hundreds of thousands a big
+        // generator's landing takes out of level 0 pulled the blocks next to them into one sync of seconds.
+        let order = |k: &Key| region_order(region_of(*k));
+        let slot_of = &self.slot_of;
+        let (mut now, there): (Vec<Key>, Vec<Key>) = drained.into_par_iter().partition(|k| vol.block(*k).is_none() && slot_of.contains_key(k));
         if !there.is_empty() {
             let mut fresh: Vec<(u64, Key)> = there.par_iter().map(|k| (order(k), *k)).collect();
             fresh.par_sort_unstable_by_key(|o| o.0);
@@ -963,15 +960,18 @@ impl GpuLevels {
                 self.pending = merged;
             }
         }
-        // From the end: up to the limit of blocks still pending, then to the end of that region (within reason).
+        // From the end: up to the limit of blocks still pending, then to the end of that region (within reason). A
+        // block that went and the GPU does not hold costs nothing: it does not count (a big generator's landing takes
+        // hundreds of thousands of them out of level 0).
+        let costs = |k: &Key| self.pending_set.contains(k) && (self.slot_of.contains_key(k) || vol.block(*k).is_some());
         let (mut taken, mut cut) = (0, self.pending.len());
         while cut > 0 && taken < limit {
             cut -= 1;
-            taken += self.pending_set.contains(&self.pending[cut].1) as usize;
+            taken += costs(&self.pending[cut].1) as usize;
         }
         while cut > 0 && taken < limit + limit / 2 && self.pending[cut - 1].0 == self.pending[cut].0 {
             cut -= 1;
-            taken += self.pending_set.contains(&self.pending[cut].1) as usize;
+            taken += costs(&self.pending[cut].1) as usize;
         }
         for (_, k) in self.pending.drain(cut..).rev() {
             if self.pending_set.remove(&k) {
@@ -1085,7 +1085,8 @@ impl GpuLevels {
         // Blocks left for later that the GPU does not hold count as hidden for now (as if not stored), so what is
         // sent next to them reads them as the GPU does; those it holds stay as they are, their neighbours' first layer
         // past them taken from their slots.
-        let held_back: Vec<Key> = if spread { self.pending_set.iter().copied().filter(|k| !self.slot_of.contains_key(k)).collect() } else { Vec::new() };
+        let held_back: Vec<Key> = if spread { self.held_back_near(vol, &dirty) } else { Vec::new() };
+        lap("held back");
         let hid_now = self.view.hide_for_now(&held_back);
         // Blocks that went, and blocks that came.
         let mut released = Vec::new();
@@ -1113,14 +1114,19 @@ impl GpuLevels {
             // counts as this sync's too, so the blocks below it (whose first layer past them is its samples) go with
             // it. Sent alone, a block left for later under it kept its old samples there, and the two disagreed on
             // their shared face until it landed (a smooth stroke's end, changing most blocks under it, showed it).
+            // (Only the blocks just added are looked at again: what the rest reach is in `uploads` already.)
+            let mut have: KeySet<Key> = dirty.iter().copied().collect();
+            let mut new_up = uploads.clone();
             loop {
-                let have: KeySet<Key> = dirty.iter().copied().collect();
-                let more: Vec<Key> = uploads.iter().copied().filter(|k| self.pending_set.contains(k) && !have.contains(k)).collect();
+                let more: Vec<Key> = new_up.iter().copied().filter(|k| self.pending_set.contains(k) && !have.contains(k)).collect();
                 if more.is_empty() {
                     break;
                 }
-                dirty.extend(more);
-                uploads = vol.upload_set_in(&dirty, &self.view.show(self.levels - 1));
+                have.extend(more.iter().copied());
+                dirty.extend_from_slice(&more);
+                let up: KeySet<Key> = uploads.iter().copied().collect();
+                new_up = vol.upload_set_in(&more, &self.view.show(self.levels - 1)).into_iter().filter(|k| !up.contains(k)).collect();
+                uploads.extend_from_slice(&new_up);
             }
             // Blocks sent now have landed, whether or not their own change was left for later.
             for k in &uploads {
@@ -1398,6 +1404,48 @@ impl GpuLevels {
     /// The slot of block `k`, if the GPU holds it.
     pub fn slot(&self, k: Key) -> Option<u32> {
         self.slot_of.get(&k).copied()
+    }
+}
+
+/// The level 0 block a block lies in: the region a big change lands by.
+fn region_of(k: Key) -> IVec3 {
+    k.1.div_euclid(IVec3::splat(1 << k.0))
+}
+
+/// Where region `c` comes in the order a big change lands in: Morton order, descending (the next to take is last).
+fn region_order(c: IVec3) -> u64 {
+    let c = c + IVec3::splat(1 << 19);
+    let mut m: u64 = 0;
+    for b in 0..20 {
+        m |= (((c.x >> b) & 1) as u64) << (3 * b) | (((c.y >> b) & 1) as u64) << (3 * b + 1) | (((c.z >> b) & 1) as u64) << (3 * b + 2);
+    }
+    !m
+}
+
+impl GpuLevels {
+    /// Blocks left for later that the GPU does not hold and the volume does, in the regions of `dirty` and those next
+    /// to them (what is sent reads only blocks next to it; the blocks pulled in with it lie below it and read back
+    /// toward it): only there does it matter that they read as hidden. Looked up in the pending order; going over
+    /// every block pending cost a sync tens of milliseconds while a big change landed.
+    fn held_back_near(&self, vol: &LevelVolume, dirty: &[Key]) -> Vec<Key> {
+        let mut regions: Vec<IVec3> = dirty.iter().map(|k| region_of(*k)).collect();
+        regions.sort_unstable_by_key(|c| (c.z, c.y, c.x));
+        regions.dedup();
+        let mut near: Vec<u64> = regions
+            .par_iter()
+            .flat_map_iter(|&c| (0..27).map(move |i| region_order(c + IVec3::new(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1))))
+            .collect();
+        near.par_sort_unstable();
+        near.dedup();
+        let pending = &self.pending;
+        near.par_iter()
+            .flat_map_iter(|&o| {
+                let a = pending.partition_point(|p| p.0 < o);
+                let b = a + pending[a..].partition_point(|p| p.0 <= o);
+                pending[a..b].iter().map(|p| p.1)
+            })
+            .filter(|k| self.pending_set.contains(k) && !self.slot_of.contains_key(k) && vol.block(*k).is_some())
+            .collect()
     }
 }
 

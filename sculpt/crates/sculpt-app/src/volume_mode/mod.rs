@@ -1201,8 +1201,13 @@ impl VolumeMode {
             self.gen_job = None;
             if let Some(layer) = self.layer.as_mut() {
                 let ms = done.ms;
+                let ta = Instant::now();
+                let n = done.len();
                 if layer.generator_apply(&mut self.vol, done) {
                     self.generator_full_ms = ms;
+                }
+                if std::env::var_os("SCULPT_JOIN_LOG").is_some() {
+                    eprintln!("generator job: {ms:.0} ms off the frame, {n} blocks, applied in {:.0} ms", ta.elapsed().as_secs_f64() * 1e3);
                 }
             }
             if !wait {

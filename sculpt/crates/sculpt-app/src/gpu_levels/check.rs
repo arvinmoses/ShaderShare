@@ -1440,7 +1440,8 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
     let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
     let (a, b) = (spec.size.ln(), 0.5f32.ln());
     let mut worst = 0.0f64;
-    for sweep in 0..10 {
+    let sweeps: usize = std::env::var("PROBE_SWEEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    for sweep in 0..sweeps {
         let (from, to) = if sweep % 2 == 0 { (a, b) } else { (b, a) };
         for i in 1..=40 {
             spec.size = (from + (to - from) * i as f32 / 40.0).exp();
@@ -1466,8 +1467,19 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
         }
         mode.end_generator_edit();
         let start = Instant::now();
+        let (mut frames, mut over, mut worst_land) = (0usize, 0usize, 0.0f64);
         loop {
+            let tf = Instant::now();
             let quiet = rocks_frame(&mut gpu, &mut mode);
+            let f = tf.elapsed().as_secs_f64() * 1e3;
+            frames += 1;
+            worst_land = worst_land.max(f);
+            if f > 50.0 {
+                over += 1;
+                if std::env::var_os("PROBE_LAND_LOG").is_some() {
+                    println!("  landing frame {frames} at {:.2} s: {f:.0} ms, pending {}", start.elapsed().as_secs_f64(), gpu.pending());
+                }
+            }
             if quiet && !mode.busy() && mode.vol.dirty_keys().is_empty() {
                 break;
             }
@@ -1476,7 +1488,7 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        println!("sweep {sweep} landed in {:.1} s", start.elapsed().as_secs_f64());
+        println!("sweep {sweep} landed in {:.1} s: {frames} frames, {over} over 50 ms, worst {worst_land:.0} ms", start.elapsed().as_secs_f64());
     }
     println!("worst drag frame {worst:.0} ms");
     println!("end: {} blocks, slots {} of {}", mode.vol.keys().len(), gpu.slot_of.len(), gpu.buf.slots);

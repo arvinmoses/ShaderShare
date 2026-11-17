@@ -188,6 +188,13 @@ pub struct GenDone {
     pub ms: f64,
 }
 
+impl GenDone {
+    /// Blocks it brings.
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
 impl GenJob {
     pub fn run(self) -> GenDone {
         let t = Instant::now();
@@ -203,6 +210,7 @@ impl GenJob {
             }
             blocks.extend(compose_all(&self.form, &self.stack, self.from - 1, batch));
         }
+        let t_compose = t.elapsed().as_secs_f64() * 1e3;
         let after = match self.land {
             Some(land) if !cancelled => {
                 // Joined on the GPU meanwhile, its blocks are sent again whatever they hold here.
@@ -211,6 +219,9 @@ impl GenJob {
             }
             _ => None,
         };
+        if std::env::var_os("SCULPT_JOIN_LOG").is_some() {
+            eprintln!("generator job: {} targets, compose {t_compose:.0} ms, shown after {:.0} ms", self.targets.len(), t.elapsed().as_secs_f64() * 1e3 - t_compose);
+        }
         GenDone { k: self.k, part: self.part, preview: self.preview, blocks, after, cancelled, ms: t.elapsed().as_secs_f64() * 1e3 }
     }
 
