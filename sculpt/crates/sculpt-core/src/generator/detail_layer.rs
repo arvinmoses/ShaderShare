@@ -107,6 +107,10 @@ impl GenPart {
     }
 }
 
+/// A generator's `upto` while it waits for a job with nothing shown changed yet (see
+/// [`Layered::generator_for_job`]).
+const HELD: usize = usize::MAX - 2;
+
 /// A generator's `upto` while a drag shows it on the GPU with only the blocks near its surface (see
 /// [`GenPart::thin`]); `usize::MAX` when shown on the GPU with all of them.
 const THIN: usize = usize::MAX - 1;
@@ -2235,6 +2239,11 @@ impl Layered {
         self.stack.get(k)?.scatter.as_ref().map(|g| &g.g.spec)
     }
 
+    /// Generator layer `k`'s scatter as shown (its instances placed), if it is one.
+    pub fn generator_gen(&self, k: usize) -> Option<&VolumeGen> {
+        self.stack.get(k)?.scatter.as_ref().map(|g| &g.g)
+    }
+
     /// Whether layer `k` (of any kind) has block `bc` of level `l`, for checks.
     pub fn layer_holds(&self, k: usize, l: usize, bc: IVec3) -> bool {
         self.stack.get(k).is_some_and(|x| x.holds(l, bc))
@@ -2284,10 +2293,46 @@ impl Layered {
         self.compose(shown, &changes);
     }
 
+    /// Generator layer `k` scattered as `g` (placed already: see [`VolumeGen::build`]), nothing shown changed: a job
+    /// composes it at its own level ([`Self::generator_take`]), what is shown left as it was meanwhile (a caller shows
+    /// it some other way). False, and nothing changed, if it is refused (see [`Self::fits`]); `fits`: known to fit.
+    pub fn generator_for_job(&mut self, shown: &LevelVolume, k: usize, g: VolumeGen, fits: bool) -> bool {
+        let Some(old) = self.stack.get(k).and_then(|x| x.scatter.clone()) else { return false };
+        let own = self.stack[k].level;
+        let g = g.fitted(self.form.voxel(own));
+        if !fits && !self.fits(shown, k, &GenPart::new(&self.form, g.clone(), own)) {
+            return false;
+        }
+        if self.edit.is_none() && old.g.spec != g.spec {
+            self.history.push(Undo::Layers(self.stack.clone(), self.active));
+            self.redo.clear();
+        }
+        // (Its blocks as they were: the job composes those and its new ones.)
+        self.stack[k].scatter = Some(GenPart { g, blocks: old.blocks.clone(), upto: HELD });
+        true
+    }
+
     /// Whether a generator scatter `part` keeps what is shown plus the blocks it composes within the budget; if not,
     /// noted in `refused`.
     /// An edit that leaves fewer blocks shown than now always fits (so one past the budget can be made smaller).
     fn fits(&mut self, shown: &LevelVolume, k: usize, part: &GenPart) -> bool {
+        match self.past_budget(shown, k, part) {
+            Some(n) => {
+                self.refused = Some(n);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Whether generator layer `k` scattered as `g` would be refused (see [`Self::fits`]): if so, how many blocks it
+    /// would leave shown.
+    pub fn generator_too_big(&self, shown: &LevelVolume, k: usize, g: &VolumeGen) -> Option<usize> {
+        let own = self.stack.get(k)?.level;
+        self.past_budget(shown, k, &GenPart::new(&self.form, g.clone(), own))
+    }
+
+    fn past_budget(&self, shown: &LevelVolume, k: usize, part: &GenPart) -> Option<usize> {
         let shown_n: usize = (0..shown.levels()).map(|l| shown.level_len(l)).sum();
         // (Blocks it composes that are shown already are counted once; those composed wholly inside are counted
         // though they end up held without samples, as composing them takes room for a moment.)
@@ -2297,11 +2342,7 @@ impl Layered {
         let gone: usize = self.stack.get(k).and_then(|x| x.scatter.as_ref()).map_or(0, |old| {
             old.blocks.iter().enumerate().map(|(l, b)| b.par_iter().filter(|bc| !part.blocks.get(l).is_some_and(|n| n.contains(*bc)) && !form.exists(l, **bc)).count()).sum()
         });
-        if shown_n + need > self.block_budget && need > gone {
-            self.refused = Some(shown_n + need - gone);
-            return false;
-        }
-        true
+        (shown_n + need > self.block_budget && need > gone).then(|| shown_n + need - gone)
     }
 
     /// Remove layer `k`.

@@ -81,11 +81,12 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
     let m = &mut app.volume;
     let Some(layer) = m.layer.as_ref() else { return };
     let k = layer.active();
-    let Some(spec) = layer.generator(k).cloned() else { return };
-    let placed = layer.generator_instances(k).len();
+    let Some(spec) = m.generator_spec(k) else { return };
+    let placed = m.proxy().map_or_else(|| layer.generator_instances(k).len(), |p| p.0.len());
     let (ms, full, join) = (m.generator_ms, m.generator_full_ms, m.join_ms);
     let on_gpu = m.layer.as_ref().is_some_and(|l| l.gpu_can_join());
     let mut next = spec.clone();
+    let mut build_now = false;
     let (mut changed, mut coalesce, mut dragging) = (false, false, false);
     section(ui, fs, "volume_generator", "GENERATOR", |ui| {
         prop(ui, "Operation", |ui| {
@@ -196,6 +197,14 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
         if let Some(note) = &m.generator_note {
             ui.label(RichText::new(note).small().color(ui.visuals().warn_fg_color));
         }
+        if m.generator_held() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Shown as plain shapes while you edit: the surface is built when you leave this layer.").small().color(weak));
+                if ui.small_button("Build now").clicked() {
+                    build_now = true;
+                }
+            });
+        }
         if placed < spec.count as usize {
             ui.label(RichText::new(format!("{placed} of {} placed: the places that take them are full or few.", spec.count)).small().color(weak));
         }
@@ -231,6 +240,9 @@ pub(crate) fn volume_generator_props(app: &mut SculptApp, ui: &mut Ui) {
         m.set_generator(k, &next, dragging || coalesce);
     } else if !dragging {
         m.end_generator_edit();
+    }
+    if build_now {
+        m.build_generator();
     }
 }
 

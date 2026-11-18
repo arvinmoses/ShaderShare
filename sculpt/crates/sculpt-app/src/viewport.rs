@@ -77,6 +77,8 @@ pub struct Viewport {
     pub(crate) bgl: wgpu::BindGroupLayout,
     /// The decimation preview, drawn in place of the volume while it shows (`decimate_ui`).
     pub decimate: Option<crate::decimate_draw::DecimateDraw>,
+    /// A generator edit held as meshes, drawn over the volume (made when first needed).
+    proxy: Option<crate::proxy_draw::ProxyDraw>,
 }
 
 /// The volume playground's surface on the GPU: built there by `gpu_levels`, and drawn from its buffers, a page of
@@ -261,6 +263,7 @@ impl Viewport {
             shader,
             bgl,
             decimate: None,
+            proxy: None,
             texture_id: None,
             last_upload: UploadStats::default(),
         }
@@ -435,6 +438,15 @@ impl Viewport {
     }
 
     /// Drop the GPU's copy of the volume: the next sync builds it afresh (a new or opened volume).
+    /// Show a generator edit held as meshes (see `VolumeMode::proxy`), or none.
+    pub fn set_proxy(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, shown: Option<(&[sculpt_core::generator::Instance], bool, u64)>) {
+        if shown.is_none() && self.proxy.is_none() {
+            return;
+        }
+        let bgl = &self.bgl;
+        self.proxy.get_or_insert_with(|| crate::proxy_draw::ProxyDraw::new(device, bgl)).set(device, queue, shown);
+    }
+
     pub fn clear_volume(&mut self) {
         self.volume = None;
     }
@@ -622,6 +634,9 @@ impl Viewport {
                     pass.multi_draw_indexed_indirect_count(draws, 0, status, 8, v.gpu.page_capacity());
                 } else {
                     pass.multi_draw_indexed_indirect(draws, 0, v.gpu.page_capacity());
+                }
+                if let Some(p) = self.proxy.as_ref().filter(|p| p.showing()) {
+                    p.draw(&mut pass);
                 }
             }
         }

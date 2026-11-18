@@ -19,6 +19,7 @@ use glam::Vec3;
 use sculpt_core::generator::detail_layer::{FollowDone, GenDone, Layered};
 use sculpt_core::LayerBlend;
 use sculpt_core::generator::layer::GeneratorSpec;
+use sculpt_core::generator::volume_gen::VolumeGen;
 use sculpt_core::surface_noise::SurfaceNoise;
 use sculpt_core::generator::{BoolOp, Primitive};
 use sculpt_core::generator::level_volume::{CarryDone, EndDone, Key, LevelVolume};
@@ -177,6 +178,28 @@ pub enum Target {
     Density { more: bool },
 }
 
+/// A generator edit held as plain meshes of its instances (drawn by `proxy_draw`), the volume left as it was: an edit of
+/// any size costs a frame the same, the volume taking it once the user leaves the layer.
+struct GenProxy {
+    k: usize,
+    spec: GeneratorSpec,
+    scatter: VolumeGen,
+    instances: Arc<Vec<sculpt_core::generator::Instance>>,
+    /// Changes with every edit (so the meshes are sent again).
+    epoch: u64,
+    /// Checked that it fits the volume (see `VolumeMode::check_proxy`).
+    checked: bool,
+}
+
+/// Why a generator edit is refused: it would leave `need` blocks shown, past `budget`.
+fn too_big_note(need: usize, budget: usize) -> String {
+    format!(
+        "Too big for this volume: it would need about {:.1}M blocks, and the most is {:.1}M. Lower the size or the count.",
+        need as f64 / 1e6,
+        budget as f64 / 1e6
+    )
+}
+
 pub struct VolumeMode {
     /// What is drawn (with a detail layer, the form with the layer on it).
     pub vol: LevelVolume,
@@ -213,6 +236,13 @@ pub struct VolumeMode {
     /// Why the last generator edit was refused (too many blocks for the volume), if it was.
     pub generator_note: Option<String>,
     generator_edit: bool,
+    /// Generator edits shown as plain meshes of their instances ([`GenProxy`]), the volume changed only once the user
+    /// leaves the layer ([`Self::build_generator`]) or anything needs the volume settled: rather than at every change.
+    pub hold_generators: bool,
+    /// A generator edit held so.
+    proxy: Option<GenProxy>,
+    /// One let go of, shown so until a job has put it in the volume.
+    landing_proxy: Option<(Arc<Vec<sculpt_core::generator::Instance>>, bool, u64)>,
     /// A generator being composed at its own level on another thread (its preview shown meanwhile).
     gen_job: Option<Receiver<GenDone>>,
     /// An edit for the GPU to join the generators for, on the next sync.
@@ -353,6 +383,9 @@ impl VolumeMode {
             generator_full_ms: 0.0,
             generator_note: None,
             generator_edit: false,
+            hold_generators: false,
+            proxy: None,
+            landing_proxy: None,
             gen_job: None,
             gpu_plan: None,
             join_ms: 0.0,
@@ -714,6 +747,7 @@ impl VolumeMode {
 
     fn tick_now(&mut self) {
         self.generator_jobs(false);
+        self.proxy_landed();
         let t = Instant::now();
         // The detail layer following the form: bring in a job that finished, start the next on what dabs queued.
         if let Some(layer) = self.layer.as_mut() {
@@ -831,6 +865,13 @@ impl VolumeMode {
     /// Finish everything still being worked out, now (strokes run ahead done for real, a stroke's end, the layers'
     /// following, generator jobs): before anything that needs the volume settled (undo, saving, editing the layers).
     pub fn settle(&mut self) {
+        // In the volume, now: whatever needs the volume settled needs the generators in it.
+        self.commit_proxy();
+        self.settle_holding();
+    }
+
+    /// [`Self::settle`], a generator edit held as meshes left so.
+    fn settle_holding(&mut self) {
         self.close_slider_edit();
         while self.ahead.is_some() {
             self.with_real(|m| m.settle_now());
@@ -844,6 +885,7 @@ impl VolumeMode {
 
     fn settle_now(&mut self) {
         self.generator_jobs(true);
+        self.proxy_landed();
         if let Some(layer) = self.layer.as_mut() {
             if let Some(rx) = self.form_end.take()
                 && let Ok(done) = rx.recv()
@@ -906,6 +948,8 @@ impl VolumeMode {
     /// Begin a stroke. Its first dab shows at once: if work it must come after is still landing (the last stroke's
     /// end, the layers' following, a generator's job), it runs ahead on a copy until that work is in (see [`Ahead`]).
     pub fn begin_stroke(&mut self) {
+        // A stroke comes after a generator edit held as meshes is in the volume.
+        self.commit_proxy();
         self.close_slider_edit();
         while self.run_dabs(f64::INFINITY) > 0 {}
         if dab_log() {
@@ -1123,6 +1167,92 @@ impl VolumeMode {
 
     /// Change generator layer `k`'s parameters. While `dragging`, the changes undo as one, until a change that is not.
     pub fn set_generator(&mut self, k: usize, spec: &GeneratorSpec, dragging: bool) {
+        if self.hold_generators && self.layer.as_ref().is_some_and(|l| l.generator(k).is_some()) {
+            self.hold_generator(k, spec);
+            if !dragging {
+                self.check_proxy();
+            }
+            return;
+        }
+        self.set_generator_now(k, spec, dragging);
+    }
+
+    /// Hold generator layer `k`'s edit as meshes of its instances, placed as they would be: the volume as it was.
+    fn hold_generator(&mut self, k: usize, spec: &GeneratorSpec) {
+        if self.proxy.as_ref().is_some_and(|p| p.k != k) {
+            self.commit_proxy();
+        }
+        let Some(layer) = self.layer.as_ref() else { return };
+        let t = Instant::now();
+        let scatter = {
+            let old = self.proxy.as_ref().map(|p| &p.scatter).or_else(|| layer.generator_gen(k));
+            if old.is_some_and(|g| g.spec == *spec) {
+                return;
+            }
+            VolumeGen::build(layer.form(), spec, old)
+        };
+        let epoch = self.proxy.as_ref().map_or(0, |p| p.epoch) + 1;
+        self.proxy = Some(GenProxy { k, spec: spec.clone(), instances: Arc::new(scatter.instances().to_vec()), scatter, epoch, checked: false });
+        self.generator_note = None;
+        self.generator_ms = ms(t);
+    }
+
+    /// Whether the edit held as meshes fits the volume, noted if not (once it is let go of: it takes about as long as
+    /// finding its blocks).
+    fn check_proxy(&mut self) {
+        let (Some(p), Some(layer)) = (self.proxy.as_mut(), self.layer.as_ref()) else { return };
+        if std::mem::replace(&mut p.checked, true) {
+            return;
+        }
+        self.generator_note = layer.generator_too_big(&self.vol, p.k, &p.scatter).map(|need| too_big_note(need, layer.block_budget));
+    }
+
+    /// A generator edit held as meshes, put in the volume now: composed at its own level off the frame, the meshes
+    /// shown till it is in.
+    fn commit_proxy(&mut self) {
+        let Some(p) = self.proxy.take() else { return };
+        self.settle_holding();
+        // (Checked and refused already: the layer as it was.)
+        if p.checked && self.generator_note.is_some() {
+            return;
+        }
+        let Some(layer) = self.layer.as_mut() else { return };
+        layer.refused = None;
+        let cut = p.spec.op == BoolOp::Subtract;
+        let taken = layer.generator_for_job(&self.vol, p.k, p.scatter, p.checked);
+        self.generator_note = layer.refused.take().map(|need| too_big_note(need, layer.block_budget));
+        if taken {
+            self.landing_proxy = Some((p.instances, cut, p.epoch));
+            self.start_generator_job();
+        }
+    }
+
+    /// A generator edit held as meshes (its instances, whether they cut, and a number that changes with them), if any:
+    /// as edited, or on its way into the volume.
+    pub fn proxy(&self) -> Option<(&[sculpt_core::generator::Instance], bool, u64)> {
+        match (&self.proxy, &self.landing_proxy) {
+            (Some(p), _) => Some((p.instances.as_slice(), p.spec.op == BoolOp::Subtract, p.epoch)),
+            (None, Some((i, cut, epoch))) => Some((i.as_slice(), *cut, *epoch)),
+            _ => None,
+        }
+    }
+
+    /// The meshes of an edit on its way into the volume let go of once it is in.
+    fn proxy_landed(&mut self) {
+        if self.landing_proxy.is_some() && self.gen_job.is_none() && !self.layer.as_ref().is_some_and(|l| l.previewing()) {
+            self.landing_proxy = None;
+        }
+    }
+
+    /// Generator layer `k`'s parameters as edited (held or not).
+    pub fn generator_spec(&self, k: usize) -> Option<GeneratorSpec> {
+        match &self.proxy {
+            Some(p) if p.k == k => Some(p.spec.clone()),
+            _ => self.layer.as_ref()?.generator(k).cloned(),
+        }
+    }
+
+    fn set_generator_now(&mut self, k: usize, spec: &GeneratorSpec, dragging: bool) {
         // Mid-drag, the job composing an earlier frame's rocks at their own level is stale: stopped, not waited on
         // (no job starts again until the drag is over: see `start_generator_job`).
         if self.generator_edit {
@@ -1144,17 +1274,21 @@ impl VolumeMode {
             None if layer.refused.is_some() => {}
             None => layer.preview_generator(&mut self.vol, k, spec),
         }
-        self.generator_note = layer.refused.take().map(|need| {
-            format!(
-                "Too big for this volume: it would need about {:.1}M blocks, and the most is {:.1}M. Lower the size or the count.",
-                need as f64 / 1e6,
-                layer.block_budget as f64 / 1e6
-            )
-        });
+        self.generator_note = layer.refused.take().map(|need| too_big_note(need, layer.block_budget));
         self.generator_ms = ms(t);
         if !dragging {
             self.end_generator_edit();
         }
+    }
+
+    /// Whether a generator edit is held as meshes, waiting for [`Self::build_generator`].
+    pub fn generator_held(&self) -> bool {
+        self.proxy.is_some()
+    }
+
+    /// The user left the generator they were editing: put in the volume now, composed at its own level off the frame.
+    pub fn build_generator(&mut self) {
+        self.commit_proxy();
     }
 
     /// Start composing a previewed generator at its own level on another thread, unless one is under way.
@@ -1218,8 +1352,10 @@ impl VolumeMode {
         }
     }
 
-    /// A drag of a generator's parameter is over: shown at its own level again, one undo step for all of it.
+    /// A drag of a generator's parameter is over: shown at its own level again, one undo step for all of it (held as
+    /// meshes: checked that it fits).
     pub fn end_generator_edit(&mut self) {
+        self.check_proxy();
         if self.ahead.is_some() {
             self.settle();
         }
@@ -1409,7 +1545,12 @@ impl VolumeMode {
     }
 
     pub fn set_active_layer(&mut self, k: usize) {
-        self.settle();
+        // Another layer: a generator edit held as meshes goes in the volume.
+        if self.proxy.as_ref().is_some_and(|p| p.k != k) {
+            self.settle();
+        } else {
+            self.settle_holding();
+        }
         if let Some(m) = self.mesh.as_mut() {
             m.set_active(k);
         } else if let Some(layer) = self.layer.as_mut() {

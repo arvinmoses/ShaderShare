@@ -715,6 +715,9 @@ fn layers_panel(app: &mut SculptApp, ui: &mut Ui) {
         m.remove_mask(k, mi);
     }
     if let Some(t) = act.target {
+        if t != m.target {
+            m.build_generator();
+        }
         m.target = t;
     }
     if let Some((k, on)) = act.visible {

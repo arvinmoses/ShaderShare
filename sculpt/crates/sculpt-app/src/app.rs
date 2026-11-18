@@ -152,7 +152,11 @@ impl SculptApp {
         let triangles = std::env::var("SCULPT_VOLUME").ok().and_then(|v| v.parse::<f32>().ok()).map_or(opts.triangles, |m| m * 1e6);
 
         let mut app = SculptApp {
-            volume: VolumeMode::ball(triangles),
+            volume: {
+                let mut v = VolumeMode::ball(triangles);
+                v.hold_generators = true;
+                v
+            },
             volume_path: None,
             viewport: cc.wgpu_render_state.as_ref().map(Viewport::new),
             camera: Camera::default(),
@@ -266,6 +270,7 @@ impl SculptApp {
     fn replace_volume(&mut self, mut mode: VolumeMode) {
         self.end_stroke();
         mode.generation = self.volume.generation + 1;
+        mode.hold_generators = true;
         self.volume = mode;
         if let Some(vp) = self.viewport.as_mut() {
             vp.clear_volume();
@@ -507,6 +512,7 @@ impl SculptApp {
             let demo = self.volume_demo.as_ref();
             let eye = demo.and_then(|d| d.level_eye).unwrap_or(self.camera.eye());
             self.settling = vp.sync_volume(rs, mode, eye, focal_px, demo.map(|d| d.clock()));
+            vp.set_proxy(&rs.device, &rs.queue, mode.proxy());
             let rows = mode.take_rows_dirty();
             vp.sync_layer_rows(mode.mesh_layers(), rows);
             if self.settling {
@@ -607,6 +613,9 @@ impl SculptApp {
             m.bake_noise(k, level);
         }
         if let Some(t) = f.target {
+            if t != m.target {
+                m.build_generator();
+            }
             m.target = t;
         }
         if let Some(t) = f.tint {
@@ -635,7 +644,7 @@ impl SculptApp {
             && let Some(layer) = m.layer.as_ref()
         {
             let k = layer.active();
-            if let Some(mut spec) = layer.generator(k).cloned() {
+            if let Some(mut spec) = m.generator_spec(k) {
                 edit(&mut spec);
                 m.set_generator(k, &spec, f.generator_dragging);
             }

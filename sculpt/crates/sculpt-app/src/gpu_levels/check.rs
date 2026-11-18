@@ -1432,13 +1432,17 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
     let tris: f32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(13.2);
     let mut mode = crate::volume_mode::VolumeMode::ball(tris);
     mode.add_generator();
+    // As the app has it: edits held at a preview's density until the user leaves the layer (`PROBE_NO_HOLD`: not).
+    mode.hold_generators = std::env::var_os("PROBE_NO_HOLD").is_none();
     let mut gpu = GpuLevels::new(&device, &queue, &mode.vol, mode.vol.levels() - 1);
     mode.layer.as_mut().unwrap().block_budget = gpu.block_budget();
     println!("block budget {}", gpu.block_budget());
+    let mut drag_over = 0usize;
     rocks_frame(&mut gpu, &mut mode);
     let k = mode.layer.as_ref().unwrap().active();
     let mut spec = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
-    let (a, b) = (spec.size.ln(), 0.5f32.ln());
+    let top: f32 = std::env::var("PROBE_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+    let (a, b) = (spec.size.ln(), top.ln());
     let mut worst = 0.0f64;
     let sweeps: usize = std::env::var("PROBE_SWEEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     for sweep in 0..sweeps {
@@ -1457,6 +1461,7 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
             }
             let f = t.elapsed().as_secs_f64() * 1e3;
             worst = worst.max(f);
+            drag_over += (f > 50.0) as usize;
             let (cap, high, free) = gpu.join_pool();
             if i % 10 == 0 {
                 println!("sweep {sweep} size {:.3}: {f:.0} ms, slots {} of {}, pool {high} used ({free} free) of {cap}, note {:?}", spec.size, gpu.slot_of.len(), gpu.buf.slots, mode.generator_note);
@@ -1465,7 +1470,14 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
                 return Err(format!("the join pool holds {high} places for {} slots", gpu.buf.slots).into());
             }
         }
+        let t = Instant::now();
         mode.end_generator_edit();
+        println!("let go at size {:.3} in {:.0} ms, note {:?}", spec.size, t.elapsed().as_secs_f64() * 1e3, mode.generator_note);
+        // Let go: a few frames as held, then the user leaves the layer.
+        for _ in 0..5 {
+            rocks_frame(&mut gpu, &mut mode);
+        }
+        mode.build_generator();
         let start = Instant::now();
         let (mut frames, mut over, mut worst_land) = (0usize, 0usize, 0.0f64);
         loop {
@@ -1488,9 +1500,9 @@ pub fn size_drag_probe(args: &[String]) -> Res<()> {
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        println!("sweep {sweep} landed in {:.1} s: {frames} frames, {over} over 50 ms, worst {worst_land:.0} ms", start.elapsed().as_secs_f64());
+        println!("sweep {sweep} landed in {:.1} s: {frames} frames, {over} over 50 ms, worst {worst_land:.0} ms, {} blocks, note {:?}", start.elapsed().as_secs_f64(), mode.vol.keys().len(), mode.generator_note);
     }
-    println!("worst drag frame {worst:.0} ms");
+    println!("worst drag frame {worst:.0} ms, {drag_over} drag frames over 50 ms");
     println!("end: {} blocks, slots {} of {}", mode.vol.keys().len(), gpu.slot_of.len(), gpu.buf.slots);
     Ok(())
 }

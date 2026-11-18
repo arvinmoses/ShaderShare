@@ -1062,6 +1062,65 @@ fn big_results_land_without_a_long_frame() {
     shown_as_afresh(&mode, "undone");
 }
 
+/// Generator edits held as meshes: a drag and a click change only the meshes shown (the volume and the layer as they
+/// were); leaving the layer puts the last of them in off the frame (the meshes shown till it is in), as one undo step,
+/// and what is shown ends as composed afresh. One too big for the volume is noted when let go of, and left out.
+#[test]
+fn held_generator_edits_go_in_when_the_layer_is_left() {
+    let _one = timing_lock();
+    let mut mode = VolumeMode::ball(1e6);
+    mode.hold_generators = true;
+    mode.add_generator();
+    mode.settle();
+    mode.vol.drain_dirty();
+    let k = mode.layer.as_ref().unwrap().active();
+    let was = mode.layer.as_ref().unwrap().generator(k).unwrap().clone();
+    let before = mode.layer.as_ref().unwrap().history_len();
+    let mut spec = was.clone();
+    for size in [0.1, 0.2, 0.3] {
+        spec.size = size;
+        mode.set_generator(k, &spec, true);
+    }
+    mode.end_generator_edit();
+    spec.seed += 1;
+    mode.set_generator(k, &spec, false);
+    assert!(mode.vol.dirty_keys().is_empty() && mode.gpu_plan.is_none() && mode.gen_job.is_none(), "a held edit changed the volume");
+    assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&was));
+    assert_eq!(mode.generator_spec(k), Some(spec.clone()));
+    assert!(mode.generator_held() && mode.generator_note.is_none());
+    let (n, epoch) = mode.proxy().map(|p| (p.0.len(), p.2)).unwrap();
+    assert!(n > 0);
+    // Clicking the layer again keeps it held; leaving it puts it in off the frame, the meshes shown meanwhile.
+    mode.set_active_layer(k);
+    assert!(mode.generator_held());
+    mode.build_generator();
+    assert!(!mode.generator_held() && mode.gen_job.is_some());
+    assert_eq!(mode.proxy().map(|p| p.2), Some(epoch));
+    let (worst, _, _) = frames_until_settled(&mut mode);
+    eprintln!("held rocks put in: worst tick {worst:.1} ms");
+    assert!(mode.proxy().is_none(), "the meshes stayed after it was in");
+    assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&spec));
+    assert_eq!(mode.layer.as_ref().unwrap().generator_instances(k).len(), n);
+    shown_as_afresh(&mode, "held, then left");
+    assert_eq!(mode.layer.as_ref().unwrap().history_len(), before + 1);
+    assert!(mode.undo());
+    frames_until_settled(&mut mode);
+    assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&was));
+    shown_as_afresh(&mode, "held, left, undone");
+    // Too big: noted when let go of, and left out.
+    mode.layer.as_mut().unwrap().set_active(k);
+    mode.layer.as_mut().unwrap().block_budget = mode.vol.keys().len() + 1000;
+    spec.size = 0.5;
+    mode.set_generator(k, &spec, true);
+    assert!(mode.generator_note.is_none());
+    mode.end_generator_edit();
+    assert!(mode.generator_note.is_some(), "too big, not noted");
+    mode.build_generator();
+    frames_until_settled(&mut mode);
+    assert_eq!(mode.layer.as_ref().unwrap().generator(k), Some(&was));
+    assert!(mode.proxy().is_none());
+}
+
 /// Edits arriving while a big release's result is still being worked out: a form stroke (which takes the rocks at
 /// their own level and leaves the job's result stale), and another drag and release of the slider. What is shown
 /// ends as composed afresh.

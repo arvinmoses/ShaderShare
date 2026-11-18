@@ -21,6 +21,7 @@ mod mesh_edit;
 mod mesh_stack;
 mod panels;
 mod pen;
+mod proxy_draw;
 mod theme;
 mod tools;
 mod viewport;
