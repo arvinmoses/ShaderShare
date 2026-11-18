@@ -960,6 +960,17 @@ impl GpuLevels {
                 self.pending = merged;
             }
         }
+        // Blocks that go now pull in the changed blocks the GPU holds next to them, and those the ones next to them,
+        // ring by ring, until nearly every one it holds lands with them (see the pull in `sync_in`): a big generator's
+        // landing took over a hundred rounds of seconds' worth of looking. They are taken now, all at once.
+        if !now.is_empty() && !self.pending_set.is_empty() {
+            let set = &self.pending_set;
+            let held: Vec<Key> = self.pending.par_iter().map(|p| p.1).filter(|k| set.contains(k) && slot_of.contains_key(k)).collect();
+            for k in &held {
+                self.pending_set.remove(k);
+            }
+            now.extend(held);
+        }
         // From the end: up to the limit of blocks still pending, then to the end of that region (within reason). A
         // block that went and the GPU does not hold costs nothing: it does not count (a big generator's landing takes
         // hundreds of thousands of them out of level 0).
