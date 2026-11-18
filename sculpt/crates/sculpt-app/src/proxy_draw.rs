@@ -5,6 +5,11 @@
 //! The primitives' unit meshes live end to end in one storage buffer (position and normal per vertex, no index buffer);
 //! the instances, sorted by primitive, in another. One instanced draw per primitive present. The pipeline shares
 //! group 0 (the viewport's uniforms) with the volume's, and is lit by the same `lit`, tinted so it reads as a preview.
+//!
+//! Rocks that cut are drawn as the holes they make, in two draws after the volume's: their faces in front of the
+//! surface count in the stencil (up where a ray goes into one, down where it comes out), so a pixel whose surface lies
+//! inside a rock is left above zero; there, the rock's far side behind the surface is drawn, as the hole's wall. Exact
+//! for rocks that are convex and apart; the parts of rocks out in the air show nothing, as they cut nothing.
 
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat3, Vec2, Vec3};
@@ -14,7 +19,7 @@ use sculpt_core::generator::sdf::TORUS_MINOR;
 // As the viewport's render targets (`viewport.rs`).
 const MSAA: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 
 const WGSL: &str = r#"
 // ------------------------------------------------------------------ a generator held as meshes (proxy_draw.rs)
@@ -69,6 +74,21 @@ fn fs_proxy(i: ProxyOut) -> @location(0) vec4<f32> {
     let c = lit(m, n, u.clay.rgb * tint);
     return vec4<f32>(c.rgb, 1.0);
 }
+
+// A cutting rock's far side, seen through the surface it cuts: the wall of its hole, facing out of the hole.
+@fragment
+fn fs_proxy_wall(i: ProxyOut) -> @location(0) vec4<f32> {
+    var m: MeshOut;
+    m.clip = i.clip;
+    m.world = i.world;
+    m.overlay = 0.0;
+    m.base = i.world;
+    let l2 = dot(i.normal, i.normal);
+    let n = -select(vec3<f32>(0.0, 1.0, 0.0), i.normal * inverseSqrt(max(l2, 1e-30)), l2 > 1e-30);
+    m.normal = n;
+    let c = lit(m, n, u.clay.rgb * vec3<f32>(1.0, 0.8, 0.72));
+    return vec4<f32>(c.rgb, 1.0);
+}
 "#;
 
 #[repr(C)]
@@ -80,6 +100,11 @@ struct ProxyInst {
 
 pub struct ProxyDraw {
     pipe: wgpu::RenderPipeline,
+    /// Rocks that cut: their faces in front of the surface counted in the stencil, then their far sides drawn behind it
+    /// where the count is above zero.
+    mark: wgpu::RenderPipeline,
+    wall: wgpu::RenderPipeline,
+    cut: bool,
     bgl: wgpu::BindGroupLayout,
     verts: wgpu::Buffer,
     /// Each primitive's vertices in `verts` (in `Primitive::ALL`'s order).
@@ -109,24 +134,34 @@ impl ProxyDraw {
         };
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("proxy"), entries: &[ro(0), ro(1)] });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("proxy"), bind_group_layouts: &[Some(view_bgl), None, Some(&bgl)], immediate_size: 0 });
-        let target = [Some(wgpu::ColorTargetState { format: COLOR_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })];
-        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("proxy"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_proxy"), compilation_options: Default::default(), buffers: &[] },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_proxy"), compilation_options: Default::default(), targets: &target }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = |label: &str, fs: &str, writes: wgpu::ColorWrites, cull: Option<wgpu::Face>, write: bool, compare: wgpu::CompareFunction, stencil: wgpu::StencilState| {
+            let target = [Some(wgpu::ColorTargetState { format: COLOR_FORMAT, blend: None, write_mask: writes })];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_proxy"), compilation_options: Default::default(), buffers: &[] },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &target }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: cull, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(write), depth_compare: Some(compare), stencil, bias: Default::default() }),
+                multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let face = |compare: wgpu::CompareFunction, pass_op: wgpu::StencilOperation| wgpu::StencilFaceState { compare, fail_op: wgpu::StencilOperation::Keep, depth_fail_op: wgpu::StencilOperation::Keep, pass_op };
+        let pipe = pipeline("proxy", "fs_proxy", wgpu::ColorWrites::ALL, None, true, wgpu::CompareFunction::Less, Default::default());
+        // (The unit meshes wind counter-clockwise seen from outside: see `unit_mesh`.)
+        let mark = pipeline(
+            "proxy cut mark",
+            "fs_proxy",
+            wgpu::ColorWrites::empty(),
+            None,
+            false,
+            wgpu::CompareFunction::Less,
+            wgpu::StencilState { front: face(wgpu::CompareFunction::Always, wgpu::StencilOperation::IncrementWrap), back: face(wgpu::CompareFunction::Always, wgpu::StencilOperation::DecrementWrap), read_mask: 0xff, write_mask: 0xff },
+        );
+        let inside = face(wgpu::CompareFunction::NotEqual, wgpu::StencilOperation::Keep);
+        let wall = pipeline("proxy cut wall", "fs_proxy_wall", wgpu::ColorWrites::ALL, Some(wgpu::Face::Front), true, wgpu::CompareFunction::Greater, wgpu::StencilState { front: inside, back: inside, read_mask: 0xff, write_mask: 0 });
         let mut all: Vec<[f32; 6]> = Vec::new();
         let mut ranges = Vec::new();
         for p in Primitive::ALL {
@@ -137,7 +172,7 @@ impl ProxyDraw {
         let verts = buffer(device, "proxy vertices", (all.len() * 24) as u64);
         let inst = buffer(device, "proxy instances", 64 * std::mem::size_of::<ProxyInst>() as u64);
         let group = bind(device, &bgl, &verts, &inst);
-        ProxyDraw { pipe, bgl, verts, ranges, inst, group, draws: Vec::new(), epoch: None, pending_verts: Some(all) }
+        ProxyDraw { pipe, mark, wall, cut: false, bgl, verts, ranges, inst, group, draws: Vec::new(), epoch: None, pending_verts: Some(all) }
     }
 
     /// Show `instances` (cutting ones if `cut`) as the edit numbered `epoch`; `None` shows none.
@@ -154,6 +189,7 @@ impl ProxyDraw {
             return;
         }
         self.epoch = Some(epoch);
+        self.cut = cut;
         // Sorted by primitive, one run each.
         let mut order: Vec<(usize, &Instance)> = instances.iter().map(|i| (Primitive::ALL.iter().position(|p| *p == i.primitive).unwrap_or(1), i)).collect();
         order.sort_by_key(|x| x.0);
@@ -199,10 +235,14 @@ impl ProxyDraw {
 
     /// Draw into `pass` (its group 0 bound already).
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        pass.set_pipeline(&self.pipe);
         pass.set_bind_group(2, &self.group, &[]);
-        for (v, i) in &self.draws {
-            pass.draw(v.clone(), i.clone());
+        let pipes: &[&wgpu::RenderPipeline] = if self.cut { &[&self.mark, &self.wall] } else { &[&self.pipe] };
+        for pipe in pipes {
+            pass.set_pipeline(pipe);
+            pass.set_stencil_reference(0);
+            for (v, i) in &self.draws {
+                pass.draw(v.clone(), i.clone());
+            }
         }
     }
 }
@@ -230,7 +270,9 @@ const AROUND: usize = 24;
 /// Primitive `p` at unit size (as `sdf.rs` has it), as triangles: position and normal per corner.
 fn unit_mesh(p: Primitive) -> Vec<[f32; 6]> {
     let mut out = Vec::new();
+    // (Wound counter-clockwise seen from outside, the side its normals face: the stencil counts on it.)
     let mut tri = |a: (Vec3, Vec3), b: (Vec3, Vec3), c: (Vec3, Vec3)| {
+        let (b, c) = if (b.0 - a.0).cross(c.0 - a.0).dot(a.1 + b.1 + c.1) < 0.0 { (c, b) } else { (b, c) };
         for (q, n) in [a, b, c] {
             out.push([q.x, q.y, q.z, n.x, n.y, n.z]);
         }
@@ -379,5 +421,31 @@ mod tests {
         assert!(shown > px / 100, "the meshes barely show: {shown} of {px} pixels");
         vp.set_proxy(&device, &queue, None);
         assert_eq!(differ(&before, &vp.render_offscreen(&device, &queue, size, &cam, &theme)), 0, "the meshes stayed");
+        // Rocks that cut, held: drawn as the holes they make, so closer to the cut surface once built than the surface
+        // before them is.
+        spec.op = sculpt_core::generator::BoolOp::Subtract;
+        spec.lift = -0.2;
+        mode.set_generator(k, &spec, false);
+        vp.set_proxy(&device, &queue, mode.proxy());
+        let held = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+        if let Ok(p) = std::env::var("PROXY_SHOT") {
+            let image = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], &held);
+            crate::app::write_png(std::path::Path::new(&p.replace(".png", "_cut.png")), &image, false).unwrap();
+        }
+        mode.build_generator();
+        mode.settle();
+        vp.set_proxy(&device, &queue, mode.proxy());
+        settle(&mut vp, &mut mode);
+        let built = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+        if let Ok(p) = std::env::var("PROXY_SHOT") {
+            let image = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], &built);
+            crate::app::write_png(std::path::Path::new(&p.replace(".png", "_built.png")), &image, false).unwrap();
+        }
+        // Pixels far apart in colour, as the eye would see a hole that is there or not.
+        let far = |a: &[u8], b: &[u8]| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| (0..3).map(|c| (p[c] as i32 - q[c] as i32).abs()).sum::<i32>() > 40).count();
+        let (was, now) = (far(&before, &built), far(&held, &built));
+        println!("cutting rocks: {was} pixels far from the built surface before them, {now} with them held");
+        // (Not alike: the built one's blend is soft, and rocks at the outline show their far side held.)
+        assert!(was > px / 100 && (now as f64) < 0.7 * was as f64, "the held cut does not look like the built one: {now} pixels off, {was} before");
     }
 }

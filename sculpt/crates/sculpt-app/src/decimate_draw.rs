@@ -20,7 +20,7 @@ use sculpt_core::decimate::{Maps, TriMesh};
 // As the viewport's render targets (`viewport.rs`).
 const MSAA: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 
 const WGSL: &str = r#"
 // ------------------------------------------------------------------ the decimation preview (decimate_draw.rs)
