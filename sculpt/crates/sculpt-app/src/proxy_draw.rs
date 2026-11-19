@@ -9,7 +9,9 @@
 //! Rocks that cut are drawn as the holes they make, in two draws after the volume's: their faces in front of the
 //! surface count in the stencil (up where a ray goes into one, down where it comes out), so a pixel whose surface lies
 //! inside a rock is left above zero; there, the rock's far side behind the surface is drawn, as the hole's wall. Exact
-//! for rocks that are convex and apart; the parts of rocks out in the air show nothing, as they cut nothing.
+//! for rocks that are convex; the parts of rocks out in the air show nothing, as they cut nothing. Where rocks overlap,
+//! the part of one's wall inside another is cut away too (each rock tests the few it overlaps), so the wall shown is
+//! where the cut ends.
 
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat3, Vec2, Vec3};
@@ -33,16 +35,38 @@ struct ProxyInst {
     n0: vec4<f32>,
     n1: vec4<f32>,
     n2: vec4<f32>,
+    // Its primitive (in `Primitive::ALL`'s order), and where the rocks it overlaps start and how many in `px_near`.
+    x: vec4<u32>,
 };
 
 @group(2) @binding(0) var<storage, read> px_vert: array<f32>;
 @group(2) @binding(1) var<storage, read> px_inst: array<ProxyInst>;
+@group(2) @binding(2) var<storage, read> px_near: array<u32>;
+
+// Whether world point `w` lies inside rock `j` (as `sdf.rs` has its primitives, at unit size).
+fn px_inside(j: u32, w: vec3<f32>) -> bool {
+    let m = px_inst[j];
+    let d = w - vec3<f32>(m.c0.w, m.c1.w, m.c2.w);
+    let p = vec3<f32>(dot(d, m.n0.xyz), dot(d, m.n1.xyz), dot(d, m.n2.xyz));
+    let a = abs(p);
+    let r = length(p.xz);
+    switch m.x.x {
+        case 0u: { return all(a < vec3<f32>(1.0)); }
+        case 1u: { return dot(p, p) < 1.0; }
+        case 2u: { return r < 1.0 && a.y < 1.0; }
+        case 3u: { return a.y < 1.0 && r < 0.5 * (1.0 - p.y); }
+        case 4u: { return a.z < 1.0 && p.x > -1.0 && p.y > -1.0 && p.x + p.y < 0.0; }
+        case 5u: { return a.z < 1.0 && a.x + a.y < 1.0; }
+        default: { return (r - 1.0) * (r - 1.0) + p.y * p.y < PX_TORUS_MINOR * PX_TORUS_MINOR; }
+    }
+}
 
 struct ProxyOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) @interpolate(flat) cut: f32,
+    @location(3) @interpolate(flat) inst: u32,
 };
 
 @vertex
@@ -56,6 +80,7 @@ fn vs_proxy(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> P
     o.world = w;
     o.normal = m.n0.xyz * n.x + m.n1.xyz * n.y + m.n2.xyz * n.z;
     o.cut = m.n0.w;
+    o.inst = i;
     return o;
 }
 
@@ -78,6 +103,13 @@ fn fs_proxy(i: ProxyOut) -> @location(0) vec4<f32> {
 // A cutting rock's far side, seen through the surface it cuts: the wall of its hole, facing out of the hole.
 @fragment
 fn fs_proxy_wall(i: ProxyOut) -> @location(0) vec4<f32> {
+    // Inside a rock it overlaps: cut away by that one too, not where the cut ends.
+    let x = px_inst[i.inst].x;
+    for (var q = x.y; q < x.y + x.z; q++) {
+        if px_inside(px_near[q], i.world) {
+            discard;
+        }
+    }
     var m: MeshOut;
     m.clip = i.clip;
     m.world = i.world;
@@ -86,7 +118,7 @@ fn fs_proxy_wall(i: ProxyOut) -> @location(0) vec4<f32> {
     let l2 = dot(i.normal, i.normal);
     let n = -select(vec3<f32>(0.0, 1.0, 0.0), i.normal * inverseSqrt(max(l2, 1e-30)), l2 > 1e-30);
     m.normal = n;
-    let c = lit(m, n, u.clay.rgb * vec3<f32>(1.0, 0.8, 0.72));
+    let c = lit(m, n, u.clay.rgb);
     return vec4<f32>(c.rgb, 1.0);
 }
 "#;
@@ -96,7 +128,11 @@ fn fs_proxy_wall(i: ProxyOut) -> @location(0) vec4<f32> {
 struct ProxyInst {
     c: [[f32; 4]; 3],
     n: [[f32; 4]; 3],
+    x: [u32; 4],
 }
+
+/// Most rocks one rock's wall is tested against (the nearest it overlaps).
+const NEAR_MOST: usize = 16;
 
 pub struct ProxyDraw {
     pipe: wgpu::RenderPipeline,
@@ -110,6 +146,8 @@ pub struct ProxyDraw {
     /// Each primitive's vertices in `verts` (in `Primitive::ALL`'s order).
     ranges: Vec<std::ops::Range<u32>>,
     inst: wgpu::Buffer,
+    /// Each rock's overlapping rocks, end to end (see `ProxyInst::x`).
+    near: wgpu::Buffer,
     group: wgpu::BindGroup,
     /// One draw per primitive present: its vertices and its instances.
     draws: Vec<(std::ops::Range<u32>, std::ops::Range<u32>)>,
@@ -124,15 +162,15 @@ impl ProxyDraw {
     pub fn new(device: &wgpu::Device, view_bgl: &wgpu::BindGroupLayout) -> ProxyDraw {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("proxy"),
-            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}\n{}", include_str!("viewport.wgsl"), sculpt_core::surface_noise::WGSL, WGSL).into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}\nconst PX_TORUS_MINOR: f32 = {TORUS_MINOR:?};\n{}", include_str!("viewport.wgsl"), sculpt_core::surface_noise::WGSL, WGSL).into()),
         });
         let ro = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("proxy"), entries: &[ro(0), ro(1)] });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("proxy"), entries: &[ro(0), ro(1), ro(2)] });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("proxy"), bind_group_layouts: &[Some(view_bgl), None, Some(&bgl)], immediate_size: 0 });
         let pipeline = |label: &str, fs: &str, writes: wgpu::ColorWrites, cull: Option<wgpu::Face>, write: bool, compare: wgpu::CompareFunction, stencil: wgpu::StencilState| {
             let target = [Some(wgpu::ColorTargetState { format: COLOR_FORMAT, blend: None, write_mask: writes })];
@@ -171,8 +209,9 @@ impl ProxyDraw {
         }
         let verts = buffer(device, "proxy vertices", (all.len() * 24) as u64);
         let inst = buffer(device, "proxy instances", 64 * std::mem::size_of::<ProxyInst>() as u64);
-        let group = bind(device, &bgl, &verts, &inst);
-        ProxyDraw { pipe, mark, wall, cut: false, bgl, verts, ranges, inst, group, draws: Vec::new(), epoch: None, pending_verts: Some(all) }
+        let near = buffer(device, "proxy near", 1024);
+        let group = bind(device, &bgl, &verts, &inst, &near);
+        ProxyDraw { pipe, mark, wall, cut: false, bgl, verts, ranges, inst, near, group, draws: Vec::new(), epoch: None, pending_verts: Some(all) }
     }
 
     /// Show `instances` (cutting ones if `cut`) as the edit numbered `epoch`; `None` shows none.
@@ -193,10 +232,30 @@ impl ProxyDraw {
         // Sorted by primitive, one run each.
         let mut order: Vec<(usize, &Instance)> = instances.iter().map(|i| (Primitive::ALL.iter().position(|p| *p == i.primitive).unwrap_or(1), i)).collect();
         order.sort_by_key(|x| x.0);
+        // Each rock's overlapping ones (by bounding spheres), nearest first: only rocks that cut need them.
+        let ball = |i: &Instance| (i.translation, (i.primitive.local_half_extent() * i.scale).length());
+        let mut near: Vec<u32> = Vec::new();
+        let mut spans = vec![(0u32, 0u32); order.len()];
+        if cut {
+            let balls: Vec<(Vec3, f32)> = order.iter().map(|(_, i)| ball(i)).collect();
+            for (a, &(ca, ra)) in balls.iter().enumerate() {
+                let mut by: Vec<(f32, u32)> = balls
+                    .iter()
+                    .enumerate()
+                    .filter(|&(b, &(cb, rb))| b != a && ca.distance_squared(cb) < (ra + rb) * (ra + rb))
+                    .map(|(b, &(cb, _))| (ca.distance_squared(cb), b as u32))
+                    .collect();
+                by.sort_by(|x, y| x.0.total_cmp(&y.0));
+                by.truncate(NEAR_MOST);
+                spans[a] = (near.len() as u32, by.len() as u32);
+                near.extend(by.iter().map(|x| x.1));
+            }
+        }
         let cut = if cut { 1.0 } else { 0.0 };
         let data: Vec<ProxyInst> = order
             .iter()
-            .map(|(_, i)| {
+            .zip(&spans)
+            .map(|((p, i), &(from, n))| {
                 let r = Mat3::from_quat(i.rotation);
                 let s = i.scale;
                 let si = s.recip();
@@ -205,16 +264,26 @@ impl ProxyDraw {
                 ProxyInst {
                     c: [col(r.x_axis * s.x, t.x), col(r.y_axis * s.y, t.y), col(r.z_axis * s.z, t.z)],
                     n: [col(r.x_axis * si.x, cut), col(r.y_axis * si.y, 0.0), col(r.z_axis * si.z, 0.0)],
+                    x: [*p as u32, from, n, 0],
                 }
             })
             .collect();
         let bytes = (data.len().max(1) * std::mem::size_of::<ProxyInst>()) as u64;
-        if self.inst.size() < bytes {
-            self.inst = buffer(device, "proxy instances", bytes.next_power_of_two());
-            self.group = bind(device, &self.bgl, &self.verts, &self.inst);
+        let near_bytes = (near.len().max(1) * 4) as u64;
+        if self.inst.size() < bytes || self.near.size() < near_bytes {
+            if self.inst.size() < bytes {
+                self.inst = buffer(device, "proxy instances", bytes.next_power_of_two());
+            }
+            if self.near.size() < near_bytes {
+                self.near = buffer(device, "proxy near", near_bytes.next_power_of_two());
+            }
+            self.group = bind(device, &self.bgl, &self.verts, &self.inst, &self.near);
         }
         if !data.is_empty() {
             queue.write_buffer(&self.inst, 0, bytemuck::cast_slice(&data));
+        }
+        if !near.is_empty() {
+            queue.write_buffer(&self.near, 0, bytemuck::cast_slice(&near));
         }
         self.draws.clear();
         let mut a = 0;
@@ -256,11 +325,15 @@ fn buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     })
 }
 
-fn bind(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, verts: &wgpu::Buffer, inst: &wgpu::Buffer) -> wgpu::BindGroup {
+fn bind(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, verts: &wgpu::Buffer, inst: &wgpu::Buffer, near: &wgpu::Buffer) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("proxy"),
         layout: bgl,
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: verts.as_entire_binding() }, wgpu::BindGroupEntry { binding: 1, resource: inst.as_entire_binding() }],
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: verts.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: inst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: near.as_entire_binding() },
+        ],
     })
 }
 
@@ -422,30 +495,35 @@ mod tests {
         vp.set_proxy(&device, &queue, None);
         assert_eq!(differ(&before, &vp.render_offscreen(&device, &queue, size, &cam, &theme)), 0, "the meshes stayed");
         // Rocks that cut, held: drawn as the holes they make, so closer to the cut surface once built than the surface
-        // before them is.
+        // before them is. Then many, so they overlap (where one's wall is inside another, it is cut away too): shown and
+        // measured, not gated (the built one's soft blend merges them).
         spec.op = sculpt_core::generator::BoolOp::Subtract;
         spec.lift = -0.2;
-        mode.set_generator(k, &spec, false);
-        vp.set_proxy(&device, &queue, mode.proxy());
-        let held = vp.render_offscreen(&device, &queue, size, &cam, &theme);
-        if let Ok(p) = std::env::var("PROXY_SHOT") {
-            let image = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], &held);
-            crate::app::write_png(std::path::Path::new(&p.replace(".png", "_cut.png")), &image, false).unwrap();
+        for (count, spacing, gate) in [(spec.count, spec.min_spacing, true), (60, 0.0, false)] {
+            spec.count = count;
+            spec.min_spacing = spacing;
+            vp.set_proxy(&device, &queue, None);
+            let before = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+            mode.set_generator(k, &spec, false);
+            vp.set_proxy(&device, &queue, mode.proxy());
+            let held = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+            mode.build_generator();
+            mode.settle();
+            vp.set_proxy(&device, &queue, mode.proxy());
+            settle(&mut vp, &mut mode);
+            let built = vp.render_offscreen(&device, &queue, size, &cam, &theme);
+            if let Ok(p) = std::env::var("PROXY_SHOT") {
+                for (what, shot) in [("cut", &held), ("built", &built)] {
+                    let image = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], shot);
+                    crate::app::write_png(std::path::Path::new(&p.replace(".png", &format!("_{what}{count}.png"))), &image, false).unwrap();
+                }
+            }
+            // Pixels far apart in colour, as the eye would see a hole that is there or not.
+            let far = |a: &[u8], b: &[u8]| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| (0..3).map(|c| (p[c] as i32 - q[c] as i32).abs()).sum::<i32>() > 40).count();
+            let (was, now) = (far(&before, &built), far(&held, &built));
+            println!("{count} cutting rocks: {was} pixels far from the built surface before them, {now} with them held");
+            // (Not alike: the built one's blend is soft, and rocks at the outline show their far side held.)
+            assert!(!gate || (was > px / 100 && (now as f64) < 0.7 * was as f64), "the held cut does not look like the built one: {now} pixels off, {was} before");
         }
-        mode.build_generator();
-        mode.settle();
-        vp.set_proxy(&device, &queue, mode.proxy());
-        settle(&mut vp, &mut mode);
-        let built = vp.render_offscreen(&device, &queue, size, &cam, &theme);
-        if let Ok(p) = std::env::var("PROXY_SHOT") {
-            let image = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], &built);
-            crate::app::write_png(std::path::Path::new(&p.replace(".png", "_built.png")), &image, false).unwrap();
-        }
-        // Pixels far apart in colour, as the eye would see a hole that is there or not.
-        let far = |a: &[u8], b: &[u8]| a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| (0..3).map(|c| (p[c] as i32 - q[c] as i32).abs()).sum::<i32>() > 40).count();
-        let (was, now) = (far(&before, &built), far(&held, &built));
-        println!("cutting rocks: {was} pixels far from the built surface before them, {now} with them held");
-        // (Not alike: the built one's blend is soft, and rocks at the outline show their far side held.)
-        assert!(was > px / 100 && (now as f64) < 0.7 * was as f64, "the held cut does not look like the built one: {now} pixels off, {was} before");
     }
 }
